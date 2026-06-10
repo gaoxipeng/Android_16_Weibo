@@ -1,0 +1,314 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-05-05T00:00:00Z",
+  "title": "Design System: xb",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Canvas",
+        "canonical": "oklch(1 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0 0)",
+          "oklch(0.25 0 0)",
+          "oklch(0.35 0 0)",
+          "oklch(0.45 0 0)",
+          "oklch(0.55 0 0)",
+          "oklch(0.7 0 0)",
+          "oklch(0.85 0 0)",
+          "oklch(0.95 0 0)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Surface",
+        "canonical": "oklch(0.97 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0 0)",
+          "oklch(0.25 0 0)",
+          "oklch(0.35 0 0)",
+          "oklch(0.45 0 0)",
+          "oklch(0.55 0 0)",
+          "oklch(0.7 0 0)",
+          "oklch(0.85 0 0)",
+          "oklch(0.95 0 0)"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Border",
+        "canonical": "oklch(0.922 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0 0)",
+          "oklch(0.25 0 0)",
+          "oklch(0.35 0 0)",
+          "oklch(0.45 0 0)",
+          "oklch(0.55 0 0)",
+          "oklch(0.7 0 0)",
+          "oklch(0.85 0 0)",
+          "oklch(0.95 0 0)"
+        ]
+      },
+      "placeholder": {
+        "role": "neutral",
+        "displayName": "Placeholder",
+        "canonical": "oklch(0.556 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0 0)",
+          "oklch(0.25 0 0)",
+          "oklch(0.35 0 0)",
+          "oklch(0.45 0 0)",
+          "oklch(0.55 0 0)",
+          "oklch(0.7 0 0)",
+          "oklch(0.85 0 0)",
+          "oklch(0.95 0 0)"
+        ]
+      },
+      "foreground": {
+        "role": "neutral",
+        "displayName": "Foreground",
+        "canonical": "oklch(0.205 0 0)",
+        "tonalRamp": [
+          "oklch(0.15 0 0)",
+          "oklch(0.25 0 0)",
+          "oklch(0.35 0 0)",
+          "oklch(0.45 0 0)",
+          "oklch(0.55 0 0)",
+          "oklch(0.7 0 0)",
+          "oklch(0.85 0 0)",
+          "oklch(0.95 0 0)"
+        ]
+      },
+      "action-comment": {
+        "role": "accent",
+        "displayName": "Comment Blue",
+        "canonical": "oklch(0.637 0.151 230)",
+        "tonalRamp": [
+          "oklch(0.2 0.08 230)",
+          "oklch(0.3 0.1 230)",
+          "oklch(0.4 0.12 230)",
+          "oklch(0.5 0.14 230)",
+          "oklch(0.6 0.15 230)",
+          "oklch(0.7 0.13 230)",
+          "oklch(0.8 0.1 230)",
+          "oklch(0.9 0.06 230)"
+        ]
+      },
+      "action-repost": {
+        "role": "accent",
+        "displayName": "Repost Green",
+        "canonical": "oklch(0.637 0.165 160)",
+        "tonalRamp": [
+          "oklch(0.2 0.08 160)",
+          "oklch(0.3 0.1 160)",
+          "oklch(0.4 0.12 160)",
+          "oklch(0.5 0.14 160)",
+          "oklch(0.6 0.16 160)",
+          "oklch(0.7 0.14 160)",
+          "oklch(0.8 0.1 160)",
+          "oklch(0.9 0.06 160)"
+        ]
+      },
+      "action-like": {
+        "role": "accent",
+        "displayName": "Like Rose",
+        "canonical": "oklch(0.637 0.22 15)",
+        "tonalRamp": [
+          "oklch(0.2 0.1 15)",
+          "oklch(0.3 0.14 15)",
+          "oklch(0.4 0.17 15)",
+          "oklch(0.5 0.2 15)",
+          "oklch(0.6 0.22 15)",
+          "oklch(0.7 0.18 15)",
+          "oklch(0.8 0.12 15)",
+          "oklch(0.9 0.06 15)"
+        ]
+      },
+      "destructive": {
+        "role": "accent",
+        "displayName": "Destructive Red",
+        "canonical": "oklch(0.577 0.245 27.325)",
+        "tonalRamp": [
+          "oklch(0.2 0.1 27)",
+          "oklch(0.3 0.14 27)",
+          "oklch(0.4 0.18 27)",
+          "oklch(0.5 0.22 27)",
+          "oklch(0.6 0.24 27)",
+          "oklch(0.7 0.2 27)",
+          "oklch(0.8 0.14 27)",
+          "oklch(0.9 0.07 27)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "body": {
+        "displayName": "Body",
+        "purpose": "Feed text, descriptions, content. The default reading size at 16px."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Author names, section headings, card titles. Semibold at 16px."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Timestamps, source attribution, tab labels, navigation labels. 12px medium weight."
+      },
+      "caption": {
+        "displayName": "Caption",
+        "purpose": "Secondary metadata, region names, version numbers. 12px regular weight."
+      }
+    },
+    "shadows": [
+      {
+        "name": "sm",
+        "value": "0 1px 2px 0 oklch(0 0 0 / 0.05)",
+        "purpose": "Barely-visible lift. Used only on floating overlays (rewrite paused card)."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Default easing for hover transitions and state changes."
+      },
+      {
+        "name": "scale-press",
+        "value": "scale(0.96)",
+        "purpose": "Tactile press feedback on action buttons."
+      }
+    ],
+    "breakpoints": [
+      { "name": "md", "value": "768px" },
+      { "name": "xl", "value": "1280px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Main action button. Dark background, light text. Used for compose and primary CTAs.",
+      "html": "<button class=\"ds-btn-primary\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z\"/><path d=\"m15 5 4 4\"/></svg><span>Compose</span></button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; gap: 8px; justify-content: center; white-space: nowrap; border-radius: 5px; font-size: 14px; font-weight: 500; height: 36px; padding: 8px 16px; background: oklch(0.205 0 0); color: oklch(1 0 0); border: none; cursor: pointer; transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; } .ds-btn-primary:hover { background: oklch(0.3 0 0); } .ds-btn-primary:focus-visible { outline: 2px solid oklch(0.708 0 0 / 50%); outline-offset: 2px; } .ds-btn-primary:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Supporting actions. Light surface background, dark text. Used for settings, theme toggle.",
+      "html": "<button class=\"ds-btn-secondary\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg><span>Settings</span></button>",
+      "css": ".ds-btn-secondary { display: inline-flex; align-items: center; gap: 8px; justify-content: center; white-space: nowrap; border-radius: 5px; font-size: 14px; font-weight: 500; height: 36px; padding: 8px 16px; background: oklch(0.97 0 0); color: oklch(0.205 0 0); border: 1px solid oklch(0.922 0 0); cursor: pointer; transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; } .ds-btn-secondary:hover { background: oklch(0.94 0 0); } .ds-btn-secondary:focus-visible { outline: 2px solid oklch(0.708 0 0 / 50%); outline-offset: 2px; } .ds-btn-secondary:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Transparent action button. Used for navigation items and feed action bar. Full rounding on action buttons.",
+      "html": "<button class=\"ds-btn-ghost\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M7.9 20A9 9 0 1 0 4 16.1L2 22Z\"/></svg><span>128</span></button>",
+      "css": ".ds-btn-ghost { display: inline-flex; align-items: center; gap: 4px; justify-content: center; white-space: nowrap; border-radius: 9999px; font-size: 12px; font-weight: 400; height: auto; padding: 8px 16px; background: transparent; color: oklch(0.556 0 0); border: none; cursor: pointer; transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1), color 0.15s; outline: none; } .ds-btn-ghost:hover { background: oklch(0.97 0 0); color: oklch(0.637 0.151 230); } .ds-btn-ghost:focus-visible { outline: 2px solid oklch(0.708 0 0 / 50%); outline-offset: 2px; } .ds-btn-ghost:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Container for feed items and sidebar widgets. Flat surface with subtle border.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-header\"><div class=\"ds-card-avatar\"></div><div class=\"ds-card-meta\"><div class=\"ds-card-author\">Author Name</div><div class=\"ds-card-time\">2 hours ago</div></div></div><div class=\"ds-card-body\">This is a sample feed post with enough text to demonstrate line height and spacing within the card component.</div><div class=\"ds-card-actions\"><button class=\"ds-action-btn\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M7.9 20A9 9 0 1 0 4 16.1L2 22Z\"/></svg><span>12</span></button><button class=\"ds-action-btn\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m17 2 4 4-4 4\"/><path d=\"M3 11v-1a4 4 0 0 1 4-4h14\"/><path d=\"m7 22-4-4 4-4\"/><path d=\"M21 13v1a4 4 0 0 1-4 4H3\"/></svg><span>5</span></button><button class=\"ds-action-btn\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z\"/></svg><span>42</span></button></div></div>",
+      "css": ".ds-card { background: oklch(1 0 0); border-radius: 6.25px; border: 1px solid oklch(0.922 0 0 / 70%); padding: 16px; display: flex; flex-direction: column; gap: 16px; } .ds-card-header { display: flex; gap: 12px; align-items: flex-start; } .ds-card-avatar { width: 48px; height: 48px; border-radius: 9999px; background: oklch(0.922 0 0); flex-shrink: 0; } .ds-card-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; } .ds-card-author { font-size: 16px; font-weight: 600; color: oklch(0.205 0 0); line-height: 1.4; } .ds-card-time { font-size: 12px; color: oklch(0.556 0 0); line-height: 1.4; } .ds-card-body { font-size: 16px; line-height: 1.5; color: oklch(0.205 0 0); white-space: pre-wrap; } .ds-card-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; } .ds-action-btn { display: inline-flex; align-items: center; gap: 4px; justify-content: center; border-radius: 9999px; font-size: 12px; padding: 8px 16px; background: transparent; color: oklch(0.556 0 0); border: none; cursor: pointer; transition: background 0.15s, color 0.15s; } .ds-action-btn:hover { background: oklch(0.97 0 0); color: oklch(0.637 0.151 230); } .ds-action-btn:active { transform: scale(0.96); }"
+    },
+    {
+      "name": "Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Text input field. Stroke-based with subtle border. Used for search and compose.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"Search Weibo...\" />",
+      "css": ".ds-input { display: flex; height: 36px; width: 100%; border-radius: 5px; border: 1px solid oklch(0.922 0 0); background: transparent; padding: 8px 12px; font-size: 14px; color: oklch(0.205 0 0); outline: none; transition: border-color 0.15s, box-shadow 0.15s; } .ds-input::placeholder { color: oklch(0.556 0 0); } .ds-input:focus { border-color: oklch(0.708 0 0); box-shadow: 0 0 0 2px oklch(0.708 0 0 / 20%); }"
+    },
+    {
+      "name": "Navigation Button",
+      "kind": "nav",
+      "refersTo": "nav-button",
+      "description": "Default navigation item. Transparent background, icon + optional label. Icon-only on smaller screens.",
+      "html": "<button class=\"ds-nav-btn\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8\"/><path d=\"M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\"/></svg><span>Home</span></button>",
+      "css": ".ds-nav-btn { display: flex; align-items: center; gap: 8px; width: 100%; border-radius: 5px; font-size: 14px; font-weight: 500; height: 36px; padding: 8px; background: transparent; color: oklch(0.205 0 0); border: none; cursor: pointer; transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; } .ds-nav-btn:hover { background: oklch(0.97 0 0); } .ds-nav-btn:focus-visible { outline: 2px solid oklch(0.708 0 0 / 50%); outline-offset: 2px; }"
+    },
+    {
+      "name": "Navigation Button Active",
+      "kind": "nav",
+      "refersTo": "nav-button-active",
+      "description": "Active navigation item. Surface background indicates current page.",
+      "html": "<button class=\"ds-nav-btn-active\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8\"/><path d=\"M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\"/></svg><span>Home</span></button>",
+      "css": ".ds-nav-btn-active { display: flex; align-items: center; gap: 8px; width: 100%; border-radius: 5px; font-size: 14px; font-weight: 500; height: 36px; padding: 8px; background: oklch(0.97 0 0); color: oklch(0.205 0 0); border: none; cursor: pointer; transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1); outline: none; } .ds-nav-btn-active:hover { background: oklch(0.94 0 0); } .ds-nav-btn-active:focus-visible { outline: 2px solid oklch(0.708 0 0 / 50%); outline-offset: 2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Silent Canvas",
+    "overview": "xb is a reading surface that disappears. The interface holds space for content without competing with it — every pixel serves the feed, every color choice defers to the words and images authored by others. The system rejects the visual noise of Weibo's original interface: no ad slots, no animated banners, no decorative gradients, no competing navigation hierarchies.\n\nThe aesthetic philosophy is restrained neutrality. Backgrounds are tinted off-whites, not pure white. Text is near-black, not jet black. Borders whisper. Shadows barely exist. The only chromatic moments are functional: a sky-blue reply, an emerald repost, a rose like. These accents appear on interaction, not at rest — the canvas is silent until the reader acts.\n\nThis is not a SaaS dashboard. There are no hero metrics, no card grids, no gradient CTAs. It is not Weibo. There are no ad breaks, no trending popups, no cluttered sidebars. It is a reading surface with the discipline of a well-set book page.",
+    "keyCharacteristics": [
+      "Content-first: the feed dominates; chrome is minimal",
+      "Achromatic at rest: all color is reserved for interactive feedback",
+      "Tonal layering: depth through background shade differences, not shadows",
+      "System typography: no custom fonts; the OS native stack provides clarity at all sizes",
+      "Responsive rail layout: navigation collapses from labeled sidebar to icon rail on smaller screens"
+    ],
+    "rules": [
+      {
+        "name": "The No-Brand-Color Rule",
+        "body": "There is no primary accent color in the design system. The interface's identity is its absence. Do not introduce a brand hue to 'add personality' — personality comes from typography, spacing, and the restraint itself.",
+        "section": "colors"
+      },
+      {
+        "name": "The Interaction-Only Rule",
+        "body": "Chromatic colors (blue, green, rose) appear exclusively on interactive hover/active states. At rest, every surface is achromatic.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tinted-Neutral Rule",
+        "body": "Never use pure #000 or #fff. Use the OKLCH-defined neutrals which are perceptually calibrated.",
+        "section": "colors"
+      },
+      {
+        "name": "The System Font Rule",
+        "body": "Never load custom web fonts for the UI chrome. The system font stack renders instantly, handles CJK text natively, and respects the user's OS preferences.",
+        "section": "typography"
+      },
+      {
+        "name": "The Weight-Over-Size Rule",
+        "body": "Create hierarchy through font-weight contrast (400 → 600) before increasing font size. The title and body share the same 1rem size — weight alone distinguishes them.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Surfaces are flat at rest. No component carries a drop shadow in its default state.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Tonal-Layering Rule",
+        "body": "Use background shade to indicate elevation, not shadows. Canvas is the base layer. Surface is one step up.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Use OKLCH for all color definitions. Perceptual uniformity depends on OKLCH's lightness channel.",
+      "Keep all surfaces achromatic at rest. Color is reserved for interactive feedback only.",
+      "Use system-ui font stack. Custom fonts are a performance and consistency liability for a browser extension.",
+      "Use tonal layering (background shade differences) to indicate elevation, not shadows.",
+      "Maintain the three-column responsive layout: navigation rail → main feed → right sidebar.",
+      "Use active:scale-[0.96] on action buttons for tactile press feedback.",
+      "Apply backdrop-blur to sticky header elements (tabs) so content scrolls cleanly beneath them.",
+      "Keep the action bar's chromatic hover colors consistent: sky-blue for reply, emerald for repost, rose for like."
+    ],
+    "donts": [
+      "Introduce a brand accent color. The interface's identity is its restraint. '克制的个性' means personality comes from what's absent.",
+      "Use pure #000 or #fff in the UI. Use the OKLCH-defined neutrals.",
+      "Add drop shadows to cards or containers. The system is flat by default — rejects Weibo's shadow-heavy aesthetic.",
+      "Use gradient text (background-clip: text with gradients). Single solid colors only.",
+      "Use side-stripe borders (border-left or border-right > 1px as colored accents).",
+      "Load custom web fonts for UI chrome. System fonts render instantly and handle CJK natively.",
+      "Use glassmorphism as a default treatment. backdrop-blur is reserved for sticky headers only.",
+      "Create identical card grids with icon + heading + text repeated endlessly. Rejects '传统 SaaS 仪表盘'.",
+      "Use modals as the first solution for user flows. Exhaust inline and progressive alternatives first.",
+      "Animate CSS layout properties. Use transform and opacity for motion only.",
+      "Use bounce or elastic easing curves. Use ease-out with exponential curves."
+    ]
+  }
+}

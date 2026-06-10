@@ -1,0 +1,28 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "tags": ["-lintignore"],
+  "entry": [
+    "src/entrypoints/weibo.content.tsx",
+    "src/entrypoints/weibo-main-world.ts",
+    "src/entrypoints/weibo-hide.content.ts",
+    "src/entrypoints/weibo-search.pending.ts",
+    "src/entrypoints/options/theme.ts"
+  ],
+  "project": ["src/**/*.{ts,tsx,css}", "*.config.{ts,mjs}", "release.config.mjs"],
+  "ignoreDependencies": [
+    "motion",
+    "@videojs/core",
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/git",
+    "@semantic-release/github",
+    "@semantic-release/npm",
+    "@semantic-release/release-notes-generator",
+    "conventional-changelog-conventionalcommits"
+  ],
+  "ignoreBinaries": ["only-allow"],
+  "ignore": [
+    "src/components/ui/*",
+    "src/hooks/use-mobile.ts",
+    "src/lib/weibo/content/weibo-search-overrides.css"
+  ]
+}

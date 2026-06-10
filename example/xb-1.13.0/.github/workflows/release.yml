@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run（只预览版本和 changelog，不实际发布）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      new_release: ${{ steps.release_meta.outputs.new_release || 'false' }}
+      release_version: ${{ steps.release_meta.outputs.release_version }}
+      release_git_tag: ${{ steps.release_meta.outputs.release_git_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bunx oxlint .
+
+      - name: Typecheck
+        run: bun run compile
+
+      - name: Test
+        run: bun run test:unit
+
+      - name: Build
+        env:
+          FIREFOX_EXTENSION_ID: ${{ secrets.FIREFOX_EXTENSION_ID }}
+        run: bun run build && bun run build:firefox
+
+      - name: Capture current release tag
+        id: release_base
+        run: |
+          latest_tag="$(git tag --sort=-version:refname | head -n 1)"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Release
+        id: semantic_release
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            bunx semantic-release --dry-run
+          else
+            bunx semantic-release
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Capture release metadata
+        if: ${{ !inputs.dry_run }}
+        id: release_meta
+        run: |
+          before_tag="${{ steps.release_base.outputs.latest_tag }}"
+          after_tag="$(git tag --sort=-version:refname | head -n 1)"
+
+          if [ -n "$after_tag" ] && [ "$after_tag" != "$before_tag" ]; then
+            echo "new_release=true" >> "$GITHUB_OUTPUT"
+            echo "release_git_tag=$after_tag" >> "$GITHUB_OUTPUT"
+            echo "release_version=${after_tag#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish-stores:
+    needs: release
+    if: needs.release.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release.outputs.release_git_tag }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Zip extensions
+        env:
+          EXTENSION_VERSION: ${{ needs.release.outputs.release_version }}
+          FIREFOX_EXTENSION_ID: ${{ secrets.FIREFOX_EXTENSION_ID }}
+        run: |
+          bun run zip
+          bun run zip:edge
+          bun run zip:firefox
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.release.outputs.release_git_tag }}" \
+            .output/*-chrome.zip \
+            .output/*-edge.zip \
+            .output/*-firefox.zip \
+            --clobber
+
+      - name: Submit to stores
+        env:
+          EXTENSION_VERSION: ${{ needs.release.outputs.release_version }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+          FIREFOX_EXTENSION_ID: ${{ secrets.FIREFOX_EXTENSION_ID }}
+          FIREFOX_JWT_ISSUER: ${{ secrets.FIREFOX_JWT_ISSUER }}
+          FIREFOX_JWT_SECRET: ${{ secrets.FIREFOX_JWT_SECRET }}
+          EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
+          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
+        run: |
+          bunx wxt submit \
+            --chrome-zip .output/*-chrome.zip \
+            --firefox-zip .output/*-firefox.zip \
+            --firefox-sources-zip .output/*-sources.zip \
+            --firefox-channel listed \
+            --edge-zip .output/*-chrome.zip \

@@ -1,0 +1,138 @@
+/* ============================================
+   Center Play Button
+   ============================================ */
+
+.video-center-play {
+  position: absolute;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  transition: opacity 200ms ease-out;
+}
+
+.video-center-play__button {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+  background: oklch(1 0 0 / 0.85);
+  backdrop-filter: blur(8px) saturate(1.5);
+  border: none;
+  cursor: pointer;
+  color: oklch(0 0 0);
+  box-shadow: 0 2px 8px oklch(0 0 0 / 0.3);
+  transition: scale 150ms ease-out;
+  opacity: 70%;
+}
+
+.video-center-play__button:hover {
+  scale: 1.05;
+  opacity: 1;
+}
+
+.video-center-play__button:active {
+  scale: 0.95;
+}
+
+/* Hide center play button when video is playing (started and not paused) */
+.media-default-skin--video:has(.media-button--play[data-started]:not([data-paused]))
+  .video-center-play {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Hide center play button when video ended (restart state handled by bottom bar) */
+.media-default-skin--video:has(.media-button--play[data-ended]) .video-center-play {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ============================================
+   Controls Visibility
+   ============================================ */
+
+/* Show controls only when user is actively hovering/interacting,
+   regardless of paused/playing state. Overrides the library default
+   where controls are always shown when paused. */
+.media-default-skin--video .media-controls:not([data-user-active]) {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  scale: 0.9 !important;
+}
+
+/* Also hide the overlay scrim when user is not active */
+.media-default-skin--video .media-controls:not([data-user-active]) ~ .media-overlay {
+  opacity: 0 !important;
+}
+
+/* ============================================
+   Progress Bar Hover Expand
+   ============================================ */
+
+/* Default horizontal track height: 3px */
+.media-default-skin--video .media-slider .media-slider__track[data-orientation='horizontal'] {
+  height: 3px;
+  transition: height 150ms ease-out;
+}
+
+/* Hover: expand to 5px */
+.media-default-skin--video .media-slider:hover .media-slider__track[data-orientation='horizontal'] {
+  height: 5px;
+}
+
+/* Dragging: expand to 6px */
+.media-default-skin--video
+  .media-slider[data-dragging]
+  .media-slider__track[data-orientation='horizontal'] {
+  height: 6px;
+}
+
+/* ============================================
+   Seek Time Preview on Hover
+   ============================================ */
+
+/* The default skin.css shows preview only when :has([role="img"]:not([data-hidden]))
+   (i.e., only when there's a loaded thumbnail). Override to show on pointer hover
+   since we don't use VTT thumbnail tracks. */
+.media-default-skin--video .media-slider[data-pointing] .media-slider__preview {
+  opacity: 1;
+  scale: 1;
+  filter: blur(0);
+}
+
+.video-time-preview {
+  background: oklch(0 0 0 / 0.9);
+  border-radius: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  color: oklch(1 0 0);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ============================================
+   Buffer Progress Bar Color
+   ============================================ */
+
+.media-default-skin--video .media-slider__buffer {
+  background-color: oklch(1 0 0 / 0.25);
+}
+
+.media-inline-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483646 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  max-height: none !important;
+  border-radius: 0 !important;
+  background: oklch(0 0 0) !important;
+}

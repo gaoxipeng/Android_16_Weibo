@@ -1,0 +1,28 @@
+name: Feature Request
+description: Submit a new feature request
+title: '[Feature] '
+labels: [Feature]
+
+body:
+  - type: input
+    attributes:
+      label: 页面地址
+      description: 如果涉及特定页面，请提供页面地址
+      placeholder: '例如：https://weibo.com/u/1234567890'
+    validations:
+      required: false
+
+  - type: textarea
+    attributes:
+      label: 需求描述
+      description: 描述你希望添加的功能，与UI相关的最好能附图说明
+      placeholder: 请描述你的功能需求，包括期望的行为、使用场景等，如果有参考的插件或脚本，请提供链接
+    validations:
+      required: true
+
+  - type: checkboxes
+    attributes:
+      label: 参与贡献
+      options:
+        - label: 我将自行创建 PR 实现此功能
+          required: false
