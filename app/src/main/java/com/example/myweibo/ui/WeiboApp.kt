@@ -6,8 +6,10 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -17,7 +19,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -68,15 +70,18 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
@@ -91,6 +96,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -110,6 +116,8 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.example.myweibo.R
 import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
@@ -133,8 +141,11 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.abs
+import kotlin.math.hypot
 
 private enum class MainTab(val label: String) {
     Search("\u641C\u7D22"),
@@ -149,10 +160,20 @@ private enum class MineContentTab(val label: String) {
     Album("\u76F8\u518C")
 }
 
+private class VideoPlaybackCoordinator {
+    var activeKey by mutableStateOf<String?>(null)
+    val positions = mutableStateMapOf<String, Long>()
+}
+
+private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
+
+private fun videoPlaybackKey(media: FeedMedia): String =
+    media.streamUrl.ifBlank { media.downloadUrl.orEmpty() }.ifBlank { media.coverUrl.orEmpty() }
+
 /*
 private enum class LegacyMainTab(val label: String) {
-    Feed("首页"),
-    Account("账户"),
+    Feed("棣栭〉"),
+    Account("璐︽埛"),
 }
 
 */
@@ -168,6 +189,7 @@ fun WeiboApp() {
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
     val minePostsListState = rememberLazyListState()
+    val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
     val timelineKind = TimelineKind.Following
@@ -292,7 +314,7 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
-                        showMessage("没有读到信息流", "请先在账户页登录微博，或稍后再同步")
+                        showMessage("没有读到信息流", "请先在我的页面设置中登录微博，或稍后再刷新")
                     }
                 }
                 .onFailure { error ->
@@ -318,7 +340,7 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
-                        showMessage("没有读到信息流", "请先在账户页登录微博，或稍后再同步")
+                        showMessage("没有读到信息流", "请先在我的页面设置中登录微博，或稍后再刷新")
                     }
                 }
                 .onFailure { error ->
@@ -507,6 +529,7 @@ fun WeiboApp() {
         }
     }
 
+    CompositionLocalProvider(LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator) {
     MyWeiboScaffold(
         selectedTab = selectedTab,
         selectedItem = selectedItem,
@@ -665,12 +688,13 @@ fun WeiboApp() {
             }
 
             mediaPreview?.let { media ->
-                MediaPreviewOverlay(
+                FullscreenMediaPreview(
                     media = media,
                     onDismiss = { mediaPreview = null },
                 )
             }
         }
+    }
     }
 }
 
@@ -778,7 +802,7 @@ private fun FloatingBottomBar(
                     .height(72.dp)
                     .clip(glassShape),
             ) {
-                // 底层：毛玻璃背景
+                // 搴曞眰锛氭瘺鐜荤拑鑳屾櫙
                 Box(
                     modifier = Modifier
                         .matchParentSize()
@@ -805,7 +829,7 @@ private fun FloatingBottomBar(
                         )
                 )
 
-                // 上层：内容（清晰）
+                // 涓婂眰锛氬唴瀹癸紙娓呮櫚锛?
                 BoxWithConstraints(
                     Modifier
                         .fillMaxSize()
@@ -1209,7 +1233,7 @@ private fun FeedScreen(
             item {
                 EmptyState(
                     title = "等待微博数据",
-                    body = "先到账户页完成登录，再回到首页同步。数据源使用 weibo.com/ajax/*，和 example 的浏览器扩展路线一致。",
+                    body = "先到我的页面设置中完成登录，再回到首页刷新。数据源使用 weibo.com/ajax/*，和 example 的浏览器扩展路线一致。",
                     actionLabel = "打开微博登录页",
                     onAction = { session.openLogin() },
                 )
@@ -1300,15 +1324,15 @@ private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: 
     val inlineContent = mutableMapOf<String, InlineTextContent>()
     val emojiSize = style.fontSize.times(1.4f)
 
-    // 添加表情 inline content
+    // 娣诲姞琛ㄦ儏 inline content
     emoticonMap.forEach { (phrase, url) ->
         inlineContent[phrase] = InlineTextContent(
             Placeholder(width = emojiSize, height = emojiSize, placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter)
         ) { EmojiImage(url = url) }
     }
 
-    // 添加 @username 为可点击的 pink 文字 inline content
-    val mentionPattern = Regex("""@[\w一-鿿-]+""")
+    // 娣诲姞 @username 涓哄彲鐐瑰嚮鐨?pink 鏂囧瓧 inline content
+    val mentionPattern = Regex("""@[\w\u4e00-\u9fa5]+""")
     val lineH = style.lineHeight.takeIf { it != TextUnit.Unspecified } ?: style.fontSize * 1.5f
     Regex("""@[\p{L}\p{N}_-]+""").findAll(text).forEach { match ->
         val token = match.value
@@ -1330,7 +1354,7 @@ private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: 
     }
 
     val annotatedString = buildAnnotatedString {
-        val tokenPattern = Regex("""\[[^\[\]]+\]|@[\w一-鿿-]+""")
+        val tokenPattern = Regex("""\[[^\[\]]+\]|@[\w\u4e00-\u9fa5]+""")
         var last = 0
         Regex("""\[[^\[\]]+\]|@[\p{L}\p{N}_-]+""").findAll(text).forEach { match ->
             if (match.range.first > last) {
@@ -1338,7 +1362,7 @@ private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: 
             }
             val token = match.value
             if (emoticonMap.containsKey(token) || token.startsWith("@")) {
-                // 检查是否真的是 inline content 的 key
+                // 妫€鏌ユ槸鍚︾湡鐨勬槸 inline content 鐨?key
                 if (inlineContent.containsKey(token)) {
                     appendInlineContent(token, token)
                 } else {
@@ -1495,7 +1519,7 @@ private fun AuthorRow(item: FeedItem, onUserClick: ((String) -> Unit)? = null) {
             }
             if (false) {
             Text(
-                text = listOfNotNull(formatWeiboTime(item.createdAt), item.source).joinToString(" · "),
+                text = listOfNotNull(formatWeiboTime(item.createdAt), item.source).joinToString(" 路 "),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -1564,15 +1588,23 @@ private fun MediaStrip(
                                     contentScale = if (images.size == 1) ContentScale.FillWidth else ContentScale.Crop,
                                 )
                                 if (image.isLivePhoto) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_tab_compose),
-                                        contentDescription = "Live",
+                                    Surface(
                                         modifier = Modifier
-                                            .align(Alignment.TopStart)
-                                            .padding(6.dp)
-                                            .size(16.dp),
-                                        tint = Color.White,
-                                    )
+                                            .align(Alignment.BottomEnd)
+                                            .padding(5.dp),
+                                        shape = CircleShape,
+                                        color = Color.Black.copy(alpha = 0.42f),
+                                        contentColor = Color.White,
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(R.drawable.ic_live_photo),
+                                            contentDescription = "LivePhoto",
+                                            modifier = Modifier
+                                                .padding(3.dp)
+                                                .size(15.dp),
+                                            tint = Color.White,
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1585,7 +1617,7 @@ private fun MediaStrip(
             }
 
             if (viewerOpen) {
-                ImageViewer(
+                FullscreenImageViewer(
                     images = images,
                     initialIndex = viewerIndex,
                     onDismiss = { viewerOpen = false },
@@ -1594,90 +1626,154 @@ private fun MediaStrip(
         }
 
         if (media != null) {
-            VideoPreview(media = media, onClick = { onMediaClick(media) })
+            InlineVideoPlayer(media = media, onClick = { onMediaClick(media) })
         }
     }
 }
 
 @Composable
-private fun ImageViewer(
+private fun FullscreenImageViewer(
     images: List<FeedImage>,
     initialIndex: Int,
     onDismiss: () -> Unit,
 ) {
     val pagerState = rememberPagerState(pageCount = { images.size }, initialPage = initialIndex)
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .clickable(onClick = onDismiss),
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
-            ZoomableImage(
-                url = images[page].largeUrl,
-                onTap = onDismiss,
+        BackHandler { onDismiss() }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        ) {
+            HorizontalPager(state = pagerState, modifier = Modifier.fillMaxSize()) { page ->
+                ZoomableFullscreenImage(
+                    image = images[page],
+                    onTap = onDismiss,
+                )
+            }
+            Text(
+                text = "${pagerState.currentPage + 1} / ${images.size}",
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 48.dp),
+                color = Color.White,
+                style = MaterialTheme.typography.labelLarge,
             )
         }
-
-        Text(
-            text = "${pagerState.currentPage + 1} / ${images.size}",
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 48.dp),
-            color = Color.White,
-            style = MaterialTheme.typography.labelLarge,
-        )
     }
 }
 
 @Composable
-private fun ZoomableImage(url: String, onTap: () -> Unit) {
-    var scale by remember { mutableStateOf(1f) }
-    var offsetX by remember { mutableStateOf(0f) }
-    var offsetY by remember { mutableStateOf(0f) }
-    var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
+    var targetScale by remember(image.largeUrl) { mutableStateOf(1f) }
+    val scale by animateFloatAsState(
+        targetValue = targetScale,
+        animationSpec = tween(durationMillis = 180),
+        label = "fullscreen-image-scale",
+    )
+    var offsetX by remember(image.largeUrl) { mutableStateOf(0f) }
+    var offsetY by remember(image.largeUrl) { mutableStateOf(0f) }
+    var bitmap by remember(image.largeUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
 
-    LaunchedEffect(url) {
-        runCatching {
-            withContext(Dispatchers.IO) {
-                val bytes = URL(url).openConnection().apply {
-                    (this as HttpURLConnection).connectTimeout = 8000
-                    readTimeout = 8000
-                    setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
-                    setRequestProperty("Referer", "https://weibo.com/")
-                }.inputStream.use { it.readBytes() }
-                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-                val maxDim = 2048
-                val sampleSize = maxOf(1, Integer.highestOneBit(maxOf(opts.outWidth, opts.outHeight) / maxDim))
-                opts.inJustDecodeBounds = false
-                opts.inSampleSize = sampleSize
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-            }
-        }.onSuccess { bitmap = it }
+    LaunchedEffect(image.largeUrl) {
+        bitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
     }
 
-    val image = bitmap
-    if (image != null) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        scale = (scale * zoom).coerceIn(1f, 5f)
-                        offsetX = if (scale > 1f) offsetX + pan.x else 0f
-                        offsetY = if (scale > 1f) offsetY + pan.y else 0f
+    val loadedBitmap = bitmap
+    if (loadedBitmap == null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(color = Color.White)
+        }
+        return
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(image.largeUrl) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var lastCentroid: Offset? = null
+                    var lastDistance = 0f
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val pressed = event.changes.filter { it.pressed }
+                        if (pressed.isEmpty()) break
+
+                        if (pressed.size >= 2) {
+                            val first = pressed[0].position
+                            val second = pressed[1].position
+                            val centroid = Offset((first.x + second.x) / 2f, (first.y + second.y) / 2f)
+                            val distance = hypot(first.x - second.x, first.y - second.y)
+                            if (lastDistance > 0f) {
+                                val zoom = (distance / lastDistance).coerceIn(0.72f, 1.38f)
+                                targetScale = (targetScale * zoom).coerceIn(1f, 5f)
+                                val previousCentroid = lastCentroid ?: centroid
+                                val pan = centroid - previousCentroid
+                                offsetX = if (targetScale > 1f) offsetX + pan.x else 0f
+                                offsetY = if (targetScale > 1f) offsetY + pan.y else 0f
+                            }
+                            lastCentroid = centroid
+                            lastDistance = distance
+                            event.changes.forEach { it.consume() }
+                        } else {
+                            lastCentroid = null
+                            lastDistance = 0f
+                            val change = pressed.first()
+                            val totalDrag = change.position - down.position
+                            val delta = change.position - change.previousPosition
+                            if (targetScale > 1.01f) {
+                                offsetX += delta.x
+                                offsetY += delta.y
+                                change.consume()
+                            } else if (totalDrag.y > 72f && abs(totalDrag.y) > abs(totalDrag.x) * 1.35f) {
+                                change.consume()
+                                onTap()
+                                break
+                            }
+                        }
                     }
                 }
-                .pointerInput(Unit) {
-                    detectTapGestures(onTap = { onTap() })
+            }
+            .pointerInput(image.largeUrl) {
+                detectTapGestures(
+                    onTap = { onTap() },
+                    onDoubleTap = {
+                        if (targetScale > 1f) {
+                            targetScale = 1f
+                            offsetX = 0f
+                            offsetY = 0f
+                        } else {
+                            targetScale = 2.6f
+                        }
+                    },
+                    onLongPress = {
+                        if (image.isLivePhoto) livePlaying = true
+                    },
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Image(
+            bitmap = loadedBitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offsetX
+                    translationY = offsetY
                 },
-            contentAlignment = Alignment.Center,
-        ) {
-            Image(
-                bitmap = image.asImageBitmap(),
-                contentDescription = null,
+            contentScale = ContentScale.Fit,
+        )
+        if (image.isLivePhoto && livePlaying) {
+            LivePhotoOverlay(
+                image = image,
                 modifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer {
@@ -1686,160 +1782,521 @@ private fun ZoomableImage(url: String, onTap: () -> Unit) {
                         translationX = offsetX
                         translationY = offsetY
                     },
-                contentScale = ContentScale.Fit,
+                onEnded = { livePlaying = false },
             )
-        }
-    } else {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator(color = Color.White)
         }
     }
 }
 
 @Composable
-private fun VideoPreview(media: FeedMedia, onClick: () -> Unit) {
-    var inlinePlaying by remember { mutableStateOf(false) }
+private fun LivePhotoOverlay(
+    image: FeedImage,
+    modifier: Modifier = Modifier,
+    onEnded: () -> Unit,
+) {
     val context = LocalContext.current
+    val videoUrl = image.livePhotoVideoUrl.orEmpty()
+    var videoVisible by remember(videoUrl) { mutableStateOf(false) }
+    val player = remember(videoUrl) {
+        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            setMediaSource(buildVideoMediaSource(context, videoUrl))
+            repeatMode = androidx.media3.common.Player.REPEAT_MODE_OFF
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(player) {
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onRenderedFirstFrame() {
+                videoVisible = true
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == androidx.media3.common.Player.STATE_ENDED) onEnded()
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                onEnded()
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
+    }
+
+    AndroidView(
+        modifier = modifier.graphicsLayer {
+            alpha = if (videoVisible) 1f else 0f
+        },
+        factory = { ctx ->
+            (android.view.LayoutInflater.from(ctx)
+                .inflate(R.layout.view_live_photo_player, null, false) as androidx.media3.ui.PlayerView).apply {
+                this.player = player
+                useController = false
+                resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            }
+        },
+        update = { it.player = player },
+    )
+}
+
+@Composable
+private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
+    val inlinePlaying = videoCoordinator.activeKey == playbackKey
+    var fullscreen by remember(media.streamUrl) { mutableStateOf(false) }
+    var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
 
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .aspectRatio(aspectRatio.coerceIn(0.56f, 1.78f))
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHighest),
     ) {
         if (inlinePlaying && media.type == MediaType.Video) {
-            val videoCandidates = remember(media.streamUrl, media.downloadUrl) {
-                listOfNotNull(media.streamUrl, media.downloadUrl).distinct()
-            }
-            var videoIndex by remember(videoCandidates) { mutableStateOf(0) }
-            val videoUrl = videoCandidates.getOrElse(videoIndex) { media.streamUrl }
-            var playbackError by remember(videoUrl) { mutableStateOf<String?>(null) }
-            var isBuffering by remember(videoUrl) { mutableStateOf(true) }
-            val player = remember(videoUrl) {
-                androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
-                    val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
-                    val headers = buildMap {
-                        put("Referer", "https://weibo.com/")
-                        put("Origin", "https://weibo.com")
-                        put("User-Agent", DESKTOP_CHROME_USER_AGENT)
-                        if (cookie.isNotBlank()) put("Cookie", cookie)
-                    }
-                    val dataSourceFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
-                        .setUserAgent(DESKTOP_CHROME_USER_AGENT)
-                        .setDefaultRequestProperties(headers)
-                        .setAllowCrossProtocolRedirects(true)
-                        .setConnectTimeoutMs(12_000)
-                        .setReadTimeoutMs(20_000)
-                    val mediaItem = androidx.media3.common.MediaItem.fromUri(videoUrl)
-                    val source = if (videoUrl.contains("m3u8", ignoreCase = true)) {
-                        androidx.media3.exoplayer.hls.HlsMediaSource
-                            .Factory(dataSourceFactory)
-                            .createMediaSource(mediaItem)
-                    } else {
-                        androidx.media3.exoplayer.source.ProgressiveMediaSource
-                            .Factory(dataSourceFactory)
-                            .createMediaSource(mediaItem)
-                    }
-                    setMediaSource(source)
-                    prepare()
-                    playWhenReady = true
-                }
-            }
-
-            DisposableEffect(player) {
-                val listener = object : androidx.media3.common.Player.Listener {
-                    override fun onPlaybackStateChanged(playbackState: Int) {
-                        isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING ||
-                            playbackState == androidx.media3.common.Player.STATE_IDLE
-                    }
-
-                    override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        isBuffering = false
-                        if (videoIndex < videoCandidates.lastIndex) {
-                            videoIndex += 1
-                        } else {
-                            playbackError = error.message ?: "\u89C6\u9891\u65E0\u6CD5\u64AD\u653E"
-                        }
-                    }
-                }
-                player.addListener(listener)
-                onDispose {
-                    player.removeListener(listener)
-                    player.release()
-                }
-            }
-
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    androidx.media3.ui.PlayerView(ctx).apply {
-                        this.player = player
-                        useController = true
-                    }
-                },
-                update = { view ->
-                    view.player = player
-                },
+            WeiboVideoSurface(
+                media = media,
+                isFullscreen = false,
+                onAspectRatio = { aspectRatio = it },
+                onFullscreen = { fullscreen = true },
             )
-            if (isBuffering && playbackError == null) {
-                Box(
-                    modifier = Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.18f)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    CircularProgressIndicator(color = Color.White, modifier = Modifier.size(28.dp))
-                }
-            }
-            playbackError?.let { error ->
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .background(Color.Black.copy(alpha = 0.56f))
-                        .clickable { inlinePlaying = false },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = error,
-                        color = Color.White,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(16.dp),
-                        textAlign = TextAlign.Center,
-                    )
-                }
-            }
         } else {
             RemoteImage(
                 url = media.coverUrl,
-                modifier = Modifier.fillMaxSize().clickable {
-                    if (media.type == MediaType.Video) inlinePlaying = true else onClick()
-                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable {
+                        if (media.type == MediaType.Video) {
+                            videoCoordinator.activeKey = playbackKey
+                        } else {
+                            onClick()
+                        }
+                    },
                 contentScale = ContentScale.Crop,
             )
             IconButton(
                 onClick = {
-                    if (media.type == MediaType.Video) inlinePlaying = true else onClick()
+                    if (media.type == MediaType.Video) {
+                        videoCoordinator.activeKey = playbackKey
+                    } else {
+                        onClick()
+                    }
                 },
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .size(48.dp)
-                    .background(Color.Black.copy(alpha = 0.55f), CircleShape),
+                    .size(52.dp),
             ) {
                 Icon(
-                    painter = painterResource(R.drawable.ic_tab_compose),
+                    painter = painterResource(R.drawable.ic_video_play),
                     contentDescription = "播放",
-                    modifier = Modifier.size(24.dp),
+                    modifier = Modifier.size(32.dp),
                     tint = Color.White,
+                )
+            }
+            Text(
+                text = media.title,
+                modifier = Modifier.align(Alignment.BottomStart).padding(12.dp),
+                color = Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelLarge,
+            )
+        }
+    }
+
+    if (fullscreen) {
+        Dialog(
+            onDismissRequest = { fullscreen = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+        ) {
+            BackHandler { fullscreen = false }
+            Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+                WeiboVideoSurface(
+                    media = media,
+                    isFullscreen = true,
+                    onAspectRatio = {},
+                    onFullscreen = { fullscreen = false },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun WeiboVideoSurface(
+    media: FeedMedia,
+    isFullscreen: Boolean,
+    onAspectRatio: (Float) -> Unit,
+    onFullscreen: () -> Unit,
+    modifier: Modifier = Modifier.fillMaxSize(),
+) {
+    val context = LocalContext.current
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
+    val videoCandidates = remember(media.streamUrl, media.downloadUrl) {
+        listOfNotNull(media.streamUrl, media.downloadUrl)
+            .flatMap(::videoUrlCandidates)
+            .distinct()
+    }
+    var videoIndex by remember(videoCandidates) { mutableStateOf(0) }
+    val videoUrl = videoCandidates.getOrElse(videoIndex) { media.streamUrl }
+    var playbackError by remember(videoUrl) { mutableStateOf<String?>(null) }
+    var isBuffering by remember(videoUrl) { mutableStateOf(true) }
+    var positionMs by remember(videoUrl) { mutableStateOf(0L) }
+    var durationMs by remember(videoUrl) { mutableStateOf(0L) }
+    var isPlaying by remember(videoUrl) { mutableStateOf(true) }
+    var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
+    var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
+
+    val player = remember(videoUrl) {
+        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            setMediaSource(buildVideoMediaSource(context, videoUrl))
+            prepare()
+            videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(player) {
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING ||
+                    playbackState == androidx.media3.common.Player.STATE_IDLE
+                isPlaying = player.isPlaying
+            }
+
+            override fun onIsPlayingChanged(value: Boolean) {
+                isPlaying = value
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                val width = videoSize.width.takeIf { it > 0 } ?: return
+                val height = videoSize.height.takeIf { it > 0 } ?: return
+                onAspectRatio(width.toFloat() / height.toFloat())
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                isBuffering = false
+                if (videoIndex < videoCandidates.lastIndex) {
+                    videoIndex += 1
+                } else {
+                    playbackError = error.message ?: "视频无法播放"
+                }
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            videoCoordinator.positions[playbackKey] = player.currentPosition.coerceAtLeast(0L)
+            player.removeListener(listener)
+            player.release()
+        }
+    }
+
+    LaunchedEffect(player) {
+        while (true) {
+            positionMs = player.currentPosition.coerceAtLeast(0L)
+            videoCoordinator.positions[playbackKey] = positionMs
+            durationMs = player.duration.takeIf { it > 0 } ?: durationMs
+            isPlaying = player.isPlaying
+            delay(80)
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .background(Color.Black),
+    ) {
+        AndroidView(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(player, selectedSpeed) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
+                        val upBeforeLongPress = withTimeoutOrNull(360L) { waitForUpOrCancellation() }
+                        if (upBeforeLongPress == null) {
+                            displayedSpeed = 2f
+                            player.setPlaybackSpeed(2f)
+                            val up = waitForUpOrCancellation()
+                            up?.consume()
+                            displayedSpeed = selectedSpeed
+                            player.setPlaybackSpeed(selectedSpeed)
+                        } else {
+                            upBeforeLongPress.consume()
+                        }
+                    }
+                },
+            factory = { ctx ->
+                androidx.media3.ui.PlayerView(ctx).apply {
+                    this.player = player
+                    useController = false
+                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    setShutterBackgroundColor(android.graphics.Color.BLACK)
+                }
+            },
+            update = { it.player = player },
+        )
+
+        if (!isFullscreen) {
+            GlassTextButton(
+                text = "全屏",
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+                    .width(54.dp)
+                    .height(28.dp),
+                onClick = onFullscreen,
+            )
+        }
+
+        if (isBuffering && playbackError == null) {
+            Box(
+                modifier = Modifier.matchParentSize().background(Color.Black.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Color.White, modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+            }
+        }
+
+        playbackError?.let { error ->
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(Color.Black.copy(alpha = 0.64f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = error,
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(16.dp),
+                    textAlign = TextAlign.Center,
                 )
             }
         }
 
+        VideoControls(
+            isPlaying = isPlaying,
+            positionMs = positionMs,
+            durationMs = durationMs,
+            speed = displayedSpeed,
+            onPlayPause = {
+                if (player.isPlaying) {
+                    player.pause()
+                } else {
+                    videoCoordinator.activeKey = playbackKey
+                    player.play()
+                }
+                isPlaying = player.isPlaying
+            },
+            onSeek = { target ->
+                positionMs = target
+                player.seekTo(target)
+            },
+            onSpeedClick = {
+                selectedSpeed = when (selectedSpeed) {
+                    1f -> 1.5f
+                    1.5f -> 2f
+                    else -> 1f
+                }
+                displayedSpeed = selectedSpeed
+                player.setPlaybackSpeed(selectedSpeed)
+            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(start = 6.dp, end = 6.dp, bottom = if (isFullscreen) 24.dp else 8.dp)
+                .fillMaxWidth()
+                .height(32.dp),
+        )
+    }
+}
+
+@Composable
+private fun GlassTextButton(
+    text: String,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = modifier.clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        VideoControlGlassBackground(Modifier.matchParentSize())
         Text(
-            text = media.title,
-            modifier = Modifier.align(Alignment.BottomStart).padding(12.dp),
+            text = text,
             color = Color.White,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.labelLarge,
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun VideoControls(
+    isPlaying: Boolean,
+    positionMs: Long,
+    durationMs: Long,
+    speed: Float,
+    onPlayPause: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onSpeedClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier = modifier) {
+        VideoControlGlassBackground(Modifier.matchParentSize())
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            IconButton(
+                onClick = onPlayPause,
+                modifier = Modifier.size(24.dp),
+            ) {
+                Icon(
+                    painter = painterResource(if (isPlaying) R.drawable.ic_video_pause else R.drawable.ic_video_play),
+                    contentDescription = if (isPlaying) "暂停" else "播放",
+                    modifier = Modifier.size(17.dp),
+                    tint = Color.White,
+                )
+            }
+            Text(
+                text = formatVideoTime(positionMs),
+                modifier = Modifier.width(38.dp),
+                color = Color.White,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+            )
+            CompactVideoScrubber(
+                positionMs = positionMs,
+                durationMs = durationMs,
+                onSeek = onSeek,
+                modifier = Modifier.weight(1f).height(18.dp),
+            )
+            Text(
+                text = "-${formatVideoTime((durationMs - positionMs).coerceAtLeast(0L))}",
+                modifier = Modifier.width(42.dp),
+                color = Color.White,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+            )
+            TextButton(
+                onClick = onSpeedClick,
+                modifier = Modifier.width(30.dp),
+                contentPadding = PaddingValues(0.dp),
+            ) {
+                Text(
+                    text = speedLabel(speed),
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactVideoScrubber(
+    positionMs: Long,
+    durationMs: Long,
+    onSeek: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val progress = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+    Canvas(
+        modifier = modifier.pointerInput(durationMs) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                fun seekTo(x: Float) {
+                    if (durationMs <= 0L || size.width <= 0) return
+                    val ratio = (x / size.width.toFloat()).coerceIn(0f, 1f)
+                    onSeek((durationMs * ratio).toLong())
+                }
+                seekTo(down.position.x)
+                while (true) {
+                    val event = awaitPointerEvent()
+                    val change = event.changes.firstOrNull() ?: break
+                    if (change.pressed) seekTo(change.position.x)
+                    if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
+                }
+            }
+        },
+    ) {
+        val y = size.height / 2f
+        val stroke = 3.dp.toPx()
+        drawLine(
+            color = Color.White.copy(alpha = 0.26f),
+            start = Offset(0f, y),
+            end = Offset(size.width, y),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color(0xFFFF4F9A),
+            start = Offset(0f, y),
+            end = Offset(size.width * progress, y),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawCircle(
+            color = Color.White,
+            radius = 5.5.dp.toPx(),
+            center = Offset(size.width * progress, y),
+        )
+    }
+}
+
+@Composable
+private fun VideoControlGlassBackground(modifier: Modifier = Modifier) {
+    Canvas(
+        modifier = modifier
+            .clip(RoundedCornerShape(7.dp))
+    ) {
+        val radius = 7.dp.toPx()
+        val corner = CornerRadius(radius, radius)
+
+        // A frosted panel needs to obscure the moving video first; the grain below
+        // breaks up sharp details so the background no longer reads clearly.
+        drawRoundRect(
+            color = Color(0xFF5A5254).copy(alpha = 0.94f),
+            cornerRadius = corner,
+        )
+        drawRoundRect(
+            color = Color(0xFF332E30).copy(alpha = 0.38f),
+            cornerRadius = corner,
+        )
+        val grainStep = 3.dp.toPx().coerceAtLeast(2f)
+        var y = grainStep * 0.5f
+        var row = 0
+        while (y < size.height) {
+            var x = if (row % 2 == 0) grainStep * 0.45f else grainStep * 0.95f
+            while (x < size.width) {
+                val seed = ((x * 13f + y * 7f).toInt() % 5)
+                drawCircle(
+                    color = Color.White.copy(alpha = if (seed == 0) 0.055f else 0.028f),
+                    radius = 0.55.dp.toPx(),
+                    center = Offset(x, y),
+                )
+                x += grainStep
+            }
+            y += grainStep
+            row += 1
+        }
+        drawRoundRect(
+            color = Color.Black.copy(alpha = 0.16f),
+            cornerRadius = corner,
+            style = Stroke(width = 0.6.dp.toPx()),
         )
     }
 }
@@ -2440,6 +2897,8 @@ private fun MineAlbumTimeline(
     albumImages: List<FeedImage>,
     onMediaClick: (FeedMedia) -> Unit,
 ) {
+    var viewerImages by remember { mutableStateOf<List<FeedImage>>(emptyList()) }
+    var viewerIndex by remember { mutableStateOf(0) }
     val postGroups = remember(posts) {
         posts.mapNotNull { post ->
             val imgs = post.images.distinctBy { it.largeUrl }
@@ -2499,7 +2958,10 @@ private fun MineAlbumTimeline(
                             MineAlbumTile(
                                 image = image,
                                 size = cellSize,
-                                onMediaClick = onMediaClick,
+                                onClick = {
+                                    viewerImages = images
+                                    viewerIndex = images.indexOf(image).coerceAtLeast(0)
+                                },
                             )
                         }
                     }
@@ -2507,28 +2969,27 @@ private fun MineAlbumTimeline(
             }
         }
     }
+
+    if (viewerImages.isNotEmpty()) {
+        FullscreenImageViewer(
+            images = viewerImages,
+            initialIndex = viewerIndex,
+            onDismiss = { viewerImages = emptyList() },
+        )
+    }
 }
 
 @Composable
 private fun MineAlbumTile(
     image: FeedImage,
     size: androidx.compose.ui.unit.Dp,
-    onMediaClick: (FeedMedia) -> Unit,
+    onClick: () -> Unit,
 ) {
     Box(
         modifier = Modifier
             .size(size)
             .clip(RoundedCornerShape(8.dp))
-            .clickable(enabled = image.isLivePhoto) {
-                onMediaClick(
-                    FeedMedia(
-                        type = MediaType.Live,
-                        title = "LivePhoto",
-                        coverUrl = image.largeUrl,
-                        streamUrl = image.livePhotoVideoUrl.orEmpty(),
-                    )
-                )
-            }
+            .clickable(onClick = onClick)
     ) {
         RemoteImage(
             url = image.thumbnailUrl.ifBlank { image.largeUrl },
@@ -2755,7 +3216,7 @@ private fun AccountScreen(session: WeiboWebSession) {
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("微博网页会话", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "这里使用桌面 Chrome 标识打开 weibo.com。登录成功后点下方按钮回到微博首页，再切回首页同步。",
+                    "这里使用桌面 Chrome 标识打开 weibo.com。登录成功后回到微博首页，再到首页刷新。",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -2790,39 +3251,19 @@ private fun HiddenSessionWebView(session: WeiboWebSession) {
 }
 
 @Composable
-private fun MediaPreviewOverlay(media: FeedMedia, onDismiss: () -> Unit) {
-    Surface(
-        modifier = Modifier.fillMaxSize(),
-        color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.78f),
+private fun FullscreenMediaPreview(media: FeedMedia, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = media.title,
-                    modifier = Modifier.weight(1f),
-                    color = Color.White,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Button(onClick = onDismiss) { Text("关闭") }
-            }
-            AndroidView(
-                modifier = Modifier.fillMaxWidth().fillMaxHeight(),
-                factory = { context ->
-                    WebView(context).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.mediaPlaybackRequiresUserGesture = false
-                        loadDataWithBaseURL(
-                            "https://weibo.com/",
-                            mediaHtml(media.streamUrl),
-                            "text/html",
-                            "utf-8",
-                            null,
-                        )
-                    }
-                },
+        BackHandler { onDismiss() }
+        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
+            WeiboVideoSurface(
+                media = media,
+                isFullscreen = true,
+                onAspectRatio = {},
+                onFullscreen = onDismiss,
+                modifier = Modifier.fillMaxSize(),
             )
         }
     }
@@ -2915,29 +3356,105 @@ private fun WebView.detachFromParent(): WebView {
     return this
 }
 
-private fun mediaHtml(url: String): String {
-    val escaped = url
-        .replace("&", "&amp;")
-        .replace("\"", "&quot;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    return """
-        <!doctype html>
-        <html>
-          <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <style>
-              html, body { margin: 0; height: 100%; background: #000; }
-              body { display: flex; align-items: center; justify-content: center; }
-              video { width: 100%; height: auto; max-height: 100%; }
-            </style>
-          </head>
-          <body>
-            <video src="$escaped" controls autoplay playsinline></video>
-          </body>
-        </html>
-    """.trimIndent()
+private object FullscreenBitmapCache {
+    private const val MaxEntries = 24
+    private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
+            size > MaxEntries
+    }
+
+    @Synchronized
+    fun get(url: String): android.graphics.Bitmap? = entries[url]
+
+    @Synchronized
+    fun put(url: String, bitmap: android.graphics.Bitmap) {
+        entries[url] = bitmap
+    }
 }
+
+private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
+    val candidates = (image.downloadUrls + image.largeUrl + image.thumbnailUrl)
+        .filter { it.isNotBlank() }
+        .distinct()
+    candidates.forEach { url ->
+        FullscreenBitmapCache.get(url)?.let { return it }
+    }
+    candidates.forEach { url ->
+        runCatching {
+            val bytes = URL(url).openConnection().apply {
+                (this as HttpURLConnection).connectTimeout = 10_000
+                readTimeout = 20_000
+                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+                setRequestProperty("Referer", "https://weibo.com/")
+            }.inputStream.use { it.readBytes() }
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            val maxDim = 4096
+            val rawSample = maxOf(opts.outWidth / maxDim, opts.outHeight / maxDim).coerceAtLeast(1)
+            opts.inJustDecodeBounds = false
+            opts.inSampleSize = Integer.highestOneBit(rawSample).coerceAtLeast(1)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+        }.getOrNull()?.let { bitmap ->
+            FullscreenBitmapCache.put(url, bitmap)
+            return bitmap
+        }
+    }
+    return null
+}
+
+private fun buildVideoMediaSource(
+    context: android.content.Context,
+    url: String,
+): androidx.media3.exoplayer.source.MediaSource {
+    val mediaItem = androidx.media3.common.MediaItem.fromUri(android.net.Uri.parse(url))
+    val factory = weiboDataSourceFactory(context)
+    return when {
+        url.startsWith("data:application/dash+xml", ignoreCase = true) ||
+            url.contains(".mpd", ignoreCase = true) ->
+            androidx.media3.exoplayer.dash.DashMediaSource.Factory(factory).createMediaSource(mediaItem)
+        url.contains("m3u8", ignoreCase = true) ->
+            androidx.media3.exoplayer.hls.HlsMediaSource.Factory(factory).createMediaSource(mediaItem)
+        else ->
+            androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(factory).createMediaSource(mediaItem)
+    }
+}
+
+private fun weiboDataSourceFactory(context: android.content.Context): androidx.media3.datasource.DefaultDataSource.Factory {
+    val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
+    val headers = buildMap {
+        put("Accept", "*/*")
+        put("Referer", "https://weibo.com/")
+        put("Origin", "https://weibo.com")
+        put("User-Agent", DESKTOP_CHROME_USER_AGENT)
+        if (cookie.isNotBlank()) put("Cookie", cookie)
+    }
+    val httpFactory = androidx.media3.datasource.DefaultHttpDataSource.Factory()
+        .setUserAgent(DESKTOP_CHROME_USER_AGENT)
+        .setDefaultRequestProperties(headers)
+        .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(12_000)
+        .setReadTimeoutMs(20_000)
+    return androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
+}
+
+private fun videoUrlCandidates(url: String): List<String> {
+    val trimmed = url.trim()
+    if (trimmed.isBlank()) return emptyList()
+    if (trimmed.startsWith("http://", ignoreCase = true)) {
+        return listOf(trimmed.replaceFirst("http://", "https://", ignoreCase = true), trimmed)
+    }
+    return listOf(trimmed)
+}
+
+private fun formatVideoTime(ms: Long): String {
+    val totalSeconds = (ms / 1000L).coerceAtLeast(0L)
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return "$minutes:${seconds.toString().padStart(2, '0')}"
+}
+
+private fun speedLabel(speed: Float): String =
+    if (speed == speed.toInt().toFloat()) "${speed.toInt()}x" else "${speed}x"
 
 private const val DESKTOP_CHROME_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +

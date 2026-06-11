@@ -6,10 +6,10 @@
     android:viewportHeight="48">
 
     <group
-        android:scaleX="0.78"
-        android:scaleY="0.78"
-        android:translateX="5.28"
-        android:translateY="5.28">
+        android:scaleX="0.62"
+        android:scaleY="0.62"
+        android:translateX="9.12"
+        android:translateY="9.12">
     <path
         android:fillColor="#FFFFFFFF"
         android:pathData="M34,29c-0.6,-5.8 -7.6,-9.8 -16,-8.9c-4.9,0.5 -9.4,2.6 -11.9,5.6C4.5,27.6 3.8,29.8 4,32c0.5,5.3 6.4,9 13.8,9c0.7,0 1.4,0 2.2,-0.1c4.9,-0.5 9.4,-2.6 11.9,-5.6C33.5,33.4 34.2,31.2 34,29z" />
