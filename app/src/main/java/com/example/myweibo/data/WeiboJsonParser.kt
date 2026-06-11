@@ -289,14 +289,19 @@ object WeiboJsonParser {
                     imageUrl(info, "bmiddle"),
                     imageUrl(info, "thumbnail"),
                 ).distinct()
+                val imgType = info.optNullableString("type")
+                val isLive = imgType == "livephoto"
+                val isGif = imgType == "gif"
                 add(
                     FeedImage(
                         id = picId,
                         thumbnailUrl = normalizeUrl(thumbnail),
                         largeUrl = normalizeUrl(large),
                         downloadUrls = downloadUrls.map(::normalizeUrl),
-                        livePhotoVideoUrl = info.optNullableString("video")
-                            ?: info.optNullableString("video_hd"),
+                        livePhotoVideoUrl = if (isLive || isGif)
+                            (info.optNullableString("video") ?: info.optNullableString("video_hd"))
+                        else null,
+                        type = imgType,
                         width = largeInfo?.optInt("width")?.takeIf { it > 0 },
                         height = largeInfo?.optInt("height")?.takeIf { it > 0 },
                     )

@@ -172,8 +172,8 @@ private fun videoPlaybackKey(media: FeedMedia): String =
 
 /*
 private enum class LegacyMainTab(val label: String) {
-    Feed("棣栭〉"),
-    Account("璐︽埛"),
+    Feed("Feed"),
+    Account("Account"),
 }
 
 */
@@ -219,6 +219,7 @@ fun WeiboApp() {
     var mineAlbumHasMore by remember { mutableStateOf(true) }
     var mineAlbumLoadingMore by remember { mutableStateOf(false) }
     var emoticonMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var emoticonSyncing by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
     var visitedUserScreenName by remember { mutableStateOf("") }
     var visitedProfile by remember { mutableStateOf<UserProfile?>(null) }
@@ -296,7 +297,7 @@ fun WeiboApp() {
 
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
-        scope.launch { snackbarHostState.showSnackbar("$title：$detail") }
+        scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
     }
 
     fun refreshTimeline() {
@@ -314,7 +315,7 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
-                        showMessage("没有读到信息流", "请先在我的页面设置中登录微博，或稍后再刷新")
+                        showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
                     }
                 }
                 .onFailure { error ->
@@ -340,7 +341,7 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
-                        showMessage("没有读到信息流", "请先在我的页面设置中登录微博，或稍后再刷新")
+                        showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
                     }
                 }
                 .onFailure { error ->
@@ -360,7 +361,7 @@ fun WeiboApp() {
                     items = items + page.items
                     nextCursor = page.nextCursor
                 }
-                .onFailure { error -> showMessage("加载失败", error.message ?: "无法读取下一页") }
+                .onFailure { error -> showMessage("\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u4E0B\u4E00\u9875") }
             isLoading = false
         }
     }
@@ -474,7 +475,7 @@ fun WeiboApp() {
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
                 }
-                .onFailure { error -> showMessage("评论加载失败", error.message ?: "微博接口无响应") }
+                .onFailure { error -> showMessage("\u8BC4\u8BBA\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94") }
             commentsLoading = false
         }
     }
@@ -492,6 +493,22 @@ fun WeiboApp() {
                     commentsHasMore = page.nextCursor != null
                 }
             commentsLoading = false
+        }
+    }
+
+    fun syncEmoticons() {
+        if (emoticonSyncing) return
+        scope.launch {
+            emoticonSyncing = true
+            runCatching { session.loadEmotions() }
+                .onSuccess { emotions ->
+                    emoticonMap = emotions.associate { it.phrase to it.url }
+                    showMessage("\u8868\u60C5\u540C\u6B65\u5B8C\u6210", "\u5DF2\u540C\u6B65 ${emoticonMap.size} \u4E2A\u8868\u60C5")
+                }
+                .onFailure { error ->
+                    showMessage("表情同步失败", error.message ?: "无法读取微博表情配置")
+                }
+            emoticonSyncing = false
         }
     }
 
@@ -568,11 +585,14 @@ fun WeiboApp() {
                         postsHasMore = visitedPostsHasMore,
                         albumHasMore = false,
                         emoticonMap = emoticonMap,
+                        emoticonCount = emoticonMap.size,
+                        emoticonSyncing = emoticonSyncing,
                         onRefresh = {
                             visitedUserId?.let { loadVisitedUserProfile(ProfileLookup.Uid(it)) }
                         },
                         onLoadMorePosts = { loadMoreVisitedPosts() },
                         onLoadMoreAlbum = {},
+                        onSyncEmoticons = { syncEmoticons() },
                         onItemClick = ::openDetail,
                         onMediaClick = { mediaPreview = it },
                         onUserClick = ::openUser,
@@ -634,10 +654,13 @@ fun WeiboApp() {
                         postsHasMore = minePostsHasMore,
                         albumHasMore = mineAlbumHasMore,
                         emoticonMap = emoticonMap,
+                        emoticonCount = emoticonMap.size,
+                        emoticonSyncing = emoticonSyncing,
                         postsListState = minePostsListState,
                         onRefresh = { refreshMineProfile() },
                         onLoadMorePosts = { loadMoreMinePosts() },
                         onLoadMoreAlbum = { loadMoreMineAlbum() },
+                        onSyncEmoticons = { syncEmoticons() },
                         onItemClick = ::openDetail,
                         onMediaClick = { mediaPreview = it },
                         onUserClick = ::openUser,
@@ -735,7 +758,7 @@ private fun MyWeiboScaffold(
                 actions = {
                     if (false) {
                         TextButton(onClick = onRefresh, enabled = !isLoading) {
-                            Text(if (isLoading) "同步中" else "同步")
+                            Text(if (isLoading) "\u540C\u6B65\u4E2D" else "\u540C\u6B65")
                         }
                     }
                 }
@@ -829,7 +852,7 @@ private fun FloatingBottomBar(
                         )
                 )
 
-                // 涓婂眰锛氬唴瀹癸紙娓呮櫚锛?
+                // Upper layer: clear content over the glass background.
                 BoxWithConstraints(
                     Modifier
                         .fillMaxSize()
@@ -1233,8 +1256,8 @@ private fun FeedScreen(
             item {
                 EmptyState(
                     title = "等待微博数据",
-                    body = "先到我的页面设置中完成登录，再回到首页刷新。数据源使用 weibo.com/ajax/*，和 example 的浏览器扩展路线一致。",
-                    actionLabel = "打开微博登录页",
+                    body = "\u5148\u5230\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u5B8C\u6210\u767B\u5F55\uFF0C\u518D\u56DE\u5230\u9996\u9875\u5237\u65B0\u3002\u6570\u636E\u6E90\u4F7F\u7528 weibo.com/ajax/*\uFF0C\u548C example \u7684\u6D4F\u89C8\u5668\u6269\u5C55\u8DEF\u7EBF\u4E00\u81F4\u3002",
+                    actionLabel = "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
                     onAction = { session.openLogin() },
                 )
             }
@@ -1282,7 +1305,7 @@ private fun FeedHeader(
             fontWeight = FontWeight.SemiBold,
         )
         Text(
-            text = "使用微博网页登录态读取接口，原生 Material 3 呈现信息流、媒体和评论。",
+            text = "\u4F7F\u7528\u5FAE\u535A\u7F51\u9875\u767B\u5F55\u6001\u8BFB\u53D6\u63A5\u53E3\uFF0C\u539F\u751F Material 3 \u5448\u73B0\u4FE1\u606F\u6D41\u3001\u5A92\u4F53\u548C\u8BC4\u8BBA\u3002",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1308,7 +1331,7 @@ private fun FeedHeader(
             }
         }
         if (!isLoading) {
-            TextButton(onClick = onRefresh) { Text("从微博同步最新内容") }
+            TextButton(onClick = onRefresh) { Text("\u4ECE\u5FAE\u535A\u540C\u6B65\u6700\u65B0\u5185\u5BB9") }
         }
     }
 }
@@ -1316,7 +1339,7 @@ private fun FeedHeader(
 @Composable
 private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: TextStyle, onUserClick: ((String) -> Unit)? = null) {
     if (text.isBlank()) {
-        Text(text = "无正文", style = style)
+        Text(text = "\u65E0\u6B63\u6587", style = style)
         return
     }
 
@@ -1331,7 +1354,7 @@ private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: 
         ) { EmojiImage(url = url) }
     }
 
-    // 娣诲姞 @username 涓哄彲鐐瑰嚮鐨?pink 鏂囧瓧 inline content
+    // Add clickable @username inline content.
     val mentionPattern = Regex("""@[\w\u4e00-\u9fa5]+""")
     val lineH = style.lineHeight.takeIf { it != TextUnit.Unspecified } ?: style.fontSize * 1.5f
     Regex("""@[\p{L}\p{N}_-]+""").findAll(text).forEach { match ->
@@ -1362,7 +1385,7 @@ private fun EmoticonText(text: String, emoticonMap: Map<String, String>, style: 
             }
             val token = match.value
             if (emoticonMap.containsKey(token) || token.startsWith("@")) {
-                // 妫€鏌ユ槸鍚︾湡鐨勬槸 inline content 鐨?key
+                // Check whether this token has inline content.
                 if (inlineContent.containsKey(token)) {
                     appendInlineContent(token, token)
                 } else {
@@ -1519,7 +1542,7 @@ private fun AuthorRow(item: FeedItem, onUserClick: ((String) -> Unit)? = null) {
             }
             if (false) {
             Text(
-                text = listOfNotNull(formatWeiboTime(item.createdAt), item.source).joinToString(" 路 "),
+                text = listOfNotNull(formatWeiboTime(item.createdAt), item.source).joinToString(" \u00B7 "),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
@@ -1572,10 +1595,10 @@ private fun MediaStrip(
                                         if (images.size == 1) {
                                             val w = image.width ?: 0
                                             val h = image.height ?: 0
-                                            if (w > 0 && h > 0) (w.toFloat() / h).coerceIn(0.75f, 1.5f) else 1f
+                                            if (w > 0 && h > 0) (w.toFloat() / h).coerceIn(0.33f, 3f) else 1f
                                         } else 1f
                                     )
-                                    .clip(RoundedCornerShape(8.dp))
+                                    .clip(RoundedCornerShape(4.dp))
                                     .background(MaterialTheme.colorScheme.surfaceContainerHighest)
                                     .clickable {
                                         viewerIndex = images.indexOf(image)
@@ -1587,7 +1610,7 @@ private fun MediaStrip(
                                     modifier = Modifier.fillMaxSize(),
                                     contentScale = if (images.size == 1) ContentScale.FillWidth else ContentScale.Crop,
                                 )
-                                if (image.isLivePhoto) {
+                                if (image.isLivePhoto || image.isGif) {
                                     Surface(
                                         modifier = Modifier
                                             .align(Alignment.BottomEnd)
@@ -1598,7 +1621,7 @@ private fun MediaStrip(
                                     ) {
                                         Icon(
                                             painter = painterResource(R.drawable.ic_live_photo),
-                                            contentDescription = "LivePhoto",
+                                            contentDescription = if (image.isGif) "GIF" else "LivePhoto",
                                             modifier = Modifier
                                                 .padding(3.dp)
                                                 .size(15.dp),
@@ -1677,7 +1700,7 @@ private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
     var offsetX by remember(image.largeUrl) { mutableStateOf(0f) }
     var offsetY by remember(image.largeUrl) { mutableStateOf(0f) }
     var bitmap by remember(image.largeUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
+    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto || image.isGif) }
 
     LaunchedEffect(image.largeUrl) {
         bitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
@@ -1752,7 +1775,7 @@ private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
                         }
                     },
                     onLongPress = {
-                        if (image.isLivePhoto) livePlaying = true
+                        if (image.isLivePhoto || image.isGif) livePlaying = true
                     },
                 )
             },
@@ -1771,7 +1794,7 @@ private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
                 },
             contentScale = ContentScale.Fit,
         )
-        if (image.isLivePhoto && livePlaying) {
+        if ((image.isLivePhoto || image.isGif) && livePlaying) {
             LivePhotoOverlay(
                 image = image,
                 modifier = Modifier
@@ -1795,7 +1818,9 @@ private fun LivePhotoOverlay(
     onEnded: () -> Unit,
 ) {
     val context = LocalContext.current
-    val videoUrl = image.livePhotoVideoUrl.orEmpty()
+    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() }
+        ?: if (image.isGif) image.largeUrl else ""
+    val gifFallback = videoUrl == image.largeUrl
     var videoVisible by remember(videoUrl) { mutableStateOf(false) }
     val player = remember(videoUrl) {
         androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
@@ -1956,13 +1981,16 @@ private fun WeiboVideoSurface(
     var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
     var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
 
+    val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
     val player = remember(videoUrl) {
-        androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
-            setMediaSource(buildVideoMediaSource(context, videoUrl))
-            prepare()
-            videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
-            playWhenReady = true
-        }
+        playerCache[videoUrl]?.also { it.playWhenReady = true }
+            ?: androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+                playerCache[videoUrl] = this
+                setMediaSource(buildVideoMediaSource(context, videoUrl))
+                prepare()
+                videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
+                playWhenReady = true
+            }
     }
 
     DisposableEffect(player) {
@@ -2092,6 +2120,9 @@ private fun WeiboVideoSurface(
                 if (player.isPlaying) {
                     player.pause()
                 } else {
+                    if (durationMs > 0 && positionMs >= durationMs - 500) {
+                        player.seekTo(0)
+                    }
                     videoCoordinator.activeKey = playbackKey
                     player.play()
                 }
@@ -2259,46 +2290,20 @@ private fun CompactVideoScrubber(
 
 @Composable
 private fun VideoControlGlassBackground(modifier: Modifier = Modifier) {
-    Canvas(
+    Box(
         modifier = modifier
-            .clip(RoundedCornerShape(7.dp))
-    ) {
-        val radius = 7.dp.toPx()
-        val corner = CornerRadius(radius, radius)
-
-        // A frosted panel needs to obscure the moving video first; the grain below
-        // breaks up sharp details so the background no longer reads clearly.
-        drawRoundRect(
-            color = Color(0xFF5A5254).copy(alpha = 0.94f),
-            cornerRadius = corner,
-        )
-        drawRoundRect(
-            color = Color(0xFF332E30).copy(alpha = 0.38f),
-            cornerRadius = corner,
-        )
-        val grainStep = 3.dp.toPx().coerceAtLeast(2f)
-        var y = grainStep * 0.5f
-        var row = 0
-        while (y < size.height) {
-            var x = if (row % 2 == 0) grainStep * 0.45f else grainStep * 0.95f
-            while (x < size.width) {
-                val seed = ((x * 13f + y * 7f).toInt() % 5)
-                drawCircle(
-                    color = Color.White.copy(alpha = if (seed == 0) 0.055f else 0.028f),
-                    radius = 0.55.dp.toPx(),
-                    center = Offset(x, y),
+            .clip(RoundedCornerShape(8.dp))
+            .blur(24.dp)
+            .background(Color(0xFF3A3A3C).copy(alpha = 0.45f))
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color.White.copy(alpha = 0.06f),
+                        Color.White.copy(alpha = 0.02f),
+                    )
                 )
-                x += grainStep
-            }
-            y += grainStep
-            row += 1
-        }
-        drawRoundRect(
-            color = Color.Black.copy(alpha = 0.16f),
-            cornerRadius = corner,
-            style = Stroke(width = 0.6.dp.toPx()),
-        )
-    }
+            ),
+    )
 }
 
 @Composable
@@ -2335,7 +2340,7 @@ private fun StatusActions(item: FeedItem, onCommentClick: (() -> Unit)? = null) 
             modifier = Modifier.height(24.dp),
             colors = AssistChipDefaults.assistChipColors(containerColor = Color.Transparent, labelColor = actionColor),
             border = null,
-            label = { Text("赞 ${item.likesCount}", fontSize = 11.sp, color = chipColor) },
+            label = { Text("\u8D5E ${item.likesCount}", fontSize = 11.sp, color = chipColor) },
         )
     }
 }
@@ -2451,7 +2456,7 @@ private fun CommentRow(comment: CommentItem, depth: Int = 0) {
                     text = listOfNotNull(
                         formatWeiboTime(comment.createdAt),
                         comment.ipLocation?.let { "来自$it" },
-                        "赞 ${comment.likesCount}",
+                        "\u8D5E ${comment.likesCount}",
                     ).joinToString("  "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.58f),
@@ -2513,37 +2518,54 @@ private fun MineScreen(
     postsHasMore: Boolean = true,
     albumHasMore: Boolean = true,
     emoticonMap: Map<String, String> = emptyMap(),
+    emoticonCount: Int = 0,
+    emoticonSyncing: Boolean = false,
     postsListState: LazyListState = rememberLazyListState(),
     onRefresh: () -> Unit,
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
+    onSyncEmoticons: () -> Unit,
     onItemClick: (FeedItem) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     onUserClick: ((String) -> Unit)? = null,
 ) {
     var showSettings by remember { mutableStateOf(false) }
+    var showAccountManagement by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { MineContentTab.entries.size })
     val coroutineScope = rememberCoroutineScope()
     val albumListState = rememberLazyListState()
 
     if (showSettings) {
-        Column(Modifier.fillMaxSize()) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TextButton(onClick = { showSettings = false }) { Text("\u8FD4\u56DE") }
-                Text(
-                    text = "\u8BBE\u7F6E",
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+        BackHandler {
+            if (showAccountManagement) {
+                showAccountManagement = false
+            } else {
+                showSettings = false
             }
-            AccountLoginPanel(session = session)
+        }
+        if (showAccountManagement) {
+            SettingsPageShell(
+                title = "\u8D26\u53F7\u7BA1\u7406",
+                onBack = { showAccountManagement = false },
+            ) {
+                AccountLoginPanel(session = session)
+            }
+        } else {
+            SettingsScreen(
+                hasLoginCookie = hasLoginCookie,
+                emoticonCount = emoticonCount,
+                emoticonSyncing = emoticonSyncing,
+                onBack = {
+                    showAccountManagement = false
+                    showSettings = false
+                },
+                onOpenAccount = { showAccountManagement = true },
+                onSyncEmoticons = onSyncEmoticons,
+            )
         }
         return
     }
+
 
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -2586,7 +2608,7 @@ private fun MineScreen(
                     profile = profile,
                     hasLoginCookie = hasLoginCookie,
                     loadError = loadError,
-                    onOpenSettings = if (hasLoginCookie) ({ showSettings = true }) else null,
+                    onOpenSettings = { showSettings = true },
                 )
 
                 MineContentTabs(
@@ -2654,7 +2676,7 @@ private fun MineScreen(
                                     if (!postsHasMore && posts.isNotEmpty()) {
                                         item {
                                             Text(
-                                                text = "— 已经到底了 —",
+                                                text = "\u5DF2\u7ECF\u5230\u5E95\u4E86",
                                                 modifier = Modifier.fillMaxWidth().padding(16.dp),
                                                 textAlign = TextAlign.Center,
                                                 style = MaterialTheme.typography.bodySmall,
@@ -2685,7 +2707,7 @@ private fun MineScreen(
                                 if (!albumHasMore && albumImages.isNotEmpty()) {
                                     item {
                                         Text(
-                                            text = "— 已经到底了 —",
+                                            text = "\u5DF2\u7ECF\u5230\u5E95\u4E86",
                                             modifier = Modifier.fillMaxWidth().padding(16.dp),
                                             textAlign = TextAlign.Center,
                                             style = MaterialTheme.typography.bodySmall,
@@ -2703,6 +2725,180 @@ private fun MineScreen(
 }
 
 @Composable
+private fun SettingsPageShell(
+    title: String,
+    onBack: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    start = 16.dp,
+                    top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 6.dp,
+                    end = 16.dp,
+                    bottom = 8.dp,
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = title,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
+private fun SettingsScreen(
+    hasLoginCookie: Boolean,
+    emoticonCount: Int,
+    emoticonSyncing: Boolean,
+    onBack: () -> Unit,
+    onOpenAccount: () -> Unit,
+    onSyncEmoticons: () -> Unit,
+) {
+    SettingsPageShell(title = "设置", onBack = onBack) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                SettingsActionCard(
+                    title = "账号管理",
+                    subtitle = if (hasLoginCookie) {
+                        "\u7BA1\u7406\u5FAE\u535A\u7F51\u9875\u767B\u5F55\u6001\uFF0C\u6216\u91CD\u65B0\u767B\u5F55\u8D26\u53F7"
+                    } else {
+                        "\u767B\u5F55\u5FAE\u535A\u4EE5\u8BFB\u53D6\u4E3B\u9875\u3001\u4FE1\u606F\u6D41\u4E0E\u8BC4\u8BBA"
+                    },
+                    status = if (hasLoginCookie) "\u5DF2\u767B\u5F55" else "\u672A\u767B\u5F55",
+                    actionLabel = "进入",
+                    onClick = onOpenAccount,
+                )
+            }
+            item {
+                SettingsActionCard(
+                    title = "表情同步",
+                    subtitle = if (emoticonCount > 0) {
+                        "\u5DF2\u540C\u6B65 $emoticonCount \u4E2A\u5FAE\u535A\u8868\u60C5\uFF0C\u53EF\u7EE7\u7EED\u66F4\u65B0"
+                    } else {
+                        "同步微博表情配置，提升正文与评论表情显示"
+                    },
+                    status = if (emoticonSyncing) {
+                        "\u540C\u6B65\u4E2D"
+                    } else if (emoticonCount > 0) {
+                        "\u5DF2\u540C\u6B65"
+                    } else {
+                        "\u672A\u540C\u6B65"
+                    },
+                    actionLabel = if (emoticonCount > 0) "更新" else "同步",
+                    loading = emoticonSyncing,
+                    enabled = !emoticonSyncing,
+                    onClick = onSyncEmoticons,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsActionCard(
+    title: String,
+    subtitle: String,
+    status: String,
+    actionLabel: String,
+    loading: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    ElevatedCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(enabled = enabled, onClick = onClick),
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text(
+                            text = status,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Text(
+                    text = actionLabel,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (enabled) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun MineProfileHeader(
     profile: UserProfile?,
     hasLoginCookie: Boolean,
@@ -2714,7 +2910,7 @@ private fun MineProfileHeader(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(132.dp)
+                    .aspectRatio(3f)
                     .background(
                         Brush.linearGradient(
                             colors = listOf(
@@ -2729,12 +2925,12 @@ private fun MineProfileHeader(
                     RemoteImage(
                         url = cover,
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop,
+                        contentScale = ContentScale.FillWidth,
                     )
                 }
                 if (onOpenSettings != null) {
                     Surface(
-                        modifier = Modifier.align(Alignment.TopEnd).padding(10.dp),
+                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 32.dp, end = 10.dp),
                         shape = CircleShape,
                         color = Color.White.copy(alpha = 0.62f),
                         tonalElevation = 0.dp,
@@ -2857,7 +3053,7 @@ private fun MineContentTabs(
             val selected = selectedTab == tab
             Column(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(3.dp))
                     .clickable { onTabSelected(tab) }
                     .padding(horizontal = 2.dp, vertical = 4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -2999,7 +3195,7 @@ private fun MineAlbumTile(
         if (image.isLivePhoto) {
             Surface(
                 modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
-                shape = RoundedCornerShape(6.dp),
+                shape = RoundedCornerShape(3.dp),
                 color = Color.Black.copy(alpha = 0.38f),
                 contentColor = Color.White,
             ) {
@@ -3216,12 +3412,12 @@ private fun AccountScreen(session: WeiboWebSession) {
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("微博网页会话", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "这里使用桌面 Chrome 标识打开 weibo.com。登录成功后回到微博首页，再到首页刷新。",
+                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 weibo.com\u3002\u767B\u5F55\u6210\u529F\u540E\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u518D\u5230\u9996\u9875\u5237\u65B0\u3002",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = { session.openWeiboHome() }) {
-                        Text("完成登录，回到微博首页")
+                        Text("\u5B8C\u6210\u767B\u5F55\uFF0C\u56DE\u5230\u5FAE\u535A\u9996\u9875")
                     }
                     TextButton(onClick = { session.openLogin() }) {
                         Text("重新打开")
@@ -3319,7 +3515,7 @@ private fun RemoteImage(
             )
         } else if (failed) {
             Text(
-                text = "图片不可用",
+                text = "\u56FE\u7247\u4E0D\u53EF\u7528",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -3419,7 +3615,20 @@ private fun buildVideoMediaSource(
     }
 }
 
-private fun weiboDataSourceFactory(context: android.content.Context): androidx.media3.datasource.DefaultDataSource.Factory {
+private var videoCache: androidx.media3.datasource.cache.SimpleCache? = null
+private fun getVideoCache(context: android.content.Context): androidx.media3.datasource.cache.SimpleCache {
+    return videoCache ?: run {
+        val cacheDir = java.io.File(context.cacheDir, "weibo-video")
+        cacheDir.mkdirs()
+        androidx.media3.datasource.cache.SimpleCache(
+            cacheDir,
+            androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor(200L * 1024 * 1024),
+            androidx.media3.database.StandaloneDatabaseProvider(context),
+        ).also { videoCache = it }
+    }
+}
+
+private fun weiboDataSourceFactory(context: android.content.Context): androidx.media3.datasource.DataSource.Factory {
     val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
     val headers = buildMap {
         put("Accept", "*/*")
@@ -3434,7 +3643,11 @@ private fun weiboDataSourceFactory(context: android.content.Context): androidx.m
         .setAllowCrossProtocolRedirects(true)
         .setConnectTimeoutMs(12_000)
         .setReadTimeoutMs(20_000)
-    return androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
+    val upstream = androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
+    return androidx.media3.datasource.cache.CacheDataSource.Factory()
+        .setCache(getVideoCache(context))
+        .setUpstreamDataSourceFactory(upstream)
+        .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 }
 
 private fun videoUrlCandidates(url: String): List<String> {

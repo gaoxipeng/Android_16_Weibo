@@ -162,8 +162,8 @@ class WeiboWebSession(context: Context) {
         )
         val items = WeiboJsonParser.parseComments(raw)
         val json = org.json.JSONObject(raw)
-        val cursor = json.optJSONObject("data")?.optString("max_id", null)
-            ?: json.optString("max_id", null)
+        val cursor = json.optJSONObject("data")?.nullableString("max_id")
+            ?: json.nullableString("max_id")
         return CommentsPage(items, cursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
@@ -185,8 +185,8 @@ class WeiboWebSession(context: Context) {
         )
         val items = WeiboJsonParser.parseComments(raw)
         val json = org.json.JSONObject(raw)
-        val nextCursor = json.optJSONObject("data")?.optString("max_id", null)
-            ?: json.optString("max_id", null)
+        val nextCursor = json.optJSONObject("data")?.nullableString("max_id")
+            ?: json.nullableString("max_id")
         return CommentsPage(items, nextCursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
@@ -495,6 +495,9 @@ class WeiboWebSession(context: Context) {
 
     private fun String.jsQuote(): String =
         JSONObject.quote(this)
+
+    private fun org.json.JSONObject.nullableString(key: String): String? =
+        if (has(key) && !isNull(key)) optString(key, "") else null
 
     companion object {
         private const val WEIBO_HOME = "https://weibo.com/"

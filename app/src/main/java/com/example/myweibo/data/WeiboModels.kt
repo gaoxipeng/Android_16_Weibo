@@ -33,9 +33,12 @@ data class FeedImage(
     val createdAt: String? = null,
     val width: Int? = null,
     val height: Int? = null,
+    val type: String? = null,
 ) {
     val isLivePhoto: Boolean
-        get() = livePhotoVideoUrl != null
+        get() = type == "livephoto" && livePhotoVideoUrl != null
+    val isGif: Boolean
+        get() = type == "gif"
 }
 
 data class AlbumPage(
