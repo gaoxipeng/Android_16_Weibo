@@ -1,9 +1,13 @@
 package com.example.myweibo.ui
 
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
+import android.graphics.drawable.Drawable
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
+import android.widget.ImageView
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -144,6 +148,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
 import kotlin.math.abs
 import kotlin.math.hypot
 
@@ -801,7 +806,7 @@ private fun FloatingBottomBar(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 18.dp, vertical = 10.dp),
+            .padding(start = 18.dp, top = 4.dp, end = 18.dp, bottom = 24.dp),
         contentAlignment = Alignment.Center,
     ) {
         Surface(
@@ -1609,6 +1614,7 @@ private fun MediaStrip(
                                     url = image.largeUrl,
                                     modifier = Modifier.fillMaxSize(),
                                     contentScale = if (images.size == 1) ContentScale.FillWidth else ContentScale.Crop,
+                                    animated = image.isGif,
                                 )
                                 if (image.isLivePhoto || image.isGif) {
                                     Surface(
@@ -1700,7 +1706,7 @@ private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
     var offsetX by remember(image.largeUrl) { mutableStateOf(0f) }
     var offsetY by remember(image.largeUrl) { mutableStateOf(0f) }
     var bitmap by remember(image.largeUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
-    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto || image.isGif) }
+    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
 
     LaunchedEffect(image.largeUrl) {
         bitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
@@ -1714,99 +1720,121 @@ private fun ZoomableFullscreenImage(image: FeedImage, onTap: () -> Unit) {
         return
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInput(image.largeUrl) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    var lastCentroid: Offset? = null
-                    var lastDistance = 0f
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val pressed = event.changes.filter { it.pressed }
-                        if (pressed.isEmpty()) break
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center,
+    ) {
+        val containerAspect = remember(maxWidth, maxHeight) {
+            val width = maxWidth.value.coerceAtLeast(1f)
+            val height = maxHeight.value.coerceAtLeast(1f)
+            width / height
+        }
+        val imageAspect = remember(loadedBitmap.width, loadedBitmap.height, image.width, image.height) {
+            val width = (image.width ?: loadedBitmap.width).coerceAtLeast(1)
+            val height = (image.height ?: loadedBitmap.height).coerceAtLeast(1)
+            width.toFloat() / height.toFloat()
+        }
+        val fillScreenScale = remember(containerAspect, imageAspect) {
+            maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
+                .coerceIn(1.35f, 5f)
+        }
 
-                        if (pressed.size >= 2) {
-                            val first = pressed[0].position
-                            val second = pressed[1].position
-                            val centroid = Offset((first.x + second.x) / 2f, (first.y + second.y) / 2f)
-                            val distance = hypot(first.x - second.x, first.y - second.y)
-                            if (lastDistance > 0f) {
-                                val zoom = (distance / lastDistance).coerceIn(0.72f, 1.38f)
-                                targetScale = (targetScale * zoom).coerceIn(1f, 5f)
-                                val previousCentroid = lastCentroid ?: centroid
-                                val pan = centroid - previousCentroid
-                                offsetX = if (targetScale > 1f) offsetX + pan.x else 0f
-                                offsetY = if (targetScale > 1f) offsetY + pan.y else 0f
-                            }
-                            lastCentroid = centroid
-                            lastDistance = distance
-                            event.changes.forEach { it.consume() }
-                        } else {
-                            lastCentroid = null
-                            lastDistance = 0f
-                            val change = pressed.first()
-                            val totalDrag = change.position - down.position
-                            val delta = change.position - change.previousPosition
-                            if (targetScale > 1.01f) {
-                                offsetX += delta.x
-                                offsetY += delta.y
-                                change.consume()
-                            } else if (totalDrag.y > 72f && abs(totalDrag.y) > abs(totalDrag.x) * 1.35f) {
-                                change.consume()
-                                onTap()
-                                break
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(image.largeUrl) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        var lastCentroid: Offset? = null
+                        var lastDistance = 0f
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pressed = event.changes.filter { it.pressed }
+                            if (pressed.isEmpty()) break
+
+                            if (pressed.size >= 2) {
+                                val first = pressed[0].position
+                                val second = pressed[1].position
+                                val centroid = Offset((first.x + second.x) / 2f, (first.y + second.y) / 2f)
+                                val distance = hypot(first.x - second.x, first.y - second.y)
+                                if (lastDistance > 0f) {
+                                    val zoom = (distance / lastDistance).coerceIn(0.72f, 1.38f)
+                                    targetScale = (targetScale * zoom).coerceIn(1f, 5f)
+                                    val previousCentroid = lastCentroid ?: centroid
+                                    val pan = centroid - previousCentroid
+                                    offsetX = if (targetScale > 1f) offsetX + pan.x else 0f
+                                    offsetY = if (targetScale > 1f) offsetY + pan.y else 0f
+                                }
+                                lastCentroid = centroid
+                                lastDistance = distance
+                                event.changes.forEach { it.consume() }
+                            } else {
+                                lastCentroid = null
+                                lastDistance = 0f
+                                val change = pressed.first()
+                                val totalDrag = change.position - down.position
+                                val delta = change.position - change.previousPosition
+                                if (targetScale > 1.01f) {
+                                    offsetX += delta.x
+                                    offsetY += delta.y
+                                    change.consume()
+                                } else if (totalDrag.y > 72f && abs(totalDrag.y) > abs(totalDrag.x) * 1.35f) {
+                                    change.consume()
+                                    onTap()
+                                    break
+                                }
                             }
                         }
                     }
                 }
-            }
-            .pointerInput(image.largeUrl) {
-                detectTapGestures(
-                    onTap = { onTap() },
-                    onDoubleTap = {
-                        if (targetScale > 1f) {
-                            targetScale = 1f
-                            offsetX = 0f
-                            offsetY = 0f
-                        } else {
-                            targetScale = 2.6f
-                        }
-                    },
-                    onLongPress = {
-                        if (image.isLivePhoto || image.isGif) livePlaying = true
-                    },
-                )
-            },
-        contentAlignment = Alignment.Center,
-    ) {
-        Image(
-            bitmap = loadedBitmap.asImageBitmap(),
-            contentDescription = null,
-            modifier = Modifier
+                .pointerInput(image.largeUrl, fillScreenScale) {
+                    detectTapGestures(
+                        onTap = { onTap() },
+                        onDoubleTap = {
+                            if (targetScale > 1f) {
+                                targetScale = 1f
+                                offsetX = 0f
+                                offsetY = 0f
+                            } else {
+                                targetScale = fillScreenScale
+                            }
+                        },
+                        onLongPress = {
+                            if (image.isLivePhoto) livePlaying = true
+                        },
+                    )
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            val imageModifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
                     scaleX = scale
                     scaleY = scale
                     translationX = offsetX
                     translationY = offsetY
-                },
-            contentScale = ContentScale.Fit,
-        )
-        if ((image.isLivePhoto || image.isGif) && livePlaying) {
-            LivePhotoOverlay(
-                image = image,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offsetX
-                        translationY = offsetY
-                    },
-                onEnded = { livePlaying = false },
-            )
+                }
+            if (image.isGif) {
+                AnimatedRemoteImage(
+                    url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
+                    modifier = imageModifier,
+                    contentScale = ContentScale.Fit,
+                )
+            } else {
+                Image(
+                    bitmap = loadedBitmap.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = imageModifier,
+                    contentScale = ContentScale.Fit,
+                )
+            }
+            if (image.isLivePhoto && livePlaying) {
+                LivePhotoOverlay(
+                    image = image,
+                    modifier = imageModifier,
+                    onEnded = { livePlaying = false },
+                )
+            }
         }
     }
 }
@@ -1818,9 +1846,7 @@ private fun LivePhotoOverlay(
     onEnded: () -> Unit,
 ) {
     val context = LocalContext.current
-    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() }
-        ?: if (image.isGif) image.largeUrl else ""
-    val gifFallback = videoUrl == image.largeUrl
+    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return
     var videoVisible by remember(videoUrl) { mutableStateOf(false) }
     val player = remember(videoUrl) {
         androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
@@ -3191,18 +3217,22 @@ private fun MineAlbumTile(
             url = image.thumbnailUrl.ifBlank { image.largeUrl },
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop,
+            animated = image.isGif,
         )
-        if (image.isLivePhoto) {
+        if (image.isLivePhoto || image.isGif) {
             Surface(
                 modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
-                shape = RoundedCornerShape(3.dp),
-                color = Color.Black.copy(alpha = 0.38f),
+                shape = CircleShape,
+                color = Color.Black.copy(alpha = 0.42f),
                 contentColor = Color.White,
             ) {
-                Text(
-                    text = "Live",
-                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
-                    style = MaterialTheme.typography.labelSmall,
+                Icon(
+                    painter = painterResource(R.drawable.ic_live_photo),
+                    contentDescription = if (image.isGif) "GIF" else "LivePhoto",
+                    modifier = Modifier
+                        .padding(3.dp)
+                        .size(15.dp),
+                    tint = Color.White,
                 )
             }
         }
@@ -3470,7 +3500,17 @@ private fun RemoteImage(
     url: String?,
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
+    animated: Boolean = false,
 ) {
+    if (animated) {
+        AnimatedRemoteImage(
+            url = url,
+            modifier = modifier,
+            contentScale = contentScale,
+        )
+        return
+    }
+
     var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
     var failed by remember(url) { mutableStateOf(false) }
 
@@ -3480,12 +3520,7 @@ private fun RemoteImage(
         val target = url?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         runCatching {
             withContext(Dispatchers.IO) {
-                val bytes = URL(target).openConnection().apply {
-                    (this as HttpURLConnection).connectTimeout = 8000
-                    readTimeout = 8000
-                    setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
-                    setRequestProperty("Referer", "https://weibo.com/")
-                }.inputStream.use { it.readBytes() }
+                val bytes = fetchRemoteBytes(target, connectTimeoutMs = 8000, readTimeoutMs = 8000)
 
                 val options = BitmapFactory.Options().apply {
                     inJustDecodeBounds = true
@@ -3522,6 +3557,68 @@ private fun RemoteImage(
         }
     }
 }
+
+@Composable
+private fun AnimatedRemoteImage(
+    url: String?,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop,
+) {
+    var drawable by remember(url) { mutableStateOf<Drawable?>(null) }
+    var failed by remember(url) { mutableStateOf(false) }
+
+    LaunchedEffect(url) {
+        drawable = null
+        failed = false
+        val target = url?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        runCatching {
+            withContext(Dispatchers.IO) {
+                loadRemoteAnimatedDrawable(target)
+            }
+        }.onSuccess { drawable = it }
+            .onFailure { failed = true }
+    }
+
+    Box(
+        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        contentAlignment = Alignment.Center,
+    ) {
+        val image = drawable
+        if (image != null) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { context ->
+                    ImageView(context).apply {
+                        adjustViewBounds = false
+                        scaleType = imageViewScaleType(contentScale)
+                        setImageDrawable(image)
+                        (drawable as? AnimatedImageDrawable)?.start()
+                    }
+                },
+                update = { view ->
+                    view.scaleType = imageViewScaleType(contentScale)
+                    if (view.drawable !== image) {
+                        view.setImageDrawable(image)
+                    }
+                    (image as? AnimatedImageDrawable)?.start()
+                },
+            )
+        } else if (failed) {
+            Text(
+                text = "\u56FE\u7247\u4E0D\u53EF\u7528",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun imageViewScaleType(contentScale: ContentScale): ImageView.ScaleType =
+    when (contentScale) {
+        ContentScale.Crop -> ImageView.ScaleType.CENTER_CROP
+        ContentScale.FillBounds -> ImageView.ScaleType.FIT_XY
+        else -> ImageView.ScaleType.FIT_CENTER
+    }
 
 @Composable
 private fun EmptyState(
@@ -3568,6 +3665,47 @@ private object FullscreenBitmapCache {
     }
 }
 
+private object RemoteBytesCache {
+    private const val MaxEntries = 36
+    private const val MaxBytesPerEntry = 12 * 1024 * 1024
+    private val entries = object : LinkedHashMap<String, ByteArray>(MaxEntries, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
+            size > MaxEntries
+    }
+
+    @Synchronized
+    fun get(url: String): ByteArray? = entries[url]
+
+    @Synchronized
+    fun put(url: String, bytes: ByteArray) {
+        if (bytes.size <= MaxBytesPerEntry) {
+            entries[url] = bytes
+        }
+    }
+}
+
+private fun fetchRemoteBytes(
+    url: String,
+    connectTimeoutMs: Int,
+    readTimeoutMs: Int,
+): ByteArray {
+    RemoteBytesCache.get(url)?.let { return it }
+    val bytes = URL(url).openConnection().apply {
+        (this as HttpURLConnection).connectTimeout = connectTimeoutMs
+        readTimeout = readTimeoutMs
+        setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+        setRequestProperty("Referer", "https://weibo.com/")
+    }.inputStream.use { it.readBytes() }
+    RemoteBytesCache.put(url, bytes)
+    return bytes
+}
+
+private fun loadRemoteAnimatedDrawable(url: String): Drawable {
+    val bytes = fetchRemoteBytes(url, connectTimeoutMs = 10_000, readTimeoutMs = 20_000)
+    val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+    return ImageDecoder.decodeDrawable(source)
+}
+
 private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
     val candidates = (image.downloadUrls + image.largeUrl + image.thumbnailUrl)
         .filter { it.isNotBlank() }
@@ -3577,12 +3715,7 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
     }
     candidates.forEach { url ->
         runCatching {
-            val bytes = URL(url).openConnection().apply {
-                (this as HttpURLConnection).connectTimeout = 10_000
-                readTimeout = 20_000
-                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
-                setRequestProperty("Referer", "https://weibo.com/")
-            }.inputStream.use { it.readBytes() }
+            val bytes = fetchRemoteBytes(url, connectTimeoutMs = 10_000, readTimeoutMs = 20_000)
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
             val maxDim = 4096
