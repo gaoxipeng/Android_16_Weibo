@@ -37,25 +37,125 @@ object WeiboJsonParser {
                     ?: comment.optNullableString("id")
                     ?: continue
                 val htmlText = comment.optNullableString("text") ?: ""
+                val images = parseCommentImages(comment)
                 add(
                     CommentItem(
                         id = id,
                         authorName = user?.optNullableString("screen_name") ?: "微博用户",
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
-                        text = plainText(
-                            comment.optNullableString("text_raw")
-                                ?: htmlText
-                        ),
+                        text = parseCommentText(comment, images),
                         createdAt = comment.optNullableString("created_at"),
                         likesCount = formatCount(comment.opt("like_counts")),
                         ipLocation = parseIpLocation(comment),
                         emoticons = extractEmoticonsFromHtml(htmlText),
+                        images = images,
                         comments = parseNestedComments(comment.optJSONArray("comments")),
                         replyToAuthor = comment.optJSONObject("reply_comment")?.optJSONObject("user")
                             ?.optNullableString("screen_name"),
                     )
                 )
+            }
+        }
+    }
+
+    private fun parseCommentText(comment: JSONObject, images: List<FeedImage>): String {
+        val raw = comment.optNullableString("text_raw")
+            ?: comment.optNullableString("text")
+            ?: ""
+        var text = plainText(raw)
+        text = stripEntityTokens(
+            text,
+            imageUrlTokensFromUrlStruct(comment.optJSONArray("url_struct"), raw),
+        )
+        if (images.isNotEmpty()) {
+            text = stripOrphanMediaLinks(text)
+        }
+        return text
+    }
+
+    private fun parseStatusText(
+        status: JSONObject,
+        sourceRaw: String,
+        images: List<FeedImage>,
+        media: FeedMedia?,
+    ): String {
+        var text = plainText(sourceRaw)
+        val urlStruct = status.optJSONArray("url_struct")
+        text = stripEntityTokens(text, imageUrlTokensFromUrlStruct(urlStruct, sourceRaw))
+        if (media != null) {
+            text = stripEntityTokens(text, mediaUrlTokensFromUrlStruct(urlStruct, sourceRaw))
+        }
+        if (images.isNotEmpty() || media != null) {
+            text = stripOrphanMediaLinks(text)
+        }
+        return text
+    }
+
+    private fun imageUrlTokensFromUrlStruct(urlStruct: JSONArray?, sourceText: String): List<String> {
+        if (urlStruct == null) return emptyList()
+        return buildList {
+            for (index in 0 until urlStruct.length()) {
+                val entity = urlStruct.optJSONObject(index) ?: continue
+                val picIds = entity.optJSONArray("pic_ids") ?: continue
+                if (picIds.length() == 0) continue
+                if (entity.optJSONObject("pic_infos") == null) continue
+                val shortUrl = entity.optNullableString("short_url") ?: continue
+                if (sourceText.contains(shortUrl)) add(shortUrl)
+            }
+        }
+    }
+
+    private fun mediaUrlTokensFromUrlStruct(urlStruct: JSONArray?, sourceText: String): List<String> {
+        if (urlStruct == null) return emptyList()
+        return buildList {
+            for (index in 0 until urlStruct.length()) {
+                val entity = urlStruct.optJSONObject(index) ?: continue
+                val picIds = entity.optJSONArray("pic_ids")
+                if (picIds != null && picIds.length() > 0 && entity.optJSONObject("pic_infos") != null) {
+                    continue
+                }
+                val shortUrl = entity.optNullableString("short_url") ?: continue
+                if (sourceText.contains(shortUrl)) add(shortUrl)
+            }
+        }
+    }
+
+    private fun stripOrphanMediaLinks(text: String): String =
+        text
+            .replace(Regex("""https?://t\.cn/\S+"""), "")
+            .replace(Regex("""(?<!\S)https?:(?=\s|$)"""), "")
+            .replace(Regex("[ \\t]{2,}"), " ")
+            .replace(Regex("[ \\t]+\\n"), "\n")
+            .replace(Regex("\\n[ \\t]+"), "\n")
+            .trim()
+
+    private fun stripEntityTokens(text: String, tokens: List<String>): String {
+        if (tokens.isEmpty()) return text.trim()
+        var result = text
+        for (token in tokens) {
+            result = result.replace(token, "")
+            result = result.replace(Regex("[ \\t]{2,}"), " ")
+        }
+        return result
+            .replace(Regex("[ \\t]+\\n"), "\n")
+            .replace(Regex("\\n[ \\t]+"), "\n")
+            .trim()
+    }
+
+    private fun parseCommentImages(comment: JSONObject): List<FeedImage> {
+        val direct = parseImages(comment)
+        if (direct.isNotEmpty()) return direct
+
+        val seen = mutableSetOf<String>()
+        val urlStruct = comment.optJSONArray("url_struct") ?: return emptyList()
+        return buildList {
+            for (index in 0 until urlStruct.length()) {
+                val entity = urlStruct.optJSONObject(index) ?: continue
+                imagesFromParts(entity.optJSONArray("pic_ids"), entity.optJSONObject("pic_infos"))
+                    .forEach { image ->
+                        if (seen.add(image.id)) add(image)
+                    }
             }
         }
     }
@@ -68,23 +168,44 @@ object WeiboJsonParser {
                 val user = obj.optJSONObject("user")
                 val id = obj.optNullableString("idstr") ?: obj.optNullableString("id") ?: continue
                 val htmlText = obj.optNullableString("text") ?: ""
+                val images = parseCommentImages(obj)
                 add(
                     CommentItem(
                         id = id,
                         authorName = user?.optNullableString("screen_name") ?: "微博用户",
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
-                        text = plainText(obj.optNullableString("text_raw") ?: htmlText),
+                        text = parseCommentText(obj, images),
                         createdAt = obj.optNullableString("created_at"),
                         likesCount = formatCount(obj.opt("like_counts")),
                         ipLocation = parseIpLocation(obj),
                         emoticons = extractEmoticonsFromHtml(htmlText),
+                        images = images,
                         replyToAuthor = obj.optJSONObject("reply_comment")?.optJSONObject("user")
                             ?.optNullableString("screen_name"),
                     )
                 )
             }
         }
+    }
+
+    fun mergeLongTextIntoFeedItem(item: FeedItem, data: JSONObject): FeedItem {
+        val contentHtml = data.optNullableString("longTextContent") ?: ""
+        val contentRaw = data.optNullableString("longTextContent_raw")
+            ?: contentHtml
+        val rawForParse = stripLongTextPreviewLabel(contentRaw)
+        val additionalImages = parseImages(data).map {
+            it.copy(createdAt = it.createdAt ?: item.createdAt)
+        }
+        val mergedImages = (item.images + additionalImages).distinctBy { it.largeUrl }
+        val text = parseStatusText(data, rawForParse, mergedImages, item.media)
+        val mergedEmoticons = item.emoticons + extractEmoticonsFromHtml(contentHtml)
+        return item.copy(
+            isLongText = false,
+            text = text,
+            emoticons = mergedEmoticons,
+            images = mergedImages,
+        )
     }
 
     fun parseUserProfile(raw: String, fallback: JSONObject? = null): UserProfile {
@@ -117,9 +238,55 @@ object WeiboJsonParser {
             followersCount = formatCount(user.opt("followers_count")),
             statusesCount = formatCount(user.opt("statuses_count")),
             photosCount = user.opt("photos_count")?.let(::formatCount),
-            coverUrl = user.optNullableString("cover_image_phone")
-                ?: user.optNullableString("cover_image"),
+            coverUrls = parseProfileCoverUrls(user),
         )
+    }
+
+    fun profileCoverImages(urls: List<String>): List<FeedImage> =
+        urls.map { url ->
+            val downloadUrls = profileCoverDownloadUrls(url)
+            FeedImage(
+                id = url,
+                thumbnailUrl = downloadUrls.first(),
+                largeUrl = downloadUrls.first(),
+                downloadUrls = downloadUrls,
+            )
+        }
+
+    private fun parseProfileCoverUrls(user: JSONObject): List<String> {
+        val rawValues = listOfNotNull(
+            user.optNullableString("cover_image_phone"),
+            user.optNullableString("cover_image"),
+        )
+        return rawValues
+            .flatMap { raw -> raw.split(';') }
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map(::normalizeProfileCoverUrl)
+            .distinct()
+    }
+
+    private fun normalizeProfileCoverUrl(url: String): String {
+        var normalized = url.trim()
+        if (normalized.startsWith("//")) normalized = "https:$normalized"
+        if (normalized.startsWith("http://")) {
+            normalized = normalized.replaceFirst("http://", "https://")
+        }
+        normalized = normalized.substringBefore('?')
+        normalized = normalized.replace(Regex("""crop\.\d+\.\d+\.\d+\.\d+"""), "mw2000")
+        return normalized
+    }
+
+    private fun profileCoverDownloadUrls(url: String): List<String> {
+        val normalized = normalizeProfileCoverUrl(url)
+        val match = Regex("""(https?://[^/]+)/([^/]+)/(.+)""").find(normalized)
+        if (match == null) return listOf(normalized)
+        val host = match.groupValues[1]
+        val path = match.groupValues[3]
+        return listOf("mw2000", "woriginal", "large", "orj960", "bmiddle")
+            .map { size -> "$host/$size/$path" }
+            .distinct()
+            .filter(::looksLikeImageUrl)
     }
 
     fun parseAlbumImages(raw: String): List<FeedImage> = parseAlbumPage(raw).images
@@ -199,6 +366,118 @@ object WeiboJsonParser {
         return AlbumPage(images = found.values.toList(), nextCursor = nextCursor)
     }
 
+    data class ImageWallParseResult(
+        val images: List<FeedImage>,
+        val nextSinceId: String?,
+        val subalbumContainerIds: List<String>,
+    )
+
+    fun parseImageWallPage(raw: String): ImageWallParseResult {
+        val root = runCatching { JSONObject(raw) }.getOrNull()
+            ?: return ImageWallParseResult(emptyList(), null, emptyList())
+        if (root.optInt("ok", 0) != 1) {
+            return ImageWallParseResult(emptyList(), null, emptyList())
+        }
+        val data = root.optJSONObject("data")
+            ?: return ImageWallParseResult(emptyList(), null, emptyList())
+        val images = parseAlbumPhotoList(data.optJSONArray("list"))
+        val nextSinceId = data.optNullableString("since_id")
+            ?: data.optNullableString("sinceid")
+        val subalbumContainerIds = buildList {
+            val albumList = data.optJSONArray("album_list") ?: return@buildList
+            for (index in 0 until albumList.length()) {
+                val album = albumList.optJSONObject(index) ?: continue
+                album.optNullableString("containerid")?.takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }
+        return ImageWallParseResult(
+            images = images,
+            nextSinceId = nextSinceId?.takeIf { it.isNotBlank() && it != "0" },
+            subalbumContainerIds = subalbumContainerIds,
+        )
+    }
+
+    fun parseAlbumDetailPage(raw: String): AlbumPage {
+        val root = runCatching { JSONObject(raw) }.getOrNull()
+            ?: return AlbumPage(emptyList(), null)
+        if (root.optInt("ok", 0) != 1) {
+            return AlbumPage(emptyList(), null)
+        }
+        val data = root.optJSONObject("data")
+            ?: return AlbumPage(emptyList(), null)
+        val images = parseAlbumPhotoList(data.optJSONArray("list"))
+        val nextCursor = data.optNullableString("since_id")
+            ?: data.optNullableString("sinceid")
+        return AlbumPage(
+            images = images,
+            nextCursor = nextCursor?.takeIf { it.isNotBlank() && it != "0" },
+        )
+    }
+
+    private fun parseAlbumPhotoList(list: JSONArray?): List<FeedImage> {
+        if (list == null) return emptyList()
+        return buildList {
+            for (index in 0 until list.length()) {
+                parseAlbumPhotoItem(list.optJSONObject(index))?.let(::add)
+            }
+        }
+    }
+
+    private fun parseAlbumPhotoItem(item: JSONObject?): FeedImage? {
+        item ?: return null
+        val pid = item.optNullableString("pid")
+            ?: item.optNullableString("pic_id")
+        val thumbnail = item.optNullableString("pic")
+            ?: item.optNullableString("thumbnail")
+            ?: item.optNullableString("bmiddle")
+            ?: item.optNullableString("orj360")
+            ?: pid?.let(::pidToLargeUrl)
+            ?: return null
+        val large = item.optNullableString("largest")
+            ?: item.optNullableString("original")
+            ?: item.optNullableString("large")
+            ?: item.optNullableString("mw2000")
+            ?: upgradeSinaimgUrl(thumbnail)
+            ?: pid?.let(::pidToLargeUrl)
+            ?: return null
+        if (!looksLikeImageUrl(large)) return null
+        val createdAt = item.optNullableString("created_at")
+            ?: item.optNullableString("created")
+            ?: item.optNullableString("time")
+            ?: item.optNullableString("date")
+        val normalizedLarge = normalizeUrl(large)
+        val normalizedThumb = normalizeUrl(thumbnail)
+        return FeedImage(
+            id = pid?.ifBlank { normalizedLarge } ?: normalizedLarge,
+            thumbnailUrl = normalizedThumb,
+            largeUrl = normalizedLarge,
+            downloadUrls = listOfNotNull(
+                normalizedLarge,
+                normalizedThumb,
+                pid?.let(::pidToLargeUrl),
+            ).distinct(),
+            createdAt = createdAt,
+        )
+    }
+
+    private fun pidToLargeUrl(pid: String): String {
+        val host = when {
+            pid.startsWith("006") || pid.startsWith("007") -> "wx2"
+            pid.startsWith("008") || pid.startsWith("009") -> "wx3"
+            else -> "wx1"
+        }
+        return "https://$host.sinaimg.cn/large/$pid.jpg"
+    }
+
+    private fun upgradeSinaimgUrl(url: String): String? {
+        if (!looksLikeImageUrl(url)) return null
+        val upgraded = url.replace(
+            Regex("""/(orj360|wap360|bmiddle|thumb(?:180|300|150)?|small|thumbnail)/"""),
+            "/large/",
+        )
+        return normalizeUrl(upgraded)
+    }
+
     private fun parseStatus(status: JSONObject, allowRetweeted: Boolean): FeedItem? {
         val id = status.optNullableString("idstr")
             ?: status.optNullableString("mid")
@@ -208,17 +487,41 @@ object WeiboJsonParser {
         val authorId = user?.optNullableString("idstr")
             ?: user?.optNullableString("id")
             ?: ""
-        val media = parseMedia(status)
-        val images = parseImages(status).map {
-            it.copy(createdAt = it.createdAt ?: status.optNullableString("created_at"))
-        }
-        val retweeted = if (allowRetweeted) {
-            status.optJSONObject("retweeted_status")?.takeUnless { it.looksLikeAd() }?.let {
-                parseStatus(it, allowRetweeted = false)
-            }
+        val retweetedJson = if (allowRetweeted) {
+            status.optJSONObject("retweeted_status")?.takeUnless { it.looksLikeAd() }
         } else {
             null
         }
+        val mediaBelongsToRetweeted =
+            retweetedJson != null && shouldAttachMediaToRetweeted(status, retweetedJson)
+        val media = if (mediaBelongsToRetweeted) null else parseMedia(status)
+        val images = if (mediaBelongsToRetweeted) {
+            emptyList()
+        } else {
+            parseImages(status).map {
+                it.copy(createdAt = it.createdAt ?: status.optNullableString("created_at"))
+            }
+        }
+        val retweeted = retweetedJson?.let { json ->
+            val normalized = if (mediaBelongsToRetweeted) {
+                mergeRetweetedMediaFields(status, json)
+            } else {
+                json
+            }
+            parseStatus(normalized, allowRetweeted = false)
+        }
+        val resolvedMedia = when {
+            mediaBelongsToRetweeted -> null
+            retweeted?.media != null && media != null -> null
+            else -> media
+        }
+
+        val htmlText = status.optNullableString("text") ?: ""
+        val rawText = status.optNullableString("text_raw")
+            ?: status.optNullableString("raw_text")
+            ?: htmlText
+        val isLongText = status.isLongTextPreview()
+        val displayText = if (isLongText) stripLongTextPreviewLabel(rawText) else rawText
 
         return FeedItem(
             id = id,
@@ -230,18 +533,14 @@ object WeiboJsonParser {
             createdAt = status.optNullableString("created_at"),
             source = plainText(status.optNullableString("source") ?: ""),
             ipLocation = parseIpLocation(status),
-            text = plainText(
-                status.optNullableString("text_raw")
-                    ?: status.optNullableString("raw_text")
-                    ?: status.optNullableString("text")
-                    ?: ""
-            ),
-            emoticons = extractEmoticonsFromHtml(status.optNullableString("text") ?: ""),
+            text = parseStatusText(status, displayText, images, resolvedMedia),
+            isLongText = isLongText,
+            emoticons = extractEmoticonsFromHtml(htmlText),
             repostsCount = formatCount(status.opt("reposts_count")),
             commentsCount = formatCount(status.opt("comments_count")),
             likesCount = formatCount(status.opt("attitudes_count")),
             images = images,
-            media = media,
+            media = resolvedMedia,
             retweetedStatus = retweeted,
         )
     }
@@ -538,6 +837,69 @@ object WeiboJsonParser {
             ?.trim()
     }
 
+    private fun statusId(status: JSONObject): String =
+        status.optNullableString("idstr")
+            ?: status.optNullableString("mid")
+            ?: status.optNullableString("id")
+            ?: ""
+
+    private fun pickAnalysisExtraValue(analysisExtra: String?, key: String): String? {
+        if (analysisExtra.isNullOrBlank()) return null
+        val pattern = Regex("""$key:([^|]+)""")
+        return pattern.find(analysisExtra)?.groupValues?.getOrNull(1)
+    }
+
+    private fun shouldAttachMediaToRetweeted(outer: JSONObject, retweeted: JSONObject): Boolean {
+        val retweetedId = statusId(retweeted)
+        if (retweetedId.isBlank()) return false
+
+        val pageInfo = outer.optJSONObject("page_info")
+        val mediaAuthorMid = pageInfo?.optJSONObject("media_info")?.optNullableString("author_mid")
+            ?: pageInfo?.optNullableString("author_mid")
+        if (!mediaAuthorMid.isNullOrBlank() && mediaAuthorMid == retweetedId) {
+            return true
+        }
+
+        val rootMid = pickAnalysisExtraValue(outer.optNullableString("analysis_extra"), "mblog_rt_mid")
+        return rootMid == retweetedId
+    }
+
+    private fun mergeRetweetedMediaFields(outer: JSONObject, retweeted: JSONObject): JSONObject {
+        val merged = JSONObject(retweeted.toString())
+        if (merged.optJSONObject("page_info") == null) {
+            outer.optJSONObject("page_info")?.let { merged.put("page_info", it) }
+        }
+        if (isJsonArrayEmpty(merged.optJSONArray("pic_ids"))) {
+            outer.optJSONArray("pic_ids")?.let { merged.put("pic_ids", it) }
+        }
+        if (isJsonObjectEmpty(merged.optJSONObject("pic_infos"))) {
+            outer.optJSONObject("pic_infos")?.let { merged.put("pic_infos", it) }
+        }
+        if (isJsonArrayEmpty(merged.optJSONArray("url_struct"))) {
+            outer.optJSONArray("url_struct")?.let { merged.put("url_struct", it) }
+        }
+        if (!hasMixMediaVideo(merged) && hasMixMediaVideo(outer)) {
+            outer.optJSONObject("mix_media_info")?.let { merged.put("mix_media_info", it) }
+        }
+        return merged
+    }
+
+    private fun isJsonArrayEmpty(array: JSONArray?): Boolean =
+        array == null || array.length() == 0
+
+    private fun isJsonObjectEmpty(obj: JSONObject?): Boolean =
+        obj == null || obj.length() == 0
+
+    private fun hasMixMediaVideo(status: JSONObject): Boolean {
+        val items = status.optJSONObject("mix_media_info")?.optJSONArray("items") ?: return false
+        for (index in 0 until items.length()) {
+            if (items.optJSONObject(index)?.optNullableString("type") == "video") {
+                return true
+            }
+        }
+        return false
+    }
+
     private fun JSONObject.looksLikeAd(): Boolean {
         if (optBoolean("is_ad")) return true
         if (has("ad_state") || has("promotion") || has("ad_marked")) return true
@@ -567,6 +929,28 @@ object WeiboJsonParser {
         }
         return map
     }
+
+    private fun JSONObject.isLongTextPreview(): Boolean =
+        optBoolean("isLongText") && (!has("longText") || isNull("longText"))
+
+    private fun stripLongTextPreviewLabel(text: String): String =
+        text
+            .replace(
+                Regex(
+                    """<span\b[^>]*\bclass=(["'])[^"']*\bexpand\b[^"']*\1[^>]*>.*?</span>""",
+                    RegexOption.IGNORE_CASE,
+                ),
+                "",
+            )
+            .replace(
+                Regex(
+                    """((?:\.{3}|…|⋯)\s*)(?:<a\b[^>]*>\s*)?全文\s*(?:</a>)?\s*$""",
+                    RegexOption.IGNORE_CASE,
+                ),
+                "$1",
+            )
+            .replace(Regex("""(?<=\S)(?:\.{3}|…|⋯)?\s*全文\s*$"""), "")
+            .trimEnd()
 
     private fun plainText(value: String): String =
         value

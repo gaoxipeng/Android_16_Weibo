@@ -15,6 +15,7 @@ data class FeedItem(
     val source: String?,
     val ipLocation: String?,
     val text: String,
+    val isLongText: Boolean = false,
     val emoticons: Map<String, String> = emptyMap(),
     val repostsCount: String,
     val commentsCount: String,
@@ -75,6 +76,7 @@ data class CommentItem(
     val likesCount: String,
     val ipLocation: String? = null,
     val emoticons: Map<String, String> = emptyMap(),
+    val images: List<FeedImage> = emptyList(),
     val comments: List<CommentItem> = emptyList(),
     val replyToAuthor: String? = null,
 )
@@ -90,8 +92,11 @@ data class UserProfile(
     val followersCount: String,
     val statusesCount: String,
     val photosCount: String? = null,
-    val coverUrl: String? = null,
-)
+    val coverUrls: List<String> = emptyList(),
+) {
+    val coverUrl: String?
+        get() = coverUrls.firstOrNull()
+}
 
 enum class TimelineKind(val label: String) {
     ForYou("\u63A8\u8350"),

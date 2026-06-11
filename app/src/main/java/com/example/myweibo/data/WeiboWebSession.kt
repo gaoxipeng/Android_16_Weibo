@@ -30,6 +30,8 @@ class WeiboWebSession(context: Context) {
     var isWeiboPageReady: Boolean = false
         private set
 
+    private val albumSubalbumCache = mutableMapOf<String, List<String>>()
+
     init {
         configureWebView()
         webView.loadUrl(WEIBO_HOME)
@@ -72,57 +74,122 @@ class WeiboWebSession(context: Context) {
         )
 
     suspend fun loadUserAlbumImages(uid: String, cursor: String? = null): AlbumPage {
-        // 第一步：尝试用 AJAX header 请求相册页面，看是否返回 JSON
-        val fallbackPage = cursor?.removePrefix("timeline:")?.takeIf { it != cursor }?.toIntOrNull()
-        if (fallbackPage == null) {
-            runCatching {
-                fetchJson(
-                    WeiboEndpoints.PROFILE_IMAGE_WALL,
-                    linkedMapOf(
-                        "uid" to uid,
-                        "sinceid" to (cursor ?: "0"),
-                    ),
-                )
-            }.getOrNull()?.let { raw ->
-                val parsed = WeiboJsonParser.parseAlbumPage(raw)
-                if (parsed.images.isNotEmpty()) {
-                    return parsed.copy(nextCursor = parsed.nextCursor ?: "timeline:1")
-                }
-            }
+        return when {
+            cursor?.startsWith("timeline:") == true -> loadTimelineAlbumPage(uid, cursor)
+            cursor?.startsWith("sub:") == true -> loadSubalbumPage(uid, cursor)
+            else -> loadImageWallPage(uid, cursor)
+        }
+    }
 
-            if (cursor == null) {
-                runCatching {
-                    nativeFetchAbsoluteJson(
-                        url = "https://weibo.com/u/$uid?tabtype=album",
-                        referer = "https://weibo.com/",
-                        origin = "https://weibo.com",
-                    )
-                }.getOrNull()?.let { raw ->
-                    val parsed = WeiboJsonParser.parseAlbumPage(raw)
-                    if (parsed.images.isNotEmpty()) {
-                        return parsed.copy(nextCursor = parsed.nextCursor ?: "timeline:1")
-                    }
-                }
+    private suspend fun loadImageWallPage(uid: String, cursor: String?): AlbumPage {
+        val isStart = cursor == null
+        val sinceId = cursor
+            ?.removePrefix("wall:")
+            ?.takeIf { cursor.startsWith("wall:") }
+            ?.ifBlank { "0" }
+            ?: "0"
+
+        val params = linkedMapOf(
+            "uid" to uid,
+            "sinceid" to sinceId,
+        )
+        if (isStart) {
+            params["has_album"] = "true"
+        }
+
+        val raw = runCatching {
+            fetchJson(WeiboEndpoints.PROFILE_IMAGE_WALL, params)
+        }.getOrNull()
+
+        if (raw == null) {
+            return if (isStart) loadAlbumHtmlFallback(uid) else AlbumPage(emptyList(), null)
+        }
+
+        val wall = WeiboJsonParser.parseImageWallPage(raw)
+        if (isStart) {
+            if (wall.subalbumContainerIds.isNotEmpty()) {
+                albumSubalbumCache[uid] = wall.subalbumContainerIds
+            } else {
+                albumSubalbumCache.remove(uid)
             }
         }
 
-        // 第二步：用 mymblog 连续翻页收集全部带图微博图片
-        var page = fallbackPage ?: 1
-        repeat(5) {
-            val timeline = loadUserTimeline(uid, page)
-            if (timeline.items.isEmpty()) {
-                return AlbumPage(images = emptyList(), nextCursor = null)
-            }
-            val images = timeline.items.flatMap { item ->
-                item.images.map { it.copy(createdAt = item.createdAt ?: it.createdAt) }
-            }.distinctBy { it.largeUrl }
-            val nextCursor = "timeline:${page + 1}"
-            if (images.isNotEmpty()) {
-                return AlbumPage(images = images, nextCursor = nextCursor)
-            }
-            page++
+        if (isStart && wall.images.isEmpty() && wall.nextSinceId == null && wall.subalbumContainerIds.isEmpty()) {
+            loadAlbumHtmlFallback(uid).takeIf { it.images.isNotEmpty() }?.let { return it }
         }
-        return AlbumPage(images = emptyList(), nextCursor = "timeline:$page")
+
+        val nextCursor = when {
+            wall.nextSinceId != null -> "wall:${wall.nextSinceId}"
+            albumSubalbumCache[uid]?.isNotEmpty() == true -> "sub:0:0"
+            isStart && wall.images.isEmpty() -> "timeline:1"
+            else -> null
+        }
+        return AlbumPage(images = wall.images, nextCursor = nextCursor)
+    }
+
+    private suspend fun loadSubalbumPage(uid: String, cursor: String): AlbumPage {
+        val body = cursor.removePrefix("sub:")
+        val separator = body.indexOf(':')
+        if (separator <= 0) return AlbumPage(emptyList(), null)
+
+        val index = body.substring(0, separator).toIntOrNull() ?: return AlbumPage(emptyList(), null)
+        val sinceId = body.substring(separator + 1).ifBlank { "0" }
+        val containerId = albumSubalbumCache[uid]?.getOrNull(index)
+            ?: return loadTimelineAlbumPage(uid, "timeline:1")
+
+        val raw = runCatching {
+            fetchJson(
+                WeiboEndpoints.PROFILE_ALBUM_DETAIL,
+                linkedMapOf(
+                    "uid" to uid,
+                    "containerid" to containerId,
+                    "since_id" to sinceId,
+                ),
+            )
+        }.getOrNull() ?: return AlbumPage(emptyList(), null)
+
+        val page = WeiboJsonParser.parseAlbumDetailPage(raw)
+        val nextCursor = when {
+            page.nextCursor != null -> "sub:$index:${page.nextCursor}"
+            index + 1 < (albumSubalbumCache[uid]?.size ?: 0) -> "sub:${index + 1}:0"
+            else -> {
+                albumSubalbumCache.remove(uid)
+                null
+            }
+        }
+        return AlbumPage(images = page.images, nextCursor = nextCursor)
+    }
+
+    private suspend fun loadTimelineAlbumPage(uid: String, cursor: String): AlbumPage {
+        val page = cursor.removePrefix("timeline:").toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val timeline = loadUserTimeline(uid, page)
+        if (timeline.items.isEmpty()) {
+            return AlbumPage(images = emptyList(), nextCursor = null)
+        }
+        val images = timeline.items.flatMap { item ->
+            item.images.map { image -> image.copy(createdAt = item.createdAt ?: image.createdAt) }
+        }.distinctBy { it.largeUrl }
+        return AlbumPage(
+            images = images,
+            nextCursor = "timeline:${page + 1}",
+        )
+    }
+
+    private suspend fun loadAlbumHtmlFallback(uid: String): AlbumPage {
+        val raw = runCatching {
+            nativeFetchAbsoluteJson(
+                url = "https://weibo.com/u/$uid?tabtype=album",
+                referer = "https://weibo.com/",
+                origin = "https://weibo.com",
+            )
+        }.getOrNull() ?: return AlbumPage(emptyList(), nextCursor = "timeline:1")
+
+        val parsed = WeiboJsonParser.parseAlbumPage(raw)
+        return if (parsed.images.isNotEmpty()) {
+            parsed.copy(nextCursor = parsed.nextCursor?.let { "wall:$it" } ?: "timeline:1")
+        } else {
+            AlbumPage(emptyList(), nextCursor = "timeline:1")
+        }
     }
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
@@ -144,6 +211,16 @@ class WeiboWebSession(context: Context) {
     }
 
     data class CommentsPage(val items: List<CommentItem>, val nextCursor: String?)
+
+    suspend fun expandLongText(item: FeedItem): FeedItem {
+        val raw = fetchJson(
+            WeiboEndpoints.STATUS_LONG_TEXT,
+            linkedMapOf("id" to item.statusId),
+        )
+        val data = JSONObject(raw).optJSONObject("data")
+            ?: throw IllegalStateException("微博长文接口未返回内容")
+        return WeiboJsonParser.mergeLongTextIntoFeedItem(item, data)
+    }
 
     suspend fun loadComments(item: FeedItem): CommentsPage {
         val raw = fetchJson(

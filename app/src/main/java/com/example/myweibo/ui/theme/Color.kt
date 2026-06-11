@@ -9,3 +9,5 @@ val WeiboCoral80 = Color(0xFFFFC6B8)
 val WeiboBlue40 = Color(0xFFE91E8C)
 val WeiboTeal40 = Color(0xFF4CAFB9)
 val WeiboCoral40 = Color(0xFFE9836F)
+
+val WeiboTopicBlue = Color(0xFF6CB4EE)

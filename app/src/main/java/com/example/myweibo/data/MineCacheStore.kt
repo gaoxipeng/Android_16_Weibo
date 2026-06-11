@@ -92,10 +92,18 @@ class MineCacheStore(context: Context) {
             .put("followers_count", followersCount)
             .put("statuses_count", statusesCount)
             .put("photos_count", photosCount)
+            .put("cover_urls", JSONArray(coverUrls))
             .put("cover_url", coverUrl)
 
-    private fun profileFromJson(json: JSONObject): UserProfile =
-        UserProfile(
+    private fun profileFromJson(json: JSONObject): UserProfile {
+        val coverUrls = json.optJSONArray("cover_urls")?.let { array ->
+            buildList {
+                for (index in 0 until array.length()) {
+                    array.optString(index).takeIf { it.isNotBlank() }?.let(::add)
+                }
+            }
+        } ?: json.optNullableString("cover_url")?.let { listOf(it) } ?: emptyList()
+        return UserProfile(
             id = json.optString("id"),
             screenName = json.optString("screen_name", "\u5FAE\u535A\u7528\u6237"),
             avatarUrl = json.optNullableString("avatar_url"),
@@ -106,8 +114,9 @@ class MineCacheStore(context: Context) {
             followersCount = json.optString("followers_count", "--"),
             statusesCount = json.optString("statuses_count", "--"),
             photosCount = json.optNullableString("photos_count"),
-            coverUrl = json.optNullableString("cover_url"),
+            coverUrls = coverUrls,
         )
+    }
 
     private fun List<FeedItem>.toFeedItemsJsonArray(): JSONArray =
         JSONArray().also { array -> forEach { array.put(it.toJson()) } }
@@ -123,6 +132,7 @@ class MineCacheStore(context: Context) {
             .put("source", source)
             .put("ip_location", ipLocation)
             .put("text", text)
+            .put("is_long_text", isLongText)
             .put("emoticons", JSONObject(emoticons))
             .put("reposts_count", repostsCount)
             .put("comments_count", commentsCount)
@@ -151,6 +161,7 @@ class MineCacheStore(context: Context) {
             source = optNullableString("source"),
             ipLocation = optNullableString("ip_location"),
             text = optString("text"),
+            isLongText = optBoolean("is_long_text"),
             emoticons = optJSONObject("emoticons").toStringMap(),
             repostsCount = optString("reposts_count", "0"),
             commentsCount = optString("comments_count", "0"),
