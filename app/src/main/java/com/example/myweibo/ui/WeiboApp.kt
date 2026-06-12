@@ -96,6 +96,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -105,6 +106,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.runtime.DisposableEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -182,9 +186,13 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import com.example.myweibo.R
+import com.example.myweibo.VideoPipActivity
 import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
@@ -197,6 +205,7 @@ import com.example.myweibo.data.ProfileLookup
 import com.example.myweibo.data.FeedMedia
 import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
+import com.example.myweibo.data.PlaybackSettingsStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
 import com.example.myweibo.data.StoredWeiboAccount
@@ -245,12 +254,25 @@ private fun feedRefreshHintMessage(
 ): String {
     val previousIds = previousItems.asSequence().map { it.statusId }.toSet()
     val newCount = refreshedItems.count { it.statusId !in previousIds }
-    return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u672C\u6B21\u5237\u65B0 $newCount \u6761\u5FAE\u535A"
+    return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u66F4\u65B0\u4E86 $newCount \u6761\u5FAE\u535A"
 }
 
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
     val positions = mutableStateMapOf<String, Long>()
+    private val pauseHandlers = mutableSetOf<() -> Unit>()
+
+    fun registerPauseHandler(handler: () -> Unit) {
+        pauseHandlers += handler
+    }
+
+    fun unregisterPauseHandler(handler: () -> Unit) {
+        pauseHandlers -= handler
+    }
+
+    fun pauseAll() {
+        pauseHandlers.forEach { it() }
+    }
 }
 
 private data class VisitedProfileSnapshot(
@@ -343,6 +365,7 @@ fun WeiboApp() {
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
+    val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -369,6 +392,7 @@ fun WeiboApp() {
     var commentsCursor by remember { mutableStateOf<String?>(null) }
     var commentsHasMore by remember { mutableStateOf(true) }
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
+    var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
@@ -543,7 +567,7 @@ fun WeiboApp() {
                                 if (loadGeneration != visitedProfileLoadGeneration) return@onSuccess
                                 visitedPosts = page.items
                                 visitedPostsPage = 1
-                                visitedPostsHasMore = page.items.isNotEmpty()
+                                visitedPostsHasMore = page.nextCursor != null
                             }
                         runCatching { session.loadUserAlbumImages(profile.id) }
                             .onSuccess { page ->
@@ -592,7 +616,7 @@ fun WeiboApp() {
                 .onSuccess { page ->
                     visitedPosts = (visitedPosts + page.items).distinctBy { it.id }
                     visitedPostsPage = next
-                    visitedPostsHasMore = page.items.isNotEmpty()
+                    visitedPostsHasMore = page.nextCursor != null
                 }
             visitedPostsLoadingMore = false
         }
@@ -784,9 +808,15 @@ fun WeiboApp() {
                         .onSuccess { page ->
                             minePosts = page.items
                             minePostsPage = 1
-                            minePostsHasMore = page.items.isNotEmpty()
+                            minePostsHasMore = page.nextCursor != null
                             minePostsError = null
-                            mineCacheStore.writePosts(MinePostsCache(page.items, page = 1, hasMore = page.items.isNotEmpty()))
+                            mineCacheStore.writePosts(
+                                MinePostsCache(
+                                    page.items,
+                                    page = 1,
+                                    hasMore = page.nextCursor != null,
+                                )
+                            )
                         }
                         .onFailure {
                             minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
@@ -839,13 +869,13 @@ fun WeiboApp() {
                     val merged = (minePosts + page.items).distinctBy { it.id }
                     minePosts = merged
                     minePostsPage = nextPage
-                    minePostsHasMore = page.items.isNotEmpty()
+                    minePostsHasMore = page.nextCursor != null
                     minePostsError = null
                     mineCacheStore.writePosts(
                         MinePostsCache(
                             items = merged,
                             page = nextPage,
-                            hasMore = page.items.isNotEmpty(),
+                            hasMore = page.nextCursor != null,
                         )
                     )
                 }
@@ -1072,6 +1102,18 @@ fun WeiboApp() {
         }
     }
 
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, backgroundPlaybackEnabled) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && !backgroundPlaybackEnabled) {
+                videoPlaybackCoordinator.pauseAll()
+                videoPlaybackCoordinator.activeKey = null
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
@@ -1244,6 +1286,11 @@ fun WeiboApp() {
                         },
                         pendingOpenAccountLogin = pendingOpenAccountLogin,
                         onPendingOpenAccountLoginConsumed = { pendingOpenAccountLogin = false },
+                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                        onBackgroundPlaybackChange = { enabled ->
+                            backgroundPlaybackEnabled = enabled
+                            playbackSettingsStore.writeBackgroundPlaybackEnabled(enabled)
+                        },
                     )
                 }
 
@@ -1333,13 +1380,6 @@ fun WeiboApp() {
                 )
             }
 
-            mediaPreview?.let { media ->
-                FullscreenMediaPreview(
-                    media = media,
-                    onDismiss = { mediaPreview = null },
-                )
-            }
-
             ExitConfirmCapsule(
                 visible = exitHintVisible,
                 token = exitHintToken,
@@ -1365,6 +1405,14 @@ fun WeiboApp() {
                     onCancel = { videoPeekController.cancel() },
                 )
             }
+            }
+            mediaPreview?.let { media ->
+                Box(Modifier.fillMaxSize().zIndex(500f)) {
+                    FullscreenMediaPreview(
+                        media = media,
+                        onDismiss = { mediaPreview = null },
+                    )
+                }
             }
         }
     }
@@ -3508,7 +3556,11 @@ private fun MediaStrip(
         }
 
         if (media != null) {
-            InlineVideoPlayer(media = media, onClick = { onMediaClick(media) })
+            InlineVideoPlayer(
+                media = media,
+                onClick = { onMediaClick(media) },
+                onFullscreenRequest = { onMediaClick(media) },
+            )
         }
     }
 }
@@ -4141,6 +4193,7 @@ private fun LivePhotoOverlay(
     onEnded: () -> Unit,
 ) {
     val context = LocalContext.current
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return
     var videoVisible by remember(videoUrl) { mutableStateOf(false) }
     val player = remember(videoUrl) {
@@ -4153,6 +4206,8 @@ private fun LivePhotoOverlay(
     }
 
     DisposableEffect(player) {
+        val pauseHandler = { player.pause() }
+        videoCoordinator.registerPauseHandler(pauseHandler)
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onRenderedFirstFrame() {
                 videoVisible = true
@@ -4168,6 +4223,7 @@ private fun LivePhotoOverlay(
         }
         player.addListener(listener)
         onDispose {
+            videoCoordinator.unregisterPauseHandler(pauseHandler)
             player.removeListener(listener)
             player.release()
         }
@@ -4192,14 +4248,17 @@ private fun LivePhotoOverlay(
 }
 
 @Composable
-private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
+private fun InlineVideoPlayer(
+    media: FeedMedia,
+    onClick: () -> Unit = {},
+    onFullscreenRequest: () -> Unit = onClick,
+) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
     val inlinePlaying = videoCoordinator.activeKey == playbackKey
-    var fullscreen by remember(media.streamUrl) { mutableStateOf(false) }
     var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
@@ -4232,7 +4291,8 @@ private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
                     resetPeekState()
                     scope.launch {
                         delay(32)
-                        fullscreen = true
+                        videoCoordinator.activeKey = null
+                        onFullscreenRequest()
                     }
                 },
             ),
@@ -4335,12 +4395,18 @@ private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
                 }
             },
     ) {
-        if (inlinePlaying && !fullscreen && media.type == MediaType.Video) {
+        if (inlinePlaying && media.type == MediaType.Video) {
             WeiboVideoSurface(
                 media = media,
                 isFullscreen = false,
                 onAspectRatio = { aspectRatio = it },
-                onFullscreen = { fullscreen = true },
+                onFullscreen = {
+                    videoCoordinator.activeKey = null
+                    onFullscreenRequest()
+                },
+                onEnterPictureInPicture = {
+                    videoCoordinator.activeKey = null
+                },
             )
         } else {
             RemoteImage(
@@ -4349,15 +4415,13 @@ private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
                 contentScale = ContentScale.Crop,
             )
             Box(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .size(52.dp),
+                modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     painter = painterResource(R.drawable.ic_video_play),
                     contentDescription = "播放",
-                    modifier = Modifier.size(32.dp),
+                    modifier = Modifier.size(60.dp),
                     tint = Color.White,
                 )
             }
@@ -4371,24 +4435,6 @@ private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
             )
         }
     }
-
-    if (fullscreen) {
-        Dialog(
-            onDismissRequest = { fullscreen = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
-        ) {
-            BackHandler { fullscreen = false }
-            Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-                WeiboVideoSurface(
-                    media = media,
-                    isFullscreen = true,
-                    onAspectRatio = {},
-                    onFullscreen = { fullscreen = false },
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-    }
 }
 
 @Composable
@@ -4397,6 +4443,7 @@ private fun WeiboVideoSurface(
     isFullscreen: Boolean,
     onAspectRatio: (Float) -> Unit,
     onFullscreen: () -> Unit,
+    onEnterPictureInPicture: (() -> Unit)? = null,
     modifier: Modifier = Modifier.fillMaxSize(),
     controlsEnabled: Boolean = true,
     resumePosition: Boolean = true,
@@ -4424,6 +4471,7 @@ private fun WeiboVideoSurface(
     var controlsVisible by remember(videoUrl) { mutableStateOf(true) }
     var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
     var downloading by remember(videoUrl) { mutableStateOf(false) }
+    var aspectRatio by remember(videoUrl) { mutableFloatStateOf(16f / 9f) }
     val fullscreenTopInset = if (isFullscreen) {
         WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     } else {
@@ -4466,7 +4514,30 @@ private fun WeiboVideoSurface(
             }
     }
 
+    fun enterPictureInPicture() {
+        showControls()
+        val currentPosition = player.currentPosition.coerceAtLeast(0L)
+        videoCoordinator.positions[playbackKey] = currentPosition
+        player.pause()
+        VideoPipActivity.start(
+            context = context,
+            media = media,
+            positionMs = currentPosition,
+            speed = selectedSpeed,
+            aspectRatio = aspectRatio,
+        )
+        onEnterPictureInPicture?.invoke()
+    }
+
     DisposableEffect(player) {
+        val pauseHandler = {
+            val currentPosition = player.currentPosition.coerceAtLeast(0L)
+            if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
+                videoCoordinator.positions[playbackKey] = currentPosition
+            }
+            player.pause()
+        }
+        videoCoordinator.registerPauseHandler(pauseHandler)
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING ||
@@ -4481,7 +4552,9 @@ private fun WeiboVideoSurface(
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 val width = videoSize.width.takeIf { it > 0 } ?: return
                 val height = videoSize.height.takeIf { it > 0 } ?: return
-                onAspectRatio(width.toFloat() / height.toFloat())
+                val ratio = width.toFloat() / height.toFloat()
+                aspectRatio = ratio
+                onAspectRatio(ratio)
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -4496,6 +4569,7 @@ private fun WeiboVideoSurface(
         }
         player.addListener(listener)
         onDispose {
+            videoCoordinator.unregisterPauseHandler(pauseHandler)
             if (savePositionOnDispose) {
                 val currentPosition = player.currentPosition.coerceAtLeast(0L)
                 if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
@@ -4580,6 +4654,27 @@ private fun WeiboVideoSurface(
                     showControls()
                     onFullscreen()
                 },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = controlsEnabled && controlsVisible,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .zIndex(if (isFullscreen) 20f else 0f),
+        ) {
+            GlassTextButton(
+                text = "画中画",
+                modifier = Modifier
+                    .padding(
+                        end = 10.dp,
+                        top = if (isFullscreen) fullscreenTopInset + 10.dp else 10.dp,
+                    )
+                    .width(66.dp)
+                    .height(28.dp),
+                onClick = { enterPictureInPicture() },
             )
         }
 
@@ -4947,13 +5042,13 @@ private fun DetailScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp),
+                            .padding(start = CommentRowOuterStart, end = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Text(
                             text = "评论 ${item.commentsCount}",
-                            style = MaterialTheme.typography.titleMedium,
+                            fontSize = CommentAuthorFontSize,
                             fontWeight = FontWeight.SemiBold,
                         )
                         CommentSortActionMenu(
@@ -4974,7 +5069,16 @@ private fun DetailScreen(
 
             if (comments.isEmpty() && !isLoadingComments) {
                 item {
-                    EmptyState(title = "暂无评论", body = "")
+                    Text(
+                        text = "暂无评论",
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp),
+                        fontSize = CommentAuthorFontSize,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
                 }
             }
 
@@ -4989,6 +5093,7 @@ private fun DetailScreen(
 }
 
 private val CommentRowOuterStart = 18.dp
+private val CommentAuthorFontSize = 13.sp
 private val CommentAvatarSize = 28.dp
 private val CommentAvatarTextGap = 8.dp
 
@@ -5038,7 +5143,7 @@ private fun CommentRow(
                     Text(
                         text = comment.authorName,
                         fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp,
+                        fontSize = CommentAuthorFontSize,
                         modifier = Modifier.clickable(
                             enabled = onUserClick != null && authorTarget.isNotBlank(),
                             onClick = { onUserClick?.invoke(authorTarget) },
@@ -5201,6 +5306,8 @@ private fun MineScreen(
     onReturnToFeed: () -> Unit = {},
     pendingOpenAccountLogin: Boolean = false,
     onPendingOpenAccountLoginConsumed: () -> Unit = {},
+    backgroundPlaybackEnabled: Boolean = false,
+    onBackgroundPlaybackChange: (Boolean) -> Unit = {},
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
@@ -5261,6 +5368,8 @@ private fun MineScreen(
                 activeAccountId = activeAccountId,
                 emoticonMap = emoticonMap,
                 emoticonSyncing = emoticonSyncing,
+                backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                 onBack = {
                     showAccountManagement = false
                     showSettings = false
@@ -5615,6 +5724,8 @@ private fun SettingsScreen(
     activeAccountId: String?,
     emoticonMap: Map<String, String>,
     emoticonSyncing: Boolean,
+    backgroundPlaybackEnabled: Boolean,
+    onBackgroundPlaybackChange: (Boolean) -> Unit,
     onBack: () -> Unit,
     onSwitchAccount: (String) -> Unit,
     onAddAccount: () -> Unit,
@@ -5650,6 +5761,59 @@ private fun SettingsScreen(
                     onSyncEmoticons = onSyncEmoticons,
                 )
             }
+            item {
+                SettingsPlaybackCard(
+                    backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                    onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsPlaybackCard(
+    backgroundPlaybackEnabled: Boolean,
+    onBackgroundPlaybackChange: (Boolean) -> Unit,
+) {
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Text(
+                    text = "后台播放声音",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (backgroundPlaybackEnabled) {
+                        "返回桌面时继续播放视频声音"
+                    } else {
+                        "返回桌面时自动暂停视频"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = backgroundPlaybackEnabled,
+                onCheckedChange = onBackgroundPlaybackChange,
+            )
         }
     }
 }
@@ -6787,25 +6951,45 @@ private fun HiddenSessionWebView(session: WeiboWebSession) {
 
 @Composable
 private fun FullscreenMediaPreview(media: FeedMedia, onDismiss: () -> Unit) {
+    val context = LocalContext.current
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val activity = context as? android.app.Activity
+
     DisposableEffect(media) {
         videoCoordinator.activeKey = null
         onDispose { }
     }
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
-    ) {
-        BackHandler { onDismiss() }
-        Box(Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) {
-            WeiboVideoSurface(
-                media = media,
-                isFullscreen = true,
-                onAspectRatio = {},
-                onFullscreen = onDismiss,
-                modifier = Modifier.fillMaxSize(),
-            )
+
+    DisposableEffect(activity) {
+        if (activity == null) return@DisposableEffect onDispose {}
+        val window = activity.window
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        insetsController.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insetsController.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose {
+            insetsController.show(WindowInsetsCompat.Type.systemBars())
+            WindowCompat.setDecorFitsSystemWindows(window, true)
         }
+    }
+
+    BackHandler(onBack = onDismiss)
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        WeiboVideoSurface(
+            media = media,
+            isFullscreen = true,
+            onAspectRatio = {},
+            onFullscreen = onDismiss,
+            onEnterPictureInPicture = onDismiss,
+            modifier = Modifier.fillMaxSize(),
+        )
     }
 }
 

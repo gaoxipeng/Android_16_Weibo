@@ -24,6 +24,22 @@ object WeiboJsonParser {
         return TimelinePage(items = items, nextCursor = nextCursor)
     }
 
+    fun parseUserTimeline(raw: String, uid: String, pageForCursor: Int? = null): TimelinePage {
+        val expectedUid = uid.trim()
+        val timelinePage = parseTimeline(raw)
+        val nextCursor = timelinePage.nextCursor
+            ?: pageForCursor
+                ?.takeIf { timelinePage.items.isNotEmpty() }
+                ?.let { (it + 1).toString() }
+        if (expectedUid.isBlank()) return timelinePage.copy(nextCursor = nextCursor)
+        return timelinePage.copy(
+            items = timelinePage.items.filter { item ->
+                item.authorId.trim() == expectedUid
+            },
+            nextCursor = nextCursor,
+        )
+    }
+
     fun parseStatusDetail(raw: String): FeedItem? {
         val root = JSONObject(raw)
         val status = unwrapStatusDetailPayload(root) ?: return null

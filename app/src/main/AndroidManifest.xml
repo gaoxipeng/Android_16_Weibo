@@ -36,6 +36,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".VideoPipActivity"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
+            android:exported="false"
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.MyWeibo" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

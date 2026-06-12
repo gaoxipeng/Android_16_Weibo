@@ -1,6 +1,9 @@
 package com.example.myweibo
 
 import android.app.PictureInPictureParams
+import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
@@ -18,9 +21,11 @@ import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.example.myweibo.data.FeedMedia
 
 class VideoPipActivity : ComponentActivity() {
     private var player: ExoPlayer? = null
+    private var playerView: PlayerView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,7 +40,7 @@ class VideoPipActivity : ComponentActivity() {
             .flatMap(::videoUrlCandidates)
             .distinct()
 
-        val playerView = PlayerView(this).apply {
+        playerView = PlayerView(this).apply {
             useController = false
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
             layoutParams = ViewGroup.LayoutParams(
@@ -51,7 +56,7 @@ class VideoPipActivity : ComponentActivity() {
             val url = candidates.getOrNull(index) ?: return
             val exoPlayer = player ?: ExoPlayer.Builder(this).build().also {
                 player = it
-                playerView.player = it
+                playerView?.player = it
             }
             exoPlayer.setMediaSource(buildMediaSource(url))
             exoPlayer.prepare()
@@ -61,7 +66,7 @@ class VideoPipActivity : ComponentActivity() {
         }
 
         player = ExoPlayer.Builder(this).build().also { exoPlayer ->
-            playerView.player = exoPlayer
+            playerView?.player = exoPlayer
             exoPlayer.addListener(object : Player.Listener {
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                     if (sourceIndex < candidates.lastIndex) {
@@ -73,20 +78,47 @@ class VideoPipActivity : ComponentActivity() {
         }
         prepare(sourceIndex)
 
-        playerView.post {
+        playerView?.post {
             enterPictureInPictureMode(pictureInPictureParams(aspectRatio))
         }
     }
 
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (!isInPictureInPictureMode) {
+            stopAndReleasePlayer()
+            finishAndRemoveTask()
+        }
+    }
+
     override fun onStop() {
+        if (!isInPictureInPictureMode) {
+            stopAndReleasePlayer()
+            if (!isFinishing) {
+                finishAndRemoveTask()
+            }
+        }
         super.onStop()
-        if (!isInPictureInPictureMode) finish()
     }
 
     override fun onDestroy() {
-        player?.release()
-        player = null
+        stopAndReleasePlayer()
+        playerView = null
         super.onDestroy()
+    }
+
+    private fun stopAndReleasePlayer() {
+        playerView?.player = null
+        player?.let { exoPlayer ->
+            exoPlayer.playWhenReady = false
+            exoPlayer.stop()
+            exoPlayer.clearMediaItems()
+            exoPlayer.release()
+        }
+        player = null
     }
 
     private fun buildMediaSource(url: String) =
@@ -125,6 +157,24 @@ class VideoPipActivity : ComponentActivity() {
         private const val DESKTOP_CHROME_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+        fun start(
+            context: Context,
+            media: FeedMedia,
+            positionMs: Long,
+            speed: Float,
+            aspectRatio: Float,
+        ) {
+            context.startActivity(
+                Intent(context, VideoPipActivity::class.java).apply {
+                    putExtra(EXTRA_STREAM_URL, media.streamUrl)
+                    media.downloadUrl?.let { putExtra(EXTRA_DOWNLOAD_URL, it) }
+                    putExtra(EXTRA_ASPECT_RATIO, aspectRatio)
+                    putExtra(EXTRA_POSITION_MS, positionMs)
+                    putExtra(EXTRA_SPEED, speed)
+                },
+            )
+        }
 
         fun pictureInPictureParams(aspectRatio: Float): PictureInPictureParams {
             val safeRatio = aspectRatio.coerceIn(0.42f, 2.39f)

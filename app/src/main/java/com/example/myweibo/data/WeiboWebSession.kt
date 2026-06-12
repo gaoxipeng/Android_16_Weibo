@@ -60,7 +60,7 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadUserTimeline(uid: String, page: Int = 1): TimelinePage {
         val raw = loadUserTimelineRaw(uid, page)
-        return WeiboJsonParser.parseTimeline(raw)
+        return WeiboJsonParser.parseUserTimeline(raw, uid, page)
     }
 
     suspend fun loadUserTimelineRaw(uid: String, page: Int = 1): String =
@@ -163,7 +163,7 @@ class WeiboWebSession(context: Context) {
     private suspend fun loadTimelineAlbumPage(uid: String, cursor: String): AlbumPage {
         val page = cursor.removePrefix("timeline:").toIntOrNull()?.coerceAtLeast(1) ?: 1
         val timeline = loadUserTimeline(uid, page)
-        if (timeline.items.isEmpty()) {
+        if (timeline.items.isEmpty() && timeline.nextCursor == null) {
             return AlbumPage(images = emptyList(), nextCursor = null)
         }
         val images = timeline.items.flatMap { item ->
@@ -171,7 +171,7 @@ class WeiboWebSession(context: Context) {
         }.distinctBy { it.largeUrl }
         return AlbumPage(
             images = images,
-            nextCursor = "timeline:${page + 1}",
+            nextCursor = timeline.nextCursor?.let { "timeline:${page + 1}" },
         )
     }
 
