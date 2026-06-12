@@ -1024,7 +1024,7 @@ private fun FloatingBottomBar(
             targetValue = if (expanded) fullBarWidth else collapsedWidth,
             animationSpec = spring(
                 dampingRatio = Spring.DampingRatioNoBouncy,
-                stiffness = Spring.StiffnessMedium,
+                stiffness = Spring.StiffnessLow,
             ),
             label = "bottom-bar-width",
         )
