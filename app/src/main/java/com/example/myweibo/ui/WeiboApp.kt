@@ -9,6 +9,11 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.widget.ImageView
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -23,7 +28,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +50,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -83,6 +89,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -95,6 +103,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -166,16 +175,25 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 private enum class MainTab(val label: String) {
-    Search("\u641C\u7D22"),
-    Messages("\u6D88\u606F"),
     Feed("\u9996\u9875"),
+    Messages("\u6D88\u606F"),
+    Search("\u641C\u7D22"),
+    Compose("\u5199\u5FAE\u535A"),
     Mine("\u6211\u7684"),
-    Compose("\u5199\u5FAE\u535A")
 }
 
 private enum class MineContentTab(val label: String) {
     Posts("\u5FAE\u535A"),
     Album("\u76F8\u518C")
+}
+
+private fun feedRefreshHintMessage(
+    previousItems: List<FeedItem>,
+    refreshedItems: List<FeedItem>,
+): String {
+    val previousIds = previousItems.asSequence().map { it.statusId }.toSet()
+    val newCount = refreshedItems.count { it.statusId !in previousIds }
+    return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u672C\u6B21\u5237\u65B0 $newCount \u6761\u5FAE\u535A"
 }
 
 private class VideoPlaybackCoordinator {
@@ -207,9 +225,16 @@ fun WeiboApp() {
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
     val minePostsListState = rememberLazyListState()
+    val mineAlbumListState = rememberLazyListState()
+    val visitedPostsListState = rememberLazyListState()
+    val visitedAlbumListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
+    var bottomBarExpanded by remember { mutableStateOf(true) }
+    var minePagerPage by remember { mutableStateOf(0) }
+    var visitedMinePagerPage by remember { mutableStateOf(0) }
+    var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     val timelineKind = TimelineKind.Following
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -344,6 +369,7 @@ fun WeiboApp() {
 
     fun refreshTimeline() {
         scope.launch {
+            val previousItems = items
             isLoading = true
             hasLoginCookie = session.hasLoginCookie()
             feedListState.animateScrollToItem(0)
@@ -357,10 +383,14 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
+                        feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
+                    } else {
+                        feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                     }
                 }
                 .onFailure { error ->
+                    feedRefreshHint = null
                     showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                 }
             isLoading = false
@@ -370,6 +400,7 @@ fun WeiboApp() {
 
     fun refreshTimelineFromTop() {
         scope.launch {
+            val previousItems = items
             feedListState.animateScrollToItem(0)
             isLoading = true
             hasLoginCookie = session.hasLoginCookie()
@@ -383,10 +414,14 @@ fun WeiboApp() {
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
                     if (page.items.isEmpty()) {
+                        feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
+                    } else {
+                        feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                     }
                 }
                 .onFailure { error ->
+                    feedRefreshHint = null
                     showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                 }
             isLoading = false
@@ -632,6 +667,35 @@ fun WeiboApp() {
         }
     }
 
+    val bottomBarListState: LazyListState? = when {
+        selectedItem != null -> null
+        visitedUserId != null -> {
+            if (visitedMinePagerPage == 0) visitedPostsListState else visitedAlbumListState
+        }
+        selectedTab == MainTab.Mine -> {
+            if (minePagerPage == 0) minePostsListState else mineAlbumListState
+        }
+        selectedTab == MainTab.Feed -> feedListState
+        else -> null
+    }
+
+    LaunchedEffect(selectedTab, visitedUserId, selectedItem) {
+        bottomBarExpanded = true
+    }
+
+    LaunchedEffect(bottomBarListState) {
+        val state = bottomBarListState ?: return@LaunchedEffect
+        var lastScrollTotal = 0
+        snapshotFlow {
+            state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
+        }.collect { scrollTotal ->
+            if (scrollTotal > lastScrollTotal + 24) {
+                bottomBarExpanded = false
+            }
+            lastScrollTotal = scrollTotal
+        }
+    }
+
     CompositionLocalProvider(LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator) {
     MyWeiboScaffold(
         selectedTab = selectedTab,
@@ -673,6 +737,9 @@ fun WeiboApp() {
                         emoticonMap = emoticonMap,
                         emoticonCount = emoticonMap.size,
                         emoticonSyncing = emoticonSyncing,
+                        postsListState = visitedPostsListState,
+                        albumListState = visitedAlbumListState,
+                        onMinePagerPageChanged = { visitedMinePagerPage = it },
                         onRefresh = {
                             visitedUserId?.let { loadVisitedUserProfile(ProfileLookup.Uid(it)) }
                         },
@@ -748,6 +815,8 @@ fun WeiboApp() {
                         emoticonCount = emoticonMap.size,
                         emoticonSyncing = emoticonSyncing,
                         postsListState = minePostsListState,
+                        albumListState = mineAlbumListState,
+                        onMinePagerPageChanged = { minePagerPage = it },
                         onRefresh = { refreshMineProfile() },
                         onLoadMorePosts = { loadMoreMinePosts() },
                         onLoadMoreAlbum = { loadMoreMineAlbum() },
@@ -790,8 +859,45 @@ fun WeiboApp() {
             }
 
             if (selectedItem == null) {
+                val feedRefreshTopInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+                AnimatedVisibility(
+                    visible = selectedTab == MainTab.Feed &&
+                        visitedUserId == null &&
+                        feedRefreshHint != null,
+                    enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
+                    exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { fullHeight -> -fullHeight / 2 },
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = feedRefreshTopInset + 10.dp),
+                ) {
+                    feedRefreshHint?.let { hint ->
+                        FeedRefreshCapsuleHint(
+                            message = hint,
+                            onDismiss = { feedRefreshHint = null },
+                        )
+                    }
+                }
+
                 FloatingBottomBar(
                     selectedTab = selectedTab,
+                    expanded = bottomBarExpanded,
+                    onExpandRequest = { bottomBarExpanded = true },
+                    onCollapsedTap = {
+                        when (selectedTab) {
+                            MainTab.Feed -> refreshTimelineFromTop()
+                            MainTab.Mine -> {
+                                scope.launch {
+                                    if (minePagerPage == 0) {
+                                        minePostsListState.animateScrollToItem(0)
+                                    } else {
+                                        mineAlbumListState.animateScrollToItem(0)
+                                    }
+                                }
+                                refreshMineProfile()
+                            }
+                            else -> Unit
+                        }
+                    },
                     onTabChange = { tab ->
                         if (tab == MainTab.Feed && selectedTab == MainTab.Feed) {
                             refreshTimelineFromTop()
@@ -865,6 +971,9 @@ private fun MyWeiboScaffold(
             if (false && selectedItem == null) {
                 FloatingBottomBar(
                     selectedTab = selectedTab,
+                    expanded = true,
+                    onExpandRequest = {},
+                    onCollapsedTap = {},
                     onTabChange = onTabChange,
                 )
             }
@@ -877,212 +986,334 @@ private fun MyWeiboScaffold(
 private fun FloatingBottomBar(
     selectedTab: MainTab,
     onTabChange: (MainTab) -> Unit,
+    expanded: Boolean,
+    onExpandRequest: () -> Unit,
+    onCollapsedTap: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val glassShape = RoundedCornerShape(36.dp)
-    val surface = MaterialTheme.colorScheme.surface
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
+    val collapsedWidth = 72.dp
+    val collapsedWidthPx = with(density) { collapsedWidth.toPx() }
+    val tabs = MainTab.entries
     var liquidActive by remember { mutableStateOf(false) }
     var gestureActive by remember { mutableStateOf(false) }
-    var gesturePillOffset by remember { mutableStateOf(0.dp) }
-    var highlightedTab by remember { mutableStateOf<MainTab?>(null) }
+    var gesturePillXPx by remember { mutableFloatStateOf(0f) }
+    var highlightedIndex by remember { mutableIntStateOf(-1) }
+    var collapsedLongPressDragging by remember { mutableStateOf(false) }
 
     LaunchedEffect(selectedTab) {
-        liquidActive = true
-        delay(260)
-        liquidActive = false
+        if (!gestureActive) {
+            liquidActive = true
+            delay(260)
+            liquidActive = false
+        }
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
             .padding(start = 18.dp, top = 4.dp, end = 18.dp, bottom = 24.dp),
-        contentAlignment = Alignment.Center,
+        contentAlignment = Alignment.BottomStart,
     ) {
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            color = Color.Transparent,
-            shadowElevation = 0.dp,
-            shape = glassShape,
-            border = BorderStroke(
-                width = 0.5.dp,
-                brush = Brush.linearGradient(
-                    colors = listOf(
-                        Color(0xFFE6E6E6).copy(alpha = 0.70f),
-                        Color(0xFFD8D8D8).copy(alpha = 0.42f),
-                        Color(0xFFF2F2F2).copy(alpha = 0.58f),
-                    )
-                )
+        val fullBarWidth = maxWidth
+        val selectedIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)
+        val showExpandedChrome = expanded || gestureActive
+        val animatedBarWidth by animateDpAsState(
+            targetValue = if (expanded) fullBarWidth else collapsedWidth,
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = Spring.StiffnessMedium,
             ),
-        ) {
-            Box(
-                modifier = Modifier
-                    .height(72.dp)
-                    .clip(glassShape),
+            label = "bottom-bar-width",
+        )
+        val barWidth = if (expanded || gestureActive) fullBarWidth else animatedBarWidth
+
+        BoxWithConstraints(Modifier.width(fullBarWidth).height(72.dp)) {
+            val barContentPadding = 8.dp
+            val contentWidth = fullBarWidth - barContentPadding * 2
+            val itemWidth = contentWidth / tabs.size
+            val restingPillWidth = itemWidth
+            val gesturePillWidth = itemWidth + 12.dp
+            val maxWidthPx = with(density) { contentWidth.toPx() }.coerceAtLeast(1f)
+            val horizontalPaddingPx = with(density) { barContentPadding.toPx() }
+            val restingPillWidthPx = with(density) { restingPillWidth.toPx() }
+            val gesturePillWidthPx = with(density) { gesturePillWidth.toPx() }
+            val expandedState by rememberUpdatedState(expanded)
+            val gestureActiveState by rememberUpdatedState(gestureActive)
+            val onExpandRequestState by rememberUpdatedState(onExpandRequest)
+            val onTabChangeState by rememberUpdatedState(onTabChange)
+            val onCollapsedTapState by rememberUpdatedState(onCollapsedTap)
+
+            fun contentX(rawX: Float) = (rawX - horizontalPaddingPx).coerceIn(0f, maxWidthPx)
+
+            fun indexForX(rawX: Float): Int {
+                val x = contentX(rawX)
+                return ((x / maxWidthPx) * tabs.size).toInt().coerceIn(0, tabs.lastIndex)
+            }
+
+            fun pillOffsetPxForX(rawX: Float, activePillWidthPx: Float = gesturePillWidthPx): Float {
+                val x = contentX(rawX)
+                val maxOffset = (maxWidthPx - activePillWidthPx).coerceAtLeast(0f)
+                return (x - activePillWidthPx / 2f).coerceIn(0f, maxOffset)
+            }
+
+            fun pillOffsetPxForIndex(index: Int, activePillWidthPx: Float = restingPillWidthPx): Float {
+                val slotStart = with(density) { (itemWidth * index).toPx() }
+                val slotCenter = slotStart + with(density) { itemWidth.toPx() } / 2f
+                val maxOffset = (maxWidthPx - activePillWidthPx).coerceAtLeast(0f)
+                return (slotCenter - activePillWidthPx / 2f).coerceIn(0f, maxOffset)
+            }
+
+            fun updateGesturePill(rawX: Float) {
+                gesturePillXPx = pillOffsetPxForX(rawX)
+                highlightedIndex = indexForX(rawX)
+            }
+
+            fun resetGesture() {
+                gestureActive = false
+                collapsedLongPressDragging = false
+                highlightedIndex = -1
+                liquidActive = false
+            }
+
+            fun finishGesture(targetIndex: Int, requestExpand: Boolean = false) {
+                highlightedIndex = -1
+                collapsedLongPressDragging = false
+                liquidActive = true
+                if (requestExpand) {
+                    onExpandRequestState()
+                }
+                onTabChangeState(tabs[targetIndex])
+                scope.launch {
+                    delay(120)
+                    gestureActive = false
+                }
+                scope.launch {
+                    delay(260)
+                    liquidActive = false
+                }
+            }
+
+            val animatedPillOffset by animateDpAsState(
+                targetValue = with(density) { pillOffsetPxForIndex(selectedIndex).toDp() },
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessLow,
+                ),
+                label = "selected-nav-pill",
+            )
+            val pillWidthDp = if (gestureActive) gesturePillWidth else restingPillWidth
+            val pillHeightDp = if (gestureActive) 62.dp else 58.dp
+            val pillOffset = if (gestureActive) {
+                with(density) { gesturePillXPx.toDp() }
+            } else {
+                animatedPillOffset
+            }
+            val highlightedTab = highlightedIndex.takeIf { it >= 0 }?.let { tabs[it] }
+
+            Surface(
+                modifier = Modifier.width(barWidth).fillMaxHeight(),
+                color = Color.Transparent,
+                shadowElevation = 0.dp,
+                shape = glassShape,
+                border = BorderStroke(
+                    width = 0.5.dp,
+                    brush = Brush.linearGradient(
+                        colors = listOf(
+                            Color(0xFFE6E6E6).copy(alpha = 0.70f),
+                            Color(0xFFD8D8D8).copy(alpha = 0.42f),
+                            Color(0xFFF2F2F2).copy(alpha = 0.58f),
+                        )
+                    )
+                ),
             ) {
-                // 搴曞眰锛氭瘺鐜荤拑鑳屾櫙
                 Box(
                     modifier = Modifier
-                        .matchParentSize()
-                        .blur(28.dp)
-                        .background(
-                            Brush.linearGradient(
-                                colors = listOf(
-                                    Color.Transparent,
-                                    Color.Transparent,
-                                    Color.Transparent,
-                                ),
-                                start = Offset(0f, 0f),
-                                end = Offset(0f, Float.POSITIVE_INFINITY),
-                            )
-                        )
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(
-                                    Color.Transparent,
-                                    Color.Transparent,
-                                    Color.Transparent,
-                                )
-                            )
-                        )
-                )
-
-                // Upper layer: clear content over the glass background.
-                BoxWithConstraints(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 8.dp)
+                        .width(fullBarWidth)
+                        .fillMaxHeight()
+                        .clip(glassShape)
+                        .padding(horizontal = barContentPadding),
                 ) {
-                    val tabs = MainTab.entries
-                    val selectedIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)
-                    val itemWidth = maxWidth / tabs.size
-                    val pillWidth = itemWidth + 2.dp
-                    val maxWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
-                    val pillWidthPx = with(density) { pillWidth.toPx() }
-                    val animatedPillOffset by animateDpAsState(
-                        targetValue = if (gestureActive) {
-                            gesturePillOffset
-                        } else {
-                            itemWidth * selectedIndex - 1.dp
-                        },
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessLow,
-                        ),
-                        label = "selected-nav-pill",
-                    )
-                    val animatedPillWidth by animateDpAsState(
-                        targetValue = if (gestureActive) pillWidth + 12.dp else pillWidth,
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessMedium,
-                        ),
-                        label = "selected-nav-pill-width",
-                    )
-                    val animatedPillHeight by animateDpAsState(
-                        targetValue = if (gestureActive) 62.dp else 58.dp,
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessMedium,
-                        ),
-                        label = "selected-nav-pill-height",
-                    )
-                    val pillOffset = animatedPillOffset - (animatedPillWidth - pillWidth) / 2
-
-                    fun indexForX(x: Float): Int {
-                        val safeX = x.coerceIn(0f, maxWidthPx - 0.01f)
-                        return ((safeX / maxWidthPx) * tabs.size).toInt().coerceIn(0, tabs.lastIndex)
-                    }
-
-                    fun pillOffsetForX(x: Float) = with(density) {
-                        val minOffset = -1.dp.toPx()
-                        val maxOffset = maxWidthPx - pillWidthPx + 1.dp.toPx()
-                        (x - pillWidthPx / 2f).coerceIn(minOffset, maxOffset).toDp()
-                    }
-
-                    fun pillOffsetForIndex(index: Int) = itemWidth * index - 1.dp
-
-                    Canvas(Modifier.fillMaxSize()) {
-                        drawRoundRect(
-                            brush = Brush.radialGradient(
-                                colors = listOf(
-                                    Color.Transparent,
-                                    Color.Transparent,
-                                    Color.Transparent,
+                    if (showExpandedChrome) {
+                        Canvas(Modifier.fillMaxSize()) {
+                            drawRoundRect(
+                                brush = Brush.radialGradient(
+                                    colors = listOf(
+                                        Color.Transparent,
+                                        Color.Transparent,
+                                        Color.Transparent,
+                                    ),
+                                    center = Offset(size.width * 0.5f, size.height * 0.1f),
+                                    radius = size.width * 0.55f,
                                 ),
-                                center = Offset(size.width * 0.5f, size.height * 0.1f),
-                                radius = size.width * 0.55f,
-                            ),
-                            cornerRadius = CornerRadius(36.dp.toPx(), 36.dp.toPx()),
+                                cornerRadius = CornerRadius(36.dp.toPx(), 36.dp.toPx()),
+                            )
+                        }
+
+                        LiquidSelectedPill(
+                            active = liquidActive || gestureActive,
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .offset(x = pillOffset)
+                                .width(pillWidthDp)
+                                .height(pillHeightDp),
                         )
-                    }
 
-                    LiquidSelectedPill(
-                        active = liquidActive || gestureActive,
-                        modifier = Modifier
-                            .align(Alignment.CenterStart)
-                            .offset(x = pillOffset)
-                            .width(animatedPillWidth)
-                            .height(animatedPillHeight),
-                    )
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(maxWidthPx, pillWidthPx) {
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(requireUnconsumed = false)
-                                    var targetIndex = indexForX(down.position.x)
-                                    gestureActive = true
-                                    highlightedTab = tabs[targetIndex]
-                                    gesturePillOffset = pillOffsetForX(down.position.x)
-                                    down.consume()
-
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val change = event.changes.firstOrNull { it.id == down.id }
-                                            ?: event.changes.firstOrNull()
-                                            ?: break
-                                        targetIndex = indexForX(change.position.x)
-                                        highlightedTab = tabs[targetIndex]
-                                        gesturePillOffset = pillOffsetForX(change.position.x)
-                                        change.consume()
-                                        if (!change.pressed) {
-                                            break
-                                        }
-                                    }
-
-                                    highlightedTab = null
-                                    gesturePillOffset = pillOffsetForIndex(targetIndex)
-                                    liquidActive = true
-                                    onTabChange(tabs[targetIndex])
-                                    scope.launch {
-                                        delay(120)
-                                        gestureActive = false
-                                    }
-                                    scope.launch {
-                                        delay(260)
-                                        liquidActive = false
-                                    }
-                                }
-                            },
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        tabs.forEach { tab ->
-                            val isTouchingSelectedTab = gestureActive && highlightedTab == selectedTab
+                        Row(
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            tabs.forEach { tab ->
+                                val isTouchingSelectedTab = gestureActive && highlightedTab == selectedTab
+                                FloatingNavItem(
+                                    tab = tab,
+                                    selected = selectedTab == tab &&
+                                        (!gestureActive || highlightedTab == null || isTouchingSelectedTab),
+                                    highlighted = gestureActive &&
+                                        highlightedTab != selectedTab &&
+                                        highlightedTab == tab,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .width(collapsedWidth)
+                                .fillMaxHeight(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            LiquidSelectedPill(
+                                active = false,
+                                modifier = Modifier.size(width = 58.dp, height = 58.dp),
+                            )
                             FloatingNavItem(
-                                tab = tab,
-                                selected = selectedTab == tab && (!gestureActive || highlightedTab == null || isTouchingSelectedTab),
-                                highlighted = gestureActive && highlightedTab != selectedTab && highlightedTab == tab,
-                                modifier = Modifier.weight(1f),
+                                tab = selectedTab,
+                                selected = true,
+                                highlighted = false,
+                                modifier = Modifier.fillMaxWidth(),
                             )
                         }
                     }
                 }
             }
+
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .pointerInput(maxWidthPx, collapsedWidthPx) {
+                        detectTapGestures(
+                            onTap = { offset ->
+                                if (!expandedState && !gestureActiveState && offset.x <= collapsedWidthPx) {
+                                    onExpandRequestState()
+                                }
+                            },
+                            onDoubleTap = { offset ->
+                                if (!expandedState && !gestureActiveState && offset.x <= collapsedWidthPx) {
+                                    onCollapsedTapState()
+                                }
+                            },
+                        )
+                    }
+                    .pointerInput(maxWidthPx, gesturePillWidthPx, collapsedWidthPx) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { offset ->
+                                if (expandedState) return@detectDragGesturesAfterLongPress
+                                if (offset.x > collapsedWidthPx) return@detectDragGesturesAfterLongPress
+                                collapsedLongPressDragging = true
+                                gestureActive = true
+                                liquidActive = true
+                                onExpandRequestState()
+                                updateGesturePill(offset.x)
+                            },
+                            onDrag = { change, _ ->
+                                if (!collapsedLongPressDragging) return@detectDragGesturesAfterLongPress
+                                updateGesturePill(change.position.x)
+                            },
+                            onDragEnd = {
+                                if (!collapsedLongPressDragging) return@detectDragGesturesAfterLongPress
+                                val targetIndex = highlightedIndex
+                                    .takeIf { it >= 0 }
+                                    ?: selectedIndex
+                                finishGesture(targetIndex, requestExpand = true)
+                            },
+                            onDragCancel = {
+                                if (collapsedLongPressDragging) {
+                                    collapsedLongPressDragging = false
+                                    gestureActive = false
+                                    highlightedIndex = -1
+                                    liquidActive = false
+                                }
+                            },
+                        )
+                    },
+            )
+
+            if (expanded && !collapsedLongPressDragging) {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .pointerInput(maxWidthPx, gesturePillWidthPx) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                var targetIndex = indexForX(down.position.x)
+                                gestureActive = true
+                                updateGesturePill(down.position.x)
+                                down.consume()
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                        ?: event.changes.firstOrNull()
+                                        ?: break
+                                    targetIndex = indexForX(change.position.x)
+                                    updateGesturePill(change.position.x)
+                                    change.consume()
+                                    if (!change.pressed) {
+                                        break
+                                    }
+                                }
+
+                                finishGesture(targetIndex)
+                            }
+                        },
+                )
+            }
         }
+    }
+}
+
+@Composable
+private fun FeedRefreshCapsuleHint(
+    message: String,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LaunchedEffect(message) {
+        delay(2200)
+        onDismiss()
+    }
+
+    val shape = RoundedCornerShape(22.dp)
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.Center,
+    ) {
+        LiquidSelectedPill(
+            active = true,
+            modifier = Modifier.matchParentSize(),
+        )
+        Text(
+            text = message,
+            modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 
@@ -3017,6 +3248,8 @@ private fun MineScreen(
     emoticonCount: Int = 0,
     emoticonSyncing: Boolean = false,
     postsListState: LazyListState = rememberLazyListState(),
+    albumListState: LazyListState = rememberLazyListState(),
+    onMinePagerPageChanged: (Int) -> Unit = {},
     onRefresh: () -> Unit,
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
@@ -3032,7 +3265,11 @@ private fun MineScreen(
     var showAccountManagement by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { MineContentTab.entries.size })
     val coroutineScope = rememberCoroutineScope()
-    val albumListState = rememberLazyListState()
+
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.currentPage }
+            .collect { page -> onMinePagerPageChanged(page) }
+    }
 
     if (showSettings) {
         BackHandler {
@@ -3120,9 +3357,13 @@ private fun MineScreen(
     val compactBarHeight = (topInset + compactBarContentHeight) * animatedCollapse
     var profileHeaderHeight by remember { mutableStateOf(0.dp) }
     val profileHeaderSlotHeight = if (profileHeaderHeight > 0.dp) {
-        profileHeaderHeight * (1f - animatedCollapse)
+        (profileHeaderHeight * (1f - animatedCollapse)).coerceAtLeast(0.dp)
     } else {
         Dp.Unspecified
+    }
+
+    LaunchedEffect(profile?.id) {
+        profileHeaderHeight = 0.dp
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -3195,23 +3436,34 @@ private fun MineScreen(
                                 Modifier
                             },
                         )
-                        .graphicsLayer { clip = true }
-                        .onGloballyPositioned { coordinates ->
-                            if (animatedCollapse < 0.01f && coordinates.size.height > 0) {
-                                profileHeaderHeight = with(density) { coordinates.size.height.toDp() }
-                            }
-                        },
+                        .clipToBounds(),
+                    contentAlignment = Alignment.TopStart,
                 ) {
-                    MineProfileHeader(
-                        profile = profile,
-                        hasLoginCookie = hasLoginCookie,
-                        loadError = loadError,
-                        onOpenSettings = if (enableSettings) {
-                            { showSettings = true }
-                        } else {
-                            null
-                        },
-                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight(unbounded = true)
+                            .onGloballyPositioned { coordinates ->
+                                if (coordinates.size.height <= 0) return@onGloballyPositioned
+                                val measured = with(density) {
+                                    coordinates.size.height.toDp()
+                                }
+                                if (measured != profileHeaderHeight) {
+                                    profileHeaderHeight = measured
+                                }
+                            },
+                    ) {
+                        MineProfileHeader(
+                            profile = profile,
+                            hasLoginCookie = hasLoginCookie,
+                            loadError = loadError,
+                            onOpenSettings = if (enableSettings) {
+                                { showSettings = true }
+                            } else {
+                                null
+                            },
+                        )
+                    }
                 }
 
                 MineContentTabs(
