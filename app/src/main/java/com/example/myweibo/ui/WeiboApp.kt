@@ -170,6 +170,7 @@ import androidx.compose.ui.window.PopupProperties
 import com.example.myweibo.R
 import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
+import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.FeedItem
@@ -264,6 +265,7 @@ fun WeiboApp() {
     val session = remember { WeiboWebSession(context) }
     val timelineCacheStore = remember { TimelineCacheStore(context) }
     val mineCacheStore = remember { MineCacheStore(context) }
+    val emoticonCacheStore = remember { EmoticonCacheStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -284,6 +286,7 @@ fun WeiboApp() {
     var nextCursor by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var selectedItem by remember { mutableStateOf<FeedItem?>(null) }
+    var pendingDetailReturnItem by remember { mutableStateOf<FeedItem?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
     var commentsCursor by remember { mutableStateOf<String?>(null) }
@@ -323,6 +326,9 @@ fun WeiboApp() {
     var visitedAlbumLoadingMore by remember { mutableStateOf(false) }
     var visitedProfileLoadGeneration by remember { mutableIntStateOf(0) }
     var visitedProfileBackStack by remember { mutableStateOf<List<VisitedProfileSnapshot>>(emptyList()) }
+    var lastHomeBackPressAt by remember { mutableStateOf(0L) }
+    var exitHintVisible by remember { mutableStateOf(false) }
+    var exitHintToken by remember { mutableIntStateOf(0) }
 
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
@@ -461,6 +467,10 @@ fun WeiboApp() {
             restoreVisitedProfileSnapshot(previous)
         } else {
             clearVisitedProfileState()
+            pendingDetailReturnItem?.let { item ->
+                selectedItem = item
+                pendingDetailReturnItem = null
+            }
         }
     }
 
@@ -508,6 +518,11 @@ fun WeiboApp() {
         }
         if (isCurrentUser) return
 
+        if (selectedItem != null) {
+            pendingDetailReturnItem = selectedItem
+            selectedItem = null
+        }
+
         currentVisitedProfileSnapshot()?.let { snapshot ->
             visitedProfileBackStack = visitedProfileBackStack + snapshot
         }
@@ -520,14 +535,34 @@ fun WeiboApp() {
         )
     }
 
-    BackHandler(
-        enabled = mediaPreview != null || selectedItem != null || visitedUserId != null || selectedTab != MainTab.Feed
-    ) {
+    BackHandler(enabled = true) {
         when {
-            mediaPreview != null -> mediaPreview = null
-            selectedItem != null -> selectedItem = null
-            visitedUserId != null -> closeVisitedProfile()
-            selectedTab != MainTab.Feed -> selectedTab = MainTab.Feed
+            mediaPreview != null -> {
+                lastHomeBackPressAt = 0L
+                mediaPreview = null
+            }
+            selectedItem != null -> {
+                lastHomeBackPressAt = 0L
+                selectedItem = null
+            }
+            visitedUserId != null -> {
+                lastHomeBackPressAt = 0L
+                closeVisitedProfile()
+            }
+            selectedTab != MainTab.Feed -> {
+                lastHomeBackPressAt = 0L
+                selectedTab = MainTab.Feed
+            }
+            else -> {
+                val now = System.currentTimeMillis()
+                if (now - lastHomeBackPressAt <= 2_000L) {
+                    (context as? android.app.Activity)?.finish()
+                } else {
+                    lastHomeBackPressAt = now
+                    exitHintVisible = true
+                    exitHintToken += 1
+                }
+            }
         }
     }
 
@@ -749,6 +784,7 @@ fun WeiboApp() {
     }
 
     fun openDetail(item: FeedItem) {
+        pendingDetailReturnItem = null
         val resolved = resolveFeedItem(item)
         selectedItem = resolved
         comments = emptyList()
@@ -793,8 +829,14 @@ fun WeiboApp() {
             emoticonSyncing = true
             runCatching { session.loadEmotions() }
                 .onSuccess { emotions ->
-                    emoticonMap = emotions.associate { it.phrase to it.url }
-                    showMessage("\u8868\u60C5\u540C\u6B65\u5B8C\u6210", "\u5DF2\u540C\u6B65 ${emoticonMap.size} \u4E2A\u8868\u60C5")
+                    if (emotions.isEmpty()) {
+                        showMessage("表情同步失败", "微博未返回表情配置，请确认已登录后重试")
+                    } else {
+                        val synced = emotions.associate { it.phrase to it.url }
+                        emoticonMap = synced
+                        emoticonCacheStore.write(synced)
+                        showMessage("表情同步完成", "已同步 ${synced.size} 个表情")
+                    }
                 }
                 .onFailure { error ->
                     showMessage("表情同步失败", error.message ?: "无法读取微博表情配置")
@@ -804,6 +846,7 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(Unit) {
+        emoticonMap = emoticonCacheStore.read()
         timelineCacheStore.readFollowingTimeline()?.let { page ->
             items = page.items
             nextCursor = page.nextCursor
@@ -1119,6 +1162,13 @@ fun WeiboApp() {
                     onDismiss = { mediaPreview = null },
                 )
             }
+
+            ExitConfirmCapsule(
+                visible = exitHintVisible,
+                token = exitHintToken,
+                onDismiss = { exitHintVisible = false },
+                modifier = Modifier.align(Alignment.Center),
+            )
             }
             }
         }
@@ -1574,6 +1624,70 @@ private fun FeedRefreshCapsuleHint(
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurface,
         )
+    }
+}
+
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun ExitConfirmCapsule(
+    visible: Boolean,
+    token: Int,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val hazeState = LocalHazeState.current
+
+    LaunchedEffect(token) {
+        if (visible) {
+            delay(1800)
+            onDismiss()
+        }
+    }
+
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier.zIndex(80f),
+        enter = fadeIn(tween(120)) + scaleIn(
+            initialScale = 0.92f,
+            animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        ),
+        exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.94f),
+    ) {
+        val shape = RoundedCornerShape(999.dp)
+        Box(
+            modifier = Modifier
+                .clip(shape)
+                .then(
+                    if (hazeState != null) {
+                        Modifier.hazeEffect(state = hazeState, style = HazeMaterials.ultraThin()) {
+                            blurRadius = 24.dp
+                            noiseFactor = 0.03f
+                            alpha = 0.76f
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
+                .background(Color.Black.copy(alpha = 0.48f))
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.18f),
+                            Color.White.copy(alpha = 0.05f),
+                            Color.Black.copy(alpha = 0.08f),
+                        ),
+                    ),
+                )
+                .padding(horizontal = 24.dp, vertical = 12.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "再按一次退出程序",
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
     }
 }
 
@@ -3595,7 +3709,7 @@ private fun VideoControls(
                 modifier = Modifier.weight(1f).height(18.dp),
             )
             Text(
-                text = "-${formatVideoTime((durationMs - positionMs).coerceAtLeast(0L))}",
+                text = formatVideoTime((durationMs - positionMs).coerceAtLeast(0L)),
                 modifier = Modifier.width(42.dp),
                 color = Color.White,
                 fontSize = 12.sp,
@@ -3801,7 +3915,7 @@ private fun DetailScreen(
             }
 
             items(comments, key = { it.id }) { comment ->
-                CommentRow(comment)
+                CommentRow(comment = comment, onUserClick = onUserClick)
                 HorizontalDivider()
             }
         }
@@ -3809,8 +3923,13 @@ private fun DetailScreen(
 }
 
 @Composable
-private fun CommentRow(comment: CommentItem, depth: Int = 0) {
+private fun CommentRow(
+    comment: CommentItem,
+    depth: Int = 0,
+    onUserClick: ((String) -> Unit)? = null,
+) {
     val resolvedMap = comment.emoticons.ifEmpty { emptyMap() }
+    val authorTarget = comment.authorId.takeIf { it.isNotBlank() } ?: comment.authorName
     val topPadding = if (depth == 0) 10.dp else 2.dp
     val bottomPadding = if (depth == 0) 4.dp else 2.dp
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -3822,22 +3941,53 @@ private fun CommentRow(comment: CommentItem, depth: Int = 0) {
         ) {
             RemoteImage(
                 url = comment.authorAvatarUrl,
-                modifier = Modifier.size(28.dp).clip(CircleShape),
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        enabled = onUserClick != null && authorTarget.isNotBlank(),
+                        onClick = { onUserClick?.invoke(authorTarget) },
+                    ),
                 contentScale = ContentScale.Crop,
             )
             Spacer(Modifier.width(8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(comment.authorName, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text(
+                        text = comment.authorName,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 13.sp,
+                        modifier = Modifier.clickable(
+                            enabled = onUserClick != null && authorTarget.isNotBlank(),
+                            onClick = { onUserClick?.invoke(authorTarget) },
+                        ),
+                    )
                     if (comment.replyToAuthor != null) {
                         Text(
-                            text = " 回复 @${comment.replyToAuthor}",
-                            style = MaterialTheme.typography.bodySmall,
+                            text = " 回复 ",
+                            style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        val replyTarget = comment.replyToAuthorId?.takeIf { it.isNotBlank() }
+                            ?: comment.replyToAuthor
+                        Text(
+                            text = "@${comment.replyToAuthor}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.clickable(
+                                enabled = onUserClick != null && !replyTarget.isNullOrBlank(),
+                                onClick = { replyTarget?.let { onUserClick?.invoke(it) } },
+                            ),
                         )
                     }
                 }
-                EmoticonText(text = comment.text, emoticonMap = resolvedMap, style = MaterialTheme.typography.bodyMedium)
+                EmoticonText(
+                    text = comment.text,
+                    emoticonMap = resolvedMap,
+                    style = MaterialTheme.typography.bodyMedium,
+                    onUserClick = onUserClick,
+                )
                 if (comment.images.isNotEmpty()) {
                     CommentImageStrip(images = comment.images)
                 }
@@ -3853,7 +4003,7 @@ private fun CommentRow(comment: CommentItem, depth: Int = 0) {
             }
         }
         comment.comments.forEach { nested ->
-            CommentRow(comment = nested, depth = depth + 1)
+            CommentRow(comment = nested, depth = depth + 1, onUserClick = onUserClick)
         }
     }
 }
@@ -4360,16 +4510,16 @@ private fun SettingsScreen(
                 SettingsActionCard(
                     title = "表情同步",
                     subtitle = if (emoticonCount > 0) {
-                        "\u5DF2\u540C\u6B65 $emoticonCount \u4E2A\u5FAE\u535A\u8868\u60C5\uFF0C\u53EF\u7EE7\u7EED\u66F4\u65B0"
+                        "本地已缓存 $emoticonCount 个微博表情，可继续更新"
                     } else {
-                        "同步微博表情配置，提升正文与评论表情显示"
+                        "本地已缓存 0 个微博表情，同步后可提升正文与评论表情显示"
                     },
                     status = if (emoticonSyncing) {
-                        "\u540C\u6B65\u4E2D"
+                        "同步中"
                     } else if (emoticonCount > 0) {
-                        "\u5DF2\u540C\u6B65"
+                        "本地 $emoticonCount 个"
                     } else {
-                        "\u672A\u540C\u6B65"
+                        "未同步"
                     },
                     actionLabel = if (emoticonCount > 0) "更新" else "同步",
                     loading = emoticonSyncing,

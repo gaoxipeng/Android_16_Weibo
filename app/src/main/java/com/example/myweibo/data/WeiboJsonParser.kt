@@ -48,6 +48,7 @@ object WeiboJsonParser {
                 add(
                     CommentItem(
                         id = id,
+                        authorId = userId(user),
                         authorName = user?.optNullableString("screen_name") ?: "微博用户",
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
@@ -60,6 +61,8 @@ object WeiboJsonParser {
                         comments = parseNestedComments(comment.optJSONArray("comments")),
                         replyToAuthor = comment.optJSONObject("reply_comment")?.optJSONObject("user")
                             ?.optNullableString("screen_name"),
+                        replyToAuthorId = userId(comment.optJSONObject("reply_comment")?.optJSONObject("user"))
+                            .takeIf { it.isNotBlank() },
                     )
                 )
             }
@@ -91,7 +94,9 @@ object WeiboJsonParser {
         val urlStruct = status.optJSONArray("url_struct")
         text = stripEntityTokens(text, imageUrlTokensFromUrlStruct(urlStruct, sourceRaw))
         if (media != null) {
-            text = stripEntityTokens(text, mediaUrlTokensFromUrlStruct(urlStruct, sourceRaw))
+            val mediaTokens = mediaUrlTokensFromUrlStruct(urlStruct, sourceRaw) +
+                mediaPageInfoTokens(status, sourceRaw)
+            text = stripEntityTokens(text, mediaTokens)
         }
         if (images.isNotEmpty() || media != null) {
             text = stripOrphanMediaLinks(text)
@@ -115,23 +120,36 @@ object WeiboJsonParser {
 
     private fun mediaUrlTokensFromUrlStruct(urlStruct: JSONArray?, sourceText: String): List<String> {
         if (urlStruct == null) return emptyList()
-        return buildList {
-            for (index in 0 until urlStruct.length()) {
-                val entity = urlStruct.optJSONObject(index) ?: continue
-                val picIds = entity.optJSONArray("pic_ids")
-                if (picIds != null && picIds.length() > 0 && entity.optJSONObject("pic_infos") != null) {
-                    continue
-                }
-                val shortUrl = entity.optNullableString("short_url") ?: continue
-                if (sourceText.contains(shortUrl)) add(shortUrl)
+        val tokens = linkedSetOf<String>()
+        for (index in 0 until urlStruct.length()) {
+            val entity = urlStruct.optJSONObject(index) ?: continue
+            val picIds = entity.optJSONArray("pic_ids")
+            if (picIds != null && picIds.length() > 0 && entity.optJSONObject("pic_infos") != null) {
+                continue
+            }
+            for (key in listOf("short_url", "long_url", "ori_url", "h5_target_url")) {
+                entity.optNullableString(key)
+                    ?.takeIf { it.isNotBlank() && sourceText.contains(it) }
+                    ?.let { tokens.add(it) }
             }
         }
+        return tokens.toList()
+    }
+
+    private fun mediaPageInfoTokens(status: JSONObject, sourceText: String): List<String> {
+        val pageInfo = status.optJSONObject("page_info") ?: return emptyList()
+        return listOfNotNull(
+            pageInfo.optNullableString("page_url"),
+            pageInfo.optNullableString("url_ori"),
+            pageInfo.optJSONObject("media_info")?.optNullableString("h5_url"),
+        ).filter { it.isNotBlank() && sourceText.contains(it) }
     }
 
     private fun stripOrphanMediaLinks(text: String): String =
         text
             .replace(Regex("""https?://t\.cn/\S+"""), "")
             .replace(Regex("""(?<!\S)https?:(?=\s|$)"""), "")
+            .replace(Regex("""(?:[ \t]*https?://\S+)+[ \t]*$"""), "")
             .replace(Regex("[ \\t]{2,}"), " ")
             .replace(Regex("[ \\t]+\\n"), "\n")
             .replace(Regex("\\n[ \\t]+"), "\n")
@@ -179,6 +197,7 @@ object WeiboJsonParser {
                 add(
                     CommentItem(
                         id = id,
+                        authorId = userId(user),
                         authorName = user?.optNullableString("screen_name") ?: "微博用户",
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
@@ -190,6 +209,8 @@ object WeiboJsonParser {
                         images = images,
                         replyToAuthor = obj.optJSONObject("reply_comment")?.optJSONObject("user")
                             ?.optNullableString("screen_name"),
+                        replyToAuthorId = userId(obj.optJSONObject("reply_comment")?.optJSONObject("user"))
+                            .takeIf { it.isNotBlank() },
                     )
                 )
             }
@@ -971,6 +992,9 @@ object WeiboJsonParser {
         return value.takeIf { it.isNotBlank() && it != "0" }
     }
 
+    private fun userId(user: JSONObject?): String =
+        user?.optNullableString("idstr") ?: user?.optNullableString("id") ?: ""
+
     private fun extractEmoticonsFromHtml(html: String): Map<String, String> {
         if (html.isBlank()) return emptyMap()
         val map = mutableMapOf<String, String>()
@@ -1057,18 +1081,77 @@ object WeiboJsonParser {
 
     fun parseEmotions(raw: String): List<WeiboEmoticon> {
         val root = org.json.JSONObject(raw)
-        val emoticons = root.optJSONObject("data")?.optJSONArray("emoticons")
-            ?: return emptyList()
-        return buildList {
-            for (i in 0 until emoticons.length()) {
-                val obj = emoticons.optJSONObject(i) ?: continue
-                val phrase = obj.optNullableString("phrase") ?: continue
-                var url = obj.optNullableString("url")
-                    ?: obj.optNullableString("icon")
-                    ?: continue
-                if (url.startsWith("//")) url = "https:$url"
-                add(WeiboEmoticon(phrase = phrase, url = url))
+        val phraseMap = linkedMapOf<String, WeiboEmoticon>()
+
+        root.optJSONObject("data")?.optJSONArray("emoticons")?.let { legacy ->
+            for (index in 0 until legacy.length()) {
+                legacy.optJSONObject(index)?.let(::normalizeEmoticonEntry)?.let { entry ->
+                    phraseMap[entry.phrase] = entry
+                }
             }
         }
+
+        for ((_, entries) in resolveEmoticonLocaleGroups(root)) {
+            for (index in 0 until entries.length()) {
+                entries.optJSONObject(index)?.let(::normalizeEmoticonEntry)?.let { entry ->
+                    phraseMap[entry.phrase] = entry
+                }
+            }
+        }
+
+        return phraseMap.values.toList()
+    }
+
+    private fun normalizeEmoticonEntry(obj: JSONObject): WeiboEmoticon? {
+        val phrase = obj.optNullableString("phrase") ?: return null
+        var url = obj.optNullableString("url")
+            ?: obj.optNullableString("icon")
+            ?: return null
+        if (url.startsWith("//")) url = "https:$url"
+        return WeiboEmoticon(phrase = phrase, url = url)
+    }
+
+    private fun resolveEmoticonLocaleGroups(root: JSONObject): Map<String, JSONArray> {
+        val nested = root.optJSONObject("data")?.optJSONObject("emoticon")
+        val topLevel = root.optJSONObject("emoticon")
+        unwrapEmoticonLocale(nested)?.let { return collectEmoticonGroups(it) }
+        unwrapEmoticonLocale(topLevel)?.let { return collectEmoticonGroups(it) }
+        resolveFlatEmoticonGroups(nested)?.let { return it }
+        resolveFlatEmoticonGroups(topLevel)?.let { return it }
+        return emptyMap()
+    }
+
+    private fun unwrapEmoticonLocale(emoticon: JSONObject?): JSONObject? {
+        if (emoticon == null) return null
+        emoticon.optJSONObject("ZH_CN")?.let { return it }
+        val keys = emoticon.keys()
+        while (keys.hasNext()) {
+            val value = emoticon.opt(keys.next())
+            if (value is JSONObject) return value
+        }
+        return emoticon
+    }
+
+    private fun collectEmoticonGroups(groups: JSONObject): Map<String, JSONArray> {
+        val result = linkedMapOf<String, JSONArray>()
+        val keys = groups.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            groups.optJSONArray(key)?.takeIf { it.length() > 0 }?.let { result[key] = it }
+        }
+        return result
+    }
+
+    private fun resolveFlatEmoticonGroups(emoticon: JSONObject?): Map<String, JSONArray>? {
+        if (emoticon == null) return null
+        val keys = emoticon.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val entries = emoticon.optJSONArray(key) ?: continue
+            if (entries.length() > 0 && entries.opt(0) is JSONObject) {
+                return mapOf(key to entries)
+            }
+        }
+        return null
     }
 }

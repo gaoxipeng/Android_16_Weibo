@@ -69,6 +69,7 @@ enum class MediaType {
 
 data class CommentItem(
     val id: String,
+    val authorId: String = "",
     val authorName: String,
     val authorAvatarUrl: String?,
     val text: String,
@@ -79,6 +80,7 @@ data class CommentItem(
     val images: List<FeedImage> = emptyList(),
     val comments: List<CommentItem> = emptyList(),
     val replyToAuthor: String? = null,
+    val replyToAuthorId: String? = null,
 )
 
 data class UserProfile(
