@@ -124,6 +124,48 @@ object ImageSaveHelper {
         }
     }
 
+    suspend fun saveVideo(context: Context, media: FeedMedia): Result<String> = withContext(Dispatchers.IO) {
+        val candidates = listOfNotNull(media.downloadUrl, media.streamUrl)
+            .flatMap(::videoDownloadCandidates)
+            .filter { it.isNotBlank() && !it.contains(".m3u8", ignoreCase = true) }
+            .distinct()
+        if (candidates.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("没有可下载的视频地址"))
+        }
+        val bytes = candidates.firstNotNullOfOrNull { url ->
+            runCatching { downloadBytes(url) }.getOrNull()
+        }
+            ?: return@withContext Result.failure(IllegalStateException("没有可下载的视频地址"))
+        val displayName = "weibo_video_${sanitize(media.title)}_${System.currentTimeMillis()}.mp4"
+        val uri = insertMedia(
+            context = context,
+            displayName = displayName,
+            mimeType = "video/mp4",
+            relativePath = "${Environment.DIRECTORY_MOVIES}/MyWeibo",
+        ) ?: return@withContext Result.failure(IllegalStateException("无法写入视频"))
+        val writeResult = runCatching {
+            context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: throw IllegalStateException("无法打开视频输出流")
+            finalizeMedia(context, uri)
+        }
+        if (writeResult.isFailure) {
+            context.contentResolver.delete(uri, null, null)
+            return@withContext Result.failure(
+                writeResult.exceptionOrNull() ?: IllegalStateException("视频保存失败"),
+            )
+        }
+        Result.success(displayName)
+    }
+
+    private fun videoDownloadCandidates(url: String): List<String> {
+        val trimmed = url.trim()
+        if (trimmed.isBlank()) return emptyList()
+        if (trimmed.startsWith("http://", ignoreCase = true)) {
+            return listOf(trimmed.replaceFirst("http://", "https://", ignoreCase = true), trimmed)
+        }
+        return listOf(trimmed)
+    }
+
     fun formatInfo(image: FeedImage, sizeBytes: Long?): List<String> = buildList {
         add("图片 ID：${image.id}")
         val width = image.width
