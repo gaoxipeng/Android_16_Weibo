@@ -35,6 +35,8 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -110,8 +112,11 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
@@ -135,8 +140,10 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
@@ -165,8 +172,6 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.compose.ui.window.Popup
-import androidx.compose.ui.window.PopupProperties
 import com.example.myweibo.R
 import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
@@ -246,6 +251,29 @@ private data class VisitedProfileSnapshot(
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
+
+private data class ImagePeekRequest(
+    val image: FeedImage,
+    val allImages: List<FeedImage>,
+    val imageIndex: Int,
+    val anchorBounds: Rect,
+    val onDismiss: () -> Unit,
+)
+
+private class ImagePeekController {
+    var activeRequest by mutableStateOf<ImagePeekRequest?>(null)
+
+    fun open(request: ImagePeekRequest) {
+        activeRequest = request
+    }
+
+    fun dismiss() {
+        activeRequest?.onDismiss?.invoke()
+        activeRequest = null
+    }
+}
+
+private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 
 private fun videoPlaybackKey(media: FeedMedia): String =
     media.streamUrl.ifBlank { media.downloadUrl.orEmpty() }.ifBlank { media.coverUrl.orEmpty() }
@@ -931,9 +959,14 @@ fun WeiboApp() {
         onRefresh = { refreshTimeline() },
     ) { innerPadding ->
         val hazeState = rememberHazeState()
-        Box(Modifier.fillMaxSize().padding(innerPadding)) {
-            CompositionLocalProvider(LocalHazeState provides hazeState) {
-            Box(Modifier.fillMaxSize().hazeSource(state = hazeState)) {
+        val imagePeekController = remember { ImagePeekController() }
+        CompositionLocalProvider(
+            LocalHazeState provides hazeState,
+            LocalImagePeekController provides imagePeekController,
+        ) {
+            Box(Modifier.fillMaxSize()) {
+            Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
+            Box(Modifier.fillMaxSize().padding(innerPadding)) {
             when {
                 selectedItem != null -> DetailScreen(
                     item = selectedItem!!,
@@ -1169,6 +1202,16 @@ fun WeiboApp() {
                 onDismiss = { exitHintVisible = false },
                 modifier = Modifier.align(Alignment.Center),
             )
+            }
+            }
+            imagePeekController.activeRequest?.let { request ->
+                ImageActionOverlay(
+                    image = request.image,
+                    allImages = request.allImages,
+                    initialImageIndex = request.imageIndex,
+                    anchorBounds = request.anchorBounds,
+                    onDismiss = { imagePeekController.dismiss() },
+                )
             }
             }
         }
@@ -2415,6 +2458,7 @@ private fun singleImageDisplayAspectRatio(width: Int, height: Int): Float {
 private fun FeedImageCell(
     image: FeedImage,
     allImages: List<FeedImage>,
+    imageIndex: Int = 0,
     modifier: Modifier = Modifier,
     previewUrl: String? = null,
     contentScale: ContentScale = ContentScale.Crop,
@@ -2423,15 +2467,39 @@ private fun FeedImageCell(
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
+    var longPressTriggered by remember(image.id) { mutableStateOf(false) }
     var anchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
+    val imagePeekController = LocalImagePeekController.current
+    val haptic = LocalHapticFeedback.current
     val peekScale by animateFloatAsState(
-        targetValue = if (peekActive) 1.08f else 1f,
+        targetValue = if (peekActive) 0.96f else 1f,
         animationSpec = spring(
             dampingRatio = Spring.DampingRatioMediumBouncy,
             stiffness = Spring.StiffnessMedium,
         ),
         label = "feed-image-peek-scale",
     )
+
+    LaunchedEffect(longPressTriggered) {
+        if (!longPressTriggered) return@LaunchedEffect
+        delay(220)
+        if (!longPressTriggered) return@LaunchedEffect
+        val bounds = anchorBounds ?: return@LaunchedEffect
+        actionOpen = true
+        imagePeekController.open(
+            ImagePeekRequest(
+                image = image,
+                allImages = allImages,
+                imageIndex = imageIndex,
+                anchorBounds = bounds,
+                onDismiss = {
+                    actionOpen = false
+                    peekActive = false
+                    longPressTriggered = false
+                },
+            ),
+        )
+    }
 
     Box(
         modifier = modifier
@@ -2442,6 +2510,7 @@ private fun FeedImageCell(
             .graphicsLayer {
                 scaleX = peekScale
                 scaleY = peekScale
+                alpha = if (actionOpen) 0f else 1f
                 clip = false
             }
             .clip(RoundedCornerShape(4.dp))
@@ -2450,13 +2519,15 @@ private fun FeedImageCell(
                 detectTapGestures(
                     onTap = { onOpenViewer() },
                     onLongPress = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        longPressTriggered = true
                         peekActive = true
-                        actionOpen = true
                     },
                     onPress = {
                         tryAwaitRelease()
                         if (!actionOpen) {
                             peekActive = false
+                            longPressTriggered = false
                         }
                     },
                 )
@@ -2489,64 +2560,6 @@ private fun FeedImageCell(
         }
     }
 
-    if (actionOpen) {
-        anchorBounds?.let { bounds ->
-            ImageActionOverlay(
-                image = image,
-                allImages = allImages,
-                anchorBounds = bounds,
-                onDismiss = {
-                    actionOpen = false
-                    peekActive = false
-                },
-            )
-        }
-    }
-}
-
-private fun calculateImageActionCardOffset(
-    anchorBounds: Rect,
-    cardSize: IntSize,
-    screenWidthPx: Float,
-    screenHeightPx: Float,
-    density: androidx.compose.ui.unit.Density,
-): IntOffset {
-    val marginPx = with(density) { 12.dp.toPx() }
-    val gapPx = with(density) { 10.dp.toPx() }
-    val cardWidth = if (cardSize.width > 0) {
-        cardSize.width.toFloat()
-    } else {
-        with(density) { 240.dp.toPx() }
-    }
-    val cardHeight = if (cardSize.height > 0) {
-        cardSize.height.toFloat()
-    } else {
-        with(density) { 168.dp.toPx() }
-    }
-
-    var x = anchorBounds.center.x - cardWidth / 2f
-    x = x.coerceIn(marginPx, (screenWidthPx - cardWidth - marginPx).coerceAtLeast(marginPx))
-
-    val spaceBelow = screenHeightPx - anchorBounds.bottom
-    val spaceAbove = anchorBounds.top
-    var showBelow = spaceBelow >= spaceAbove
-
-    var y = if (showBelow) {
-        anchorBounds.bottom + gapPx
-    } else {
-        anchorBounds.top - gapPx - cardHeight
-    }
-
-    if (showBelow && y + cardHeight > screenHeightPx - marginPx && spaceAbove > spaceBelow) {
-        showBelow = false
-        y = anchorBounds.top - gapPx - cardHeight
-    } else if (!showBelow && y < marginPx && spaceBelow >= spaceAbove) {
-        showBelow = true
-        y = anchorBounds.bottom + gapPx
-    }
-
-    y = y.coerceIn(marginPx, (screenHeightPx - cardHeight - marginPx).coerceAtLeast(marginPx))
-    return IntOffset(x.roundToInt(), y.roundToInt())
 }
 
 @OptIn(ExperimentalHazeMaterialsApi::class)
@@ -2556,42 +2569,48 @@ private fun ImageActionFrostedCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val hazeState = LocalHazeState.current
-    val shape = RoundedCornerShape(16.dp)
+    val shape = RoundedCornerShape(30.dp)
     Surface(
         modifier = modifier,
         shape = shape,
         color = Color.Transparent,
-        shadowElevation = 12.dp,
+        shadowElevation = 0.dp,
         tonalElevation = 0.dp,
     ) {
-        Box(Modifier.clip(shape)) {
+        Box(
+            Modifier
+                .clip(shape)
+                .border(0.6.dp, Color.Black.copy(alpha = 0.10f), shape),
+        ) {
             if (hazeState != null) {
                 Box(
                     Modifier
                         .matchParentSize()
                         .hazeEffect(state = hazeState, style = HazeMaterials.ultraThin()) {
-                            blurRadius = 28.dp
+                            blurRadius = 86.dp
                             noiseFactor = 0.04f
-                            alpha = 0.72f
-                        }
-                        .background(
-                            Brush.verticalGradient(
-                                colors = listOf(
-                                    Color.White.copy(alpha = 0.22f),
-                                    MaterialTheme.colorScheme.surface.copy(alpha = 0.58f),
-                                ),
-                            ),
-                        ),
-                )
-            } else {
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)),
+                            alpha = 1f
+                        },
                 )
             }
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .background(Color(0xFFF2F2F3).copy(alpha = 0.74f))
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.42f),
+                                Color(0xFFF1F1F2).copy(alpha = 0.28f),
+                                Color(0xFFD9D9DC).copy(alpha = 0.16f),
+                            ),
+                        ),
+                    ),
+            )
             Column(
-                Modifier.padding(vertical = 4.dp),
+                Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+                horizontalAlignment = Alignment.Start,
+                verticalArrangement = Arrangement.spacedBy(11.dp),
                 content = content,
             )
         }
@@ -2602,6 +2621,7 @@ private fun ImageActionFrostedCard(
 private fun ImageActionOverlay(
     image: FeedImage,
     allImages: List<FeedImage>,
+    initialImageIndex: Int,
     anchorBounds: Rect,
     onDismiss: () -> Unit,
 ) {
@@ -2610,128 +2630,250 @@ private fun ImageActionOverlay(
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     var saving by remember { mutableStateOf(false) }
-    var showInfo by remember { mutableStateOf(false) }
-    var infoSizeBytes by remember { mutableStateOf<Long?>(null) }
-    var cardSize by remember { mutableStateOf(IntSize.Zero) }
+    val images = allImages.ifEmpty { listOf(image) }
+    val safeInitialIndex = initialImageIndex.coerceIn(0, images.lastIndex)
+    val pagerState = rememberPagerState(initialPage = safeInitialIndex) { images.size }
+    val currentImage = images[pagerState.currentPage]
+    val enterProgress = remember { Animatable(0f) }
+    val dragY = remember { Animatable(0f) }
 
-    LaunchedEffect(showInfo, image.id) {
-        if (showInfo) {
-            infoSizeBytes = ImageSaveHelper.probeSizeBytes(image)
-        }
-    }
-
-    if (showInfo) {
-        AlertDialog(
-            onDismissRequest = { showInfo = false },
-            title = { Text("图片信息") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ImageSaveHelper.formatInfo(image, infoSizeBytes).forEach { line ->
-                        Text(line, style = MaterialTheme.typography.bodyMedium)
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showInfo = false }) {
-                    Text("关闭")
-                }
-            },
+    LaunchedEffect(Unit) {
+        enterProgress.animateTo(
+            targetValue = 1f,
+            animationSpec = spring(
+                dampingRatio = Spring.DampingRatioNoBouncy,
+                stiffness = Spring.StiffnessMediumLow,
+            ),
         )
     }
 
-    Popup(
-        onDismissRequest = onDismiss,
-        properties = PopupProperties(
-            focusable = true,
-            dismissOnBackPress = true,
-            dismissOnClickOutside = true,
-            clippingEnabled = false,
-        ),
+    fun dismissOverlay() {
+        scope.launch {
+            enterProgress.animateTo(0f, tween(180))
+            onDismiss()
+        }
+    }
+
+    val progress = enterProgress.value
+    val dragFade = (dragY.value / 300f).coerceIn(0f, 0.9f)
+    val scrimAlpha = (0.18f * progress) * (1f - dragFade)
+
+    BackHandler { dismissOverlay() }
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            .zIndex(300f),
     ) {
-        BackHandler { onDismiss() }
-        BoxWithConstraints(Modifier.fillMaxSize()) {
-            val screenWidthPx = with(density) { maxWidth.toPx() }
-            val screenHeightPx = with(density) { maxHeight.toPx() }
-            val cardOffset = calculateImageActionCardOffset(
-                anchorBounds = anchorBounds,
-                cardSize = cardSize,
-                screenWidthPx = screenWidthPx,
-                screenHeightPx = screenHeightPx,
-                density = density,
-            )
-            val showBelowMenu = (screenHeightPx - anchorBounds.bottom) >= anchorBounds.top
-
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.16f))
-                    .clickable(onClick = onDismiss),
-            )
-
-            AnimatedVisibility(
-                visible = true,
-                modifier = Modifier.offset { cardOffset },
-                enter = fadeIn(tween(140)) + scaleIn(
-                    initialScale = 0.92f,
-                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-                ) + slideInVertically(
-                    initialOffsetY = { fullHeight ->
-                        if (showBelowMenu) -fullHeight / 4 else fullHeight / 4
-                    },
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = scrimAlpha))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = { dismissOverlay() },
                 ),
-                exit = fadeOut(tween(100)) + scaleOut(targetScale = 0.92f),
+        )
+
+            val previewAspect = feedImagePreviewAspectRatio(currentImage)
+            val previewWidth = minOf(maxWidth * 0.88f, 340.dp)
+            val previewHeight = previewWidth / previewAspect
+            val targetLeft = (maxWidth - previewWidth) / 2
+            val targetTop = maxHeight * 0.18f
+            val anchorLeft = with(density) { anchorBounds.left.toDp() }
+            val anchorTop = with(density) { anchorBounds.top.toDp() }
+            val anchorWidth = with(density) { anchorBounds.width.toDp().coerceAtLeast(1.dp) }
+            val anchorHeight = with(density) { anchorBounds.height.toDp().coerceAtLeast(1.dp) }
+            val previewLeft = anchorLeft + (targetLeft - anchorLeft) * progress
+            val previewTop = anchorTop + (targetTop - anchorTop) * progress + with(density) { dragY.value.toDp() }
+            val previewW = anchorWidth + (previewWidth - anchorWidth) * progress
+            val previewH = anchorHeight + (previewHeight - anchorHeight) * progress
+            val previewCorner = 4.dp + (18.dp - 4.dp) * progress
+            val previewAlpha = (1f - dragFade) * progress.coerceIn(0f, 1f)
+            val previewShape = RoundedCornerShape(previewCorner)
+            val dragOffsetY = with(density) { dragY.value.toDp() }
+
+            Column(
+                modifier = Modifier
+                    .offset(x = previewLeft, y = previewTop + dragOffsetY)
+                    .width(previewW)
+                    .graphicsLayer { alpha = previewAlpha },
             ) {
-                ImageActionFrostedCard(
+                Box(
                     modifier = Modifier
-                        .widthIn(min = 220.dp, max = 280.dp)
-                        .onSizeChanged { cardSize = it },
+                        .size(previewW, previewH)
+                        .shadow(
+                            elevation = (18f * progress).dp,
+                            shape = previewShape,
+                            clip = false,
+                        )
+                        .clip(previewShape)
+                        .background(Color.Black)
+                        .pointerInput(Unit) {
+                            detectVerticalDragGestures(
+                                onVerticalDrag = { _, amount ->
+                                    scope.launch {
+                                        dragY.snapTo((dragY.value + amount).coerceAtLeast(0f))
+                                    }
+                                },
+                                onDragEnd = {
+                                    if (dragY.value > 140f) {
+                                        dismissOverlay()
+                                    } else {
+                                        scope.launch {
+                                            dragY.animateTo(
+                                                targetValue = 0f,
+                                                animationSpec = spring(stiffness = Spring.StiffnessMedium),
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        },
                 ) {
-                    ImageActionRow(
-                        label = "保存图片",
-                        enabled = !saving,
-                        onClick = {
-                            saving = true
-                            scope.launch {
-                                ImageSaveHelper.saveImage(context, image)
-                                    .onSuccess { name ->
-                                        onMessage("保存成功", "已保存到相册：$name")
-                                        onDismiss()
-                                    }
-                                    .onFailure { error ->
-                                        onMessage("保存失败", error.message ?: "请稍后重试")
-                                    }
-                                saving = false
+                    if (images.size > 1) {
+                        HorizontalPager(
+                            state = pagerState,
+                            modifier = Modifier.fillMaxSize(),
+                        ) { page ->
+                            ImageActionPreviewImage(
+                                image = images[page],
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                    } else {
+                        ImageActionPreviewImage(
+                            image = currentImage,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+
+                    if (images.size > 1) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            images.forEachIndexed { index, _ ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(if (index == pagerState.currentPage) 7.dp else 6.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            Color.White.copy(
+                                                alpha = if (index == pagerState.currentPage) 0.95f else 0.42f,
+                                            ),
+                                        ),
+                                )
                             }
-                        },
-                    )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.18f))
-                    ImageActionRow(
-                        label = "保存该条微博所有图片",
-                        enabled = !saving && allImages.isNotEmpty(),
-                        onClick = {
-                            saving = true
-                            scope.launch {
-                                ImageSaveHelper.saveAllImages(context, allImages)
-                                    .onSuccess { count ->
-                                        onMessage("保存成功", "已保存 $count 张图片到相册")
-                                        onDismiss()
+                        }
+                    }
+                }
+
+                AnimatedVisibility(
+                    visible = progress > 0.55f,
+                    enter = fadeIn(tween(160)) + scaleIn(
+                        initialScale = 0.94f,
+                        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.CenterEnd,
+                    ) {
+                        ImageActionFrostedCard(
+                            modifier = Modifier.widthIn(min = 150.dp, max = 180.dp),
+                        ) {
+                            ImageActionRow(
+                                label = "保存",
+                                enabled = !saving,
+                                onClick = {
+                                    saving = true
+                                    scope.launch {
+                                        ImageSaveHelper.saveImage(context, currentImage)
+                                            .onSuccess { name ->
+                                                onMessage("保存成功", "已保存到相册：$name")
+                                                dismissOverlay()
+                                            }
+                                            .onFailure { error ->
+                                                onMessage("保存失败", error.message ?: "请稍后重试")
+                                            }
+                                        saving = false
                                     }
-                                    .onFailure { error ->
-                                        onMessage("保存失败", error.message ?: "请稍后重试")
+                                },
+                            )
+                            HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+                            ImageActionRow(
+                                label = "保存全部",
+                                enabled = !saving && images.isNotEmpty(),
+                                onClick = {
+                                    saving = true
+                                    scope.launch {
+                                        ImageSaveHelper.saveAllImages(context, images)
+                                            .onSuccess { count ->
+                                                onMessage("保存成功", "已保存 $count 张图片到相册")
+                                                dismissOverlay()
+                                            }
+                                            .onFailure { error ->
+                                                onMessage("保存失败", error.message ?: "请稍后重试")
+                                            }
+                                        saving = false
                                     }
-                                saving = false
-                            }
-                        },
-                    )
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.18f))
-                    ImageActionRow(
-                        label = "图片信息",
-                        enabled = !saving,
-                        onClick = { showInfo = true },
-                    )
+                                },
+                            )
+                            HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+                            ImageActionRow(
+                                label = "分享",
+                                enabled = !saving,
+                                onClick = {
+                                    saving = true
+                                    scope.launch {
+                                        ImageSaveHelper.shareImage(context, currentImage)
+                                            .onFailure { error ->
+                                                onMessage("分享失败", error.message ?: "请稍后重试")
+                                            }
+                                        saving = false
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
             }
-        }
+    }
+}
+
+private fun feedImagePreviewAspectRatio(image: FeedImage): Float {
+    val width = image.width ?: 0
+    val height = image.height ?: 0
+    if (width > 0 && height > 0) {
+        return (width.toFloat() / height.toFloat()).coerceIn(0.45f, 2.2f)
+    }
+    return 1f
+}
+
+@Composable
+private fun ImageActionPreviewImage(
+    image: FeedImage,
+    modifier: Modifier = Modifier,
+) {
+    if (image.isGif) {
+        AnimatedRemoteImage(
+            url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
+            modifier = modifier,
+            contentScale = ContentScale.Fit,
+        )
+    } else {
+        RemoteImage(
+            url = image.largeUrl.ifBlank { image.thumbnailUrl },
+            fallbackUrls = image.downloadUrls.filter { it.isNotBlank() },
+            modifier = modifier,
+            contentScale = ContentScale.Fit,
+        )
     }
 }
 
@@ -2741,19 +2883,21 @@ private fun ImageActionRow(
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
-    TextButton(
-        onClick = onClick,
-        enabled = enabled,
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 4.dp),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            .height(28.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 7.dp),
+        contentAlignment = Alignment.CenterStart,
     ) {
         Text(
             text = label,
             modifier = Modifier.fillMaxWidth(),
             textAlign = TextAlign.Start,
-            style = MaterialTheme.typography.bodyMedium,
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (enabled) Color(0xFF1C1C1E) else Color(0x661C1C1E),
         )
     }
 }
@@ -2822,6 +2966,7 @@ private fun MediaStrip(
                             FeedImageCell(
                                 image = image,
                                 allImages = images,
+                                imageIndex = images.indexOf(image),
                                 modifier = Modifier
                                     .weight(1f)
                                     .aspectRatio(
@@ -3379,7 +3524,7 @@ private fun InlineVideoPlayer(media: FeedMedia, onClick: () -> Unit = {}) {
             .clip(RoundedCornerShape(8.dp))
             .background(MaterialTheme.colorScheme.surfaceContainerHighest),
     ) {
-        if (inlinePlaying && media.type == MediaType.Video) {
+        if (inlinePlaying && !fullscreen && media.type == MediaType.Video) {
             WeiboVideoSurface(
                 media = media,
                 isFullscreen = false,
@@ -3474,6 +3619,30 @@ private fun WeiboVideoSurface(
     var isPlaying by remember(videoUrl) { mutableStateOf(true) }
     var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
     var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
+    var controlsVisible by remember(videoUrl) { mutableStateOf(true) }
+    var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
+
+    fun showControls() {
+        controlsVisible = true
+        controlsHideSignal++
+    }
+
+    fun toggleControls() {
+        if (controlsVisible) {
+            controlsVisible = false
+        } else {
+            showControls()
+        }
+    }
+
+    LaunchedEffect(isPlaying, isBuffering, playbackError, controlsHideSignal) {
+        if (!isPlaying || isBuffering || playbackError != null) {
+            controlsVisible = true
+            return@LaunchedEffect
+        }
+        delay(3_000)
+        controlsVisible = false
+    }
 
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
     val player = remember(videoUrl) {
@@ -3517,6 +3686,7 @@ private fun WeiboVideoSurface(
         player.addListener(listener)
         onDispose {
             videoCoordinator.positions[playbackKey] = player.currentPosition.coerceAtLeast(0L)
+            player.pause()
             player.removeListener(listener)
             player.release()
         }
@@ -3539,22 +3709,27 @@ private fun WeiboVideoSurface(
         AndroidView(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(player, selectedSpeed) {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        down.consume()
-                        val upBeforeLongPress = withTimeoutOrNull(360L) { waitForUpOrCancellation() }
-                        if (upBeforeLongPress == null) {
-                            displayedSpeed = 2f
-                            player.setPlaybackSpeed(2f)
-                            val up = waitForUpOrCancellation()
-                            up?.consume()
-                            displayedSpeed = selectedSpeed
-                            player.setPlaybackSpeed(selectedSpeed)
-                        } else {
-                            upBeforeLongPress.consume()
-                        }
-                    }
+                .pointerInput(player, selectedSpeed, isFullscreen, onFullscreen) {
+                    detectTapGestures(
+                        onTap = { toggleControls() },
+                        onDoubleTap = {
+                            if (!isFullscreen) {
+                                onFullscreen()
+                            }
+                        },
+                        onPress = {
+                            val releasedEarly = withTimeoutOrNull(360L) { tryAwaitRelease() }
+                            if (releasedEarly == null) {
+                                showControls()
+                                displayedSpeed = 2f
+                                player.setPlaybackSpeed(2f)
+                                tryAwaitRelease()
+                                displayedSpeed = selectedSpeed
+                                player.setPlaybackSpeed(selectedSpeed)
+                                showControls()
+                            }
+                        },
+                    )
                 },
             factory = { ctx ->
                 androidx.media3.ui.PlayerView(ctx).apply {
@@ -3567,15 +3742,22 @@ private fun WeiboVideoSurface(
             update = { it.player = player },
         )
 
-        if (!isFullscreen) {
+        AnimatedVisibility(
+            visible = controlsVisible && !isFullscreen,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            modifier = Modifier.align(Alignment.TopStart),
+        ) {
             GlassTextButton(
                 text = "全屏",
                 modifier = Modifier
-                    .align(Alignment.TopStart)
                     .padding(10.dp)
                     .width(54.dp)
                     .height(28.dp),
-                onClick = onFullscreen,
+                onClick = {
+                    showControls()
+                    onFullscreen()
+                },
             )
         }
 
@@ -3605,42 +3787,53 @@ private fun WeiboVideoSurface(
             }
         }
 
-        VideoControls(
-            isPlaying = isPlaying,
-            positionMs = positionMs,
-            durationMs = durationMs,
-            speed = displayedSpeed,
-            onPlayPause = {
-                if (player.isPlaying) {
-                    player.pause()
-                } else {
-                    if (durationMs > 0 && positionMs >= durationMs - 500) {
-                        player.seekTo(0)
-                    }
-                    videoCoordinator.activeKey = playbackKey
-                    player.play()
-                }
-                isPlaying = player.isPlaying
-            },
-            onSeek = { target ->
-                positionMs = target
-                player.seekTo(target)
-            },
-            onSpeedClick = {
-                selectedSpeed = when (selectedSpeed) {
-                    1f -> 1.5f
-                    1.5f -> 2f
-                    else -> 1f
-                }
-                displayedSpeed = selectedSpeed
-                player.setPlaybackSpeed(selectedSpeed)
-            },
+        AnimatedVisibility(
+            visible = controlsVisible,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { it },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(start = 6.dp, end = 6.dp, bottom = if (isFullscreen) 24.dp else 8.dp)
-                .fillMaxWidth()
-                .height(32.dp),
-        )
+                .fillMaxWidth(),
+        ) {
+            VideoControls(
+                isPlaying = isPlaying,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                speed = displayedSpeed,
+                onPlayPause = {
+                    showControls()
+                    if (player.isPlaying) {
+                        player.pause()
+                    } else {
+                        if (durationMs > 0 && positionMs >= durationMs - 500) {
+                            player.seekTo(0)
+                        }
+                        videoCoordinator.activeKey = playbackKey
+                        player.play()
+                    }
+                    isPlaying = player.isPlaying
+                },
+                onSeek = { target ->
+                    showControls()
+                    positionMs = target
+                    player.seekTo(target)
+                },
+                onSpeedClick = {
+                    showControls()
+                    selectedSpeed = when (selectedSpeed) {
+                        1f -> 1.5f
+                        1.5f -> 2f
+                        else -> 1f
+                    }
+                    displayedSpeed = selectedSpeed
+                    player.setPlaybackSpeed(selectedSpeed)
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp),
+            )
+        }
     }
 }
 
@@ -4023,6 +4216,7 @@ private fun CommentImageStrip(images: List<FeedImage>) {
             FeedImageCell(
                 image = image,
                 allImages = images,
+                imageIndex = index,
                 modifier = Modifier.size(72.dp),
                 previewUrl = image.thumbnailUrl,
                 contentScale = ContentScale.Crop,
@@ -5288,6 +5482,11 @@ private fun HiddenSessionWebView(session: WeiboWebSession) {
 
 @Composable
 private fun FullscreenMediaPreview(media: FeedMedia, onDismiss: () -> Unit) {
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    DisposableEffect(media) {
+        videoCoordinator.activeKey = null
+        onDispose { }
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),

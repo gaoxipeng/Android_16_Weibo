@@ -2,11 +2,15 @@ package com.example.myweibo.data
 
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -77,6 +81,29 @@ object ImageSaveHelper {
             }
         }
         Result.success(displayName)
+    }
+
+    suspend fun shareImage(context: Context, image: FeedImage): Result<Unit> = withContext(Dispatchers.IO) {
+        val bytes = loadBytes(image) ?: return@withContext Result.failure(IllegalStateException("图片下载失败"))
+        val isGif = image.isGif || looksLikeGif(bytes)
+        val ext = if (isGif) "gif" else "jpg"
+        val mime = if (isGif) "image/gif" else "image/jpeg"
+        val file = File(context.cacheDir, "share_${sanitize(image.id)}_${System.currentTimeMillis()}.$ext")
+        file.writeBytes(bytes)
+        withContext(Dispatchers.Main) {
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(intent, "分享图片"))
+        }
+        Result.success(Unit)
     }
 
     suspend fun saveAllImages(context: Context, images: List<FeedImage>): Result<Int> = withContext(Dispatchers.IO) {
@@ -152,17 +179,21 @@ object ImageSaveHelper {
         displayName: String,
         mimeType: String,
         relativePath: String,
-    ): android.net.Uri? {
-        val uri = context.contentResolver.insert(
-            MediaStore.Files.getContentUri("external"),
+    ): Uri? {
+        val collection = when {
+            mimeType.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            mimeType.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            else -> MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        }
+        return context.contentResolver.insert(
+            collection,
             ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
                 put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                 put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             },
-        ) ?: return null
-        return uri
+        )
     }
 
     private fun finalizeMedia(context: Context, uri: android.net.Uri) {
