@@ -50,7 +50,7 @@ class WeiboWebSession(context: Context) {
         val cookie = CookieManager.getInstance().getCookie(WEIBO_HOME)
             ?: CookieManager.getInstance().getCookie("https://www.weibo.com/")
             ?: ""
-        return cookie.contains("SUB=") || cookie.contains("SUBP=")
+        return hasAuthenticatedCookie(cookie)
     }
 
     suspend fun loadTimeline(kind: TimelineKind, cursor: String? = null): TimelinePage {
@@ -212,6 +212,19 @@ class WeiboWebSession(context: Context) {
 
     data class CommentsPage(val items: List<CommentItem>, val nextCursor: String?)
 
+    private fun commentRequestParams(item: FeedItem, sort: CommentSort): LinkedHashMap<String, String> =
+        linkedMapOf(
+            "id" to item.id,
+            "uid" to item.authorId,
+            "flow" to sort.flow,
+            "is_reload" to "1",
+            "is_show_bulletin" to "2",
+            "is_mix" to "0",
+            "count" to "20",
+            "fetch_level" to "0",
+            "locale" to "zh",
+        )
+
     suspend fun expandLongText(item: FeedItem): FeedItem {
         val candidates = buildList {
             item.statusId.takeIf { it.isNotBlank() }?.let { add(it) }
@@ -260,20 +273,10 @@ class WeiboWebSession(context: Context) {
         throw lastError ?: IllegalStateException("微博长文接口未返回内容")
     }
 
-    suspend fun loadComments(item: FeedItem): CommentsPage {
+    suspend fun loadComments(item: FeedItem, sort: CommentSort = CommentSort.Time): CommentsPage {
         val raw = fetchJson(
             WeiboEndpoints.STATUS_COMMENTS,
-            linkedMapOf(
-                "id" to item.id,
-                "uid" to item.authorId,
-                "flow" to "0",
-                "is_reload" to "1",
-                "is_show_bulletin" to "2",
-                "is_mix" to "0",
-                "count" to "20",
-                "fetch_level" to "0",
-                "locale" to "zh",
-            )
+            commentRequestParams(item, sort),
         )
         val items = WeiboJsonParser.parseComments(raw)
         val json = org.json.JSONObject(raw)
@@ -282,21 +285,14 @@ class WeiboWebSession(context: Context) {
         return CommentsPage(items, cursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
-    suspend fun loadMoreComments(item: FeedItem, cursor: String): CommentsPage {
+    suspend fun loadMoreComments(
+        item: FeedItem,
+        cursor: String,
+        sort: CommentSort = CommentSort.Time,
+    ): CommentsPage {
         val raw = fetchJson(
             WeiboEndpoints.STATUS_COMMENTS,
-            linkedMapOf(
-                "id" to item.id,
-                "uid" to item.authorId,
-                "flow" to "0",
-                "is_reload" to "1",
-                "is_show_bulletin" to "2",
-                "is_mix" to "0",
-                "count" to "20",
-                "fetch_level" to "0",
-                "locale" to "zh",
-                "max_id" to cursor,
-            )
+            commentRequestParams(item, sort) + linkedMapOf("max_id" to cursor),
         )
         val items = WeiboJsonParser.parseComments(raw)
         val json = org.json.JSONObject(raw)
@@ -410,7 +406,7 @@ class WeiboWebSession(context: Context) {
             val cookie = CookieManager.getInstance().getCookie(WEIBO_HOME)
                 ?: CookieManager.getInstance().getCookie("https://www.weibo.com/")
                 ?: ""
-            if (!cookie.contains("SUB=") && !cookie.contains("SUBP=")) {
+            if (!hasAuthenticatedCookie(cookie)) {
                 throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后回到微博首页")
             }
 
@@ -430,6 +426,7 @@ class WeiboWebSession(context: Context) {
             }
 
             val status = connection.responseCode
+            syncResponseCookies(connection)
             val body = if (status in 200..299) {
                 connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             } else {
@@ -453,7 +450,7 @@ class WeiboWebSession(context: Context) {
                 ?: CookieManager.getInstance().getCookie(WEIBO_HOME)
                 ?: CookieManager.getInstance().getCookie("https://www.weibo.com/")
                 ?: ""
-            if (!cookie.contains("SUB=") && !cookie.contains("SUBP=")) {
+            if (!hasAuthenticatedCookie(cookie)) {
                 throw IllegalStateException("\u672A\u53D1\u73B0\u5FAE\u535A\u767B\u5F55 Cookie")
             }
 
@@ -472,6 +469,7 @@ class WeiboWebSession(context: Context) {
             }
 
             val status = connection.responseCode
+            syncResponseCookies(connection)
             val body = if (status in 200..299) {
                 connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             } else {
@@ -486,12 +484,33 @@ class WeiboWebSession(context: Context) {
             body
         }
 
+    private fun syncResponseCookies(connection: HttpURLConnection) {
+        val manager = CookieManager.getInstance()
+        val requestUrl = connection.url.toString()
+        connection.headerFields?.forEach { (key, values) ->
+            if (key != null && key.equals("Set-Cookie", ignoreCase = true)) {
+                values.forEach { cookieLine ->
+                    manager.setCookie(requestUrl, cookieLine)
+                    COOKIE_ORIGINS.forEach { origin ->
+                        manager.setCookie(origin, cookieLine)
+                    }
+                }
+            }
+        }
+        manager.flush()
+    }
+
     private fun buildUrl(path: String, params: Map<String, String>): String {
         val query = params.entries.joinToString("&") { (key, value) ->
             "${key.urlEncode()}=${value.urlEncode()}"
         }
         return "https://weibo.com$path" + if (query.isBlank()) "" else "?$query"
     }
+
+    private fun hasAuthenticatedCookie(cookie: String): Boolean =
+        cookie.split(";")
+            .map { it.trim() }
+            .any { it.startsWith("SUB=") && it.length > "SUB=".length }
 
     private fun String.urlEncode(): String =
         URLEncoder.encode(this, Charsets.UTF_8.name())

@@ -67,6 +67,17 @@ enum class MediaType {
     Audio
 }
 
+enum class CommentSort(val flow: String, val label: String) {
+    Time("1", "按时间"),
+    Hot("0", "按热度"),
+    ;
+
+    companion object {
+        fun fromFlow(flow: String?): CommentSort =
+            entries.firstOrNull { it.flow == flow } ?: Time
+    }
+}
+
 data class CommentItem(
     val id: String,
     val authorId: String = "",

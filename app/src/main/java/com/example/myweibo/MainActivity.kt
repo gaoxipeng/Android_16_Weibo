@@ -28,6 +28,17 @@ class MainActivity : ComponentActivity() {
             }
             override fun put(uri: URI, responseHeaders: Map<String, List<String>>?) {
                 fallback.put(uri, responseHeaders)
+                val webkit = android.webkit.CookieManager.getInstance()
+                responseHeaders?.forEach { (key, values) ->
+                    if (key.equals("Set-Cookie", ignoreCase = true) ||
+                        key.equals("Set-Cookie2", ignoreCase = true)
+                    ) {
+                        values.forEach { cookieLine ->
+                            webkit.setCookie(uri.toString(), cookieLine)
+                        }
+                    }
+                }
+                webkit.flush()
             }
         })
 

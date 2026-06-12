@@ -69,6 +69,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerDefaults
@@ -181,9 +182,13 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import com.example.myweibo.R
 import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
+import com.example.myweibo.data.CommentSort
+import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FeedImage
@@ -198,6 +203,7 @@ import com.example.myweibo.data.StoredWeiboAccount
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.data.UserProfile
+import com.example.myweibo.data.WeiboStatusActions
 import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
 import com.example.myweibo.data.WeiboWebSession
@@ -336,6 +342,7 @@ fun WeiboApp() {
     val mineCacheStore = remember { MineCacheStore(context) }
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
+    val commentSortStore = remember { CommentSortStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -361,6 +368,7 @@ fun WeiboApp() {
     var commentsLoading by remember { mutableStateOf(false) }
     var commentsCursor by remember { mutableStateOf<String?>(null) }
     var commentsHasMore by remember { mutableStateOf(true) }
+    var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
@@ -401,10 +409,24 @@ fun WeiboApp() {
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
     var exitHintVisible by remember { mutableStateOf(false) }
     var exitHintToken by remember { mutableIntStateOf(0) }
+    var pendingOpenAccountLogin by remember { mutableStateOf(false) }
+
+    fun openAccountLoginManagement() {
+        selectedTab = MainTab.Mine
+        pendingOpenAccountLogin = true
+    }
 
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
+    }
+
+    fun isLoginStateFailure(error: Throwable): Boolean {
+        val message = error.message.orEmpty()
+        return message.contains("未发现微博登录 Cookie") ||
+            message.contains("登录未生效") ||
+            message.contains("weibo-native-request-failed:401") ||
+            message.contains("weibo-native-request-failed:403")
     }
 
     fun reloadStoredAccounts() {
@@ -667,6 +689,7 @@ fun WeiboApp() {
                     items = page.items
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
+                    persistLoginSession()
                     if (page.items.isEmpty()) {
                         feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
@@ -676,6 +699,13 @@ fun WeiboApp() {
                 }
                 .onFailure { error ->
                     feedRefreshHint = null
+                    if (isLoginStateFailure(error)) {
+                        hasLoginCookie = false
+                        mineHasLoginCookie = false
+                    } else {
+                        hasLoginCookie = session.hasLoginCookie()
+                        mineHasLoginCookie = hasLoginCookie
+                    }
                     showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                 }
             isLoading = false
@@ -698,6 +728,7 @@ fun WeiboApp() {
                     items = page.items
                     nextCursor = page.nextCursor
                     hasLoginCookie = true
+                    persistLoginSession()
                     if (page.items.isEmpty()) {
                         feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
@@ -707,6 +738,13 @@ fun WeiboApp() {
                 }
                 .onFailure { error ->
                     feedRefreshHint = null
+                    if (isLoginStateFailure(error)) {
+                        hasLoginCookie = false
+                        mineHasLoginCookie = false
+                    } else {
+                        hasLoginCookie = session.hasLoginCookie()
+                        mineHasLoginCookie = hasLoginCookie
+                    }
                     showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                 }
             isLoading = false
@@ -885,6 +923,25 @@ fun WeiboApp() {
         }
     }
 
+    fun reloadComments() {
+        val item = selectedItem ?: return
+        scope.launch {
+            commentsLoading = true
+            commentsCursor = null
+            commentsHasMore = true
+            runCatching { session.loadComments(item, commentSort) }
+                .onSuccess { page ->
+                    comments = page.items
+                    commentsCursor = page.nextCursor
+                    commentsHasMore = page.nextCursor != null
+                }
+                .onFailure { error ->
+                    showMessage("\u8BC4\u8BBA\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
+                }
+            commentsLoading = false
+        }
+    }
+
     fun openDetail(item: FeedItem) {
         pendingDetailReturnItem = null
         val resolved = resolveFeedItem(item)
@@ -896,17 +953,14 @@ fun WeiboApp() {
             loadLongText(resolved)
         }
         resolved.retweetedStatus?.takeIf { it.isLongText }?.let { loadLongText(it) }
-        scope.launch {
-            commentsLoading = true
-            runCatching { session.loadComments(resolved) }
-                .onSuccess { page ->
-                    comments = page.items
-                    commentsCursor = page.nextCursor
-                    commentsHasMore = page.nextCursor != null
-                }
-                .onFailure { error -> showMessage("\u8BC4\u8BBA\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94") }
-            commentsLoading = false
-        }
+        reloadComments()
+    }
+
+    fun changeCommentSort(sort: CommentSort) {
+        if (sort == commentSort) return
+        commentSort = sort
+        commentSortStore.write(sort)
+        reloadComments()
     }
 
     fun loadMoreComments() {
@@ -915,7 +969,7 @@ fun WeiboApp() {
         if (commentsLoading || !commentsHasMore) return
         scope.launch {
             commentsLoading = true
-            runCatching { session.loadMoreComments(item, cursor) }
+            runCatching { session.loadMoreComments(item, cursor, commentSort) }
                 .onSuccess { page ->
                     comments = comments + page.items
                     commentsCursor = page.nextCursor
@@ -1055,22 +1109,13 @@ fun WeiboApp() {
                 selectedItem != null -> DetailScreen(
                     item = selectedItem!!,
                     comments = comments,
+                    commentSort = commentSort,
                     isLoadingComments = commentsLoading,
                     isLongTextLoading = { it.statusId in longTextLoadingIds },
                     onLoadLongText = ::loadLongText,
                     onBack = { selectedItem = null },
-                    onRefresh = {
-                        scope.launch {
-                            commentsLoading = true
-                            commentsCursor = null
-                            runCatching { session.loadComments(selectedItem!!) }
-                                .onSuccess { page ->
-                                    comments = page.items
-                                    commentsCursor = page.nextCursor
-                                }
-                            commentsLoading = false
-                        }
-                    },
+                    onRefresh = { reloadComments() },
+                    onCommentSortChange = ::changeCommentSort,
                     onLoadMoreComments = { loadMoreComments() },
                     commentsHasMore = commentsHasMore,
                     onMediaClick = { mediaPreview = it },
@@ -1197,6 +1242,8 @@ fun WeiboApp() {
                                 refreshTimeline()
                             }
                         },
+                        pendingOpenAccountLogin = pendingOpenAccountLogin,
+                        onPendingOpenAccountLoginConsumed = { pendingOpenAccountLogin = false },
                     )
                 }
 
@@ -1215,7 +1262,7 @@ fun WeiboApp() {
                     emoticonMap = emoticonMap,
                     onRefresh = { refreshTimeline() },
                     onLoadMore = { loadMore() },
-                    onOpenLoginSettings = { selectedTab = MainTab.Mine },
+                    onOpenLoginSettings = ::openAccountLoginManagement,
                     onUserClick = ::openUser,
                     onItemClick = ::openDetail,
                     onMediaClick = { mediaPreview = it },
@@ -2375,7 +2422,15 @@ private fun FeedCard(
     ) {
         val resolvedEmoticonMap = item.emoticons.ifEmpty { emoticonMap }
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            AuthorRow(item = item, onUserClick = onUserClick)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Box(Modifier.weight(1f)) {
+                    AuthorRow(item = item, onUserClick = onUserClick)
+                }
+                FeedCardActionMenu(item = item)
+            }
             Column(
                 modifier = Modifier.clickable(onClick = onClick),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -2484,6 +2539,155 @@ private fun QuotedStatus(
                 )
             }
             MediaStrip(images = item.images, media = item.media, onMediaClick = onMediaClick)
+        }
+    }
+}
+
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun CommentSortActionMenu(
+    selected: CommentSort,
+    onSelected: (CommentSort) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+
+    fun dismissMenu() {
+        expanded = false
+    }
+
+    if (expanded) {
+        BackHandler { dismissMenu() }
+    }
+
+    val metaColor = weiboMetaTextColor()
+    Box {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                        expanded = !expanded
+                    },
+                )
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = selected.label,
+                style = MaterialTheme.typography.bodySmall,
+                color = metaColor,
+            )
+            SettingsExpandIndicator(
+                expanded = expanded,
+                modifier = Modifier.size(16.dp),
+                tint = metaColor,
+            )
+        }
+
+        if (expanded) {
+            Popup(
+                alignment = Alignment.TopEnd,
+                offset = IntOffset(0, with(density) { 30.dp.roundToPx() }),
+                onDismissRequest = { dismissMenu() },
+                properties = PopupProperties(focusable = true),
+            ) {
+                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
+                    CommentSort.entries.forEachIndexed { index, sort ->
+                        if (index > 0) {
+                            ImageActionMenuDivider()
+                        }
+                        ImageActionRow(
+                            label = sort.label,
+                            enabled = true,
+                            selected = sort == selected,
+                            onClick = {
+                                dismissMenu()
+                                if (sort != selected) {
+                                    onSelected(sort)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun FeedCardActionMenu(item: FeedItem) {
+    var expanded by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+    val shareUrl = remember(item.id, item.statusId, item.authorId) {
+        WeiboStatusActions.weiboUrl(item)
+    }
+
+    fun dismissMenu() {
+        expanded = false
+    }
+
+    if (expanded) {
+        BackHandler { dismissMenu() }
+    }
+
+    Box {
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                        expanded = !expanded
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            SettingsExpandIndicator(
+                expanded = expanded,
+                modifier = Modifier.size(18.dp),
+                tint = weiboMetaTextColor(),
+            )
+        }
+
+        if (expanded) {
+            Popup(
+                alignment = Alignment.TopEnd,
+                offset = IntOffset(0, with(density) { 34.dp.roundToPx() }),
+                onDismissRequest = { dismissMenu() },
+                properties = PopupProperties(focusable = true),
+            ) {
+                ImageActionFrostedCard(modifier = Modifier.width(140.dp)) {
+                    ImageActionRow(
+                        label = "跳转到微博",
+                        enabled = shareUrl != null,
+                        onClick = {
+                            dismissMenu()
+                            WeiboStatusActions.openInWeiboApp(context, item)
+                        },
+                    )
+                    ImageActionMenuDivider()
+                    ImageActionRow(
+                        label = "分享",
+                        enabled = shareUrl != null,
+                        onClick = {
+                            dismissMenu()
+                            WeiboStatusActions.shareLink(context, item)
+                        },
+                    )
+                }
+            }
         }
     }
 }
@@ -2677,6 +2881,24 @@ private fun FeedImageCell(
 
 }
 
+private val ActionMenuCornerRadius = 14.dp
+private val ActionMenuRowHeight = 40.dp
+private val ActionMenuPaddingHorizontal = 12.dp
+private val ActionMenuPaddingVertical = 0.dp
+private val ActionMenuDividerThickness = 0.5.dp
+private val ActionMenuThreeRowHeight =
+    ActionMenuPaddingVertical * 2 + ActionMenuRowHeight * 3 + ActionMenuDividerThickness * 2
+private val ActionMenuTwoRowHeight =
+    ActionMenuPaddingVertical * 2 + ActionMenuRowHeight * 2 + ActionMenuDividerThickness
+
+@Composable
+private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
+    MaterialTheme.typography.bodyMedium.copy(
+        fontSize = 15.sp,
+        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+    )
+
 @OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun ImageActionFrostedCard(
@@ -2684,7 +2906,7 @@ private fun ImageActionFrostedCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val hazeState = LocalHazeState.current
-    val shape = RoundedCornerShape(30.dp)
+    val shape = RoundedCornerShape(ActionMenuCornerRadius)
     Surface(
         modifier = modifier,
         shape = shape,
@@ -2723,9 +2945,9 @@ private fun ImageActionFrostedCard(
                     ),
             )
             Column(
-                Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+                Modifier.padding(vertical = ActionMenuPaddingVertical),
                 horizontalAlignment = Alignment.Start,
-                verticalArrangement = Arrangement.spacedBy(11.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
                 content = content,
             )
         }
@@ -2816,7 +3038,7 @@ private fun ImageActionOverlay(
                 bottom = with(density) { (actualPreviewTop + previewH).toPx() },
             )
             val menuWidth = 180.dp
-            val menuHeight = 152.dp
+            val menuHeight = ActionMenuThreeRowHeight
             val menuPlacement = calculateActionMenuOffsetFromAnchorPx(
                 anchorBounds = previewBounds,
                 screenWidthPx = with(density) { maxWidth.toPx() },
@@ -2938,7 +3160,7 @@ private fun ImageActionOverlay(
                             }
                         },
                     )
-                    HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+                    ImageActionMenuDivider()
                     ImageActionRow(
                         label = "保存全部",
                         enabled = !saving && images.isNotEmpty(),
@@ -2957,7 +3179,7 @@ private fun ImageActionOverlay(
                             }
                         },
                     )
-                    HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+                    ImageActionMenuDivider()
                     ImageActionRow(
                         label = "分享",
                         enabled = !saving,
@@ -3144,26 +3366,42 @@ private fun calculateActionMenuOffsetFromAnchorPx(
 }
 
 @Composable
+private fun ImageActionMenuDivider() {
+    HorizontalDivider(
+        modifier = Modifier.padding(horizontal = ActionMenuPaddingHorizontal),
+        thickness = ActionMenuDividerThickness,
+        color = Color.Black.copy(alpha = 0.08f),
+    )
+}
+
+@Composable
 private fun ImageActionRow(
     label: String,
     enabled: Boolean,
+    selected: Boolean = false,
     onClick: () -> Unit,
 ) {
-    Box(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(28.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 7.dp),
-        contentAlignment = Alignment.CenterStart,
+            .height(ActionMenuRowHeight)
+            .clickable(enabled = enabled, onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = label,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Start,
-            style = MaterialTheme.typography.bodyLarge,
-            color = if (enabled) Color(0xFF1C1C1E) else Color(0x661C1C1E),
+            modifier = Modifier
+                .fillMaxHeight()
+                .wrapContentHeight(Alignment.CenterVertically)
+                .padding(horizontal = ActionMenuPaddingHorizontal),
+            style = actionMenuTextStyle(selected = selected),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = when {
+                !enabled -> Color(0x661C1C1E)
+                selected -> MaterialTheme.colorScheme.primary
+                else -> Color(0xFF1C1C1E)
+            },
         )
     }
 }
@@ -3428,6 +3666,7 @@ private fun ZoomableFullscreenImage(
     var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
     var actionMenuOffset by remember(image.largeUrl) { mutableStateOf<Offset?>(null) }
     var actionMenuVisible by remember(image.largeUrl) { mutableStateOf(false) }
+    val haptic = LocalHapticFeedback.current
 
     LaunchedEffect(image.largeUrl) {
         dismissTranslationY = 0f
@@ -3736,6 +3975,7 @@ private fun ZoomableFullscreenImage(
                             if (image.isLivePhoto && isInsideDisplayedImage(offset)) {
                                 livePlaying = true
                             } else {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 actionMenuOffset = offset
                                 actionMenuVisible = true
                             }
@@ -3809,7 +4049,7 @@ private fun BoxScope.FullscreenImageActionMenu(
     var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
     val menuWidth = 180.dp
-    val estimatedMenuHeight = 152.dp
+    val estimatedMenuHeight = ActionMenuThreeRowHeight
     val margin = 14.dp
     val gap = 10.dp
     val menuPlacement = calculateActionMenuOffsetFromPointPx(
@@ -3855,7 +4095,7 @@ private fun BoxScope.FullscreenImageActionMenu(
                     }
                 },
             )
-            HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+            ImageActionMenuDivider()
             ImageActionRow(
                 label = "保存全部",
                 enabled = !saving && images.isNotEmpty(),
@@ -3874,7 +4114,7 @@ private fun BoxScope.FullscreenImageActionMenu(
                     }
                 },
             )
-            HorizontalDivider(color = Color.Black.copy(alpha = 0.08f))
+            ImageActionMenuDivider()
             ImageActionRow(
                 label = "分享",
                 enabled = !saving,
@@ -4654,9 +4894,11 @@ private fun StatusActions(item: FeedItem, onCommentClick: (() -> Unit)? = null) 
 private fun DetailScreen(
     item: FeedItem,
     comments: List<CommentItem>,
+    commentSort: CommentSort,
     isLoadingComments: Boolean,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
+    onCommentSortChange: (CommentSort) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     emoticonMap: Map<String, String> = emptyMap(),
     onRetweetClick: ((FeedItem) -> Unit)? = null,
@@ -4702,12 +4944,23 @@ private fun DetailScreen(
                         isLongTextLoading = isLongTextLoading,
                         onLoadLongText = onLoadLongText,
                     )
-                    Text(
-                        text = "评论 ${item.commentsCount}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(horizontal = 8.dp),
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "评论 ${item.commentsCount}",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        CommentSortActionMenu(
+                            selected = commentSort,
+                            onSelected = onCommentSortChange,
+                        )
+                    }
                 }
             }
 
@@ -4725,12 +4978,30 @@ private fun DetailScreen(
                 }
             }
 
-            items(comments, key = { it.id }) { comment ->
+            itemsIndexed(comments, key = { _, comment -> comment.id }) { index, comment ->
                 CommentRow(comment = comment, onUserClick = onUserClick)
-                HorizontalDivider()
+                if (index < comments.lastIndex) {
+                    CommentDivider()
+                }
             }
         }
     }
+}
+
+private val CommentRowOuterStart = 18.dp
+private val CommentAvatarSize = 28.dp
+private val CommentAvatarTextGap = 8.dp
+
+@Composable
+private fun CommentDivider() {
+    HorizontalDivider(
+        modifier = Modifier.padding(
+            start = CommentRowOuterStart,
+            end = 24.dp,
+        ),
+        thickness = 0.5.dp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.10f),
+    )
 }
 
 @Composable
@@ -4741,19 +5012,19 @@ private fun CommentRow(
 ) {
     val resolvedMap = comment.emoticons.ifEmpty { emptyMap() }
     val authorTarget = comment.authorId.takeIf { it.isNotBlank() } ?: comment.authorName
-    val topPadding = if (depth == 0) 10.dp else 2.dp
-    val bottomPadding = if (depth == 0) 4.dp else 2.dp
+    val verticalPadding = if (depth == 0) 4.dp else 2.dp
+    val rowStart = CommentRowOuterStart + (depth * 24).dp
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = (18 + depth * 24).dp, end = 18.dp, top = topPadding, bottom = bottomPadding),
+                .padding(start = rowStart, end = 18.dp, top = verticalPadding, bottom = verticalPadding),
             verticalAlignment = Alignment.Top,
         ) {
             RemoteImage(
                 url = comment.authorAvatarUrl,
                 modifier = Modifier
-                    .size(28.dp)
+                    .size(CommentAvatarSize)
                     .clip(CircleShape)
                     .clickable(
                         enabled = onUserClick != null && authorTarget.isNotBlank(),
@@ -4761,7 +5032,7 @@ private fun CommentRow(
                     ),
                 contentScale = ContentScale.Crop,
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(CommentAvatarTextGap))
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -4928,11 +5199,23 @@ private fun MineScreen(
     onPrepareAddAccount: suspend () -> Unit = {},
     onPersistLoginSession: suspend () -> Unit = {},
     onReturnToFeed: () -> Unit = {},
+    pendingOpenAccountLogin: Boolean = false,
+    onPendingOpenAccountLoginConsumed: () -> Unit = {},
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
     val pagerState = rememberPagerState(pageCount = { MineContentTab.entries.size })
     val coroutineScope = rememberCoroutineScope()
+
+    LaunchedEffect(pendingOpenAccountLogin) {
+        if (!pendingOpenAccountLogin) return@LaunchedEffect
+        onPendingOpenAccountLoginConsumed()
+        coroutineScope.launch {
+            onPrepareAddAccount()
+            showSettings = true
+            showAccountManagement = true
+        }
+    }
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }
@@ -5372,9 +5655,14 @@ private fun SettingsScreen(
 }
 
 @Composable
+private fun weiboMetaTextColor(): Color =
+    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.58f)
+
+@Composable
 private fun SettingsExpandIndicator(
     expanded: Boolean,
     modifier: Modifier = Modifier,
+    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
 ) {
     val rotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
@@ -5387,7 +5675,7 @@ private fun SettingsExpandIndicator(
         modifier = modifier
             .size(20.dp)
             .graphicsLayer { rotationZ = rotation },
-        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        tint = tint,
     )
 }
 
