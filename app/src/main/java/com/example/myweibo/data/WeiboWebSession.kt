@@ -13,10 +13,13 @@ import android.webkit.WebViewClient
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLDecoder
 import java.net.URLEncoder
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -24,13 +27,13 @@ import kotlin.coroutines.resumeWithException
 class WeiboWebSession(context: Context) {
     val webView: WebView = WebView(context)
 
+    private val albumLoadMutex = Mutex()
+
     var currentUrl: String = ""
         private set
 
     var isWeiboPageReady: Boolean = false
         private set
-
-    private val albumSubalbumCache = mutableMapOf<String, List<String>>()
 
     init {
         configureWebView()
@@ -73,123 +76,109 @@ class WeiboWebSession(context: Context) {
             )
         )
 
-    suspend fun loadUserAlbumImages(uid: String, cursor: String? = null): AlbumPage {
-        return when {
-            cursor?.startsWith("timeline:") == true -> loadTimelineAlbumPage(uid, cursor)
-            cursor?.startsWith("sub:") == true -> loadSubalbumPage(uid, cursor)
-            else -> loadImageWallPage(uid, cursor)
-        }
-    }
-
-    private suspend fun loadImageWallPage(uid: String, cursor: String?): AlbumPage {
+    suspend fun loadUserAlbumImages(
+        uid: String,
+        cursor: String? = null,
+        onPageLoaded: ((List<FeedImage>) -> Unit)? = null,
+    ): AlbumPage = albumLoadMutex.withLock {
+        val referer = "https://weibo.com/u/$uid?tabtype=album"
         val isStart = cursor == null
-        val sinceId = cursor
+        var sinceId = cursor
             ?.removePrefix("wall:")
             ?.takeIf { cursor.startsWith("wall:") }
             ?.ifBlank { "0" }
             ?: "0"
 
-        val params = linkedMapOf(
-            "uid" to uid,
-            "sinceid" to sinceId,
-        )
-        if (isStart) {
-            params["has_album"] = "true"
-        }
+        val fetchAll = cursor == null
+        val accumulated = mutableListOf<FeedImage>()
+        val monthContext = WeiboJsonParser.AlbumMonthContext()
+        var nextSinceId: String? = null
+        var pageIndex = 0
+        var emptyStreak = 0
+        val maxPages = if (fetchAll) MAX_ALBUM_FETCH_PAGES else MAX_ALBUM_EMPTY_PAGES
+        while (pageIndex < maxPages) {
+            val params = linkedMapOf(
+                "uid" to uid,
+                "sinceid" to sinceId,
+            )
+            if (isStart && pageIndex == 0) {
+                params["has_album"] = "true"
+            }
 
-        val raw = runCatching {
-            fetchJson(WeiboEndpoints.PROFILE_IMAGE_WALL, params)
-        }.getOrNull()
+            val raw = runCatching {
+                fetchJson(WeiboEndpoints.PROFILE_IMAGE_WALL, params, referer)
+            }.recoverCatching {
+                ensureOnUserAlbumPage(uid)
+                webViewFetchJson(WeiboEndpoints.PROFILE_IMAGE_WALL, params)
+            }.getOrElse { throw it }
 
-        if (raw == null) {
-            return if (isStart) loadAlbumHtmlFallback(uid) else AlbumPage(emptyList(), null)
-        }
-
-        val wall = WeiboJsonParser.parseImageWallPage(raw)
-        if (isStart) {
-            if (wall.subalbumContainerIds.isNotEmpty()) {
-                albumSubalbumCache[uid] = wall.subalbumContainerIds
+            val wall = WeiboJsonParser.parseImageWallPage(
+                raw = raw,
+                monthContext = monthContext,
+            )
+            accumulated += wall.images
+            nextSinceId = wall.nextSinceId
+            onPageLoaded?.invoke(accumulated.distinctBy { it.largeUrl })
+            if (nextSinceId == null) {
+                break
+            }
+            if (!fetchAll && wall.images.isNotEmpty()) {
+                break
+            }
+            if (wall.images.isEmpty()) {
+                emptyStreak++
+                if (emptyStreak > MAX_ALBUM_EMPTY_PAGES) {
+                    break
+                }
             } else {
-                albumSubalbumCache.remove(uid)
+                emptyStreak = 0
+            }
+            sinceId = nextSinceId!!
+            pageIndex++
+            if (fetchAll) {
+                delay(200)
             }
         }
 
-        if (isStart && wall.images.isEmpty() && wall.nextSinceId == null && wall.subalbumContainerIds.isEmpty()) {
-            loadAlbumHtmlFallback(uid).takeIf { it.images.isNotEmpty() }?.let { return it }
-        }
-
-        val nextCursor = when {
-            wall.nextSinceId != null -> "wall:${wall.nextSinceId}"
-            albumSubalbumCache[uid]?.isNotEmpty() == true -> "sub:0:0"
-            isStart && wall.images.isEmpty() -> "timeline:1"
-            else -> null
-        }
-        return AlbumPage(images = wall.images, nextCursor = nextCursor)
-    }
-
-    private suspend fun loadSubalbumPage(uid: String, cursor: String): AlbumPage {
-        val body = cursor.removePrefix("sub:")
-        val separator = body.indexOf(':')
-        if (separator <= 0) return AlbumPage(emptyList(), null)
-
-        val index = body.substring(0, separator).toIntOrNull() ?: return AlbumPage(emptyList(), null)
-        val sinceId = body.substring(separator + 1).ifBlank { "0" }
-        val containerId = albumSubalbumCache[uid]?.getOrNull(index)
-            ?: return loadTimelineAlbumPage(uid, "timeline:1")
-
-        val raw = runCatching {
-            fetchJson(
-                WeiboEndpoints.PROFILE_ALBUM_DETAIL,
-                linkedMapOf(
-                    "uid" to uid,
-                    "containerid" to containerId,
-                    "since_id" to sinceId,
-                ),
-            )
-        }.getOrNull() ?: return AlbumPage(emptyList(), null)
-
-        val page = WeiboJsonParser.parseAlbumDetailPage(raw)
-        val nextCursor = when {
-            page.nextCursor != null -> "sub:$index:${page.nextCursor}"
-            index + 1 < (albumSubalbumCache[uid]?.size ?: 0) -> "sub:${index + 1}:0"
-            else -> {
-                albumSubalbumCache.remove(uid)
-                null
-            }
-        }
-        return AlbumPage(images = page.images, nextCursor = nextCursor)
-    }
-
-    private suspend fun loadTimelineAlbumPage(uid: String, cursor: String): AlbumPage {
-        val page = cursor.removePrefix("timeline:").toIntOrNull()?.coerceAtLeast(1) ?: 1
-        val timeline = loadUserTimeline(uid, page)
-        if (timeline.items.isEmpty() && timeline.nextCursor == null) {
-            return AlbumPage(images = emptyList(), nextCursor = null)
-        }
-        val images = timeline.items.flatMap { item ->
-            item.images.map { image -> image.copy(createdAt = item.createdAt ?: image.createdAt) }
-        }.distinctBy { it.largeUrl }
-        return AlbumPage(
-            images = images,
-            nextCursor = timeline.nextCursor?.let { "timeline:${page + 1}" },
+        AlbumPage(
+            images = accumulated.distinctBy { it.largeUrl },
+            nextCursor = nextSinceId?.let { "wall:$it" },
         )
     }
 
-    private suspend fun loadAlbumHtmlFallback(uid: String): AlbumPage {
-        val raw = runCatching {
-            nativeFetchAbsoluteJson(
-                url = "https://weibo.com/u/$uid?tabtype=album",
-                referer = "https://weibo.com/",
-                origin = "https://weibo.com",
-            )
-        }.getOrNull() ?: return AlbumPage(emptyList(), nextCursor = "timeline:1")
-
-        val parsed = WeiboJsonParser.parseAlbumPage(raw)
-        return if (parsed.images.isNotEmpty()) {
-            parsed.copy(nextCursor = parsed.nextCursor?.let { "wall:$it" } ?: "timeline:1")
-        } else {
-            AlbumPage(emptyList(), nextCursor = "timeline:1")
+    private suspend fun ensureOnUserAlbumPage(uid: String) {
+        val albumUrl = "https://weibo.com/u/$uid?tabtype=album"
+        if (!currentUrl.contains("/u/$uid")) {
+            suspendCancellableCoroutine { continuation ->
+                webView.post {
+                    webView.loadUrl(albumUrl)
+                    continuation.resume(Unit)
+                }
+            }
+            delay(900)
+            waitForWeiboOrigin()
         }
+    }
+
+    private suspend fun webViewFetchJson(path: String, params: Map<String, String>): String {
+        ensureOnWeiboOrigin()
+        waitForWeiboOrigin()
+        val payload = evaluateJson(fetchScript(path, params))
+        val httpOk = payload.optBoolean("ok")
+        val status = payload.optInt("status")
+        if (!httpOk && status != 0) {
+            val error = payload.nullableString("error").orEmpty()
+            throw IllegalStateException("weibo-webview-fetch-failed:$status $error")
+        }
+        if (status == 0 && !payload.has("body")) {
+            val error = payload.nullableString("error").orEmpty()
+            throw IllegalStateException("weibo-webview-fetch-failed:0 $error")
+        }
+        val body = payload.getString("body")
+        if (body.trimStart().startsWith("<")) {
+            throw IllegalStateException("\u5FAE\u535A\u8FD4\u56DE HTML\uFF0C\u8BF7\u786E\u8BA4\u767B\u5F55\u72B6\u6001")
+        }
+        return body
     }
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
@@ -394,13 +383,21 @@ class WeiboWebSession(context: Context) {
         }
     }
 
-    suspend fun fetchJson(path: String, params: Map<String, String> = emptyMap()): String {
+    suspend fun fetchJson(
+        path: String,
+        params: Map<String, String> = emptyMap(),
+        referer: String = WEIBO_HOME,
+    ): String {
         ensureOnWeiboOrigin()
         waitForWeiboOrigin()
-        return nativeFetchJson(path, params)
+        return nativeFetchJson(path, params, referer)
     }
 
-    private suspend fun nativeFetchJson(path: String, params: Map<String, String>): String =
+    private suspend fun nativeFetchJson(
+        path: String,
+        params: Map<String, String>,
+        referer: String = WEIBO_HOME,
+    ): String =
         withContext(Dispatchers.IO) {
             CookieManager.getInstance().flush()
             val cookie = CookieManager.getInstance().getCookie(WEIBO_HOME)
@@ -419,10 +416,13 @@ class WeiboWebSession(context: Context) {
                 setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
                 setRequestProperty("Accept", "application/json, text/plain, */*")
                 setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-                setRequestProperty("Referer", WEIBO_HOME)
+                setRequestProperty("Referer", referer)
                 setRequestProperty("Origin", "https://weibo.com")
                 setRequestProperty("X-Requested-With", "XMLHttpRequest")
                 setRequestProperty("Cookie", cookie)
+            }
+            extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
+                connection.setRequestProperty("X-XSRF-TOKEN", URLDecoder.decode(token, Charsets.UTF_8.name()))
             }
 
             val status = connection.responseCode
@@ -442,6 +442,13 @@ class WeiboWebSession(context: Context) {
             }
             body
         }
+
+    private fun extractCookieValue(cookie: String, name: String): String? =
+        cookie.split(";")
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("$name=") }
+            ?.substringAfter("=")
+            ?.takeIf { it.isNotBlank() }
 
     private suspend fun nativeFetchAbsoluteJson(url: String, referer: String, origin: String): String =
         withContext(Dispatchers.IO) {
@@ -582,7 +589,6 @@ class WeiboWebSession(context: Context) {
                 const url = base + ${path.jsQuote()} + (params.toString() ? '?' + params.toString() : '');
                 const response = await fetch(url, {
                   credentials: 'include',
-                  referrer: base + '/',
                   headers: {
                     'accept': 'application/json, text/plain, */*',
                     'x-requested-with': 'XMLHttpRequest'
@@ -593,7 +599,7 @@ class WeiboWebSession(context: Context) {
               } catch (error) {
                 return { ok: false, status: 0, error: String(error), href: location.href };
               }
-            })();
+            })()
         """.trimIndent()
     }
 
@@ -708,6 +714,8 @@ class WeiboWebSession(context: Context) {
         if (has(key) && !isNull(key)) optString(key, "") else null
 
     companion object {
+        private const val MAX_ALBUM_EMPTY_PAGES = 12
+        private const val MAX_ALBUM_FETCH_PAGES = 80
         private const val WEIBO_HOME = "https://weibo.com/"
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private val COOKIE_ORIGINS = listOf(

@@ -219,6 +219,7 @@ import com.example.myweibo.data.WeiboWebSession
 import com.example.myweibo.data.formatWeiboTime
 import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -414,6 +415,9 @@ fun WeiboApp() {
     var mineAlbumNextCursor by remember { mutableStateOf<String?>(null) }
     var mineAlbumHasMore by remember { mutableStateOf(true) }
     var mineAlbumLoadingMore by remember { mutableStateOf(false) }
+    var mineAlbumLoading by remember { mutableStateOf(false) }
+    var mineAlbumError by remember { mutableStateOf<String?>(null) }
+    var mineAlbumJob by remember { mutableStateOf<Job?>(null) }
     var emoticonMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var emoticonSyncing by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
@@ -428,6 +432,9 @@ fun WeiboApp() {
     var visitedAlbumNextCursor by remember { mutableStateOf<String?>(null) }
     var visitedAlbumHasMore by remember { mutableStateOf(false) }
     var visitedAlbumLoadingMore by remember { mutableStateOf(false) }
+    var visitedAlbumLoading by remember { mutableStateOf(false) }
+    var visitedAlbumError by remember { mutableStateOf<String?>(null) }
+    var visitedAlbumJob by remember { mutableStateOf<Job?>(null) }
     var visitedProfileLoadGeneration by remember { mutableIntStateOf(0) }
     var visitedProfileBackStack by remember { mutableStateOf<List<VisitedProfileSnapshot>>(emptyList()) }
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
@@ -484,6 +491,7 @@ fun WeiboApp() {
     }
 
     fun restoreVisitedProfileSnapshot(snapshot: VisitedProfileSnapshot) {
+        visitedAlbumJob?.cancel()
         visitedProfileLoadGeneration += 1
         visitedUserId = snapshot.userId
         visitedUserScreenName = snapshot.screenName
@@ -497,10 +505,13 @@ fun WeiboApp() {
         visitedAlbumNextCursor = snapshot.albumNextCursor
         visitedAlbumHasMore = snapshot.albumHasMore
         visitedAlbumLoadingMore = false
+        visitedAlbumLoading = false
+        visitedAlbumError = null
         visitedMinePagerPage = snapshot.pagerPage
     }
 
     fun clearVisitedProfileState() {
+        visitedAlbumJob?.cancel()
         visitedProfileLoadGeneration += 1
         visitedProfileBackStack = emptyList()
         visitedUserId = null
@@ -515,10 +526,51 @@ fun WeiboApp() {
         visitedAlbumNextCursor = null
         visitedAlbumHasMore = false
         visitedAlbumLoadingMore = false
+        visitedAlbumLoading = false
+        visitedAlbumError = null
         visitedMinePagerPage = 0
     }
 
+    fun loadVisitedUserAlbum(uid: String, loadGeneration: Int) {
+        visitedAlbumJob?.cancel()
+        visitedAlbumJob = scope.launch {
+            visitedAlbumLoading = true
+            visitedAlbumError = null
+            try {
+                val page = session.loadUserAlbumImages(
+                    uid = uid,
+                    onPageLoaded = { images ->
+                        if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
+                            visitedAlbumImages = images
+                        }
+                    },
+                )
+                if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
+                    visitedAlbumImages = page.images
+                    visitedAlbumNextCursor = page.nextCursor
+                    visitedAlbumHasMore = page.nextCursor != null
+                    visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
+                        "\u76F8\u518C\u6682\u65E0\u56FE\u7247"
+                    } else {
+                        null
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                if (loadGeneration == visitedProfileLoadGeneration) {
+                    visitedAlbumError = error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u76F8\u518C"
+                }
+            } finally {
+                if (loadGeneration == visitedProfileLoadGeneration) {
+                    visitedAlbumLoading = false
+                }
+            }
+        }
+    }
+
     fun loadVisitedUserProfile(lookup: ProfileLookup, keepContent: Boolean = false) {
+        visitedAlbumJob?.cancel()
         val loadGeneration = if (keepContent) {
             visitedProfileLoadGeneration
         } else {
@@ -538,6 +590,8 @@ fun WeiboApp() {
             visitedAlbumNextCursor = null
             visitedAlbumHasMore = false
             visitedAlbumLoadingMore = false
+            visitedAlbumLoading = false
+            visitedAlbumError = null
             visitedMinePagerPage = 0
 
             when (lookup) {
@@ -569,13 +623,7 @@ fun WeiboApp() {
                                 visitedPostsPage = 1
                                 visitedPostsHasMore = page.nextCursor != null
                             }
-                        runCatching { session.loadUserAlbumImages(profile.id) }
-                            .onSuccess { page ->
-                                if (loadGeneration != visitedProfileLoadGeneration) return@onSuccess
-                                visitedAlbumImages = page.images
-                                visitedAlbumNextCursor = page.nextCursor
-                                visitedAlbumHasMore = page.nextCursor != null
-                            }
+                        loadVisitedUserAlbum(profile.id, loadGeneration)
                     }
                     .onFailure {
                         if (loadGeneration != visitedProfileLoadGeneration) return@onFailure
@@ -821,19 +869,34 @@ fun WeiboApp() {
                         .onFailure {
                             minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
                         }
-                    runCatching { session.loadUserAlbumImages(profile.id) }
-                        .onSuccess { page ->
-                            mineAlbumImages = page.images
+                    mineAlbumJob?.cancel()
+                    mineAlbumJob = scope.launch {
+                        mineAlbumLoading = true
+                        mineAlbumError = null
+                        try {
+                            val page = session.loadUserAlbumImages(
+                                uid = profile.id,
+                                onPageLoaded = { images ->
+                                    mineAlbumImages = filterOutRetweetedOnlyImages(images, minePosts)
+                                },
+                            )
+                            mineAlbumImages = filterOutRetweetedOnlyImages(page.images, minePosts)
                             mineAlbumNextCursor = page.nextCursor
                             mineAlbumHasMore = page.nextCursor != null
+                            mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
+                                "\u76F8\u518C\u6682\u65E0\u56FE\u7247"
+                            } else {
+                                null
+                            }
                             mineCacheStore.writeAlbum(page)
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Throwable) {
+                            mineAlbumError = error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u76F8\u518C"
+                        } finally {
+                            mineAlbumLoading = false
                         }
-                        .onFailure {
-                            // API 加载失败时直接用帖子里提取的图片兜底
-                            mineAlbumImages = ownAlbumImagesFromPosts(minePosts)
-                            mineCacheStore.writeAlbum(AlbumPage(images = mineAlbumImages))
-                            mineAlbumHasMore = false
-                        }
+                    }
                 }
                 .onFailure {
                     mineProfileError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u5FAE\u535A\u7528\u6237\u8D44\u6599"
@@ -897,12 +960,16 @@ fun WeiboApp() {
                     mineAlbumImages = (mineAlbumImages + page.images).distinctBy { it.largeUrl }
                     mineAlbumNextCursor = page.nextCursor
                     mineAlbumHasMore = page.nextCursor != null
+                    mineAlbumError = null
                     mineCacheStore.writeAlbum(
                         AlbumPage(
                             images = mineAlbumImages,
                             nextCursor = mineAlbumNextCursor,
                         )
                     )
+                }
+                .onFailure { error ->
+                    mineAlbumError = error.message ?: "\u65E0\u6CD5\u7EE7\u7EED\u8BFB\u53D6\u76F8\u518C"
                 }
             mineAlbumLoadingMore = false
         }
@@ -1188,6 +1255,7 @@ fun WeiboApp() {
                         postsError = null,
                         postsLoadingMore = visitedPostsLoadingMore,
                         albumImages = visitedAlbumImages,
+                        albumLoading = visitedAlbumLoading,
                         albumLoadingMore = visitedAlbumLoadingMore,
                         postsHasMore = visitedPostsHasMore,
                         albumHasMore = visitedAlbumHasMore,
@@ -1196,6 +1264,7 @@ fun WeiboApp() {
                         emoticonSyncing = emoticonSyncing,
                         postsListState = visitedPostsListState,
                         albumListState = visitedAlbumListState,
+                        albumError = visitedAlbumError,
                         onMinePagerPageChanged = { visitedMinePagerPage = it },
                         onRefresh = {
                             when {
@@ -1253,6 +1322,7 @@ fun WeiboApp() {
                         postsError = minePostsError,
                         postsLoadingMore = minePostsLoadingMore,
                         albumImages = mineAlbumImages,
+                        albumLoading = mineAlbumLoading,
                         albumLoadingMore = mineAlbumLoadingMore,
                         postsHasMore = minePostsHasMore,
                         albumHasMore = mineAlbumHasMore,
@@ -1261,6 +1331,7 @@ fun WeiboApp() {
                         emoticonSyncing = emoticonSyncing,
                         postsListState = minePostsListState,
                         albumListState = mineAlbumListState,
+                        albumError = mineAlbumError,
                         onMinePagerPageChanged = { minePagerPage = it },
                         onRefresh = { refreshMineProfile() },
                         onLoadMorePosts = { loadMoreMinePosts() },
@@ -5279,6 +5350,7 @@ private fun MineScreen(
     postsError: String?,
     postsLoadingMore: Boolean,
     albumImages: List<FeedImage>,
+    albumLoading: Boolean = false,
     albumLoadingMore: Boolean,
     postsHasMore: Boolean = true,
     albumHasMore: Boolean = true,
@@ -5287,6 +5359,7 @@ private fun MineScreen(
     emoticonSyncing: Boolean = false,
     postsListState: LazyListState = rememberLazyListState(),
     albumListState: LazyListState = rememberLazyListState(),
+    albumError: String? = null,
     onMinePagerPageChanged: (Int) -> Unit = {},
     onRefresh: () -> Unit,
     onLoadMorePosts: () -> Unit,
@@ -5647,8 +5720,9 @@ private fun MineScreen(
                             ) {
                                 item {
                                     MineAlbumTimeline(
-                                        posts = posts,
                                         albumImages = albumImages,
+                                        albumError = albumError,
+                                        albumLoading = albumLoading || albumLoadingMore || isLoading,
                                         onMediaClick = onMediaClick,
                                     )
                                 }
@@ -6573,32 +6647,38 @@ private fun MineLoadingMoreIndicator() {
 
 @Composable
 private fun MineAlbumTimeline(
-    posts: List<FeedItem>,
     albumImages: List<FeedImage>,
+    albumError: String? = null,
+    albumLoading: Boolean = false,
     onMediaClick: (FeedMedia) -> Unit,
 ) {
     var viewerImages by remember { mutableStateOf<List<FeedImage>>(emptyList()) }
     var viewerIndex by remember { mutableStateOf(0) }
-    val postGroups = remember(posts) {
-        posts.mapNotNull { post ->
-            val imgs = post.images.distinctBy { it.largeUrl }
-            if (imgs.isEmpty()) null else albumDateLabel(post.createdAt) to imgs
-        }
-        .groupBy({ it.first }, { it.second })
-        .mapValues { entry -> entry.value.flatten().distinctBy { it.largeUrl } }
-    }
     val albumGrouped = remember(albumImages) {
-        val all = albumImages.distinctBy { it.largeUrl }
-        if (all.isEmpty()) emptyMap()
-        else all.groupBy { albumDateLabel(it.createdAt) }
+        albumImages
+            .distinctBy { it.largeUrl }
+            .mapNotNull { image ->
+                albumMonthLabel(image.createdAt)?.let { label -> label to image }
+            }
+            .groupBy({ it.first }, { it.second })
             .mapValues { entry -> entry.value.distinctBy { it.largeUrl } }
+            .entries
+            .sortedWith(
+                compareByDescending<Map.Entry<Pair<String, String>, List<FeedImage>>> {
+                    albumGroupSortKey(it.key)
+                },
+            )
+            .associate { it.key to it.value }
     }
-    val visibleGroups = if (albumGrouped.isNotEmpty()) albumGrouped else postGroups
 
-    if (visibleGroups.isEmpty()) {
+    if (albumGrouped.isEmpty()) {
         EmptyState(
             title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
-            body = "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u4E2A\u4EBA\u4E3B\u9875\u5FAE\u535A\u4E2D\u6574\u7406\u56FE\u7247\u548C LivePhoto\u3002",
+            body = when {
+                albumLoading -> "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
+                !albumError.isNullOrBlank() -> albumError
+                else -> "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u3002"
+            },
         )
         return
     }
@@ -6607,49 +6687,15 @@ private fun MineAlbumTimeline(
         modifier = Modifier.padding(horizontal = 12.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        visibleGroups.forEach { (dateLabel, images) ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Column(
-                    modifier = Modifier.width(42.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text(
-                        text = dateLabel.first,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    if (dateLabel.second.isNotBlank()) {
-                        Text(
-                            text = dateLabel.second,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                BoxWithConstraints(modifier = Modifier.weight(1f)) {
-                    val gap = 6.dp
-                    val cellSize = (maxWidth - gap * 2) / 3
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(gap),
-                        verticalArrangement = Arrangement.spacedBy(gap),
-                        maxItemsInEachRow = 3,
-                    ) {
-                        images.forEach { image ->
-                            MineAlbumTile(
-                                image = image,
-                                size = cellSize,
-                                onClick = {
-                                    viewerImages = images
-                                    viewerIndex = images.indexOf(image).coerceAtLeast(0)
-                                },
-                            )
-                        }
-                    }
-                }
-            }
+        albumGrouped.forEach { (dateLabel, images) ->
+            MineAlbumMonthSection(
+                dateLabel = dateLabel,
+                images = images,
+                onImageClick = { groupImages, index ->
+                    viewerImages = groupImages
+                    viewerIndex = index
+                },
+            )
         }
     }
 
@@ -6659,6 +6705,60 @@ private fun MineAlbumTimeline(
             initialIndex = viewerIndex,
             onDismiss = { viewerImages = emptyList() },
         )
+    }
+}
+
+@Composable
+private fun MineAlbumMonthSection(
+    dateLabel: Pair<String, String>,
+    images: List<FeedImage>,
+    onImageClick: (List<FeedImage>, Int) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Column(
+            modifier = Modifier.width(42.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = dateLabel.first,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (dateLabel.second.isNotBlank()) {
+                Text(
+                    text = dateLabel.second,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        BoxWithConstraints(
+            modifier = Modifier
+                .weight(1f)
+                .wrapContentHeight(),
+        ) {
+            val gap = 6.dp
+            val cellSize = (maxWidth - gap * 2) / 3
+            Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                var imageIndex = 0
+                images.chunked(3).forEach { rowImages ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
+                        rowImages.forEach { image ->
+                            val currentIndex = imageIndex++
+                            MineAlbumTile(
+                                image = image,
+                                size = cellSize,
+                                onClick = { onImageClick(images, currentIndex) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -6700,11 +6800,6 @@ private fun MineAlbumTile(
     }
 }
 
-private fun ownAlbumImagesFromPosts(posts: List<FeedItem>): List<FeedImage> =
-    posts.flatMap { post ->
-        post.images.map { it.copy(createdAt = it.createdAt ?: post.createdAt) }
-    }.distinctBy { it.largeUrl }
-
 private fun filterOutRetweetedOnlyImages(images: List<FeedImage>, posts: List<FeedItem>): List<FeedImage> {
     if (images.isEmpty() || posts.isEmpty()) return images
     val ownUrls = posts.flatMap { it.images }.mapTo(mutableSetOf()) { it.largeUrl }
@@ -6712,6 +6807,18 @@ private fun filterOutRetweetedOnlyImages(images: List<FeedImage>, posts: List<Fe
         .mapTo(mutableSetOf()) { it.largeUrl }
     if (retweetedUrls.isEmpty()) return images
     return images.filterNot { image -> image.largeUrl in retweetedUrls && image.largeUrl !in ownUrls }
+}
+
+private fun albumMonthLabel(createdAt: String?): Pair<String, String>? {
+    val label = albumDateLabel(createdAt)
+    return label.takeUnless { it.first == "\u5168\u90E8" }
+}
+
+private fun albumGroupSortKey(label: Pair<String, String>): Long {
+    val (monthLabel, yearLabel) = label
+    val year = yearLabel.toIntOrNull() ?: 0
+    val month = monthLabel.removeSuffix("\u6708").toIntOrNull() ?: 0
+    return year * 100L + month
 }
 
 private fun albumDateLabel(createdAt: String?): Pair<String, String> {

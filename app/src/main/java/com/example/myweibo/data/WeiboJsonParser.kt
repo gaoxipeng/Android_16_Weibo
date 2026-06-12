@@ -2,6 +2,10 @@ package com.example.myweibo.data
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 object WeiboJsonParser {
     fun parseTimeline(raw: String): TimelinePage {
@@ -362,142 +366,69 @@ object WeiboJsonParser {
             .filter(::looksLikeImageUrl)
     }
 
-    fun parseAlbumImages(raw: String): List<FeedImage> = parseAlbumPage(raw).images
-
-    fun parseAlbumPage(raw: String): AlbumPage {
-        val root = JSONObject(raw)
-        val found = linkedMapOf<String, FeedImage>()
-
-        fun addImage(id: String, thumbnail: String?, large: String?, createdAt: String?) {
-            val resolved = large ?: thumbnail ?: return
-            if (!looksLikeImageUrl(resolved)) return
-            val normalizedLarge = normalizeUrl(resolved)
-            val normalizedThumb = normalizeUrl(thumbnail ?: resolved)
-            found.putIfAbsent(
-                normalizedLarge,
-                FeedImage(
-                    id = id.ifBlank { normalizedLarge },
-                    thumbnailUrl = normalizedThumb,
-                    largeUrl = normalizedLarge,
-                    downloadUrls = listOf(normalizedLarge).distinct(),
-                    createdAt = createdAt,
-                )
-            )
-        }
-
-        fun visit(value: Any?) {
-            when (value) {
-                is JSONObject -> {
-                    val id = value.optNullableString("pic_id")
-                        ?: value.optNullableString("pid")
-                        ?: value.optNullableString("id")
-                        ?: ""
-                    val thumbnail = imageUrl(value, "thumbnail")
-                        ?: imageUrl(value, "bmiddle")
-                        ?: value.optNullableString("thumbnail")
-                        ?: value.optNullableString("thumbnail_pic")
-                        ?: value.optNullableString("pic")
-                    val large = imageUrl(value, "largest")
-                        ?: imageUrl(value, "mw2000")
-                        ?: imageUrl(value, "woriginal")
-                        ?: imageUrl(value, "original")
-                        ?: imageUrl(value, "large")
-                        ?: value.optNullableString("large")
-                        ?: value.optNullableString("url")
-                    val createdAt = value.optNullableString("created_at")
-                        ?: value.optNullableString("created")
-                        ?: value.optNullableString("time")
-                        ?: value.optNullableString("date")
-                    addImage(id, thumbnail, large, createdAt)
-
-                    val keys = value.keys()
-                    while (keys.hasNext()) {
-                        val key = keys.next()
-                        if (key == "retweeted_status" || key == "retweeted_statuses") continue
-                        visit(value.opt(key))
-                    }
-                }
-
-                is JSONArray -> {
-                    for (index in 0 until value.length()) {
-                        visit(value.opt(index))
-                    }
-                }
-            }
-        }
-
-        visit(root)
-        val data = root.optJSONObject("data")
-        val nextCursor = data?.optNullableString("sinceid")
-            ?: data?.optNullableString("since_id")
-            ?: data?.optNullableString("next_since_id")
-            ?: data?.optNullableString("next_cursor")
-            ?: root.optNullableString("sinceid")
-            ?: root.optNullableString("since_id")
-            ?: root.optNullableString("next_since_id")
-            ?: root.optNullableString("next_cursor")
-        return AlbumPage(images = found.values.toList(), nextCursor = nextCursor)
-    }
-
     data class ImageWallParseResult(
         val images: List<FeedImage>,
         val nextSinceId: String?,
-        val subalbumContainerIds: List<String>,
     )
 
-    fun parseImageWallPage(raw: String): ImageWallParseResult {
+    class AlbumMonthContext(
+        var month: String? = null,
+        var year: String? = null,
+    )
+
+    fun parseImageWallPage(
+        raw: String,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): ImageWallParseResult {
         val root = runCatching { JSONObject(raw) }.getOrNull()
-            ?: return ImageWallParseResult(emptyList(), null, emptyList())
-        if (root.optInt("ok", 0) != 1) {
-            return ImageWallParseResult(emptyList(), null, emptyList())
-        }
-        val data = root.optJSONObject("data")
-            ?: return ImageWallParseResult(emptyList(), null, emptyList())
-        val images = parseAlbumPhotoList(data.optJSONArray("list"))
-        val nextSinceId = data.optNullableString("since_id")
-            ?: data.optNullableString("sinceid")
-        val subalbumContainerIds = buildList {
-            val albumList = data.optJSONArray("album_list") ?: return@buildList
-            for (index in 0 until albumList.length()) {
-                val album = albumList.optJSONObject(index) ?: continue
-                album.optNullableString("containerid")?.takeIf { it.isNotBlank() }?.let(::add)
+            ?: return ImageWallParseResult(emptyList(), null)
+        when (val ok = root.optInt("ok", 0)) {
+            1 -> Unit
+            -100 -> throw IllegalStateException("\u76F8\u518C\u9700\u8981\u767B\u5F55\u540E\u67E5\u770B")
+            else -> {
+                val hint = root.optNullableString("msg")
+                    ?: root.opt("url")?.toString()?.takeIf { it.isNotBlank() }
+                    ?: "ok=$ok"
+                throw IllegalStateException("\u76F8\u518C\u63A5\u53E3\u9519\u8BEF: $hint")
             }
         }
+        val data = root.optJSONObject("data")
+            ?: return ImageWallParseResult(emptyList(), null)
+        val responseSinceId = data.optSinceId()
+            ?: data.optNullableString("sinceid")
+            ?: data.optNullableString("next_since_id")
+        val images = (parseAlbumPhotoList(data.optJSONArray("list"), monthContext) +
+            parseAlbumPhotoList(data.optJSONArray("photo_wall"), monthContext))
+            .distinctBy { it.largeUrl }
         return ImageWallParseResult(
             images = images,
-            nextSinceId = nextSinceId?.takeIf { it.isNotBlank() && it != "0" },
-            subalbumContainerIds = subalbumContainerIds,
+            nextSinceId = responseSinceId,
         )
     }
 
-    fun parseAlbumDetailPage(raw: String): AlbumPage {
-        val root = runCatching { JSONObject(raw) }.getOrNull()
-            ?: return AlbumPage(emptyList(), null)
-        if (root.optInt("ok", 0) != 1) {
-            return AlbumPage(emptyList(), null)
-        }
-        val data = root.optJSONObject("data")
-            ?: return AlbumPage(emptyList(), null)
-        val images = parseAlbumPhotoList(data.optJSONArray("list"))
-        val nextCursor = data.optNullableString("since_id")
-            ?: data.optNullableString("sinceid")
-        return AlbumPage(
-            images = images,
-            nextCursor = nextCursor?.takeIf { it.isNotBlank() && it != "0" },
-        )
-    }
-
-    private fun parseAlbumPhotoList(list: JSONArray?): List<FeedImage> {
+    private fun parseAlbumPhotoList(
+        list: JSONArray?,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): List<FeedImage> {
         if (list == null) return emptyList()
         return buildList {
             for (index in 0 until list.length()) {
-                parseAlbumPhotoItem(list.optJSONObject(index))?.let(::add)
+                parseAlbumPhotoItem(
+                    item = list.optJSONObject(index),
+                    monthContext = monthContext,
+                )?.let(::add)
             }
         }
     }
 
-    private fun parseAlbumPhotoItem(item: JSONObject?): FeedImage? {
+    private fun parseAlbumPhotoItem(
+        item: JSONObject?,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): FeedImage? {
         item ?: return null
+        item.optBlankString("timeline_month")?.let { monthContext.month = it.trim() }
+        item.optBlankString("timeline_year")?.let { monthContext.year = it.trim() }
+
         val pid = item.optNullableString("pid")
             ?: item.optNullableString("pic_id")
         val thumbnail = item.optNullableString("pic")
@@ -514,10 +445,20 @@ object WeiboJsonParser {
             ?: pid?.let(::pidToLargeUrl)
             ?: return null
         if (!looksLikeImageUrl(large)) return null
+        val timelineMonth = item.optBlankString("timeline_month")
+        val timelineYear = item.optBlankString("timeline_year")
         val createdAt = item.optNullableString("created_at")
             ?: item.optNullableString("created")
-            ?: item.optNullableString("time")
+            ?: formatAlbumMid(item.optBlankString("mid"))
+            ?: formatAlbumTimeline(timelineYear ?: monthContext.year, timelineMonth ?: monthContext.month)
+            ?: formatAlbumTimestamp(item.optNullableString("time"))
+            ?: formatAlbumTimestamp(item.optNullableString("upload_time"))
+            ?: formatAlbumTimestamp(item.optNullableString("shoot_time"))
             ?: item.optNullableString("date")
+            ?: extractAlbumDateFromId(item.optBlankString("object_id"))
+            ?: extractAlbumDateFromId(item.optNullableString("id"))
+            ?: formatAlbumTimeline(monthContext.year, monthContext.month)
+        createdAt?.let { applyAlbumDateToContext(it, monthContext) }
         val normalizedLarge = normalizeUrl(large)
         val normalizedThumb = normalizeUrl(thumbnail)
         return FeedImage(
@@ -533,13 +474,28 @@ object WeiboJsonParser {
         )
     }
 
-    private fun pidToLargeUrl(pid: String): String {
-        val host = when {
-            pid.startsWith("006") || pid.startsWith("007") -> "wx2"
-            pid.startsWith("008") || pid.startsWith("009") -> "wx3"
-            else -> "wx1"
+    private fun JSONObject.optBlankString(name: String): String? =
+        optString(name).trim().takeIf { it.isNotBlank() }
+
+    private fun applyAlbumDateToContext(date: String, context: AlbumMonthContext) {
+        Regex("""((?:19|20)\d{2})[-/](\d{1,2})""").find(date)?.let { match ->
+            context.year = match.groupValues[1]
+            context.month = match.groupValues[2]
         }
-        return "https://$host.sinaimg.cn/large/$pid.jpg"
+    }
+
+    private fun pidToLargeUrl(pid: String): String {
+        val cleanPid = pid.substringBeforeLast('.')
+        val ext = when {
+            pid.contains(".gif", ignoreCase = true) -> "gif"
+            else -> "jpg"
+        }
+        val host = when {
+            cleanPid.startsWith("006") || cleanPid.startsWith("007") -> "wx2"
+            cleanPid.startsWith("008") || cleanPid.startsWith("009") -> "wx3"
+            else -> "wx${((cleanPid.hashCode() and Int.MAX_VALUE) % 4) + 1}"
+        }
+        return "https://$host.sinaimg.cn/large/$cleanPid.$ext"
     }
 
     private fun upgradeSinaimgUrl(url: String): String? {
@@ -550,6 +506,57 @@ object WeiboJsonParser {
         )
         return normalizeUrl(upgraded)
     }
+
+    private fun formatAlbumTimeline(year: String?, month: String?): String? {
+        if (year.isNullOrBlank() || month.isNullOrBlank()) return null
+        val normalizedMonth = month.trim().padStart(2, '0')
+        return "$year-$normalizedMonth-01"
+    }
+
+    private fun formatAlbumMid(mid: String?): String? {
+        val id = mid?.trim()?.toLongOrNull() ?: return null
+        val seconds = (id shr 22) + WEIBO_MID_EPOCH_OFFSET
+        if (seconds < 1_000_000_000L || seconds > 4_102_444_800L) return null
+        return ALBUM_DATE_FORMAT.format(Date(seconds * 1000))
+    }
+
+    private fun JSONObject.optSinceId(): String? {
+        if (!has("since_id") || isNull("since_id")) return null
+        return when (val value = opt("since_id")) {
+            is Number -> if (value.toLong() == 0L) null else value.toString()
+            else -> value.toString().trim().takeIf { it.isNotBlank() && it != "0" }
+        }
+    }
+
+    private fun formatAlbumTimestamp(value: String?): String? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        if (!raw.all { it.isDigit() }) return raw
+        val millis = raw.toLongOrNull() ?: return null
+        if (millis < 1_000_000_000_000L) return null
+        return ALBUM_DATE_FORMAT.format(Date(millis))
+    }
+
+    private fun extractAlbumDateFromId(id: String?): String? {
+        val value = id.orEmpty()
+        val patterns = listOf(
+            Regex("""_(\d{8})_"""),
+            Regex("""\|[^:]+:\d+_(\d{8})_-"""),
+            Regex("""[_|](\d{8})_-"""),
+        )
+        for (pattern in patterns) {
+            val ymd = pattern.find(value)?.groupValues?.getOrNull(1) ?: continue
+            if (!ymd.startsWith("19") && !ymd.startsWith("20")) continue
+            return "${ymd.take(4)}-${ymd.drop(4).take(2)}-${ymd.takeLast(2)}"
+        }
+        return null
+    }
+
+    private val ALBUM_DATE_FORMAT = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("Asia/Shanghai")
+    }
+
+    private const val WEIBO_MID_EPOCH_OFFSET = 515483463L
 
     private fun parseStatus(status: JSONObject, allowRetweeted: Boolean): FeedItem? {
         val id = status.optNullableString("idstr")

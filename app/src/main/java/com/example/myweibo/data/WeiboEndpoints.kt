@@ -10,9 +10,6 @@ object WeiboEndpoints {
     const val PROFILE_INFO = "/ajax/profile/info"
     const val USER_TIMELINE = "/ajax/statuses/mymblog"
     const val PROFILE_IMAGE_WALL = "/ajax/profile/getImageWall"
-    const val PROFILE_ALBUM_DETAIL = "/ajax/profile/getAlbumDetail"
-    const val PROFILE_ALBUM = "/ajax/profile/photoContents"
-    const val PROFILE_PHOTOS = "/ajax/profile/photolist"
 
     fun timelinePath(kind: TimelineKind): String =
         when (kind) {
