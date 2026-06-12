@@ -57,6 +57,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -73,13 +74,16 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -190,12 +194,15 @@ import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
+import com.example.myweibo.data.StoredWeiboAccount
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.data.UserProfile
+import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
 import com.example.myweibo.data.WeiboWebSession
 import com.example.myweibo.data.formatWeiboTime
+import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
@@ -328,6 +335,7 @@ fun WeiboApp() {
     val timelineCacheStore = remember { TimelineCacheStore(context) }
     val mineCacheStore = remember { MineCacheStore(context) }
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
+    val accountStore = remember { WeiboAccountStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -356,6 +364,8 @@ fun WeiboApp() {
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
+    var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
+    var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var cacheLoaded by remember { mutableStateOf(false) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -395,6 +405,20 @@ fun WeiboApp() {
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
+    }
+
+    fun reloadStoredAccounts() {
+        storedAccounts = accountStore.readAccounts()
+        activeAccountId = accountStore.readActiveAccountId()
+    }
+
+    suspend fun persistLoginSession() {
+        runCatching { session.persistCurrentAccount(accountStore) }
+            .onSuccess {
+                reloadStoredAccounts()
+                hasLoginCookie = session.hasLoginCookie()
+                mineHasLoginCookie = hasLoginCookie
+            }
     }
 
     fun currentVisitedProfileSnapshot(): VisitedProfileSnapshot? {
@@ -750,6 +774,22 @@ fun WeiboApp() {
         }
     }
 
+    fun switchStoredAccount(accountId: String) {
+        scope.launch {
+            runCatching { session.activateAccount(accountStore, accountId) }
+                .onSuccess {
+                    reloadStoredAccounts()
+                    hasLoginCookie = session.hasLoginCookie()
+                    mineHasLoginCookie = hasLoginCookie
+                    refreshTimeline()
+                    refreshMineProfile()
+                }
+                .onFailure { error ->
+                    showMessage("切换账号失败", error.message ?: "无法恢复该账号登录态")
+                }
+        }
+    }
+
     fun loadMoreMinePosts() {
         val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
         if (minePostsLoadingMore || mineProfileLoading || !minePostsHasMore) return
@@ -908,6 +948,14 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(Unit) {
+        val savedActiveId = accountStore.readActiveAccountId()
+        if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
+            runCatching { session.activateAccount(accountStore, savedActiveId) }
+        } else if (session.hasLoginCookie()) {
+            persistLoginSession()
+        }
+        reloadStoredAccounts()
+
         emoticonMap = emoticonCacheStore.read()
         timelineCacheStore.readFollowingTimeline()?.let { page ->
             items = page.items
@@ -1136,6 +1184,19 @@ fun WeiboApp() {
                         onUserClick = ::openUser,
                         isLongTextLoading = { it.statusId in longTextLoadingIds },
                         onLoadLongText = ::loadLongText,
+                        storedAccounts = storedAccounts,
+                        activeAccountId = activeAccountId,
+                        onSwitchAccount = ::switchStoredAccount,
+                        onPrepareAddAccount = { session.prepareAddAccount() },
+                        onPersistLoginSession = { persistLoginSession() },
+                        onReturnToFeed = {
+                            scope.launch {
+                                persistLoginSession()
+                                session.openWeiboHome()
+                                selectedTab = MainTab.Feed
+                                refreshTimeline()
+                            }
+                        },
                     )
                 }
 
@@ -2308,6 +2369,9 @@ private fun FeedCard(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 6.dp),
         shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
     ) {
         val resolvedEmoticonMap = item.emoticons.ifEmpty { emoticonMap }
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2387,7 +2451,7 @@ private fun QuotedStatus(
     val resolvedMap = item.emoticons.ifEmpty { emoticonMap }
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
     Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        color = StatusQuotedBackground,
         shape = RoundedCornerShape(8.dp),
     ) {
         Column(
@@ -4858,6 +4922,12 @@ private fun MineScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     enableSettings: Boolean = true,
+    storedAccounts: List<StoredWeiboAccount> = emptyList(),
+    activeAccountId: String? = null,
+    onSwitchAccount: (String) -> Unit = {},
+    onPrepareAddAccount: suspend () -> Unit = {},
+    onPersistLoginSession: suspend () -> Unit = {},
+    onReturnToFeed: () -> Unit = {},
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
@@ -4880,20 +4950,45 @@ private fun MineScreen(
         if (showAccountManagement) {
             SettingsPageShell(
                 title = "\u8D26\u53F7\u7BA1\u7406",
-                onBack = { showAccountManagement = false },
+                onBack = {
+                    coroutineScope.launch {
+                        if (session.hasLoginCookie()) {
+                            onPersistLoginSession()
+                        }
+                    }
+                    showAccountManagement = false
+                },
             ) {
-                AccountLoginPanel(session = session)
+                AccountLoginPanel(
+                    session = session,
+                    onReturnToFeed = {
+                        coroutineScope.launch {
+                            onPersistLoginSession()
+                        }
+                        showAccountManagement = false
+                        showSettings = false
+                        onReturnToFeed()
+                    },
+                )
             }
         } else {
             SettingsScreen(
                 hasLoginCookie = hasLoginCookie,
-                emoticonCount = emoticonCount,
+                accounts = storedAccounts,
+                activeAccountId = activeAccountId,
+                emoticonMap = emoticonMap,
                 emoticonSyncing = emoticonSyncing,
                 onBack = {
                     showAccountManagement = false
                     showSettings = false
                 },
-                onOpenAccount = { showAccountManagement = true },
+                onSwitchAccount = onSwitchAccount,
+                onAddAccount = {
+                    coroutineScope.launch {
+                        onPrepareAddAccount()
+                        showAccountManagement = true
+                    }
+                },
                 onSyncEmoticons = onSyncEmoticons,
             )
         }
@@ -4969,7 +5064,11 @@ private fun MineScreen(
         else -> Dp.Unspecified
     }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
         PullToRefreshBox(
             isRefreshing = isLoading,
             onRefresh = onRefresh,
@@ -4987,7 +5086,7 @@ private fun MineScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(topInset + compactBarContentHeight)
-                                .background(MaterialTheme.colorScheme.surface)
+                                .background(Color.White)
                                 .padding(top = topInset, start = 16.dp, end = 4.dp)
                                 .graphicsLayer { alpha = animatedCollapse },
                             verticalAlignment = Alignment.CenterVertically,
@@ -5229,12 +5328,19 @@ private fun SettingsPageShell(
 @Composable
 private fun SettingsScreen(
     hasLoginCookie: Boolean,
-    emoticonCount: Int,
+    accounts: List<StoredWeiboAccount>,
+    activeAccountId: String?,
+    emoticonMap: Map<String, String>,
     emoticonSyncing: Boolean,
     onBack: () -> Unit,
-    onOpenAccount: () -> Unit,
+    onSwitchAccount: (String) -> Unit,
+    onAddAccount: () -> Unit,
     onSyncEmoticons: () -> Unit,
 ) {
+    var accountExpanded by remember { mutableStateOf(false) }
+    var emoticonExpanded by remember { mutableStateOf(false) }
+    val emoticonCount = emoticonMap.size
+
     SettingsPageShell(title = "设置", onBack = onBack) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
@@ -5242,40 +5348,382 @@ private fun SettingsScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                SettingsActionCard(
-                    title = "账号管理",
-                    subtitle = if (hasLoginCookie) {
-                        "\u7BA1\u7406\u5FAE\u535A\u7F51\u9875\u767B\u5F55\u6001\uFF0C\u6216\u91CD\u65B0\u767B\u5F55\u8D26\u53F7"
-                    } else {
-                        "\u767B\u5F55\u5FAE\u535A\u4EE5\u8BFB\u53D6\u4E3B\u9875\u3001\u4FE1\u606F\u6D41\u4E0E\u8BC4\u8BBA"
-                    },
-                    status = if (hasLoginCookie) "\u5DF2\u767B\u5F55" else "\u672A\u767B\u5F55",
-                    actionLabel = "进入",
-                    onClick = onOpenAccount,
+                SettingsAccountCard(
+                    expanded = accountExpanded,
+                    onExpandedChange = { accountExpanded = it },
+                    accounts = accounts,
+                    activeAccountId = activeAccountId,
+                    hasLoginCookie = hasLoginCookie,
+                    onSwitchAccount = onSwitchAccount,
+                    onAddAccount = onAddAccount,
                 )
             }
             item {
-                SettingsActionCard(
-                    title = "表情同步",
-                    subtitle = if (emoticonCount > 0) {
-                        "本地已缓存 $emoticonCount 个微博表情，可继续更新"
-                    } else {
-                        "本地已缓存 0 个微博表情，同步后可提升正文与评论表情显示"
-                    },
-                    status = if (emoticonSyncing) {
-                        "同步中"
-                    } else if (emoticonCount > 0) {
-                        "本地 $emoticonCount 个"
-                    } else {
-                        "未同步"
-                    },
-                    actionLabel = if (emoticonCount > 0) "更新" else "同步",
-                    loading = emoticonSyncing,
-                    enabled = !emoticonSyncing,
-                    onClick = onSyncEmoticons,
+                SettingsEmoticonCard(
+                    expanded = emoticonExpanded,
+                    onExpandedChange = { emoticonExpanded = it },
+                    emoticonMap = emoticonMap,
+                    emoticonSyncing = emoticonSyncing,
+                    onSyncEmoticons = onSyncEmoticons,
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsExpandIndicator(
+    expanded: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val rotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = tween(200),
+        label = "settings_expand_chevron",
+    )
+    Icon(
+        painter = painterResource(R.drawable.ic_chevron_down),
+        contentDescription = null,
+        modifier = modifier
+            .size(20.dp)
+            .graphicsLayer { rotationZ = rotation },
+        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun SettingsAccountCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    accounts: List<StoredWeiboAccount>,
+    activeAccountId: String?,
+    hasLoginCookie: Boolean,
+    onSwitchAccount: (String) -> Unit,
+    onAddAccount: () -> Unit,
+) {
+    val activeAccount = accounts.firstOrNull { it.id == activeAccountId }
+    val subtitle = when {
+        activeAccount != null -> "${activeAccount.screenName}（UID ${activeAccount.id}）"
+        accounts.isNotEmpty() -> "已保存 ${accounts.size} 个账号，点击展开切换"
+        hasLoginCookie -> "已登录，点击展开管理账号"
+        else -> "登录微博以读取主页、信息流与评论"
+    }
+    val status = when {
+        accounts.isNotEmpty() -> "${accounts.size} 个账号"
+        hasLoginCookie -> "已登录"
+        else -> "未登录"
+    }
+
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "账号管理",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = status,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded)
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (accounts.isEmpty()) {
+                        Text(
+                            text = "暂无已保存账号",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                    } else {
+                        accounts.forEach { account ->
+                            val isActive = account.id == activeAccountId
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(
+                                        if (isActive) {
+                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                                        } else {
+                                            StatusQuotedBackground
+                                        }
+                                    )
+                                    .clickable(enabled = !isActive) { onSwitchAccount(account.id) }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                RemoteImage(
+                                    url = account.avatarUrl,
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(CircleShape),
+                                    contentScale = ContentScale.Crop,
+                                )
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
+                                    Text(
+                                        text = account.screenName.ifBlank { "微博用户" },
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = "UID ${account.id}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                if (isActive) {
+                                    Text(
+                                        text = "当前",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    TextButton(
+                        onClick = onAddAccount,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("添加账号")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsEmoticonCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    emoticonMap: Map<String, String>,
+    emoticonSyncing: Boolean,
+    onSyncEmoticons: () -> Unit,
+) {
+    val emoticonCount = emoticonMap.size
+    val sortedEmoticons = remember(emoticonMap) {
+        emoticonMap.entries.sortedBy { it.key }
+    }
+    val subtitle = if (emoticonCount > 0) {
+        "本地已缓存 $emoticonCount 个微博表情，点击展开查看"
+    } else {
+        "本地暂无表情缓存，同步后可提升正文与评论表情显示"
+    }
+    val status = when {
+        emoticonSyncing -> "同步中"
+        emoticonCount > 0 -> "本地 $emoticonCount 个"
+        else -> "未同步"
+    }
+
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "表情同步",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = status,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (emoticonSyncing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        strokeWidth = 2.dp,
+                    )
+                } else {
+                    SettingsExpandIndicator(expanded = expanded)
+                }
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (sortedEmoticons.isEmpty()) {
+                        Text(
+                            text = "暂无本地表情",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                    } else {
+                        BoxWithConstraints(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 360.dp)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            val gap = 6.dp
+                            val cellWidth = (maxWidth - gap * 6) / 7
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(gap),
+                                verticalArrangement = Arrangement.spacedBy(gap),
+                                maxItemsInEachRow = 7,
+                            ) {
+                                sortedEmoticons.forEach { (phrase, url) ->
+                                    SettingsEmoticonTile(
+                                        phrase = phrase,
+                                        url = url,
+                                        width = cellWidth,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    TextButton(
+                        onClick = onSyncEmoticons,
+                        enabled = !emoticonSyncing,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        if (emoticonSyncing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(if (emoticonCount > 0) "更新表情" else "同步表情")
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun emoticonDisplayLabel(phrase: String): String {
+    if (phrase.length >= 2 && phrase.startsWith("[") && phrase.endsWith("]")) {
+        return phrase.substring(1, phrase.length - 1)
+    }
+    return phrase
+}
+
+@Composable
+private fun SettingsEmoticonTile(
+    phrase: String,
+    url: String,
+    width: Dp,
+) {
+    Column(
+        modifier = Modifier.width(width),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(width),
+            contentAlignment = Alignment.Center,
+        ) {
+            EmojiImage(url = url)
+        }
+        Text(
+            text = emoticonDisplayLabel(phrase),
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 9.sp,
+                lineHeight = 10.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -5295,6 +5743,9 @@ private fun SettingsActionCard(
             .clip(RoundedCornerShape(8.dp))
             .clickable(enabled = enabled, onClick = onClick),
         shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
     ) {
         Row(
             modifier = Modifier
@@ -5434,23 +5885,18 @@ private fun ProfileCoverBanner(
         }
 
         if (onOpenSettings != null) {
-            Surface(
-                modifier = Modifier.align(Alignment.TopEnd).padding(top = 32.dp, end = 10.dp),
-                shape = CircleShape,
-                color = Color.White.copy(alpha = 0.62f),
-                tonalElevation = 0.dp,
-                shadowElevation = 1.dp,
+            IconButton(
+                onClick = onOpenSettings,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 32.dp, end = 10.dp)
+                    .size(40.dp),
             ) {
-                IconButton(
-                    onClick = onOpenSettings,
-                    modifier = Modifier.size(42.dp),
-                ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_settings),
-                        contentDescription = "\u8BBE\u7F6E",
-                        tint = MaterialTheme.colorScheme.onSurface,
-                    )
-                }
+                Icon(
+                    painter = painterResource(R.drawable.ic_settings),
+                    contentDescription = "\u8BBE\u7F6E",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                )
             }
         }
     }
@@ -5471,7 +5917,12 @@ private fun MineProfileHeader(
     loadError: String?,
     onOpenSettings: (() -> Unit)?,
 ) {
-    ElevatedCard(shape = RoundedCornerShape(8.dp)) {
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             Box(
                 modifier = Modifier
@@ -5482,7 +5933,7 @@ private fun MineProfileHeader(
                             colors = listOf(
                                 MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
                                 Color.White.copy(alpha = 0.42f),
-                                MaterialTheme.colorScheme.surfaceContainerHighest,
+                                StatusQuotedBackground,
                             )
                         )
                     )
@@ -5844,7 +6295,12 @@ private fun albumDateLabel(createdAt: String?): Pair<String, String> {
 
 @Composable
 private fun MineStatsRow(profile: UserProfile?) {
-    ElevatedCard(shape = RoundedCornerShape(8.dp)) {
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
@@ -5951,7 +6407,14 @@ private fun MineInfoLine(label: String, value: String) {
 }
 
 @Composable
-private fun AccountLoginPanel(session: WeiboWebSession) {
+private fun AccountLoginPanel(
+    session: WeiboWebSession,
+    onReturnToFeed: () -> Unit,
+) {
+    LaunchedEffect(Unit) {
+        session.openLogin()
+    }
+
     Column(Modifier.fillMaxSize()) {
         Surface(
             color = MaterialTheme.colorScheme.secondaryContainer,
@@ -5963,13 +6426,13 @@ private fun AccountLoginPanel(session: WeiboWebSession) {
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("\u5FAE\u535A\u7F51\u9875\u767B\u5F55", fontWeight = FontWeight.SemiBold)
+                Text("\u5FAE\u535A\u767B\u5F55", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 weibo.com\u3002\u767B\u5F55\u6210\u529F\u540E\u70B9\u51FB\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u518D\u5230\u9996\u9875\u540C\u6B65\u3002",
+                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u70B9\u51FB\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u5C06\u8DF3\u8F6C\u5230\u9996\u9875\u5E76\u540C\u6B65\u6570\u636E\u3002",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { session.openWeiboHome() }) {
+                    TextButton(onClick = onReturnToFeed) {
                         Text("\u56DE\u5230\u5FAE\u535A\u9996\u9875")
                     }
                     TextButton(onClick = { session.openLogin() }) {
@@ -6000,15 +6463,15 @@ private fun AccountScreen(session: WeiboWebSession) {
             Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("微博网页会话", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 weibo.com\u3002\u767B\u5F55\u6210\u529F\u540E\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u518D\u5230\u9996\u9875\u5237\u65B0\u3002",
+                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u518D\u5230\u9996\u9875\u5237\u65B0\u3002",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { session.openWeiboHome() }) {
+                    TextButton(onClick = { session.openWeiboHome() }) {
                         Text("\u5B8C\u6210\u767B\u5F55\uFF0C\u56DE\u5230\u5FAE\u535A\u9996\u9875")
                     }
                     TextButton(onClick = { session.openLogin() }) {
-                        Text("重新打开")
+                        Text("\u91CD\u65B0\u6253\u5F00")
                     }
                 }
             }

@@ -38,7 +38,7 @@ class WeiboWebSession(context: Context) {
     }
 
     fun openLogin() {
-        webView.loadUrl(WEIBO_HOME)
+        webView.loadUrl(WEIBO_PASSPORT_LOGIN)
     }
 
     fun openWeiboHome() {
@@ -623,6 +623,65 @@ class WeiboWebSession(context: Context) {
         return WeiboJsonParser.parseEmotions(raw)
     }
 
+    suspend fun persistCurrentAccount(store: WeiboAccountStore): StoredWeiboAccount? {
+        if (!hasLoginCookie()) return null
+        val profile = loadCurrentUserProfile()
+        val account = StoredWeiboAccount(
+            id = profile.id,
+            screenName = profile.screenName,
+            avatarUrl = profile.avatarUrl,
+            cookies = captureCookieSnapshot(),
+        )
+        store.upsertAccount(account)
+        return account
+    }
+
+    suspend fun activateAccount(store: WeiboAccountStore, accountId: String) {
+        val account = store.getAccount(accountId)
+            ?: throw IllegalStateException("未找到账号 $accountId")
+        clearAllCookies()
+        restoreCookieSnapshot(account.cookies)
+        store.setActiveAccountId(accountId)
+        webView.loadUrl(WEIBO_HOME)
+        delay(400)
+    }
+
+    suspend fun prepareAddAccount() {
+        clearAllCookies()
+        openLogin()
+    }
+
+    fun captureCookieSnapshot(): Map<String, String> {
+        CookieManager.getInstance().flush()
+        return COOKIE_ORIGINS.mapNotNull { origin ->
+            CookieManager.getInstance().getCookie(origin)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { origin to it }
+        }.toMap()
+    }
+
+    fun restoreCookieSnapshot(snapshot: Map<String, String>) {
+        val manager = CookieManager.getInstance()
+        snapshot.forEach { (origin, cookieValue) ->
+            cookieValue.split(";")
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .forEach { pair -> manager.setCookie(origin, pair) }
+        }
+        manager.flush()
+    }
+
+    suspend fun clearAllCookies() {
+        suspendCancellableCoroutine { continuation ->
+            CookieManager.getInstance().removeAllCookies { success ->
+                CookieManager.getInstance().flush()
+                if (continuation.isActive) {
+                    continuation.resume(success)
+                }
+            }
+        }
+    }
+
     private fun String.jsQuote(): String =
         JSONObject.quote(this)
 
@@ -631,6 +690,13 @@ class WeiboWebSession(context: Context) {
 
     companion object {
         private const val WEIBO_HOME = "https://weibo.com/"
+        private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
+        private val COOKIE_ORIGINS = listOf(
+            "https://weibo.com/",
+            "https://www.weibo.com/",
+            "https://passport.weibo.cn/",
+            "https://m.weibo.cn/",
+        )
         private const val DESKTOP_CHROME_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"

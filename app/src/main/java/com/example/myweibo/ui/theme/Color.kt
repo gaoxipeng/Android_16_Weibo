@@ -11,3 +11,7 @@ val WeiboTeal40 = Color(0xFF4CAFB9)
 val WeiboCoral40 = Color(0xFFE9836F)
 
 val WeiboTopicBlue = Color(0xFF6CB4EE)
+
+val AppBackgroundLight = Color(0xFFFAFAFA)
+
+val StatusQuotedBackground = Color(0xFFF5F5F5)
