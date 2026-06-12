@@ -213,13 +213,51 @@ class WeiboWebSession(context: Context) {
     data class CommentsPage(val items: List<CommentItem>, val nextCursor: String?)
 
     suspend fun expandLongText(item: FeedItem): FeedItem {
-        val raw = fetchJson(
-            WeiboEndpoints.STATUS_LONG_TEXT,
-            linkedMapOf("id" to item.statusId),
-        )
-        val data = JSONObject(raw).optJSONObject("data")
-            ?: throw IllegalStateException("微博长文接口未返回内容")
-        return WeiboJsonParser.mergeLongTextIntoFeedItem(item, data)
+        val candidates = buildList {
+            item.statusId.takeIf { it.isNotBlank() }?.let { add(it) }
+            item.id.takeIf { it.isNotBlank() && it != item.statusId }?.let { add(it) }
+        }
+        if (candidates.isEmpty()) {
+            throw IllegalStateException("无效的微博 ID")
+        }
+
+        var lastError: Throwable? = null
+        for (id in candidates) {
+            runCatching {
+                val raw = fetchJson(
+                    WeiboEndpoints.STATUS_LONG_TEXT,
+                    linkedMapOf("id" to id),
+                )
+                val data = JSONObject(raw).optJSONObject("data")
+                    ?: throw IllegalStateException("微博长文接口未返回内容")
+                if (!WeiboJsonParser.hasLongTextPayload(data)) {
+                    throw IllegalStateException("微博长文内容为空")
+                }
+                val merged = WeiboJsonParser.mergeLongTextIntoFeedItem(item, data)
+                if (!merged.isLongText) return merged
+                throw IllegalStateException("微博长文解析失败")
+            }.onSuccess { return it }
+                .onFailure { lastError = it }
+        }
+        for (id in candidates) {
+            runCatching {
+                val raw = fetchJson(
+                    WeiboEndpoints.STATUS_DETAIL,
+                    linkedMapOf(
+                        "id" to id,
+                        "isGetLongText" to "1",
+                    ),
+                )
+                val detail = WeiboJsonParser.parseStatusDetail(raw)
+                    ?: throw IllegalStateException("微博详情接口未返回有效内容")
+                if (!detail.isLongText && detail.text.length >= item.text.length) {
+                    return detail
+                }
+                throw IllegalStateException("微博详情长文解析失败")
+            }.onSuccess { return it }
+                .onFailure { lastError = it }
+        }
+        throw lastError ?: IllegalStateException("微博长文接口未返回内容")
     }
 
     suspend fun loadComments(item: FeedItem): CommentsPage {
@@ -270,9 +308,24 @@ class WeiboWebSession(context: Context) {
     suspend fun loadUserProfile(lookup: ProfileLookup): UserProfile {
         val params = when (lookup) {
             is ProfileLookup.Uid -> linkedMapOf("uid" to lookup.uid)
-            is ProfileLookup.ScreenName -> linkedMapOf("screen_name" to lookup.screenName)
+            is ProfileLookup.ScreenName -> linkedMapOf(
+                "screen_name" to lookup.screenName,
+                "scene" to "profile",
+            )
         }
-        val raw = fetchJson(WeiboEndpoints.PROFILE_INFO, params)
+        val raw = runCatching {
+            fetchJson(WeiboEndpoints.PROFILE_INFO, params)
+        }.getOrElse { error ->
+            if (lookup is ProfileLookup.ScreenName) {
+                nativeFetchAbsoluteJson(
+                    url = "https://m.weibo.cn/api/container/getIndex?type=uname&value=${lookup.screenName.urlEncode()}",
+                    referer = "https://m.weibo.cn/",
+                    origin = "https://m.weibo.cn",
+                )
+            } else {
+                throw error
+            }
+        }
         return WeiboJsonParser.parseUserProfile(raw)
     }
 

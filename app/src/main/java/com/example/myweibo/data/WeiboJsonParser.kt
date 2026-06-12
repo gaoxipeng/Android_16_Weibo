@@ -24,6 +24,13 @@ object WeiboJsonParser {
         return TimelinePage(items = items, nextCursor = nextCursor)
     }
 
+    fun parseStatusDetail(raw: String): FeedItem? {
+        val root = JSONObject(raw)
+        val status = unwrapStatusDetailPayload(root) ?: return null
+        if (status.looksLikeAd()) return null
+        return parseStatus(status, allowRetweeted = true)
+    }
+
     fun parseComments(raw: String): List<CommentItem> {
         val root = JSONObject(raw)
         val data = root.optJSONArray("data")
@@ -189,17 +196,46 @@ object WeiboJsonParser {
         }
     }
 
+    fun hasLongTextPayload(data: JSONObject): Boolean =
+        listOf("longTextContent", "longTextContent_raw", "text", "text_raw", "raw_text")
+            .any { data.optNullableString(it)?.isNotBlank() == true }
+
     fun mergeLongTextIntoFeedItem(item: FeedItem, data: JSONObject): FeedItem {
-        val contentHtml = data.optNullableString("longTextContent") ?: ""
+        val contentHtml = data.optNullableString("longTextContent")
+            ?: data.optNullableString("text")
+            ?: ""
         val contentRaw = data.optNullableString("longTextContent_raw")
+            ?: data.optNullableString("text_raw")
+            ?: data.optNullableString("raw_text")
             ?: contentHtml
-        val rawForParse = stripLongTextPreviewLabel(contentRaw)
+        if (!hasLongTextPayload(data)) return item
+
+        val sourceForParse = stripLongTextPreviewLabel(
+            contentRaw.takeIf { it.isNotBlank() } ?: contentHtml,
+        )
         val additionalImages = parseImages(data).map {
             it.copy(createdAt = it.createdAt ?: item.createdAt)
         }
         val mergedImages = (item.images + additionalImages).distinctBy { it.largeUrl }
-        val text = parseStatusText(data, rawForParse, mergedImages, item.media)
-        val mergedEmoticons = item.emoticons + extractEmoticonsFromHtml(contentHtml)
+        // 长文合并只依据接口返回的正文与媒体，不复用卡片上的 video 等媒体字段，避免转发场景误删正文。
+        var text = parseStatusText(data, sourceForParse, mergedImages, media = null)
+        if (text.isBlank()) {
+            text = plainText(sourceForParse)
+        }
+        if (text.isBlank()) {
+            text = sourceForParse.trim()
+        }
+        val emoticonSource = contentHtml.takeIf { it.isNotBlank() } ?: contentRaw
+        val mergedEmoticons = item.emoticons + extractEmoticonsFromHtml(emoticonSource)
+        val hasMoreImages = mergedImages.size > item.images.size
+        if (text.isBlank()) {
+            if (!hasMoreImages) return item
+            return item.copy(
+                isLongText = false,
+                emoticons = mergedEmoticons,
+                images = mergedImages,
+            )
+        }
         return item.copy(
             isLongText = false,
             text = text,
@@ -523,7 +559,7 @@ object WeiboJsonParser {
         val isLongText = status.isLongTextPreview()
         val displayText = if (isLongText) stripLongTextPreviewLabel(rawText) else rawText
 
-        return FeedItem(
+        val item = FeedItem(
             id = id,
             statusId = status.optNullableString("mblogid") ?: id,
             authorId = authorId,
@@ -543,7 +579,28 @@ object WeiboJsonParser {
             media = resolvedMedia,
             retweetedStatus = retweeted,
         )
+        val embeddedLongText = status.optJSONObject("longText")
+            ?.takeIf { hasLongTextPayload(it) }
+        return embeddedLongText?.let { mergeLongTextIntoFeedItem(item, it) } ?: item
     }
+
+    private fun unwrapStatusDetailPayload(root: JSONObject): JSONObject? {
+        root.optJSONObject("data")?.let { data ->
+            if (data.isStatusLike()) return data
+            data.optJSONObject("mblog")?.let { if (it.isStatusLike()) return it }
+            data.optJSONObject("status")?.let { if (it.isStatusLike()) return it }
+        }
+        root.optJSONObject("mblog")?.let { if (it.isStatusLike()) return it }
+        root.optJSONObject("status")?.let { if (it.isStatusLike()) return it }
+        return root.takeIf { it.isStatusLike() }
+    }
+
+    private fun JSONObject.isStatusLike(): Boolean =
+        optJSONObject("user") != null ||
+            optNullableString("idstr") != null ||
+            optNullableString("mid") != null ||
+            optNullableString("id") != null ||
+            optJSONObject("retweeted_status") != null
 
     private fun parseImages(status: JSONObject): List<FeedImage> {
         val fromStatus = imagesFromParts(status.optJSONArray("pic_ids"), status.optJSONObject("pic_infos"))
@@ -931,7 +988,7 @@ object WeiboJsonParser {
     }
 
     private fun JSONObject.isLongTextPreview(): Boolean =
-        optBoolean("isLongText") && (!has("longText") || isNull("longText"))
+        optBoolean("isLongText") && !(has("longText") && !isNull("longText"))
 
     private fun stripLongTextPreviewLabel(text: String): String =
         text
@@ -942,6 +999,14 @@ object WeiboJsonParser {
                 ),
                 "",
             )
+            .replace(
+                Regex(
+                    """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?全文\s*(?:</a>)?(?=\s*//[@＠])""",
+                    RegexOption.IGNORE_CASE,
+                ),
+                "",
+            )
+            .replace(Regex("""(?:\.{3}|…|⋯)?\s*全文(?=\s*//[@＠])"""), "")
             .replace(
                 Regex(
                     """((?:\.{3}|…|⋯)\s*)(?:<a\b[^>]*>\s*)?全文\s*(?:</a>)?\s*$""",
