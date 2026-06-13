@@ -187,6 +187,7 @@ class MineCacheStore(context: Context) {
             .put("large_url", largeUrl)
             .put("download_urls", JSONArray(downloadUrls))
             .put("live_photo_video_url", livePhotoVideoUrl)
+            .put("type", type)
             .put("created_at", createdAt)
             .put("status_id", statusId)
             .put("width", width)
@@ -208,6 +209,7 @@ class MineCacheStore(context: Context) {
                         statusId = item.optNullableString("status_id"),
                         width = item.optInt("width").takeIf { it > 0 },
                         height = item.optInt("height").takeIf { it > 0 },
+                        type = item.optNullableString("type"),
                     )
                 )
             }

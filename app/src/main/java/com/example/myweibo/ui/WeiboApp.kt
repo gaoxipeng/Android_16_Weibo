@@ -591,6 +591,7 @@ fun WeiboApp() {
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
+    var detailScrollRestoreToken by remember { mutableIntStateOf(0) }
     var activeDetailInstanceKey by remember { mutableIntStateOf(0) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
@@ -945,6 +946,7 @@ fun WeiboApp() {
         activeDetailInstanceKey = snapshot.instanceKey
         lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
         detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
+        detailScrollRestoreToken += 1
     }
 
     fun loadMoreVisitedPosts() {
@@ -1697,23 +1699,33 @@ fun WeiboApp() {
         }
     }
 
-    fun expandNestedComments(commentId: String) {
+    fun loadNestedCommentsPage(commentId: String) {
         val item = selectedItem ?: return
         val authorUid = item.authorId.takeIf { it.isNotBlank() } ?: return
         if (commentId in nestedCommentsLoadingIds) return
+        val parent = findCommentInTree(comments, commentId) ?: return
+        val append = parent.moreInfoText == null && parent.nestedNextCursor != null
+        if (!append && parent.moreInfoText == null) return
+        val cursor = if (append) parent.nestedNextCursor else null
         scope.launch {
             nestedCommentsLoadingIds = nestedCommentsLoadingIds + commentId
-            runCatching { session.loadNestedComments(commentId, authorUid) }
+            runCatching { session.loadNestedComments(commentId, authorUid, cursor) }
                 .onSuccess { page ->
                     comments = updateCommentTree(comments, commentId) { comment ->
                         comment.copy(
-                            comments = page.items,
+                            comments = if (append) {
+                                mergeCommentItems(comment.comments, page.items)
+                            } else {
+                                page.items
+                            },
                             moreInfoText = null,
+                            nestedNextCursor = page.nextCursor,
                         )
                     }
                 }
                 .onFailure { error ->
-                    showMessage("\u697C\u4E2D\u697C\u5C55\u5F00\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
+                    val title = if (append) "\u697C\u4E2D\u697C\u52A0\u8F7D\u5931\u8D25" else "\u697C\u4E2D\u697C\u5C55\u5F00\u5931\u8D25"
+                    showMessage(title, error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
                 }
             nestedCommentsLoadingIds = nestedCommentsLoadingIds - commentId
         }
@@ -2181,24 +2193,35 @@ fun WeiboApp() {
                 detailOverlayItem?.let { detailItem ->
                     key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
-                        LaunchedEffect(detailItem.id, activeDetailInstanceKey, detailScrollPending?.first) {
+                        LaunchedEffect(detailListState) {
+                            snapshotFlow {
+                                ScrollRestore(
+                                    detailListState.firstVisibleItemIndex,
+                                    detailListState.firstVisibleItemScrollOffset,
+                                )
+                            }.collect { scroll ->
+                                lastDetailScroll = scroll
+                            }
+                        }
+                        LaunchedEffect(
+                            detailItem.id,
+                            activeDetailInstanceKey,
+                            detailScrollRestoreToken,
+                        ) {
                             val pending = detailScrollPending ?: return@LaunchedEffect
                             if (pending.first != detailItem.id) return@LaunchedEffect
+                            val target = pending.second
                             var attempts = 0
-                            while (attempts < 24 && detailListState.layoutInfo.totalItemsCount == 0) {
+                            while (attempts < 48) {
+                                val total = detailListState.layoutInfo.totalItemsCount
+                                if (total > 0 && target.index < total) break
                                 delay(16)
                                 attempts++
                             }
                             runCatching {
-                                detailListState.scrollToItem(pending.second.index, pending.second.offset)
+                                detailListState.scrollToItem(target.index, target.offset)
                             }
                             detailScrollPending = null
-                        }
-                        SideEffect {
-                            lastDetailScroll = ScrollRestore(
-                                detailListState.firstVisibleItemIndex,
-                                detailListState.firstVisibleItemScrollOffset,
-                            )
                         }
                         Box(
                             Modifier
@@ -2228,7 +2251,7 @@ fun WeiboApp() {
                                     emoticonMap = emoticonMap,
                                     onRetweetClick = ::openDetail,
                                     onUserClick = ::openUser,
-                                    onExpandNestedComments = ::expandNestedComments,
+                                    onExpandNestedComments = ::loadNestedCommentsPage,
                                     nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                                     onUrlEntityClick = ::openUrlEntity,
                                 )
@@ -6614,6 +6637,23 @@ private fun commentTextContainsReplyTo(text: String, replyToAuthor: String?): Bo
     return Regex("回复\\s*@${Regex.escape(replyToAuthor)}\\s*[:：]?").containsMatchIn(trimmed)
 }
 
+private fun findCommentInTree(comments: List<CommentItem>, commentId: String): CommentItem? {
+    for (comment in comments) {
+        if (comment.id == commentId) return comment
+        findCommentInTree(comment.comments, commentId)?.let { return it }
+    }
+    return null
+}
+
+private fun mergeCommentItems(
+    existing: List<CommentItem>,
+    appended: List<CommentItem>,
+): List<CommentItem> {
+    if (appended.isEmpty()) return existing
+    val seen = existing.map { it.id }.toMutableSet()
+    return existing + appended.filter { it.id !in seen }
+}
+
 private fun updateCommentTree(
     comments: List<CommentItem>,
     commentId: String,
@@ -6751,8 +6791,10 @@ private fun CommentRow(
                 onCommentImageClick = onCommentImageClick,
             )
         }
-        comment.moreInfoText?.let { moreText ->
-            val isExpanding = comment.id in nestedCommentsLoadingIds
+        val nestedActionText = comment.moreInfoText
+            ?: comment.nestedNextCursor?.let { "\u52A0\u8F7D\u66F4\u591A" }
+        nestedActionText?.let { actionText ->
+            val isLoadingNested = comment.id in nestedCommentsLoadingIds
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -6760,18 +6802,18 @@ private fun CommentRow(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (isExpanding) {
+                if (isLoadingNested) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(12.dp),
                         strokeWidth = 1.5.dp,
                     )
                 }
                 Text(
-                    text = if (isExpanding) "加载中..." else moreText,
+                    text = if (isLoadingNested) "\u52A0\u8F7D\u4E2D..." else actionText,
                     fontSize = CommentAuthorFontSize,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.clickable(
-                        enabled = !isExpanding && onExpandNestedComments != null,
+                        enabled = !isLoadingNested && onExpandNestedComments != null,
                         onClick = { onExpandNestedComments?.invoke(comment.id) },
                     ),
                 )

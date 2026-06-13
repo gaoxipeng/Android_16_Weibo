@@ -137,6 +137,7 @@ data class CommentItem(
     val replyToAuthor: String? = null,
     val replyToAuthorId: String? = null,
     val moreInfoText: String? = null,
+    val nestedNextCursor: String? = null,
 )
 
 data class UserProfile(

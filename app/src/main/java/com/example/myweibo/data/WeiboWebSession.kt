@@ -445,19 +445,24 @@ class WeiboWebSession(context: Context) {
         return CommentsPage(items, nextCursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
-    suspend fun loadNestedComments(commentId: String, statusAuthorUid: String): CommentsPage {
+    suspend fun loadNestedComments(
+        commentId: String,
+        statusAuthorUid: String,
+        cursor: String? = null,
+    ): CommentsPage {
+        val isFirstPage = cursor.isNullOrBlank()
         val raw = fetchJson(
             WeiboEndpoints.STATUS_COMMENTS,
             linkedMapOf(
                 "flow" to "1",
                 "id" to commentId,
                 "uid" to statusAuthorUid,
-                "is_reload" to "1",
+                "is_reload" to if (isFirstPage) "1" else "0",
                 "is_show_bulletin" to "2",
                 "is_mix" to "1",
                 "fetch_level" to "1",
                 "count" to "20",
-                "max_id" to "0",
+                "max_id" to (cursor?.takeIf { it.isNotBlank() } ?: "0"),
                 "locale" to "zh",
             ),
         )
