@@ -167,7 +167,9 @@ import androidx.compose.ui.zIndex
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
@@ -277,6 +279,11 @@ private enum class MainTab(val label: String) {
 private enum class SearchMode(val label: String) {
     Weibo("微博"),
     User("用户"),
+}
+
+private enum class SearchWeiboSort(val label: String) {
+    Comprehensive("综合"),
+    Realtime("实时"),
 }
 
 private enum class MineContentTab(val label: String) {
@@ -553,6 +560,7 @@ fun WeiboApp() {
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
+    var searchWeiboSort by remember { mutableStateOf(SearchWeiboSort.Comprehensive) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
@@ -1933,6 +1941,8 @@ fun WeiboApp() {
                             onUrlEntityClick = ::openUrlEntity,
                             onOpenLoginSettings = ::openAccountLoginManagement,
                             mineProfileId = mineProfile?.id,
+                            weiboSort = searchWeiboSort,
+                            onWeiboSortChange = { searchWeiboSort = it },
                         )
 
                         MainTab.Messages -> PlaceholderScreen(
@@ -6740,6 +6750,82 @@ private fun SearchModeActionMenu(
     }
 }
 
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun SearchWeiboSortActionMenu(
+    selected: SearchWeiboSort,
+    onSelected: (SearchWeiboSort) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+
+    fun dismissMenu() {
+        expanded = false
+    }
+
+    if (expanded) {
+        BackHandler { dismissMenu() }
+    }
+
+    val metaColor = weiboMetaTextColor()
+    Box {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                        expanded = !expanded
+                    },
+                )
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = selected.label,
+                style = MaterialTheme.typography.bodySmall,
+                color = metaColor,
+            )
+            SettingsExpandIndicator(
+                modifier = Modifier.size(16.dp),
+                tint = metaColor,
+            )
+        }
+
+        if (expanded) {
+            Popup(
+                alignment = Alignment.TopEnd,
+                offset = IntOffset(0, with(density) { 30.dp.roundToPx() }),
+                onDismissRequest = { dismissMenu() },
+                properties = PopupProperties(focusable = false),
+            ) {
+                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
+                    SearchWeiboSort.entries.forEachIndexed { index, sort ->
+                        if (index > 0) {
+                            ImageActionMenuDivider()
+                        }
+                        ImageActionRow(
+                            label = sort.label,
+                            enabled = true,
+                            selected = sort == selected,
+                            onClick = {
+                                dismissMenu()
+                                if (sort != selected) {
+                                    onSelected(sort)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun SearchCapsuleField(
     value: String,
@@ -6885,9 +6971,13 @@ private fun SearchScreen(
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
     onOpenLoginSettings: () -> Unit,
     mineProfileId: String?,
+    weiboSort: SearchWeiboSort,
+    onWeiboSortChange: (SearchWeiboSort) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val showMessage = LocalUiMessenger.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val listState = rememberLazyListState()
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var queryInput by remember { mutableStateOf("") }
@@ -6922,6 +7012,20 @@ private fun SearchScreen(
         initialResultsReady = false
         searchGeneration++
         activeQuery = normalized
+    }
+
+    fun changeWeiboSort(sort: SearchWeiboSort) {
+        if (sort == weiboSort) return
+        onWeiboSortChange(sort)
+        if (searchMode == SearchMode.Weibo && activeQuery != null) {
+            resultItems = emptyList()
+            resultError = null
+            resultNextPage = null
+            resultLoading = false
+            resultLoadingMore = false
+            initialResultsReady = false
+            searchGeneration++
+        }
     }
 
     suspend fun reloadHotSearch() {
@@ -6970,7 +7074,11 @@ private fun SearchScreen(
                     }
                 }
             } else {
-                val pageResult = session.loadWeiboSearch(query, page)
+                val pageResult = session.loadWeiboSearch(
+                    query = query,
+                    page = page,
+                    realtime = weiboSort == SearchWeiboSort.Realtime,
+                )
                 if (generation != searchGeneration) return
                 if (reset) {
                     resultItems = pageResult.items
@@ -7021,16 +7129,23 @@ private fun SearchScreen(
         onPendingQueryConsumed()
     }
 
-    LaunchedEffect(activeQuery, searchGeneration, hasLoginCookie, searchMode) {
+    LaunchedEffect(activeQuery, searchGeneration, hasLoginCookie, searchMode, weiboSort) {
         val query = activeQuery ?: return@LaunchedEffect
         if (!hasLoginCookie) return@LaunchedEffect
         loadTopicResults(reset = true, generation = searchGeneration)
     }
 
+    LaunchedEffect(initialResultsReady, activeQuery, searchGeneration) {
+        if (activeQuery != null && initialResultsReady) {
+            focusManager.clearFocus(force = true)
+            keyboardController?.hide()
+        }
+    }
+
     val searchGenerationState by rememberUpdatedState(searchGeneration)
     val initialResultsReadyState by rememberUpdatedState(initialResultsReady)
 
-    LaunchedEffect(listState, activeQuery, searchGeneration, searchMode) {
+    LaunchedEffect(listState, activeQuery, searchGeneration, searchMode, weiboSort) {
         if (activeQuery == null) return@LaunchedEffect
         snapshotFlow {
             if (!initialResultsReadyState) return@snapshotFlow null
@@ -7205,18 +7320,6 @@ private fun SearchScreen(
                     }
                 } else {
                     when {
-                        resultLoading &&
-                            (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
-                            !searchPullRefreshing -> {
-                            item {
-                                Box(
-                                    modifier = Modifier.fillMaxWidth().padding(24.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    AppLoadingIndicator(size = 28.dp, strokeWidth = 2.dp)
-                                }
-                            }
-                        }
                         resultError != null &&
                             (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
                             item {
@@ -7283,14 +7386,7 @@ private fun SearchScreen(
                         }
                     }
                     if (resultLoadingMore) {
-                        item {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().padding(16.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                AppLoadingIndicator(size = 24.dp, strokeWidth = 2.dp)
-                            }
-                        }
+                        item { MineLoadingMoreIndicator() }
                     }
                 }
             }
@@ -7317,11 +7413,23 @@ private fun SearchScreen(
                         fontWeight = FontWeight.SemiBold,
                         color = WeiboTopicBlue,
                     )
-                    Text(
-                        text = "${searchMode.label}搜索结果",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "${searchMode.label}搜索结果",
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (searchMode == SearchMode.Weibo) {
+                            SearchWeiboSortActionMenu(
+                                selected = weiboSort,
+                                onSelected = ::changeWeiboSort,
+                            )
+                        }
+                    }
                 }
             }
         }

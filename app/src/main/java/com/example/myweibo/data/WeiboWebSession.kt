@@ -112,19 +112,26 @@ class WeiboWebSession(context: Context) {
         return WeiboJsonParser.parseMweiboTopicTimeline(raw, page)
     }
 
-    suspend fun loadWeiboSearch(query: String, page: Int = 1): TimelinePage {
+    suspend fun loadWeiboSearch(query: String, page: Int = 1, realtime: Boolean = false): TimelinePage {
         val normalized = query.trim()
         if (normalized.isBlank()) return TimelinePage(items = emptyList())
-        val url = Uri.Builder()
+        val builder = Uri.Builder()
             .scheme("https")
             .authority("s.weibo.com")
-            .appendPath("weibo")
+            .appendPath(if (realtime) "realtime" else "weibo")
             .appendQueryParameter("q", normalized)
-            .appendQueryParameter("topic_ad", "")
-            .appendQueryParameter("t", "547")
             .appendQueryParameter("page", page.toString())
-            .build()
-            .toString()
+        if (realtime) {
+            builder
+                .appendQueryParameter("rd", "realtime")
+                .appendQueryParameter("tw", "realtime")
+                .appendQueryParameter("Refer", "weibo_realtime")
+        } else {
+            builder
+                .appendQueryParameter("topic_ad", "")
+                .appendQueryParameter("t", "547")
+        }
+        val url = builder.build().toString()
         val raw = nativeFetchAbsoluteHtml(
             url = url,
             referer = "https://s.weibo.com/",
