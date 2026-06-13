@@ -298,6 +298,7 @@ private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
 
 private val HintCapsuleWhite = Color.White
 private val HintCapsuleText = Color(0xFF1F1F1F)
+private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 
 private class VideoPlaybackCoordinator {
@@ -2224,7 +2225,6 @@ private fun MyWeiboScaffold(
     )
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun FloatingBottomBar(
     selectedTab: MainTab,
@@ -2359,36 +2359,18 @@ private fun FloatingBottomBar(
 
             Surface(
                 modifier = Modifier.width(barWidth).fillMaxHeight(),
-                color = Color.Transparent,
+                color = HintCapsuleWhite,
                 shadowElevation = 0.dp,
                 shape = glassShape,
-                border = BorderStroke(
-                    width = 0.5.dp,
-                    brush = Brush.linearGradient(
-                        colors = listOf(
-                            Color.White.copy(alpha = 0.26f),
-                            Color.White.copy(alpha = 0.10f),
-                            Color(0xFFD4D4D4).copy(alpha = 0.12f),
-                        )
-                    )
-                ),
+                border = BorderStroke(1.dp, HintCapsuleBorderColor),
             ) {
                 Box(
                     modifier = Modifier
                         .width(fullBarWidth)
-                        .fillMaxHeight(),
+                        .fillMaxHeight()
+                        .clip(glassShape)
+                        .padding(horizontal = barContentPadding),
                 ) {
-                    FrostedBarBackground(
-                        shape = glassShape,
-                        hazeState = hazeState,
-                        modifier = Modifier.matchParentSize(),
-                    )
-                    Box(
-                        modifier = Modifier
-                            .matchParentSize()
-                            .clip(glassShape)
-                            .padding(horizontal = barContentPadding),
-                    ) {
                     if (showExpandedChrome) {
                         LiquidSelectedPill(
                             active = liquidActive || gestureActive,
@@ -2436,7 +2418,6 @@ private fun FloatingBottomBar(
                                 modifier = Modifier.fillMaxWidth(),
                             )
                         }
-                    }
                     }
                 }
             }
@@ -2526,65 +2507,6 @@ private fun FloatingBottomBar(
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
-@Composable
-private fun FrostedBarBackground(
-    shape: RoundedCornerShape,
-    hazeState: HazeState,
-    modifier: Modifier = Modifier,
-) {
-    val surface = MaterialTheme.colorScheme.surface
-    Box(modifier = modifier.clip(shape)) {
-        Box(
-            Modifier
-                .matchParentSize()
-                .hazeEffect(state = hazeState, style = HazeMaterials.ultraThin()) {
-                    blurRadius = 24.dp
-                    noiseFactor = 0.03f
-                    alpha = 0.62f
-                }
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.White.copy(alpha = 0.14f),
-                            Color.White.copy(alpha = 0.08f),
-                            surface.copy(alpha = 0.05f),
-                        ),
-                    ),
-                ),
-        )
-        Box(
-            Modifier
-                .matchParentSize()
-                .background(
-                    Brush.linearGradient(
-                        colors = listOf(
-                            Color.White.copy(alpha = 0.05f),
-                            Color.Transparent,
-                            Color(0xFFE4E4E4).copy(alpha = 0.03f),
-                        ),
-                        start = Offset(0f, 0f),
-                        end = Offset(500f, 260f),
-                    ),
-                ),
-        )
-        Canvas(Modifier.fillMaxSize()) {
-            drawRoundRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color.White.copy(alpha = 0.10f),
-                        Color.White.copy(alpha = 0.02f),
-                        Color.Transparent,
-                    ),
-                    center = Offset(size.width * 0.5f, size.height * 0.08f),
-                    radius = size.width * 0.72f,
-                ),
-                cornerRadius = CornerRadius(size.height / 2f, size.height / 2f),
-            )
-        }
-    }
-}
-
 @Composable
 private fun OpaqueHintCapsule(
     modifier: Modifier = Modifier,
@@ -2596,10 +2518,7 @@ private fun OpaqueHintCapsule(
         shape = shape,
         color = HintCapsuleWhite,
         shadowElevation = 0.dp,
-        border = BorderStroke(
-            1.dp,
-            Color(0xFFE6E6E6),
-        ),
+        border = BorderStroke(1.dp, HintCapsuleBorderColor),
     ) {
         content()
     }
