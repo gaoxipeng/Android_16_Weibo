@@ -775,12 +775,12 @@ fun WeiboApp() {
                     uid = uid,
                     onPageLoaded = { images ->
                         if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
-                            visitedAlbumImages = images
+                            visitedAlbumImages = enrichAlbumImagesFromPosts(images, visitedPosts)
                         }
                     },
                 )
                 if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
-                    visitedAlbumImages = page.images
+                    visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, visitedPosts)
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
                     visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
@@ -923,7 +923,10 @@ fun WeiboApp() {
             val cursor = visitedAlbumNextCursor
             runCatching { session.loadUserAlbumImages(uid, cursor) }
                 .onSuccess { page ->
-                    visitedAlbumImages = (visitedAlbumImages + page.images).distinctBy { it.largeUrl }
+                    visitedAlbumImages = enrichAlbumImagesFromPosts(
+                        (visitedAlbumImages + page.images).distinctBy { it.largeUrl },
+                        visitedPosts,
+                    )
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
                 }
@@ -1328,10 +1331,16 @@ fun WeiboApp() {
                             val page = session.loadUserAlbumImages(
                                 uid = profile.id,
                                 onPageLoaded = { images ->
-                                    mineAlbumImages = filterOutRetweetedOnlyImages(images, minePosts)
+                                    mineAlbumImages = filterOutRetweetedOnlyImages(
+                                        enrichAlbumImagesFromPosts(images, minePosts),
+                                        minePosts,
+                                    )
                                 },
                             )
-                            mineAlbumImages = filterOutRetweetedOnlyImages(page.images, minePosts)
+                            mineAlbumImages = filterOutRetweetedOnlyImages(
+                                enrichAlbumImagesFromPosts(page.images, minePosts),
+                                minePosts,
+                            )
                             mineAlbumNextCursor = page.nextCursor
                             mineAlbumHasMore = page.nextCursor != null
                             mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
@@ -1408,7 +1417,13 @@ fun WeiboApp() {
             val cursor = mineAlbumNextCursor
             runCatching { session.loadUserAlbumImages(uid, cursor) }
                 .onSuccess { page ->
-                    mineAlbumImages = (mineAlbumImages + page.images).distinctBy { it.largeUrl }
+                    mineAlbumImages = filterOutRetweetedOnlyImages(
+                        enrichAlbumImagesFromPosts(
+                            (mineAlbumImages + page.images).distinctBy { it.largeUrl },
+                            minePosts,
+                        ),
+                        minePosts,
+                    )
                     mineAlbumNextCursor = page.nextCursor
                     mineAlbumHasMore = page.nextCursor != null
                     mineAlbumError = null
@@ -1689,7 +1704,10 @@ fun WeiboApp() {
             minePostsError = null
         }
         mineCacheStore.readAlbum()?.let { page ->
-            mineAlbumImages = filterOutRetweetedOnlyImages(page.images, minePosts)
+            mineAlbumImages = filterOutRetweetedOnlyImages(
+                enrichAlbumImagesFromPosts(page.images, minePosts),
+                minePosts,
+            )
             mineAlbumNextCursor = page.nextCursor
             mineAlbumHasMore = page.nextCursor != null
         }
@@ -4339,20 +4357,13 @@ private fun ImageActionPreviewImage(
     image: FeedImage,
     modifier: Modifier = Modifier,
 ) {
-    if (image.isGif) {
-        AnimatedRemoteImage(
-            url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
-            modifier = modifier,
-            contentScale = ContentScale.Fit,
-        )
-    } else {
-        RemoteImage(
-            url = image.largeUrl.ifBlank { image.thumbnailUrl },
-            fallbackUrls = image.downloadUrls.filter { it.isNotBlank() },
-            modifier = modifier,
-            contentScale = ContentScale.Fit,
-        )
-    }
+    var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
+    FeedImagePreviewContent(
+        image = image,
+        livePlaying = livePlaying,
+        onLiveEnded = { livePlaying = false },
+        modifier = modifier,
+    )
 }
 
 private data class ActionMenuPlacement(
@@ -5124,6 +5135,7 @@ private fun ZoomableFullscreenImage(
                         },
                         onLongPress = { offset ->
                             if (image.isLivePhoto && isInsideDisplayedImage(offset)) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 livePlaying = true
                             } else {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -9601,6 +9613,39 @@ private fun albumImageMatchKeys(image: FeedImage): Set<String> {
         keys += image.id.substringBeforeLast('.')
     }
     return keys
+}
+
+private fun enrichAlbumImagesFromPosts(images: List<FeedImage>, posts: List<FeedItem>): List<FeedImage> {
+    if (images.isEmpty() || posts.isEmpty()) return images
+    val postImages = posts.flatMap { post ->
+        post.images + (post.retweetedStatus?.images ?: emptyList())
+    }
+    if (postImages.isEmpty()) return images
+    val imageByKey = buildMap {
+        postImages.forEach { image ->
+            albumImageMatchKeys(image).forEach { key ->
+                putIfAbsent(key, image)
+            }
+        }
+    }
+    return images.map { image ->
+        val match = albumImageMatchKeys(image)
+            .firstNotNullOfOrNull { key -> imageByKey[key] }
+            ?: return@map image
+        val mergedLiveVideo = image.livePhotoVideoUrl ?: match.livePhotoVideoUrl
+        image.copy(
+            livePhotoVideoUrl = mergedLiveVideo,
+            type = when {
+                match.type == "livephoto" && !mergedLiveVideo.isNullOrBlank() -> "livephoto"
+                match.type == "gif" -> "gif"
+                image.type.isNullOrBlank() -> match.type
+                else -> image.type
+            },
+            width = image.width ?: match.width,
+            height = image.height ?: match.height,
+            downloadUrls = (image.downloadUrls + match.downloadUrls).distinct(),
+        )
+    }
 }
 
 private fun sinaimgPid(url: String): String? =

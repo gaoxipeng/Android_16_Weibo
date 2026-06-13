@@ -652,6 +652,34 @@ object WeiboJsonParser {
         createdAt?.let { applyAlbumDateToContext(it, monthContext) }
         val normalizedLarge = normalizeUrl(large)
         val normalizedThumb = normalizeUrl(thumbnail)
+        val picInfo = listOfNotNull(
+            item.optJSONObject("pic_info"),
+            item.optJSONObject("picInfo"),
+            item.optJSONObject("pic_infos")?.let { infos ->
+                pid?.let { infos.optJSONObject(it) }
+                    ?: item.optNullableString("pic_id")?.let { infos.optJSONObject(it) }
+            },
+        ).firstOrNull()
+        val imgType = picInfo?.optNullableString("type")
+            ?: item.optNullableString("type")
+            ?: item.optNullableString("pic_type")
+            ?: item.optNullableString("object_type")
+        val livePhotoVideoUrl = listOfNotNull(
+            picInfo?.optNullableString("video"),
+            picInfo?.optNullableString("video_hd"),
+            picInfo?.optNullableString("live_photo_video_url"),
+            item.optNullableString("video"),
+            item.optNullableString("video_hd"),
+            item.optNullableString("live_photo_video_url"),
+            item.optNullableString("livephoto_video_url"),
+            item.optJSONObject("live_photo")?.optNullableString("video"),
+            item.optJSONObject("live_photo")?.optNullableString("video_hd"),
+        ).firstOrNull { it.isNotBlank() }?.let(::normalizeUrl)
+        val largeInfo = picInfo?.optJSONObject("largest")
+            ?: picInfo?.optJSONObject("mw2000")
+            ?: picInfo?.optJSONObject("woriginal")
+            ?: picInfo?.optJSONObject("original")
+            ?: picInfo?.optJSONObject("large")
         return FeedImage(
             id = pid?.ifBlank { normalizedLarge } ?: normalizedLarge,
             thumbnailUrl = normalizedThumb,
@@ -661,8 +689,14 @@ object WeiboJsonParser {
                 normalizedThumb,
                 pid?.let(::pidToLargeUrl),
             ).distinct(),
+            livePhotoVideoUrl = livePhotoVideoUrl,
             createdAt = createdAt,
             statusId = item.optBlankString("mid"),
+            width = largeInfo?.optInt("width")?.takeIf { it > 0 }
+                ?: item.optInt("width").takeIf { it > 0 },
+            height = largeInfo?.optInt("height")?.takeIf { it > 0 }
+                ?: item.optInt("height").takeIf { it > 0 },
+            type = imgType,
         )
     }
 
