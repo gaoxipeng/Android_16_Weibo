@@ -1,8 +1,8 @@
 package com.example.myweibo.data
 
 enum class FriendListTab(val label: String) {
-    Following("关注"),
     Fans("粉丝"),
+    Following("关注"),
 }
 
 data class RelationUser(
@@ -43,3 +43,26 @@ fun RelationUser.toUserProfile(): UserProfile =
         following = following,
         followMe = followMe,
     )
+
+fun SearchUserItem.toRelationUser(): RelationUser {
+    val displayFollowers = followersCount.trim()
+    val followersLabel = displayFollowers.removeSuffix("粉丝").trim()
+    val following = followText in setOf("已关注", "相互关注", "互相关注")
+    val followMe = followText in setOf("相互关注", "互相关注")
+    return RelationUser(
+        id = id,
+        name = name.ifBlank { screenName }.ifBlank { "微博用户" },
+        screenName = screenName.ifBlank { name }.ifBlank { id },
+        avatarUrl = avatarUrl,
+        avatarLarge = avatarUrl,
+        description = description.takeIf { it.isNotBlank() },
+        followersCount = followersLabel.ifBlank { displayFollowers },
+        followersCountStr = followersLabel.takeIf { it.isNotBlank() },
+        friendsCount = "--",
+        following = following,
+        followMe = followMe,
+        verified = false,
+        verifiedReason = null,
+        location = null,
+    )
+}

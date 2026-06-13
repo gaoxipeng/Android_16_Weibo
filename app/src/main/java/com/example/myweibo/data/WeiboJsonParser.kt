@@ -2,6 +2,7 @@ package com.example.myweibo.data
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLDecoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -784,11 +785,7 @@ object WeiboJsonParser {
             }
         }
         val retweeted = retweetedJson?.let { json ->
-            val normalized = if (mediaBelongsToRetweeted) {
-                mergeRetweetedMediaFields(status, json)
-            } else {
-                json
-            }
+            val normalized = normalizeRetweetedStatus(status, json)
             parseStatus(normalized, allowRetweeted = false)
         }
         val resolvedMedia = when {
@@ -1252,6 +1249,62 @@ object WeiboJsonParser {
         return rootMid == retweetedId
     }
 
+    private fun normalizeRetweetedStatus(outer: JSONObject, retweeted: JSONObject): JSONObject {
+        val mediaBelongsToRetweeted = shouldAttachMediaToRetweeted(outer, retweeted)
+        val merged = if (mediaBelongsToRetweeted) {
+            mergeRetweetedMediaFields(outer, retweeted)
+        } else {
+            JSONObject(retweeted.toString())
+        }
+        mergeRetweetedUrlStruct(outer, merged, mediaBelongsToRetweeted)
+        return merged
+    }
+
+    private fun mergeRetweetedUrlStruct(
+        outer: JSONObject,
+        retweeted: JSONObject,
+        inheritAllFromOuter: Boolean,
+    ) {
+        val outerStruct = outer.optJSONArray("url_struct") ?: return
+        if (isJsonArrayEmpty(outerStruct)) return
+
+        val retweetedStruct = retweeted.optJSONArray("url_struct")
+        val mergedStruct = JSONArray()
+        val existingShortUrls = linkedSetOf<String>()
+
+        if (!isJsonArrayEmpty(retweetedStruct)) {
+            for (index in 0 until retweetedStruct!!.length()) {
+                retweetedStruct.optJSONObject(index)?.let { entity ->
+                    entity.optNullableString("short_url")?.let(existingShortUrls::add)
+                    mergedStruct.put(entity)
+                }
+            }
+        }
+
+        val retweetedText = retweetedTextForUrlMatch(retweeted)
+        val inheritAll = inheritAllFromOuter && isJsonArrayEmpty(retweetedStruct)
+        for (index in 0 until outerStruct.length()) {
+            val entity = outerStruct.optJSONObject(index) ?: continue
+            val shortUrl = entity.optNullableString("short_url") ?: continue
+            if (shortUrl in existingShortUrls) continue
+            if (inheritAll || retweetedText.contains(shortUrl)) {
+                mergedStruct.put(entity)
+                existingShortUrls.add(shortUrl)
+            }
+        }
+
+        if (mergedStruct.length() > 0) {
+            retweeted.put("url_struct", mergedStruct)
+        }
+    }
+
+    private fun retweetedTextForUrlMatch(retweeted: JSONObject): String =
+        listOfNotNull(
+            retweeted.optNullableString("text"),
+            retweeted.optNullableString("text_raw"),
+            retweeted.optNullableString("raw_text"),
+        ).joinToString("\n")
+
     private fun mergeRetweetedMediaFields(outer: JSONObject, retweeted: JSONObject): JSONObject {
         val merged = JSONObject(retweeted.toString())
         if (merged.optJSONObject("page_info") == null) {
@@ -1568,8 +1621,12 @@ object WeiboJsonParser {
 
     fun parseMweiboTopicTimeline(raw: String, page: Int = 1): TimelinePage {
         val root = JSONObject(raw)
-        if (root.optInt("ok", 0) != 1) return TimelinePage(items = emptyList())
-        val data = root.optJSONObject("data") ?: return TimelinePage(items = emptyList())
+        if (root.optInt("ok", 0) != 1) {
+            val message = root.optNullableString("msg")?.trim().orEmpty()
+            throw IllegalStateException(message.ifBlank { "话题搜索失败，请稍后重试" })
+        }
+        val data = root.optJSONObject("data")
+            ?: throw IllegalStateException("话题搜索返回数据为空")
         val cards = data.optJSONArray("cards") ?: JSONArray()
         val cardlistInfo = data.optJSONObject("cardlistInfo")
         val items = buildList {
@@ -1590,6 +1647,382 @@ object WeiboJsonParser {
             nextCursor = if (hasMore) (currentPage + 1).toString() else null,
         )
     }
+
+    fun parseMweiboSearchTimeline(raw: String, page: Int = 1): TimelinePage =
+        parseMweiboTopicTimeline(raw, page)
+
+    fun parseSWeiboSearchTimeline(raw: String, page: Int = 1): TimelinePage {
+        val items = buildList {
+            val seen = linkedSetOf<String>()
+            extractSWeiboHtmlFragments(raw).forEach { fragment ->
+                extractSWeiboCards(fragment).forEach { card ->
+                    parseSWeiboSearchCard(card)?.let { item ->
+                        if (seen.add(item.statusId)) add(item)
+                    }
+                }
+            }
+        }
+        return TimelinePage(
+            items = items,
+            nextCursor = if (items.isNotEmpty() && page < 50) (page + 1).toString() else null,
+        )
+    }
+
+    fun parseSWeiboUserSearch(raw: String, page: Int = 1): SearchUserPage {
+        val users = buildList {
+            val seen = linkedSetOf<String>()
+            extractSWeiboHtmlFragments(raw).forEach { fragment ->
+                extractSWeiboUserCards(fragment).forEach { card ->
+                    parseSWeiboUserCard(card)?.let { user ->
+                        val key = user.id.ifBlank { user.screenName }
+                        if (key.isNotBlank() && seen.add(key)) add(user)
+                    }
+                }
+            }
+        }
+        return SearchUserPage(
+            items = users,
+            nextCursor = if (users.isNotEmpty() && page < 50) (page + 1).toString() else null,
+        )
+    }
+
+    private fun extractSWeiboUserCards(html: String): List<String> {
+        val starts = Regex(
+            """<div\b[^>]*class=['"][^'"]*(?:card-user|usercard|person-card)[^'"]*['"][^>]*>""",
+            RegexOption.IGNORE_CASE,
+        ).findAll(html).map { it.range.first }.toList()
+        if (starts.isEmpty()) {
+            return extractSWeiboGenericUserCards(html)
+        }
+        return starts.mapIndexed { index, start ->
+            val end = starts.getOrNull(index + 1) ?: html.length
+            html.substring(start, end)
+        }
+    }
+
+    private fun extractSWeiboGenericUserCards(html: String): List<String> {
+        val starts = Regex("""<div\b[^>]*(?:uid=|href=['"](?:https?:)?//weibo\.com/(?:u/)?\d+)""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .map { it.range.first }
+            .toList()
+        return starts.mapIndexedNotNull { index, start ->
+            val end = starts.getOrNull(index + 1) ?: html.length
+            html.substring(start, end).takeIf { it.contains("profile_image") || it.contains("avator") || it.contains("avatar") }
+        }
+    }
+
+    private fun parseSWeiboUserCard(card: String): SearchUserItem? {
+        val id = Regex("""(?:uid=|/u/|weibo\.com/u/)(\d+)""", RegexOption.IGNORE_CASE)
+            .find(card)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: Regex("""href=['"](?:https?:)?//weibo\.com/(\d+)""", RegexOption.IGNORE_CASE)
+                .find(card)
+                ?.groupValues
+                ?.getOrNull(1)
+            ?: Regex("""\bid=['"]?(\d{5,})""", RegexOption.IGNORE_CASE)
+                .find(card)
+                ?.groupValues
+                ?.getOrNull(1)
+            ?: ""
+        val nameBlock = Regex(
+            """<a\b[^>]*(?:class=['"][^'"]*\bname\b[^'"]*['"]|nick-name=)[^>]*>.*?</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(card)?.value.orEmpty()
+        val name = htmlAttribute(nameBlock, "nick-name")
+            ?: htmlAttribute(nameBlock, "title")
+            ?: plainText(nameBlock)
+        if (id.isBlank() && name.isBlank()) return null
+        val avatarUrl = Regex("""<img\b[^>]*(?:src|data-src)=['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+            .find(card)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let(::htmlDecode)
+            ?.let(::normalizeUrl)
+        val cardText = plainText(card)
+        val description = parseSWeiboUserDescription(card, cardText)
+        val followers = parseSWeiboFollowers(cardText)
+        val followText = parseSWeiboFollowText(card, cardText)
+        return SearchUserItem(
+            id = id,
+            screenName = name,
+            name = name,
+            avatarUrl = avatarUrl,
+            description = description,
+            followersCount = followers,
+            followText = followText,
+        )
+    }
+
+    private fun parseSWeiboUserDescription(card: String, cardText: String): String {
+        val labeled = listOf(
+            Regex("""(?:简介|个人简介|认证)\s*[:：]\s*(.+?)(?=\s*(?:粉丝|关注|微博|所在地|认证|$))"""),
+            Regex("""(?:简介|个人简介|认证)\s+(.+?)(?=\s*(?:粉丝|关注|微博|所在地|认证|$))"""),
+        ).firstNotNullOfOrNull { pattern ->
+            pattern.find(cardText)?.groupValues?.getOrNull(1)?.trim()
+        }
+        if (!labeled.isNullOrBlank()) return labeled
+
+        return Regex(
+            """<(?:p|div)\b[^>]*class=['"][^'"]*(?:txt|info|desc|s-nobr|person-info)[^'"]*['"][^>]*>(.*?)</(?:p|div)>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).findAll(card)
+            .map { plainText(it.groupValues[1]).trim() }
+            .firstOrNull { text ->
+                text.isNotBlank() &&
+                    !text.contains("关注") &&
+                    !text.contains("粉丝") &&
+                    !text.contains("微博") &&
+                    text != "简介"
+            }
+            .orEmpty()
+    }
+
+    private fun parseSWeiboFollowers(cardText: String): String =
+        Regex("""粉丝\s*[:：]?\s*([0-9.万亿亿]+)""")
+            .find(cardText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "$it 粉丝" }
+            .orEmpty()
+
+    private fun parseSWeiboFollowText(card: String, cardText: String): String {
+        val actionText = Regex(
+            """<(?:a|button)\b[^>]*(?:class=['"][^'"]*(?:follow|btn|s-btn)[^'"]*['"]|action-type=['"][^'"]*follow[^'"]*['"])[^>]*>(.*?)</(?:a|button)>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).findAll(card)
+            .map { plainText(it.groupValues[1]).trim() }
+            .firstOrNull { it in setOf("关注", "已关注", "相互关注") }
+        if (!actionText.isNullOrBlank()) return actionText
+
+        return when {
+            cardText.contains("相互关注") -> "相互关注"
+            cardText.contains("已关注") -> "已关注"
+            Regex("""(^|\s|\|)关注($|\s|\|)""").containsMatchIn(cardText) -> "关注"
+            else -> ""
+        }
+    }
+
+    private fun extractSWeiboHtmlFragments(raw: String): List<String> {
+        val fragments = linkedSetOf(raw)
+        Regex("""FM\.view\((\{.*?\})\)""", RegexOption.DOT_MATCHES_ALL)
+            .findAll(raw)
+            .forEach { match ->
+                runCatching {
+                    val obj = JSONObject(match.groupValues[1])
+                    obj.optNullableString("html")
+                }.getOrNull()
+                    ?.takeIf { it.looksLikeSWeiboFragment() }
+                    ?.let(fragments::add)
+            }
+        Regex(""""html"\s*:\s*"((?:\\.|[^"\\])*)"""", RegexOption.DOT_MATCHES_ALL)
+            .findAll(raw)
+            .forEach { match ->
+                runCatching {
+                    JSONObject("""{"html":"${match.groupValues[1]}"}""").getString("html")
+                }.getOrNull()
+                    ?.takeIf { it.looksLikeSWeiboFragment() }
+                    ?.let(fragments::add)
+            }
+        return fragments.toList()
+    }
+
+    private fun String.looksLikeSWeiboFragment(): Boolean =
+        contains("feed_list_item") ||
+            contains("pl_feedlist_index") ||
+            contains("card-wrap") ||
+            contains("card-user") ||
+            contains("person-card") ||
+            contains("usercard") ||
+            contains("pl_user_feedList")
+
+    private fun extractSWeiboCards(html: String): List<String> {
+        val starts = Regex(
+            """<div\b[^>]*class=['"][^'"]*\bcard-wrap\b[^'"]*['"][^>]*>""",
+            RegexOption.IGNORE_CASE,
+        ).findAll(html).map { it.range.first }.toList()
+        if (starts.isEmpty()) return emptyList()
+        return starts.mapIndexedNotNull { index, start ->
+            val end = starts.getOrNull(index + 1) ?: html.length
+            html.substring(start, end)
+                .takeIf { it.contains("feed_list_item") || it.contains(Regex("""\bmid=['"]\d+""")) }
+        }
+    }
+
+    private fun parseSWeiboSearchCard(card: String): FeedItem? {
+        val firstTag = Regex("""<div\b[^>]*>""", RegexOption.IGNORE_CASE)
+            .find(card)
+            ?.value
+            .orEmpty()
+        val hrefPair = Regex("""href=['"](?:https?:)?//weibo\.com/(\d+)/([A-Za-z0-9]+)""")
+            .find(card)
+        val mid = htmlAttribute(firstTag, "mid")
+            ?: Regex("""\bmid=['"](\d+)['"]""").find(card)?.groupValues?.getOrNull(1)
+            ?: hrefPair?.groupValues?.getOrNull(2)
+            ?: return null
+        val statusId = hrefPair?.groupValues?.getOrNull(2) ?: mid
+        val authorId = hrefPair?.groupValues?.getOrNull(1)
+            ?: Regex("""(?:/u/|uid=)(\d+)""").find(card)?.groupValues?.getOrNull(1)
+            ?: ""
+        val authorBlock = Regex(
+            """<a\b[^>]*class=['"][^'"]*\bname\b[^'"]*['"][^>]*>.*?</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(card)?.value.orEmpty()
+        val authorName = htmlAttribute(authorBlock, "nick-name")
+            ?: plainText(authorBlock).ifBlank { "微博用户" }
+        val avatarUrl = Regex(
+            """<div\b[^>]*class=['"][^'"]*\bavator\b[^'"]*['"][\s\S]*?<img\b[^>]*src=['"]([^'"]+)['"]""",
+            RegexOption.IGNORE_CASE,
+        ).find(card)?.groupValues?.getOrNull(1)?.let(::normalizeUrl)
+        val fromBlock = Regex(
+            """<p\b[^>]*class=['"][^'"]*\bfrom\b[^'"]*['"][^>]*>(.*?)</p>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(card)?.groupValues?.getOrNull(1).orEmpty()
+        val fromMeta = parseSWeiboFromMetadata(fromBlock)
+        val fullTextHtml = Regex(
+            """<p\b[^>]*node-type=['"]feed_list_content_full['"][^>]*>(.*?)</p>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(card)?.groupValues?.getOrNull(1)
+        val shortTextHtml = Regex(
+            """<p\b[^>]*node-type=['"]feed_list_content['"][^>]*>(.*?)</p>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(card)?.groupValues?.getOrNull(1)
+        val textHtml = fullTextHtml ?: shortTextHtml.orEmpty()
+        val images = parseSWeiboSearchImages(card, avatarUrl, statusId)
+        return FeedItem(
+            id = mid,
+            statusId = statusId,
+            authorId = authorId,
+            authorName = authorName,
+            authorAvatarUrl = avatarUrl,
+            createdAt = fromMeta.createdAt,
+            source = fromMeta.source,
+            ipLocation = fromMeta.ipLocation,
+            text = plainText(textHtml)
+                .replace(Regex("""\s*展开\s*$"""), "")
+                .trim(),
+            isLongText = fullTextHtml == null && card.contains("feed_list_content_full"),
+            emoticons = extractEmoticonsFromHtml(textHtml),
+            repostsCount = parseSWeiboActionCount(card, "转发"),
+            commentsCount = parseSWeiboActionCount(card, "评论"),
+            likesCount = parseSWeiboActionCount(card, "赞"),
+            images = images,
+            media = null,
+        )
+    }
+
+    private fun parseSWeiboSearchImages(card: String, avatarUrl: String?, statusId: String): List<FeedImage> {
+        val mediaStart = card.indexOf("class=\"media\"").takeIf { it >= 0 }
+            ?: card.indexOf("class='media'").takeIf { it >= 0 }
+            ?: return emptyList()
+        val actionStart = card.indexOf("class=\"card-act\"", startIndex = mediaStart)
+            .takeIf { it > mediaStart }
+            ?: card.indexOf("class='card-act'", startIndex = mediaStart)
+                .takeIf { it > mediaStart }
+            ?: card.length
+        val mediaBlock = card.substring(mediaStart, actionStart)
+        val urls = linkedSetOf<String>()
+        Regex("""(?:src|action-data)=['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+            .findAll(mediaBlock)
+            .forEach { match ->
+                val value = htmlDecode(match.groupValues[1])
+                Regex("""(?:pic_src|src)=([^&]+)""").find(value)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.let { runCatching { URLDecoder.decode(it, Charsets.UTF_8.name()) }.getOrDefault(it) }
+                    ?.let(urls::add)
+                if (value.contains("sinaimg.cn")) urls.add(value)
+            }
+        return urls
+            .map(::normalizeUrl)
+            .filter { url ->
+                url.contains("sinaimg.cn") &&
+                    url != avatarUrl &&
+                    !url.contains("/face/") &&
+                    !url.contains("default_avatar")
+            }
+            .distinct()
+            .mapIndexed { index, url ->
+                val large = url.replace(
+                    Regex("""/(?:thumb\d+|orj\d+|mw\d+|bmiddle|small|thumbnail)/"""),
+                    "/large/",
+                )
+                FeedImage(
+                    id = url.substringAfterLast("/").substringBefore(".").ifBlank { "$statusId-$index" },
+                    thumbnailUrl = url,
+                    largeUrl = large,
+                    downloadUrls = listOf(large, url).distinct(),
+                    statusId = statusId,
+                )
+            }
+    }
+
+    private fun parseSWeiboFromMetadata(fromBlock: String): SWeiboFromMeta {
+        if (fromBlock.isBlank()) return SWeiboFromMeta(null, null, null)
+        val plainFrom = plainText(fromBlock)
+        val firstAnchor = Regex(
+            """<a\b([^>]*)>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(fromBlock)
+        val createdAt = firstAnchor?.groupValues?.getOrNull(1)?.let { attrs ->
+            htmlAttribute("<a $attrs>", "title")
+        }?.takeIf { it.isNotBlank() }
+            ?: firstAnchor?.groupValues?.getOrNull(2)?.let(::plainText)?.takeIf { it.isNotBlank() }
+
+        val source = Regex(
+            """来自\s*(?:&nbsp;|\s)*<a\b[^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(fromBlock)?.groupValues?.getOrNull(1)?.let(::plainText)?.trim()
+            ?.removePrefix("来自")
+            ?.trim()
+            ?: Regex("""来自\s*([^<\n]+)""").find(plainFrom)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+                ?.removePrefix("来自")
+                ?.trim()
+
+        val ipLocation = Regex(
+            """<span\b[^>]*\blocation\b[^>]*>(.*?)</span>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(fromBlock)?.groupValues?.getOrNull(1)?.let(::plainText)?.trim()
+            ?.removePrefix("发布于")
+            ?.trim()
+            ?: Regex("""发布于\s*([^<\n]+)""").find(plainFrom)?.groupValues?.getOrNull(1)?.trim()
+            ?: Regex("""IP属地[：:]\s*([^<\n]+)""").find(plainFrom)?.groupValues?.getOrNull(1)?.trim()
+
+        return SWeiboFromMeta(
+            createdAt = createdAt,
+            source = source,
+            ipLocation = ipLocation?.takeIf { it.isNotBlank() },
+        )
+    }
+
+    private data class SWeiboFromMeta(
+        val createdAt: String?,
+        val source: String?,
+        val ipLocation: String?,
+    )
+
+    private fun parseSWeiboActionCount(card: String, label: String): String {
+        val text = plainText(card)
+        val match = Regex("""$label\s*([0-9万.]+)?""").find(text)
+        return match?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "0"
+    }
+
+    private fun htmlAttribute(tag: String, name: String): String? =
+        Regex("""\b${Regex.escape(name)}=['"]([^'"]*)['"]""", RegexOption.IGNORE_CASE)
+            .find(tag)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.let(::htmlDecode)
+            ?.takeIf { it.isNotBlank() }
+
+    private fun htmlDecode(value: String): String =
+        value
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
 
     private fun collectMweiboCards(card: JSONObject): List<JSONObject> {
         return when (card.optInt("card_type", -1)) {

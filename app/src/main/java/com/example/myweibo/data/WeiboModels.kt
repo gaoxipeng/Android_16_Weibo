@@ -191,9 +191,15 @@ data class SearchUserItem(
     val avatarUrl: String?,
     val description: String,
     val followersCount: String,
+    val followText: String = "",
 )
 
 data class SearchSuggestResult(
     val hotQueries: List<String> = emptyList(),
     val users: List<SearchUserItem> = emptyList(),
+)
+
+data class SearchUserPage(
+    val items: List<SearchUserItem>,
+    val nextCursor: String? = null,
 )

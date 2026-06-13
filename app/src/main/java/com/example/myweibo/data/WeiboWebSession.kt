@@ -3,6 +3,7 @@ package com.example.myweibo.data
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
+import android.net.Uri
 import android.net.http.SslError
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
@@ -10,6 +11,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -29,6 +33,8 @@ class WeiboWebSession(context: Context) {
     val webView: WebView = WebView(context)
 
     private val albumLoadMutex = Mutex()
+    private val mweiboSessionMutex = Mutex()
+    private var mweiboSessionReady = false
 
     var currentUrl: String = ""
         private set
@@ -79,18 +85,104 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun loadTopicSearch(topic: String, page: Int = 1, channelType: String = "1"): TimelinePage {
+        ensureMweiboSession()
         val normalized = topic.removePrefix("#").removeSuffix("#").trim()
         if (normalized.isBlank()) return TimelinePage(items = emptyList())
         val containerId = "231522type=$channelType&q=#$normalized#"
-        val url = buildString {
-            append("https://m.weibo.cn/api/container/getIndex?")
-            append("containerid=").append(URLEncoder.encode(containerId, "UTF-8"))
-            append("&page_type=searchall")
-            append("&v_p=42")
-            append("&page=").append(page)
-        }
-        val raw = fetchAbsoluteJson(url, WEIBO_HOME, "https://m.weibo.cn")
+        val url = Uri.Builder()
+            .scheme("https")
+            .authority("m.weibo.cn")
+            .appendPath("api")
+            .appendPath("container")
+            .appendPath("getIndex")
+            .appendQueryParameter("containerid", containerId)
+            .appendQueryParameter("page_type", "searchall")
+            .appendQueryParameter("v_p", "42")
+            .appendQueryParameter("page", page.toString())
+            .build()
+            .toString()
+        val referer = Uri.Builder()
+            .scheme("https")
+            .authority("m.weibo.cn")
+            .appendPath("search")
+            .appendQueryParameter("containerid", containerId)
+            .build()
+            .toString()
+        val raw = nativeFetchMweiboJson(url, referer)
         return WeiboJsonParser.parseMweiboTopicTimeline(raw, page)
+    }
+
+    suspend fun loadWeiboSearch(query: String, page: Int = 1): TimelinePage {
+        val normalized = query.trim()
+        if (normalized.isBlank()) return TimelinePage(items = emptyList())
+        val url = Uri.Builder()
+            .scheme("https")
+            .authority("s.weibo.com")
+            .appendPath("weibo")
+            .appendQueryParameter("q", normalized)
+            .appendQueryParameter("topic_ad", "")
+            .appendQueryParameter("t", "547")
+            .appendQueryParameter("page", page.toString())
+            .build()
+            .toString()
+        val raw = nativeFetchAbsoluteHtml(
+            url = url,
+            referer = "https://s.weibo.com/",
+            origin = "https://s.weibo.com",
+        )
+        val page = WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
+        return page.copy(items = enrichSearchFeedItems(page.items))
+    }
+
+    private suspend fun enrichSearchFeedItems(items: List<FeedItem>): List<FeedItem> {
+        if (items.isEmpty()) return items
+        return coroutineScope {
+            items.map { item ->
+                async { enrichSearchFeedItem(item) }
+            }.awaitAll()
+        }
+    }
+
+    private suspend fun enrichSearchFeedItem(item: FeedItem): FeedItem {
+        for (candidate in listOf(item.id, item.statusId).distinct()) {
+            if (candidate.isBlank()) continue
+            runCatching { loadStatusDetail(candidate) }
+                .getOrNull()
+                ?.takeIf { detail ->
+                    detail.text.isNotBlank() || detail.images.isNotEmpty() || detail.media != null
+                }
+                ?.let { return it }
+        }
+        return item
+    }
+
+    suspend fun loadWeiboUserSearch(query: String, page: Int = 1): SearchUserPage {
+        val normalized = query.trim()
+        if (normalized.isBlank()) return SearchUserPage(items = emptyList())
+        val url = Uri.Builder()
+            .scheme("https")
+            .authority("s.weibo.com")
+            .appendPath("user")
+            .appendQueryParameter("q", normalized)
+            .appendQueryParameter("page", page.toString())
+            .build()
+            .toString()
+        val raw = nativeFetchAbsoluteHtml(
+            url = url,
+            referer = "https://s.weibo.com/",
+            origin = "https://s.weibo.com",
+        )
+        return WeiboJsonParser.parseSWeiboUserSearch(raw, page)
+    }
+
+    private suspend fun ensureMweiboSession() {
+        mweiboSessionMutex.withLock {
+            if (mweiboSessionReady) return
+            runCatching {
+                nativeFetchMweiboJson("https://m.weibo.cn/api/config")
+            }
+            mweiboSessionReady = true
+        }
     }
 
     suspend fun loadUserTimeline(uid: String, page: Int = 1): TimelinePage {
@@ -693,12 +785,43 @@ class WeiboWebSession(context: Context) {
             ?.takeIf { it.isNotBlank() }
 
     private suspend fun nativeFetchAbsoluteJson(url: String, referer: String, origin: String): String =
+        nativeFetchAbsoluteJsonInternal(
+            url = url,
+            referer = referer,
+            origin = origin,
+            userAgent = DESKTOP_CHROME_USER_AGENT,
+            cookie = mergedCookieHeader(referer),
+        )
+
+    private suspend fun nativeFetchMweiboJson(url: String, referer: String = "https://m.weibo.cn/"): String =
+        nativeFetchAbsoluteJsonInternal(
+            url = url,
+            referer = referer,
+            origin = "https://m.weibo.cn",
+            userAgent = MWEIBO_USER_AGENT,
+            cookie = mergedCookieHeader("https://m.weibo.cn/"),
+        )
+
+    private suspend fun nativeFetchAbsoluteHtml(url: String, referer: String, origin: String): String =
+        nativeFetchAbsoluteTextInternal(
+            url = url,
+            referer = referer,
+            origin = origin,
+            accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            userAgent = DESKTOP_CHROME_USER_AGENT,
+            cookie = mergedCookieHeader(referer),
+            requestedWith = false,
+        )
+
+    private suspend fun nativeFetchAbsoluteJsonInternal(
+        url: String,
+        referer: String,
+        origin: String,
+        userAgent: String,
+        cookie: String,
+    ): String =
         withContext(Dispatchers.IO) {
             CookieManager.getInstance().flush()
-            val cookie = CookieManager.getInstance().getCookie(referer)
-                ?: CookieManager.getInstance().getCookie(WEIBO_HOME)
-                ?: CookieManager.getInstance().getCookie("https://www.weibo.com/")
-                ?: ""
             if (!hasAuthenticatedCookie(cookie)) {
                 throw IllegalStateException("\u672A\u53D1\u73B0\u5FAE\u535A\u767B\u5F55 Cookie")
             }
@@ -708,13 +831,19 @@ class WeiboWebSession(context: Context) {
                 connectTimeout = 12_000
                 readTimeout = 12_000
                 instanceFollowRedirects = false
-                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+                setRequestProperty("User-Agent", userAgent)
                 setRequestProperty("Accept", "application/json, text/plain, */*")
                 setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
                 setRequestProperty("Referer", referer)
                 setRequestProperty("Origin", origin)
                 setRequestProperty("X-Requested-With", "XMLHttpRequest")
                 setRequestProperty("Cookie", cookie)
+            }
+            extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
+                connection.setRequestProperty(
+                    "X-XSRF-TOKEN",
+                    URLDecoder.decode(token, Charsets.UTF_8.name()),
+                )
             }
 
             val status = connection.responseCode
@@ -732,6 +861,68 @@ class WeiboWebSession(context: Context) {
             }
             body
         }
+
+    private suspend fun nativeFetchAbsoluteTextInternal(
+        url: String,
+        referer: String,
+        origin: String,
+        accept: String,
+        userAgent: String,
+        cookie: String,
+        requestedWith: Boolean,
+    ): String =
+        withContext(Dispatchers.IO) {
+            CookieManager.getInstance().flush()
+            if (!hasAuthenticatedCookie(cookie)) {
+                throw IllegalStateException("\u672A\u53D1\u73B0\u5FAE\u535A\u767B\u5F55 Cookie")
+            }
+
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 12_000
+                readTimeout = 12_000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", userAgent)
+                setRequestProperty("Accept", accept)
+                setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                setRequestProperty("Referer", referer)
+                setRequestProperty("Origin", origin)
+                if (requestedWith) {
+                    setRequestProperty("X-Requested-With", "XMLHttpRequest")
+                }
+                setRequestProperty("Cookie", cookie)
+            }
+
+            val status = connection.responseCode
+            syncResponseCookies(connection)
+            if (status in 200..299) {
+                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } else {
+                val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                    .orEmpty()
+                throw IllegalStateException("weibo-html-request-failed:$status ${errorBody.take(120)}")
+            }
+        }
+
+    private fun mergedCookieHeader(primaryOrigin: String): String {
+        val jar = linkedMapOf<String, String>()
+        listOf(
+            primaryOrigin,
+            "https://s.weibo.com/",
+            "https://m.weibo.cn/",
+            WEIBO_HOME,
+            "https://www.weibo.com/",
+        ).forEach { origin ->
+            CookieManager.getInstance().getCookie(origin)
+                ?.split(";")
+                ?.forEach { part ->
+                    val trimmed = part.trim()
+                    if (trimmed.isBlank()) return@forEach
+                    jar[trimmed.substringBefore("=")] = trimmed
+                }
+        }
+        return jar.values.joinToString("; ")
+    }
 
     private fun syncResponseCookies(connection: HttpURLConnection) {
         val manager = CookieManager.getInstance()
@@ -963,6 +1154,7 @@ class WeiboWebSession(context: Context) {
         private val COOKIE_ORIGINS = listOf(
             "https://weibo.com/",
             "https://www.weibo.com/",
+            "https://s.weibo.com/",
             "https://passport.weibo.cn/",
             "https://m.weibo.cn/",
             "https://card.weibo.com/",
@@ -970,5 +1162,8 @@ class WeiboWebSession(context: Context) {
         private const val DESKTOP_CHROME_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        private const val MWEIBO_USER_AGENT =
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
+                "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
     }
 }

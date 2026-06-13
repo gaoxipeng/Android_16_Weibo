@@ -64,6 +64,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
@@ -215,6 +216,7 @@ import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FriendListTab
 import com.example.myweibo.data.HotSearchItem
 import com.example.myweibo.data.RelationUser
+import com.example.myweibo.data.toRelationUser
 import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.FeedItem
@@ -249,6 +251,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -269,6 +272,11 @@ private enum class MainTab(val label: String) {
     Search("\u641C\u7D22"),
     Compose("\u5199\u5FAE\u535A"),
     Mine("\u6211\u7684"),
+}
+
+private enum class SearchMode(val label: String) {
+    Weibo("微博"),
+    User("用户"),
 }
 
 private enum class MineContentTab(val label: String) {
@@ -303,6 +311,7 @@ private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
 
 private val HintCapsuleWhite = Color.White
 private val HintCapsuleText = Color(0xFF1F1F1F)
+private val HintCapsulePlaceholder = Color(0xFFAAAAAA)
 private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 
@@ -387,6 +396,7 @@ private data class FollowListOverlayState(
     val uid: String,
     val screenName: String,
     val avatarUrl: String?,
+    val description: String?,
     val tab: FriendListTab,
 )
 
@@ -1040,18 +1050,23 @@ fun WeiboApp() {
     }
 
     fun closeFollowList() {
-        navigateBack()
+        followListOverlay = null
     }
 
-    fun openFollowList(uid: String, screenName: String, avatarUrl: String?, tab: FriendListTab) {
-        pushNavigation {
-            followListOverlay = FollowListOverlayState(
-                uid = uid,
-                screenName = screenName,
-                avatarUrl = avatarUrl,
-                tab = tab,
-            )
-        }
+    fun openFollowList(
+        uid: String,
+        screenName: String,
+        avatarUrl: String?,
+        description: String?,
+        tab: FriendListTab,
+    ) {
+        followListOverlay = FollowListOverlayState(
+            uid = uid,
+            screenName = screenName,
+            avatarUrl = avatarUrl,
+            description = description,
+            tab = tab,
+        )
     }
 
     fun pushMediaPreview(media: FeedMedia) {
@@ -1067,7 +1082,8 @@ fun WeiboApp() {
     }
 
     fun openSearchTopic(topic: String) {
-        val normalized = topic.removePrefix("#").removeSuffix("#").trim()
+        val bareTopic = topic.removePrefix("#").removeSuffix("#").trim()
+        val normalized = if (bareTopic.isBlank()) "" else "#$bareTopic#"
         if (normalized.isBlank()) return
         searchPendingQuery = normalized
         selectedTab = MainTab.Search
@@ -1102,7 +1118,33 @@ fun WeiboApp() {
     }
 
     fun openUserFromFollowList(userId: String) {
-        openUser(userId)
+        val value = userId.trim().removePrefix("@")
+        if (value.isBlank()) return
+        val isSameUser = if (value.all { it.isDigit() }) {
+            value == visitedProfile?.id || value == visitedUserId
+        } else {
+            value == visitedProfile?.screenName ||
+                value == visitedUserScreenName ||
+                value == visitedUserId
+        }
+        if (isSameUser) {
+            followListOverlay = null
+            return
+        }
+        pushNavigation {
+            followListOverlay = null
+            selectedItem = null
+            comments = emptyList()
+            commentsCursor = null
+            commentsHasMore = true
+            loadVisitedUserProfile(
+                if (value.all { it.isDigit() }) {
+                    ProfileLookup.Uid(value)
+                } else {
+                    ProfileLookup.ScreenName(value)
+                },
+            )
+        }
     }
 
     fun dismissAlbumViewer() {
@@ -1114,6 +1156,11 @@ fun WeiboApp() {
     }
 
     BackHandler(enabled = true) {
+        if (followListOverlay != null) {
+            followListOverlay = null
+            lastHomeBackPressAt = 0L
+            return@BackHandler
+        }
         if (popNavigation()) {
             lastHomeBackPressAt = 0L
             return@BackHandler
@@ -1885,6 +1932,7 @@ fun WeiboApp() {
                             onToggleLike = ::toggleStatusLike,
                             onUrlEntityClick = ::openUrlEntity,
                             onOpenLoginSettings = ::openAccountLoginManagement,
+                            mineProfileId = mineProfile?.id,
                         )
 
                         MainTab.Messages -> PlaceholderScreen(
@@ -1936,8 +1984,8 @@ fun WeiboApp() {
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
                                 onUrlEntityClick = ::openUrlEntity,
-                                onOpenFollowList = { uid, screenName, avatarUrl, tab ->
-                                    openFollowList(uid, screenName, avatarUrl, tab)
+                                onOpenFollowList = { uid, screenName, avatarUrl, description, tab ->
+                                    openFollowList(uid, screenName, avatarUrl, description, tab)
                                 },
                                 storedAccounts = storedAccounts,
                                 activeAccountId = activeAccountId,
@@ -2178,6 +2226,7 @@ fun WeiboApp() {
                             overlay = overlay,
                             followingListState = followListFollowingListState,
                             fansListState = followListFansListState,
+                            onBack = ::closeFollowList,
                             onTabChange = { tab ->
                                 followListOverlay = overlay.copy(tab = tab)
                             },
@@ -2572,6 +2621,19 @@ private fun FeedRefreshCapsuleHint(
             color = HintCapsuleText,
         )
     }
+}
+
+@Composable
+private fun AppLoadingIndicator(
+    modifier: Modifier = Modifier,
+    size: Dp = 40.dp,
+    strokeWidth: Dp = 4.dp,
+) {
+    CircularProgressIndicator(
+        modifier = modifier.size(size),
+        color = FeedRefreshIndicatorColor,
+        strokeWidth = strokeWidth,
+    )
 }
 
 @Composable
@@ -3542,7 +3604,7 @@ private fun CommentSortActionMenu(
                 alignment = Alignment.TopEnd,
                 offset = IntOffset(0, with(density) { 30.dp.roundToPx() }),
                 onDismissRequest = { dismissMenu() },
-                properties = PopupProperties(focusable = true),
+                properties = PopupProperties(focusable = false),
             ) {
                 ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
                     CommentSort.entries.forEachIndexed { index, sort ->
@@ -6313,10 +6375,10 @@ private fun DetailScreen(
                     }
                 }
 
-                if (isLoadingComments && comments.isEmpty()) {
+                if (isLoadingComments && comments.isEmpty() && listState.firstVisibleItemIndex > 0) {
                     item {
                         Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator()
+                            AppLoadingIndicator()
                         }
                     }
                 }
@@ -6602,16 +6664,100 @@ private fun CommentImageStrip(
     }
 }
 
+@OptIn(ExperimentalHazeMaterialsApi::class)
+@Composable
+private fun SearchModeActionMenu(
+    selected: SearchMode,
+    onSelected: (SearchMode) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+
+    fun dismissMenu() {
+        expanded = false
+    }
+
+    if (expanded) {
+        BackHandler { dismissMenu() }
+    }
+
+    val metaColor = weiboMetaTextColor()
+    Box {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
+                        expanded = !expanded
+                    },
+                )
+                .padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = selected.label,
+                style = MaterialTheme.typography.bodySmall,
+                color = metaColor,
+            )
+            SettingsExpandIndicator(
+                modifier = Modifier.size(16.dp),
+                tint = metaColor,
+            )
+        }
+
+        if (expanded) {
+            Popup(
+                alignment = Alignment.TopStart,
+                offset = IntOffset(0, with(density) { (-92).dp.roundToPx() }),
+                onDismissRequest = { dismissMenu() },
+                properties = PopupProperties(focusable = true),
+            ) {
+                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
+                    SearchMode.entries.forEachIndexed { index, mode ->
+                        if (index > 0) {
+                            ImageActionMenuDivider()
+                        }
+                        ImageActionRow(
+                            label = mode.label,
+                            enabled = true,
+                            selected = mode == selected,
+                            onClick = {
+                                dismissMenu()
+                                if (mode != selected) {
+                                    onSelected(mode)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun SearchCapsuleField(
     value: String,
     onValueChange: (String) -> Unit,
+    mode: SearchMode,
+    onModeChange: (SearchMode) -> Unit,
     onSearch: () -> Unit,
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
 ) {
     val shape = RoundedCornerShape(22.dp)
+    val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+        color = HintCapsuleText,
+        fontSize = 15.sp,
+        lineHeight = 20.sp,
+    )
+    val placeholderStyle = fieldTextStyle.copy(color = HintCapsulePlaceholder)
     Surface(
         modifier = modifier,
         shape = shape,
@@ -6620,33 +6766,49 @@ private fun SearchCapsuleField(
         border = BorderStroke(1.dp, HintCapsuleBorderColor),
     ) {
         Row(
-            modifier = Modifier.padding(start = 16.dp, end = 4.dp),
+            modifier = Modifier
+                .height(44.dp)
+                .padding(start = 16.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            SearchModeActionMenu(
+                selected = mode,
+                onSelected = onModeChange,
+            )
+            Spacer(Modifier.width(8.dp))
             BasicTextField(
                 value = value,
                 onValueChange = onValueChange,
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(vertical = 11.dp),
-                textStyle = MaterialTheme.typography.bodyMedium.copy(color = HintCapsuleText),
+                modifier = Modifier.weight(1f),
+                textStyle = fieldTextStyle,
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { onSearch() }),
                 decorationBox = { innerTextField ->
-                    if (value.isEmpty()) {
-                        Text(
-                            text = placeholder,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (value.isEmpty()) {
+                            Text(
+                                text = placeholder,
+                                style = placeholderStyle,
+                                maxLines = 1,
+                            )
+                        }
+                        innerTextField()
                     }
-                    innerTextField()
                 },
             )
             if (value.isNotEmpty()) {
-                TextButton(onClick = onClear) {
-                    Text("清除", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                TextButton(
+                    onClick = onClear,
+                    contentPadding = PaddingValues(horizontal = 8.dp),
+                ) {
+                    Text(
+                        text = "清除",
+                        style = fieldTextStyle.copy(color = HintCapsulePlaceholder),
+                    )
                 }
             }
         }
@@ -6722,28 +6884,43 @@ private fun SearchScreen(
     onToggleLike: (FeedItem) -> Unit,
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
     onOpenLoginSettings: () -> Unit,
+    mineProfileId: String?,
 ) {
     val scope = rememberCoroutineScope()
+    val showMessage = LocalUiMessenger.current
     val listState = rememberLazyListState()
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var queryInput by remember { mutableStateOf("") }
     var activeQuery by remember { mutableStateOf<String?>(null) }
+    var searchMode by remember { mutableStateOf(SearchMode.Weibo) }
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
     var hotSearchLoading by remember { mutableStateOf(false) }
     var hotSearchError by remember { mutableStateOf<String?>(null) }
     var resultItems by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
+    var userResultItems by remember { mutableStateOf<List<RelationUser>>(emptyList()) }
     var resultLoading by remember { mutableStateOf(false) }
     var resultLoadingMore by remember { mutableStateOf(false) }
     var resultError by remember { mutableStateOf<String?>(null) }
     var resultNextPage by remember { mutableStateOf<String?>(null) }
+    var searchGeneration by remember { mutableIntStateOf(0) }
+    var initialResultsReady by remember { mutableStateOf(false) }
+    var searchPullRefreshing by remember { mutableStateOf(false) }
 
     fun normalizeTopic(raw: String): String =
-        raw.removePrefix("#").removeSuffix("#").trim()
+        raw.trim()
 
     fun submitQuery(raw: String) {
         val normalized = normalizeTopic(raw)
         if (normalized.isBlank()) return
         queryInput = normalized
+        resultItems = emptyList()
+        userResultItems = emptyList()
+        resultError = null
+        resultNextPage = null
+        resultLoading = false
+        resultLoadingMore = false
+        initialResultsReady = false
+        searchGeneration++
         activeQuery = normalized
     }
 
@@ -6757,31 +6934,81 @@ private fun SearchScreen(
         hotSearchLoading = false
     }
 
-    suspend fun reloadResults(reset: Boolean) {
+    suspend fun loadTopicResults(reset: Boolean, generation: Int) {
         val query = activeQuery ?: return
         if (!hasLoginCookie) return
+        if (generation != searchGeneration) return
         if (reset) {
             resultLoading = true
             resultError = null
             resultNextPage = null
+            resultItems = emptyList()
+            userResultItems = emptyList()
+            initialResultsReady = false
+            runCatching { listState.scrollToItem(0) }
         } else {
-            if (resultNextPage == null || resultLoadingMore) return
+            val nextPage = resultNextPage?.toIntOrNull() ?: return
+            if (resultLoading || resultLoadingMore || !initialResultsReady) return
             resultLoadingMore = true
         }
-        val page = if (reset) 1 else resultNextPage?.toIntOrNull() ?: return
-        runCatching { session.loadTopicSearch(query, page) }
-            .onSuccess { pageResult ->
-                resultItems = if (reset) pageResult.items else resultItems + pageResult.items
-                resultNextPage = pageResult.nextCursor
-            }
-            .onFailure { error ->
+        try {
+            val page = if (reset) 1 else resultNextPage?.toIntOrNull() ?: return
+            if (searchMode == SearchMode.User) {
+                val pageResult = session.loadWeiboUserSearch(query, page)
+                if (generation != searchGeneration) return
                 if (reset) {
-                    resultError = error.message ?: "搜索失败"
-                    resultItems = emptyList()
+                    userResultItems = pageResult.items.map { it.toRelationUser() }
+                    resultNextPage = pageResult.nextCursor
+                } else {
+                    val merged = (userResultItems + pageResult.items.map { it.toRelationUser() })
+                        .distinctBy { it.id.ifBlank { it.screenName } }
+                    if (merged.size == userResultItems.size) {
+                        resultNextPage = null
+                    } else {
+                        userResultItems = merged
+                        resultNextPage = pageResult.nextCursor
+                    }
+                }
+            } else {
+                val pageResult = session.loadWeiboSearch(query, page)
+                if (generation != searchGeneration) return
+                if (reset) {
+                    resultItems = pageResult.items
+                    resultNextPage = pageResult.nextCursor
+                } else {
+                    val merged = (resultItems + pageResult.items).distinctBy { it.id }
+                    if (merged.size == resultItems.size) {
+                        resultNextPage = null
+                    } else {
+                        resultItems = merged
+                        resultNextPage = pageResult.nextCursor
+                    }
                 }
             }
-        resultLoading = false
-        resultLoadingMore = false
+            resultError = null
+            initialResultsReady = true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            if (generation != searchGeneration) return
+            if (reset) {
+                resultError = error.message ?: "搜索失败"
+                resultItems = emptyList()
+                userResultItems = emptyList()
+                resultNextPage = null
+                initialResultsReady = true
+            } else {
+                resultNextPage = null
+            }
+        } finally {
+            if (generation == searchGeneration) {
+                if (reset) {
+                    resultLoading = false
+                } else {
+                    resultLoadingMore = false
+                }
+            }
+        }
     }
 
     LaunchedEffect(hasLoginCookie) {
@@ -6794,29 +7021,50 @@ private fun SearchScreen(
         onPendingQueryConsumed()
     }
 
-    LaunchedEffect(activeQuery, hasLoginCookie) {
-        if (activeQuery != null && hasLoginCookie) {
-            reloadResults(reset = true)
-        }
+    LaunchedEffect(activeQuery, searchGeneration, hasLoginCookie, searchMode) {
+        val query = activeQuery ?: return@LaunchedEffect
+        if (!hasLoginCookie) return@LaunchedEffect
+        loadTopicResults(reset = true, generation = searchGeneration)
     }
 
-    LaunchedEffect(listState, activeQuery, resultNextPage, resultLoadingMore) {
+    val searchGenerationState by rememberUpdatedState(searchGeneration)
+    val initialResultsReadyState by rememberUpdatedState(initialResultsReady)
+
+    LaunchedEffect(listState, activeQuery, searchGeneration, searchMode) {
         if (activeQuery == null) return@LaunchedEffect
         snapshotFlow {
+            if (!initialResultsReadyState) return@snapshotFlow null
             val info = listState.layoutInfo
             val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
-            info.totalItemsCount > 0 && last >= info.totalItemsCount - 3
+            val total = info.totalItemsCount
+            if (total <= 0 || last < total - 3) {
+                null
+            } else {
+                last to total
+            }
         }
             .distinctUntilChanged()
-            .filter { it }
+            .filterNotNull()
             .collect {
-                if (resultNextPage != null && !resultLoadingMore && !resultLoading) {
-                    reloadResults(reset = false)
-                }
+                loadTopicResults(reset = false, generation = searchGenerationState)
             }
     }
 
-    Column(
+    val isRefreshing = when {
+        activeQuery == null -> hotSearchLoading
+        else -> searchPullRefreshing || resultLoading
+    }
+    var searchHeaderHeight by remember { mutableStateOf(0.dp) }
+    val density = LocalDensity.current
+    val bottomNavSpace = 96.dp
+    val searchBarGap = 8.dp
+    val searchBarBottom = bottomNavSpace + searchBarGap
+    val searchFieldHeight = 44.dp
+    val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
+    val searchFieldBottom = maxOf(searchBarBottom, imeBottom + searchBarGap)
+    val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap
+
+    Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
@@ -6824,195 +7072,259 @@ private fun SearchScreen(
         SearchCapsuleField(
             value = queryInput,
             onValueChange = { queryInput = it },
+            mode = searchMode,
+            onModeChange = { mode ->
+                if (mode != searchMode) {
+                    searchMode = mode
+                    resultItems = emptyList()
+                    userResultItems = emptyList()
+                    resultError = null
+                    resultNextPage = null
+                    initialResultsReady = false
+                    activeQuery?.let { searchGeneration++ }
+                }
+            },
             onSearch = { submitQuery(queryInput) },
             onClear = {
                 queryInput = ""
                 activeQuery = null
                 resultItems = emptyList()
+                userResultItems = emptyList()
                 resultError = null
                 resultNextPage = null
+                resultLoading = false
+                resultLoadingMore = false
+                initialResultsReady = false
             },
             modifier = Modifier
+                .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(top = topInset + 8.dp, start = 16.dp, end = 16.dp, bottom = 12.dp),
+                .padding(start = 18.dp, end = 18.dp, bottom = searchFieldBottom)
+                .zIndex(2f),
         )
 
         if (!hasLoginCookie) {
             Box(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = listBottomInset),
                 contentAlignment = Alignment.Center,
             ) {
                 EmptyState(
                     title = "需要登录微博",
-                    body = "登录后即可查看热搜与话题搜索结果。",
+                    body = "登录后即可查看热搜与搜索结果。",
                     actionLabel = "打开登录",
                     onAction = onOpenLoginSettings,
                 )
             }
-            return@Column
+            return@Box
         }
 
-        LazyColumn(
-            state = listState,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 96.dp),
-        ) {
-            if (activeQuery == null) {
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
+        AppPullToRefreshBox(
+                isRefreshing = isRefreshing,
+                onRefresh = {
+                    scope.launch {
+                        if (activeQuery == null) {
+                            reloadHotSearch()
+                        } else {
+                            searchPullRefreshing = true
+                            try {
+                                loadTopicResults(reset = true, generation = searchGeneration)
+                            } finally {
+                                searchPullRefreshing = false
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                Box(Modifier.fillMaxSize()) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            top = when {
+                                activeQuery != null -> searchHeaderHeight + 8.dp
+                                else -> topInset + 8.dp
+                            },
+                            start = if (activeQuery == null) 16.dp else 0.dp,
+                            end = if (activeQuery == null) 16.dp else 0.dp,
+                            bottom = listBottomInset,
+                        ),
                     ) {
+                if (activeQuery == null) {
+                    item {
                         Text(
                             text = "热搜",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(bottom = 8.dp),
                         )
-                        TextButton(
-                            onClick = { scope.launch { reloadHotSearch() } },
-                            enabled = !hotSearchLoading,
-                        ) {
-                            Text(if (hotSearchLoading) "刷新中" else "刷新")
-                        }
                     }
-                }
-                when {
-                    hotSearchLoading && hotSearchItems.isEmpty() -> {
-                        item {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().padding(32.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                CircularProgressIndicator()
+                    when {
+                        hotSearchError != null && hotSearchItems.isEmpty() -> {
+                            item {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        text = hotSearchError.orEmpty(),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        text = "下拉刷新重试",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
                         }
-                    }
-                    hotSearchError != null && hotSearchItems.isEmpty() -> {
-                        item {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
+                        hotSearchItems.isEmpty() && !hotSearchLoading -> {
+                            item {
                                 Text(
-                                    text = hotSearchError.orEmpty(),
+                                    text = "暂无热搜",
+                                    modifier = Modifier.padding(vertical = 16.dp),
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                TextButton(onClick = { scope.launch { reloadHotSearch() } }) {
-                                    Text("重试")
+                            }
+                        }
+                        else -> {
+                            itemsIndexed(hotSearchItems, key = { _, item -> item.word }) { index, item ->
+                                HotSearchRow(
+                                    rank = index + 1,
+                                    item = item,
+                                    onClick = { submitQuery(item.word) },
+                                )
+                                if (index < hotSearchItems.lastIndex) {
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
                                 }
                             }
                         }
                     }
-                    hotSearchItems.isEmpty() -> {
-                        item {
-                            Text(
-                                text = "暂无热搜",
-                                modifier = Modifier.padding(vertical = 16.dp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    else -> {
-                        itemsIndexed(hotSearchItems, key = { _, item -> item.word }) { index, item ->
-                            HotSearchRow(
-                                rank = index + 1,
-                                item = item,
-                                onClick = { submitQuery(item.word) },
-                            )
-                            if (index < hotSearchItems.lastIndex) {
-                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                            }
-                        }
-                    }
-                }
-            } else {
-                item {
-                    Column(
-                        modifier = Modifier.padding(bottom = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        Text(
-                            text = "#${activeQuery}#",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = WeiboTopicBlue,
-                        )
-                        Text(
-                            text = "话题相关微博",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                when {
-                    resultLoading && resultItems.isEmpty() -> {
-                        item {
-                            Box(
-                                modifier = Modifier.fillMaxWidth().padding(32.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                CircularProgressIndicator()
-                            }
-                        }
-                    }
-                    resultError != null && resultItems.isEmpty() -> {
-                        item {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                Text(
-                                    text = resultError.orEmpty(),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                TextButton(onClick = { scope.launch { reloadResults(reset = true) } }) {
-                                    Text("重试")
+                } else {
+                    when {
+                        resultLoading &&
+                            (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
+                            !searchPullRefreshing -> {
+                            item {
+                                Box(
+                                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    AppLoadingIndicator(size = 28.dp, strokeWidth = 2.dp)
                                 }
                             }
                         }
+                        resultError != null &&
+                            (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
+                            item {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 16.dp, vertical = 16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        text = resultError.orEmpty(),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Text(
+                                        text = "下拉刷新重试",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                        (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
+                            !resultLoading -> {
+                            item {
+                                Text(
+                                    text = "暂无相关内容",
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 16.dp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        searchMode == SearchMode.User -> {
+                            items(userResultItems, key = { it.id.ifBlank { it.screenName } }) { user ->
+                                RelationUserRow(
+                                    user = user,
+                                    showFollowButton = !mineProfileId.isNullOrBlank() && user.id != mineProfileId,
+                                    onClick = { onUserClick(user.id.ifBlank { user.screenName }) },
+                                    session = session,
+                                    onFollowChanged = { updated ->
+                                        userResultItems = userResultItems.map {
+                                            if (it.id == updated.id) updated else it
+                                        }
+                                    },
+                                    showMessage = showMessage,
+                                )
+                            }
+                        }
+                        else -> {
+                            items(resultItems, key = { it.id }) { item ->
+                                val resolved = resolveFeedItem(item)
+                                FeedCard(
+                                    item = resolved,
+                                    onClick = { onItemClick(resolved, null) },
+                                    onMediaClick = onMediaClick,
+                                    emoticonMap = emoticonMap,
+                                    onUserClick = onUserClick,
+                                    isLongTextLoading = isLongTextLoading,
+                                    onLoadLongText = onLoadLongText,
+                                    onToggleLike = onToggleLike,
+                                    onUrlEntityClick = onUrlEntityClick,
+                                )
+                            }
+                        }
                     }
-                    resultItems.isEmpty() -> {
+                    if (resultLoadingMore) {
                         item {
-                            Text(
-                                text = "暂无相关内容",
-                                modifier = Modifier.padding(vertical = 16.dp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    else -> {
-                        items(resultItems, key = { it.id }) { item ->
-                            val resolved = resolveFeedItem(item)
-                            FeedCard(
-                                item = resolved,
-                                onClick = { onItemClick(resolved, null) },
-                                onMediaClick = onMediaClick,
-                                emoticonMap = emoticonMap,
-                                onUserClick = onUserClick,
-                                isLongTextLoading = isLongTextLoading,
-                                onLoadLongText = onLoadLongText,
-                                onToggleLike = onToggleLike,
-                                onUrlEntityClick = onUrlEntityClick,
-                            )
-                        }
-                    }
-                }
-                if (resultLoadingMore) {
-                    item {
-                        Box(
-                            modifier = Modifier.fillMaxWidth().padding(16.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                AppLoadingIndicator(size = 24.dp, strokeWidth = 2.dp)
+                            }
                         }
                     }
                 }
             }
+            if (activeQuery != null) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.background)
+                        .onGloballyPositioned { coordinates ->
+                            searchHeaderHeight = with(density) { coordinates.size.height.toDp() }
+                        }
+                        .padding(
+                            top = topInset + 12.dp,
+                            start = 16.dp,
+                            end = 16.dp,
+                            bottom = 12.dp,
+                        ),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        text = activeQuery.orEmpty(),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = WeiboTopicBlue,
+                    )
+                    Text(
+                        text = "${searchMode.label}搜索结果",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
         }
     }
 }
@@ -7102,7 +7414,7 @@ private fun MineScreen(
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
-    onOpenFollowList: ((String, String, String?, FriendListTab) -> Unit)? = null,
+    onOpenFollowList: ((String, String, String?, String?, FriendListTab) -> Unit)? = null,
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
@@ -7114,7 +7426,7 @@ private fun MineScreen(
     val openFollowListForProfile: ((FriendListTab) -> Unit)? = onOpenFollowList?.let { callback ->
         { tab ->
             profile?.id?.takeIf { it.isNotBlank() }?.let { uid ->
-                callback(uid, profile.screenName, profile.avatarUrl, tab)
+                callback(uid, profile.screenName, profile.avatarUrl, profile.description, tab)
             }
         }
     }
@@ -8392,7 +8704,7 @@ private fun VisitedUserProfileContent(
     onLoadLongText: (FeedItem) -> Unit,
     onToggleLike: (FeedItem) -> Unit,
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
-    onOpenFollowList: (String, String, String?, FriendListTab) -> Unit,
+    onOpenFollowList: (String, String, String?, String?, FriendListTab) -> Unit,
     showFollowActions: Boolean,
     followLoading: Boolean,
     onFollowClick: () -> Unit,
@@ -8447,19 +8759,21 @@ private fun FollowFansListScreen(
     overlay: FollowListOverlayState,
     followingListState: LazyListState,
     fansListState: LazyListState,
+    onBack: () -> Unit,
     onTabChange: (FriendListTab) -> Unit,
     onUserClick: (String) -> Unit,
     showMessage: (String, String) -> Unit,
     mineProfileId: String?,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val compactBarContentHeight = 48.dp
     val tabs = FriendListTab.entries
     val pagerState = rememberPagerState(
         initialPage = tabs.indexOf(overlay.tab).coerceAtLeast(0),
         pageCount = { tabs.size },
     )
     val coroutineScope = rememberCoroutineScope()
+
+    BackHandler(onBack = onBack)
 
     LaunchedEffect(overlay.tab) {
         val target = tabs.indexOf(overlay.tab).coerceAtLeast(0)
@@ -8489,29 +8803,28 @@ private fun FollowFansListScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(topInset + compactBarContentHeight)
                     .background(Color.White)
                     .padding(
-                        top = topInset,
+                        top = topInset + 12.dp,
+                        bottom = 12.dp,
                         start = 16.dp,
                         end = 16.dp,
                     ),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 RemoteImage(
                     url = overlay.avatarUrl,
                     modifier = Modifier
-                        .size(32.dp)
+                        .size(48.dp)
                         .clip(CircleShape),
                     contentScale = ContentScale.Crop,
                 )
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight()
                         .consumeTouchEvents(),
-                    verticalArrangement = Arrangement.Center,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     Text(
                         text = overlay.screenName.ifBlank { "微博用户" },
@@ -8521,11 +8834,9 @@ private fun FollowFansListScreen(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = overlay.uid,
+                        text = overlay.description?.takeIf { it.isNotBlank() } ?: "暂无简介",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
@@ -9584,10 +9895,9 @@ private fun ArticleReaderOverlay(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    TextButton(onClick = onBack) { Text("返回") }
                     Column(
                         modifier = Modifier
-                            .weight(1f)
+                            .fillMaxWidth()
                             .padding(horizontal = 8.dp),
                     ) {
                         Text(
