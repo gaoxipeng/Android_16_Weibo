@@ -4,7 +4,6 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
-import android.os.SystemClock
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebView
@@ -13,6 +12,8 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
@@ -108,6 +109,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.foundation.layout.ColumnScope
@@ -284,6 +287,10 @@ private fun likeFailureMessage(error: Throwable): String {
 private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
     start + (stop - start) * fraction
 
+private val HintCapsuleWhite = Color.White
+private val HintCapsuleText = Color(0xFF1F1F1F)
+private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
+
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
     val positions = mutableStateMapOf<String, Long>()
@@ -441,10 +448,7 @@ fun WeiboApp() {
     var nextCursor by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var selectedItem by remember { mutableStateOf<FeedItem?>(null) }
-    var pendingDetailReturnItem by remember { mutableStateOf<FeedItem?>(null) }
     var detailBackStack by remember { mutableStateOf<List<DetailSnapshot>>(emptyList()) }
-    var feedDetailSourceBounds by remember { mutableStateOf<Rect?>(null) }
-    var feedDetailTransitionLockedUntil by remember { mutableStateOf(0L) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
@@ -511,16 +515,6 @@ fun WeiboApp() {
     fun openAccountLoginManagement() {
         selectedTab = MainTab.Mine
         pendingOpenAccountLogin = true
-    }
-
-    fun isFeedDetailTransitionLocked(): Boolean =
-        SystemClock.uptimeMillis() < feedDetailTransitionLockedUntil
-
-    fun lockFeedDetailTransition(durationMs: Long) {
-        feedDetailTransitionLockedUntil = maxOf(
-            feedDetailTransitionLockedUntil,
-            SystemClock.uptimeMillis() + durationMs,
-        )
     }
 
     fun showMessage(title: String, detail: String) {
@@ -900,33 +894,11 @@ fun WeiboApp() {
     }
 
     fun closeDetail() {
-        if (selectedItem == null && pendingDetailReturnItem != null) return
         val previous = detailBackStack.lastOrNull()
         if (previous != null) {
             detailBackStack = detailBackStack.dropLast(1)
-            feedDetailSourceBounds = null
-            pendingDetailReturnItem = null
             restoreDetailSnapshot(previous)
         } else {
-            val canAnimateBackToFeed = selectedTab == MainTab.Feed &&
-                visitedUserId == null &&
-                feedDetailSourceBounds != null &&
-                selectedItem != null
-            val returningItem = if (canAnimateBackToFeed) selectedItem else null
-            pendingDetailReturnItem = returningItem
-            if (canAnimateBackToFeed) {
-                lockFeedDetailTransition(280L)
-                scope.launch {
-                    delay(300)
-                    if (selectedItem == null && pendingDetailReturnItem?.id == returningItem?.id) {
-                        pendingDetailReturnItem = null
-                        feedDetailSourceBounds = null
-                    }
-                }
-            }
-            if (!canAnimateBackToFeed) {
-                feedDetailSourceBounds = null
-            }
             selectedItem = null
             comments = emptyList()
             commentsCursor = null
@@ -1326,7 +1298,6 @@ fun WeiboApp() {
     }
 
     fun openDetailInternal(item: FeedItem) {
-        pendingDetailReturnItem = null
         pushCurrentDetailSnapshot()
         val resolved = resolveFeedItem(item)
         selectedItem = resolved
@@ -1342,15 +1313,10 @@ fun WeiboApp() {
     }
 
     fun openDetail(item: FeedItem) {
-        feedDetailSourceBounds = null
-        pendingDetailReturnItem = null
         openDetailInternal(item)
     }
 
     fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?) {
-        if (isFeedDetailTransitionLocked()) return
-        lockFeedDetailTransition(260L)
-        feedDetailSourceBounds = sourceBounds
         openDetailInternal(item)
     }
 
@@ -1568,23 +1534,32 @@ fun WeiboApp() {
             Box(Modifier.fillMaxSize()) {
             Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
             Box(Modifier.fillMaxSize().padding(innerPadding)) {
+            val detailOverlayItem = selectedItem
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
-                selectedItem == null
+                detailOverlayItem == null
             val keepFeedAlive = selectedTab == MainTab.Feed &&
-                (visitedUserId != null || selectedItem != null)
+                (visitedUserId != null || detailOverlayItem != null)
             val visitedProfileVisible = visitedUserId != null &&
                 selectedItem == null &&
                 albumViewerState == null
-            val animateFeedDetailTransition = selectedTab == MainTab.Feed && visitedUserId == null
             val feedBackdropScale by animateFloatAsState(
-                targetValue = if (selectedItem != null && animateFeedDetailTransition) 0.96f else 1f,
-                animationSpec = tween(220, easing = FastOutSlowInEasing),
+                targetValue = 1f,
+                animationSpec = tween(
+                    durationMillis = 0,
+                    easing = FastOutSlowInEasing,
+                ),
                 label = "feedBackdropScale",
             )
             val feedVisibleAlpha by animateFloatAsState(
-                targetValue = if (feedUiOnTop) 1f else 0f,
-                animationSpec = tween(280, easing = FastOutSlowInEasing),
+                targetValue = when {
+                    feedUiOnTop -> 1f
+                    else -> 0f
+                },
+                animationSpec = tween(
+                    durationMillis = 0,
+                    easing = FastOutSlowInEasing,
+                ),
                 label = "feedVisibleAlpha",
             )
 
@@ -1787,80 +1762,19 @@ fun WeiboApp() {
                 }
 
                 AnimatedContent(
-                    targetState = selectedItem,
+                    targetState = detailOverlayItem,
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(1f),
                     transitionSpec = {
-                        if (animateFeedDetailTransition) {
-                            fadeIn(tween(70, easing = FastOutSlowInEasing))
-                                .togetherWith(fadeOut(tween(90, easing = FastOutSlowInEasing)))
-                        } else {
-                            fadeIn(tween(200)).togetherWith(fadeOut(tween(180)))
-                        }
+                        EnterTransition.None togetherWith ExitTransition.None
                     },
                     contentKey = { it?.id ?: "feed-detail-none" },
                     label = "feedDetailTransition",
                 ) { detailItem ->
                     if (detailItem != null) {
-                        var detailBounds by remember(detailItem.id) { mutableStateOf<Rect?>(null) }
-                        val hasCardSource = animateFeedDetailTransition && feedDetailSourceBounds != null
-                        val returningToFeed = hasCardSource &&
-                            pendingDetailReturnItem?.id == detailItem.id
-                        val cardToDetailProgress = remember(detailItem.id, feedDetailSourceBounds) {
-                            Animatable(if (hasCardSource && !returningToFeed) 0f else 1f)
-                        }
-                        LaunchedEffect(selectedItem, returningToFeed, hasCardSource, detailBounds) {
-                            if (!hasCardSource) {
-                                cardToDetailProgress.snapTo(1f)
-                            } else if (detailBounds != null) {
-                                cardToDetailProgress.animateTo(
-                                    if (selectedItem == null && returningToFeed) 0f else 1f,
-                                    animationSpec = tween(
-                                        durationMillis = if (returningToFeed) 220 else 240,
-                                        easing = FastOutSlowInEasing,
-                                    ),
-                                )
-                            }
-                        }
-                        LaunchedEffect(selectedItem, pendingDetailReturnItem, feedDetailSourceBounds) {
-                            if (selectedItem == null && pendingDetailReturnItem != null) {
-                                delay(240)
-                                pendingDetailReturnItem = null
-                                feedDetailSourceBounds = null
-                            }
-                        }
                         Surface(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .onGloballyPositioned { coordinates ->
-                                    detailBounds = coordinates.boundsInWindow()
-                                }
-                                .graphicsLayer {
-                                    val source = feedDetailSourceBounds
-                                    val target = detailBounds
-                                    if (
-                                        hasCardSource &&
-                                        source != null &&
-                                        target != null &&
-                                        target.width > 1f &&
-                                        target.height > 1f
-                                    ) {
-                                        val progress = cardToDetailProgress.value
-                                        val startScaleX = (source.width / target.width).coerceIn(0.08f, 1f)
-                                        val startScaleY = (source.height / target.height).coerceIn(0.08f, 1f)
-                                        val startScale = maxOf(startScaleX, startScaleY)
-                                        val scale = lerpFloat(startScale, 1f, progress)
-                                        scaleX = scale
-                                        scaleY = scale
-                                        translationX = lerpFloat(source.center.x - target.center.x, 0f, progress)
-                                        translationY = lerpFloat(source.center.y - target.center.y, 0f, progress)
-                                        alpha = lerpFloat(0.92f, 1f, progress)
-                                        transformOrigin = TransformOrigin.Center
-                                        shape = RoundedCornerShape(8.dp)
-                                        clip = true
-                                    }
-                                },
+                            modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background,
                         ) {
                             DetailScreen(
@@ -2463,11 +2377,11 @@ private fun OpaqueHintCapsule(
     Surface(
         modifier = modifier,
         shape = shape,
-        color = MaterialTheme.colorScheme.surface,
+        color = HintCapsuleWhite,
         shadowElevation = 0.dp,
         border = BorderStroke(
             1.dp,
-            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f),
+            Color(0xFFE6E6E6),
         ),
     ) {
         content()
@@ -2491,7 +2405,7 @@ private fun FeedRefreshCapsuleHint(
             modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurface,
+            color = HintCapsuleText,
         )
     }
 }
@@ -2525,7 +2439,7 @@ private fun ExitConfirmCapsule(
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface,
+                color = HintCapsuleText,
             )
         }
     }
@@ -2606,6 +2520,32 @@ private fun LiquidSelectedPill(
             }
         }
     }
+}
+
+@Composable
+private fun AppPullToRefreshBox(
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val state = rememberPullToRefreshState()
+    PullToRefreshBox(
+        isRefreshing = isRefreshing,
+        onRefresh = onRefresh,
+        modifier = modifier,
+        state = state,
+        indicator = {
+            PullToRefreshDefaults.Indicator(
+                modifier = Modifier.align(Alignment.TopCenter),
+                isRefreshing = isRefreshing,
+                state = state,
+                containerColor = HintCapsuleWhite,
+                color = FeedRefreshIndicatorColor,
+            )
+        },
+        content = content,
+    )
 }
 
 @Composable
@@ -2690,7 +2630,7 @@ private fun FollowFeedScreen(
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
-    PullToRefreshBox(
+    AppPullToRefreshBox(
         isRefreshing = isLoading,
         onRefresh = onRefresh,
         modifier = Modifier.fillMaxSize(),
@@ -6133,7 +6073,7 @@ private fun DetailScreen(
             .collect { onLoadMoreComments() }
     }
 
-    PullToRefreshBox(
+    AppPullToRefreshBox(
         isRefreshing = isLoadingComments,
         onRefresh = onRefresh,
         modifier = Modifier.fillMaxSize(),
@@ -6718,7 +6658,7 @@ private fun MineScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
-        PullToRefreshBox(
+        AppPullToRefreshBox(
             isRefreshing = isLoading,
             onRefresh = onRefresh,
             modifier = Modifier.fillMaxWidth().weight(1f),
