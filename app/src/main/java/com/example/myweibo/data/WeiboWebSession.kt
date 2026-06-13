@@ -212,28 +212,36 @@ class WeiboWebSession(context: Context) {
         cursor: String? = null,
         onPageLoaded: ((List<FeedImage>) -> Unit)? = null,
     ): AlbumPage = albumLoadMutex.withLock {
+        if (cursor?.startsWith("waterfall:cursor:") == true) {
+            return@withLock loadUserAlbumWaterfall(uid, cursor, onPageLoaded)
+        }
+
         val referer = "https://weibo.com/u/$uid?tabtype=album"
         val isStart = cursor == null
-        var sinceId = cursor
-            ?.removePrefix("wall:")
-            ?.takeIf { cursor.startsWith("wall:") }
-            ?.ifBlank { "0" }
-            ?: "0"
+        val useCursorPagination = cursor?.startsWith("wall:cursor:") == true
+        var sinceId = when {
+            useCursorPagination -> null
+            cursor?.startsWith("wall:") == true -> cursor.removePrefix("wall:").ifBlank { "0" }
+            else -> "0"
+        }
+        var videoCursor = cursor?.removePrefix("wall:cursor:")?.takeIf { useCursorPagination }
 
         val fetchAll = cursor == null
         val accumulated = mutableListOf<FeedImage>()
         val monthContext = WeiboJsonParser.AlbumMonthContext()
-        var nextSinceId: String? = null
+        var nextPageCursor: String? = null
         var pageIndex = 0
         var emptyStreak = 0
         val maxPages = if (fetchAll) MAX_ALBUM_FETCH_PAGES else MAX_ALBUM_EMPTY_PAGES
         while (pageIndex < maxPages) {
-            val params = linkedMapOf(
-                "uid" to uid,
-                "sinceid" to sinceId,
-            )
-            if (isStart && pageIndex == 0) {
-                params["has_album"] = "true"
+            val params = linkedMapOf("uid" to uid)
+            if (useCursorPagination || videoCursor != null) {
+                params["cursor"] = videoCursor ?: "0"
+            } else {
+                params["sinceid"] = sinceId ?: "0"
+                if (isStart && pageIndex == 0) {
+                    params["has_album"] = "true"
+                }
             }
 
             val raw = runCatching {
@@ -248,9 +256,27 @@ class WeiboWebSession(context: Context) {
                 monthContext = monthContext,
             )
             accumulated += wall.images
-            nextSinceId = wall.nextSinceId
-            onPageLoaded?.invoke(accumulated.distinctBy { it.largeUrl })
-            if (nextSinceId == null) {
+            onPageLoaded?.invoke(accumulated.distinctByAlbumKey())
+
+            val hasMore = when {
+                wall.nextCursor != null -> {
+                    videoCursor = wall.nextCursor
+                    sinceId = null
+                    nextPageCursor = "wall:cursor:${wall.nextCursor}"
+                    true
+                }
+                wall.nextSinceId != null -> {
+                    sinceId = wall.nextSinceId
+                    videoCursor = null
+                    nextPageCursor = "wall:${wall.nextSinceId}"
+                    true
+                }
+                else -> {
+                    nextPageCursor = null
+                    false
+                }
+            }
+            if (!hasMore) {
                 break
             }
             if (!fetchAll && wall.images.isNotEmpty()) {
@@ -264,18 +290,89 @@ class WeiboWebSession(context: Context) {
             } else {
                 emptyStreak = 0
             }
-            sinceId = nextSinceId!!
             pageIndex++
             if (fetchAll) {
                 delay(200)
             }
         }
 
+        if (accumulated.isEmpty() && cursor == null) {
+            return@withLock loadUserAlbumWaterfall(uid, cursor = null, onPageLoaded)
+        }
+
         AlbumPage(
-            images = accumulated.distinctBy { it.largeUrl },
-            nextCursor = nextSinceId?.let { "wall:$it" },
+            images = accumulated.distinctByAlbumKey(),
+            nextCursor = nextPageCursor,
         )
     }
+
+    private suspend fun loadUserAlbumWaterfall(
+        uid: String,
+        cursor: String?,
+        onPageLoaded: ((List<FeedImage>) -> Unit)?,
+    ): AlbumPage {
+        val referer = "https://weibo.com/u/$uid?tabtype=album"
+        val fetchAll = cursor == null
+        var videoCursor = cursor?.removePrefix("waterfall:cursor:")?.ifBlank { "0" } ?: "0"
+        val accumulated = mutableListOf<FeedImage>()
+        val monthContext = WeiboJsonParser.AlbumMonthContext()
+        var nextPageCursor: String? = null
+        var pageIndex = 0
+        var emptyStreak = 0
+        val maxPages = if (fetchAll) MAX_ALBUM_FETCH_PAGES else MAX_ALBUM_EMPTY_PAGES
+        while (pageIndex < maxPages) {
+            val params = linkedMapOf(
+                "uid" to uid,
+                "cursor" to videoCursor,
+            )
+            val raw = runCatching {
+                fetchJson(WeiboEndpoints.PROFILE_ALBUM_WATERFALL, params, referer)
+            }.recoverCatching {
+                ensureOnUserAlbumPage(uid)
+                webViewFetchJson(WeiboEndpoints.PROFILE_ALBUM_WATERFALL, params)
+            }.getOrElse { throw it }
+
+            val wall = WeiboJsonParser.parseImageWallPage(
+                raw = raw,
+                monthContext = monthContext,
+            )
+            accumulated += wall.images
+            onPageLoaded?.invoke(accumulated.distinctByAlbumKey())
+
+            val hasMore = wall.nextCursor?.let { nextCursor ->
+                videoCursor = nextCursor
+                nextPageCursor = "waterfall:cursor:$nextCursor"
+                true
+            } == true
+            if (!hasMore) {
+                nextPageCursor = null
+                break
+            }
+            if (!fetchAll && wall.images.isNotEmpty()) {
+                break
+            }
+            if (wall.images.isEmpty()) {
+                emptyStreak++
+                if (emptyStreak > MAX_ALBUM_EMPTY_PAGES) {
+                    break
+                }
+            } else {
+                emptyStreak = 0
+            }
+            pageIndex++
+            if (fetchAll) {
+                delay(200)
+            }
+        }
+
+        return AlbumPage(
+            images = accumulated.distinctByAlbumKey(),
+            nextCursor = nextPageCursor,
+        )
+    }
+
+    private fun List<FeedImage>.distinctByAlbumKey(): List<FeedImage> =
+        distinctBy { "${it.type.orEmpty()}:${it.id}:${it.largeUrl}" }
 
     private suspend fun ensureOnUserAlbumPage(uid: String) {
         val albumUrl = "https://weibo.com/u/$uid?tabtype=album"
@@ -325,9 +422,24 @@ class WeiboWebSession(context: Context) {
                 "fid" to "110001768015440",
                 if (cursor == null) "since_id" to "0" else "max_id" to cursor,
             )
+
+            TimelineKind.FriendsCircle -> linkedMapOf(
+                "list_id" to FRIENDS_CIRCLE_GID,
+                "refresh" to "4",
+                "fast_refresh" to "1",
+                "count" to "25",
+            ).apply {
+                if (cursor != null) {
+                    put("max_id", cursor)
+                }
+            }
         }
 
-        return fetchJson(WeiboEndpoints.timelinePath(kind), params)
+        val referer = when (kind) {
+            TimelineKind.FriendsCircle -> "https://weibo.com/mygroups?gid=$FRIENDS_CIRCLE_GID"
+            else -> WEIBO_HOME
+        }
+        return fetchJson(WeiboEndpoints.timelinePath(kind), params, referer)
     }
 
     data class CommentsPage(val items: List<CommentItem>, val nextCursor: String?)
@@ -1174,6 +1286,7 @@ class WeiboWebSession(context: Context) {
         private const val MAX_ALBUM_EMPTY_PAGES = 12
         private const val MAX_ALBUM_FETCH_PAGES = 80
         private const val WEIBO_HOME = "https://weibo.com/"
+        private const val FRIENDS_CIRCLE_GID = "100097312739005"
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private val COOKIE_ORIGINS = listOf(
             "https://weibo.com/",

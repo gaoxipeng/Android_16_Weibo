@@ -39,6 +39,7 @@ data class FeedImage(
     val largeUrl: String,
     val downloadUrls: List<String> = emptyList(),
     val livePhotoVideoUrl: String? = null,
+    val videoStreamUrl: String? = null,
     val createdAt: String? = null,
     val statusId: String? = null,
     val width: Int? = null,
@@ -49,6 +50,19 @@ data class FeedImage(
         get() = type == "livephoto" && livePhotoVideoUrl != null
     val isGif: Boolean
         get() = type == "gif"
+    val isAlbumVideo: Boolean
+        get() = type == "video" && !videoStreamUrl.isNullOrBlank()
+}
+
+fun FeedImage.toAlbumFeedMedia(): FeedMedia? {
+    val streamUrl = videoStreamUrl?.takeIf { it.isNotBlank() } ?: return null
+    return FeedMedia(
+        type = MediaType.Video,
+        title = "微博视频",
+        coverUrl = thumbnailUrl.ifBlank { largeUrl }.takeIf { it.isNotBlank() },
+        streamUrl = streamUrl,
+        downloadUrl = downloadUrls.firstOrNull { it.contains(".mp4", ignoreCase = true) },
+    )
 }
 
 data class AlbumPage(
@@ -162,7 +176,8 @@ data class UserProfile(
 
 enum class TimelineKind(val label: String) {
     ForYou("\u63A8\u8350"),
-    Following("\u5173\u6CE8")
+    Following("\u6700\u65B0\u5FAE\u535A"),
+    FriendsCircle("\u597D\u53CB\u5708"),
 }
 
 data class WeiboEmoticon(

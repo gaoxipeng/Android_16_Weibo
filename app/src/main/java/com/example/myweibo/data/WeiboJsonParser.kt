@@ -582,6 +582,7 @@ object WeiboJsonParser {
     data class ImageWallParseResult(
         val images: List<FeedImage>,
         val nextSinceId: String?,
+        val nextCursor: String? = null,
     )
 
     class AlbumMonthContext(
@@ -610,29 +611,128 @@ object WeiboJsonParser {
         val responseSinceId = data.optSinceId()
             ?: data.optNullableString("sinceid")
             ?: data.optNullableString("next_since_id")
-        val images = (parseAlbumPhotoList(data.optJSONArray("list"), monthContext) +
-            parseAlbumPhotoList(data.optJSONArray("photo_wall"), monthContext))
-            .distinctBy { it.largeUrl }
+        val responseCursor = data.optAlbumCursor()
+        val images = (parseAlbumMediaList(data.optJSONArray("list"), monthContext) +
+            parseAlbumMediaList(data.optJSONArray("photo_wall"), monthContext))
+            .distinctBy { "${it.type.orEmpty()}:${it.id}:${it.largeUrl}" }
         return ImageWallParseResult(
             images = images,
             nextSinceId = responseSinceId,
+            nextCursor = responseCursor,
         )
     }
 
-    private fun parseAlbumPhotoList(
+    private fun JSONObject.optAlbumCursor(): String? {
+        if (!has("next_cursor") || isNull("next_cursor")) return null
+        return when (val value = opt("next_cursor")) {
+            is Number -> {
+                val cursor = value.toLong()
+                if (cursor < 0L) null else cursor.toString()
+            }
+            else -> value.toString().trim().takeIf { it.isNotBlank() && it != "-1" && it != "0" }
+        }
+    }
+
+    private fun parseAlbumMediaList(
         list: JSONArray?,
         monthContext: AlbumMonthContext = AlbumMonthContext(),
     ): List<FeedImage> {
         if (list == null) return emptyList()
         return buildList {
             for (index in 0 until list.length()) {
-                parseAlbumPhotoItem(
+                parseAlbumMediaItem(
                     item = list.optJSONObject(index),
                     monthContext = monthContext,
                 )?.let(::add)
             }
         }
     }
+
+    private fun parseAlbumMediaItem(
+        item: JSONObject?,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): FeedImage? {
+        item ?: return null
+        val payload = item.optJSONObject("video_detail_vo") ?: item
+        if (isAlbumVideoItem(payload)) {
+            parseAlbumVideoItem(payload, monthContext)?.let { return it }
+        }
+        return parseAlbumPhotoItem(payload, monthContext)
+    }
+
+    private fun isAlbumVideoItem(item: JSONObject): Boolean {
+        val declaredType = item.optNullableString("type")
+            ?: item.optNullableString("pic_type")
+            ?: item.optNullableString("object_type")
+        if (declaredType.equals("video", ignoreCase = true) ||
+            declaredType.equals("videos", ignoreCase = true)
+        ) {
+            return true
+        }
+        val pageInfo = item.optJSONObject("page_info") ?: return false
+        val objectType = pageInfo.optNullableString("object_type")
+        if (objectType.equals("live", ignoreCase = true) ||
+            objectType.equals("audio", ignoreCase = true)
+        ) {
+            return false
+        }
+        return pageInfo.optJSONObject("media_info") != null
+    }
+
+    private fun parseAlbumVideoItem(
+        item: JSONObject,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): FeedImage? {
+        item.optBlankString("timeline_month")?.let { monthContext.month = it.trim() }
+        item.optBlankString("timeline_year")?.let { monthContext.year = it.trim() }
+
+        val media = parseMedia(item) ?: return null
+        if (!media.isStreamPlayable()) return null
+        val cover = media.coverUrl?.let(::normalizeUrl)
+            ?: item.optNullableString("pic")?.let(::normalizeUrl)
+            ?: item.optNullableString("cover")?.let(::normalizeUrl)
+            ?: item.optNullableString("page_pic")?.let(::normalizeUrl)
+            ?: return null
+        if (!looksLikeAlbumCoverUrl(cover)) return null
+
+        val statusId = statusId(item).takeIf { it.isNotBlank() }
+            ?: item.optBlankString("mid")
+        val createdAt = item.optNullableString("created_at")
+            ?: formatAlbumMid(item.optBlankString("mid"))
+            ?: formatAlbumTimestamp(item.optNullableString("time"))
+            ?: formatAlbumTimestamp(item.optNullableString("upload_time"))
+            ?: formatAlbumTimestamp(item.optNullableString("shoot_time"))
+            ?: item.optNullableString("date")
+            ?: extractAlbumDateFromId(item.optBlankString("object_id"))
+            ?: extractAlbumDateFromId(item.optNullableString("id"))
+            ?: formatAlbumTimeline(
+                item.optBlankString("timeline_year") ?: monthContext.year,
+                item.optBlankString("timeline_month") ?: monthContext.month,
+            )
+        createdAt?.let { applyAlbumDateToContext(it, monthContext) }
+
+        return FeedImage(
+            id = statusId?.ifBlank { cover } ?: cover,
+            thumbnailUrl = cover,
+            largeUrl = cover,
+            downloadUrls = listOfNotNull(
+                cover,
+                media.downloadUrl?.let(::normalizeMediaUrl),
+            ).distinct(),
+            videoStreamUrl = media.streamUrl,
+            createdAt = createdAt,
+            statusId = statusId,
+            type = "video",
+        )
+    }
+
+    private fun looksLikeAlbumCoverUrl(value: String): Boolean =
+        looksLikeImageUrl(value) || value.contains("sinaimg.cn", ignoreCase = true)
+
+    private fun parseAlbumPhotoList(
+        list: JSONArray?,
+        monthContext: AlbumMonthContext = AlbumMonthContext(),
+    ): List<FeedImage> = parseAlbumMediaList(list, monthContext)
 
     private fun parseAlbumPhotoItem(
         item: JSONObject?,
@@ -657,7 +757,9 @@ object WeiboJsonParser {
             ?: upgradeSinaimgUrl(thumbnail)
             ?: pid?.let(::pidToLargeUrl)
             ?: return null
-        if (!looksLikeImageUrl(large)) return null
+        if (!looksLikeImageUrl(large)) {
+            return parseAlbumVideoItem(item, monthContext)
+        }
         val timelineMonth = item.optBlankString("timeline_month")
         val timelineYear = item.optBlankString("timeline_year")
         val createdAt = item.optNullableString("created_at")

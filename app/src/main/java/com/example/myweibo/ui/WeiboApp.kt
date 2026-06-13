@@ -223,6 +223,7 @@ import com.example.myweibo.data.RelationUser
 import com.example.myweibo.data.toRelationUser
 import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
+import com.example.myweibo.data.toAlbumFeedMedia
 import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.FeedUrlEntity
 import com.example.myweibo.data.ProfileLookup
@@ -582,7 +583,7 @@ fun WeiboApp() {
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
-    val timelineKind = TimelineKind.Following
+    var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -831,7 +832,7 @@ fun WeiboApp() {
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
                     visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
-                        "\u76F8\u518C\u6682\u65E0\u56FE\u7247"
+                        "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                     } else {
                         null
                     }
@@ -1264,7 +1265,9 @@ fun WeiboApp() {
             feedListState.animateScrollToItem(0)
             runCatching {
                 val raw = session.loadTimelineRaw(timelineKind)
-                timelineCacheStore.writeFollowingTimeline(raw)
+                if (timelineKind == TimelineKind.Following) {
+                    timelineCacheStore.writeFollowingTimeline(raw)
+                }
                 WeiboJsonParser.parseTimeline(raw)
             }
                 .onSuccess { page ->
@@ -1303,7 +1306,9 @@ fun WeiboApp() {
             hasLoginCookie = session.hasLoginCookie()
             runCatching {
                 val raw = session.loadTimelineRaw(timelineKind)
-                timelineCacheStore.writeFollowingTimeline(raw)
+                if (timelineKind == TimelineKind.Following) {
+                    timelineCacheStore.writeFollowingTimeline(raw)
+                }
                 WeiboJsonParser.parseTimeline(raw)
             }
                 .onSuccess { page ->
@@ -1332,6 +1337,15 @@ fun WeiboApp() {
             isLoading = false
             feedListState.animateScrollToItem(0)
         }
+    }
+
+    fun switchTimelineKind(kind: TimelineKind) {
+        if (kind == timelineKind) return
+        timelineKind = kind
+        items = emptyList()
+        nextCursor = null
+        feedRefreshHint = null
+        refreshTimeline()
     }
 
     fun loadMore() {
@@ -1406,7 +1420,7 @@ fun WeiboApp() {
                             mineAlbumNextCursor = page.nextCursor
                             mineAlbumHasMore = page.nextCursor != null
                             mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
-                                "\u76F8\u518C\u6682\u65E0\u56FE\u7247"
+                                "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                             } else {
                                 null
                             }
@@ -2308,6 +2322,12 @@ fun WeiboApp() {
                             else -> Unit
                         }
                     },
+                    feedTabLabel = timelineKind.label,
+                    selectedTimelineKind = timelineKind,
+                    onTimelineKindChange = { kind ->
+                        selectedTab = MainTab.Feed
+                        switchTimelineKind(kind)
+                    },
                     onTabChange = { tab ->
                         if (tab == MainTab.Feed && selectedTab == MainTab.Feed) {
                             refreshTimelineFromTop()
@@ -2470,6 +2490,9 @@ private fun FloatingBottomBar(
     hazeState: HazeState,
     onExpandRequest: () -> Unit,
     onCollapsedTap: () -> Unit,
+    feedTabLabel: String = MainTab.Feed.label,
+    selectedTimelineKind: TimelineKind = TimelineKind.Following,
+    onTimelineKindChange: (TimelineKind) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val glassShape = RoundedCornerShape(36.dp)
@@ -2483,6 +2506,7 @@ private fun FloatingBottomBar(
     var gesturePillXPx by remember { mutableFloatStateOf(0f) }
     var highlightedIndex by remember { mutableIntStateOf(-1) }
     var collapsedLongPressDragging by remember { mutableStateOf(false) }
+    var timelineMenuExpanded by remember { mutableStateOf(false) }
 
     LaunchedEffect(selectedTab) {
         if (!gestureActive) {
@@ -2526,6 +2550,10 @@ private fun FloatingBottomBar(
             val onExpandRequestState by rememberUpdatedState(onExpandRequest)
             val onTabChangeState by rememberUpdatedState(onTabChange)
             val onCollapsedTapState by rememberUpdatedState(onCollapsedTap)
+            val onTimelineKindChangeState by rememberUpdatedState(onTimelineKindChange)
+            val feedTabLabelState by rememberUpdatedState(feedTabLabel)
+            val selectedTimelineKindState by rememberUpdatedState(selectedTimelineKind)
+            val feedIndex = tabs.indexOf(MainTab.Feed).coerceAtLeast(0)
 
             fun contentX(rawX: Float) = (rawX - horizontalPaddingPx).coerceIn(0f, maxWidthPx)
 
@@ -2627,6 +2655,7 @@ private fun FloatingBottomBar(
                                 val isTouchingSelectedTab = gestureActive && highlightedTab == selectedTab
                                 FloatingNavItem(
                                     tab = tab,
+                                    label = if (tab == MainTab.Feed) feedTabLabelState else tab.label,
                                     selected = selectedTab == tab &&
                                         (!gestureActive || highlightedTab == null || isTouchingSelectedTab),
                                     highlighted = gestureActive &&
@@ -2650,6 +2679,7 @@ private fun FloatingBottomBar(
                             )
                             FloatingNavItem(
                                 tab = selectedTab,
+                                label = if (selectedTab == MainTab.Feed) feedTabLabelState else selectedTab.label,
                                 selected = true,
                                 highlighted = false,
                                 modifier = Modifier.fillMaxWidth(),
@@ -2739,6 +2769,63 @@ private fun FloatingBottomBar(
                             }
                         },
                 )
+
+                Box(
+                    modifier = Modifier
+                        .offset(x = barContentPadding + itemWidth * feedIndex)
+                        .width(itemWidth)
+                        .fillMaxHeight()
+                        .zIndex(4f)
+                        .combinedClickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick = {
+                                if (selectedTab == MainTab.Feed) {
+                                    onTabChangeState(MainTab.Feed)
+                                } else {
+                                    onTabChangeState(MainTab.Feed)
+                                }
+                            },
+                            onLongClick = {
+                                timelineMenuExpanded = true
+                            },
+                        ),
+                )
+            }
+
+            if (timelineMenuExpanded) {
+                val timelineMenuWidth = 136.dp
+                val timelineMenuOffsetX = with(density) {
+                    val fullWidthPx = fullBarWidth.toPx()
+                    val menuWidthPx = timelineMenuWidth.toPx()
+                    val feedCenterPx = (barContentPadding + itemWidth * feedIndex + itemWidth / 2).toPx()
+                    (feedCenterPx - menuWidthPx / 2f)
+                        .coerceIn(0f, (fullWidthPx - menuWidthPx).coerceAtLeast(0f))
+                        .roundToInt()
+                }
+                Popup(
+                    alignment = Alignment.BottomStart,
+                    offset = IntOffset(timelineMenuOffsetX, -with(density) { 94.dp.roundToPx() }),
+                    onDismissRequest = { timelineMenuExpanded = false },
+                    properties = PopupProperties(focusable = false),
+                ) {
+                    ImageActionFrostedCard(modifier = Modifier.width(timelineMenuWidth)) {
+                        listOf(TimelineKind.Following, TimelineKind.FriendsCircle).forEachIndexed { index, kind ->
+                            if (index > 0) {
+                                ImageActionMenuDivider()
+                            }
+                            ImageActionRow(
+                                label = kind.label,
+                                enabled = true,
+                                selected = kind == selectedTimelineKindState,
+                                onClick = {
+                                    timelineMenuExpanded = false
+                                    onTimelineKindChangeState(kind)
+                                },
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -2960,6 +3047,7 @@ private fun AppPullToRefreshBox(
 @Composable
 private fun FloatingNavItem(
     tab: MainTab,
+    label: String = tab.label,
     selected: Boolean,
     highlighted: Boolean,
     modifier: Modifier = Modifier,
@@ -2987,7 +3075,7 @@ private fun FloatingNavItem(
             TabIcon(tab = tab, color = iconColor)
         }
         Text(
-            text = tab.label,
+            text = label,
             fontSize = 10.sp,
             color = iconColor,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
@@ -9925,9 +10013,9 @@ private fun MineAlbumTimeline(
 ) {
     val albumGrouped = remember(albumImages) {
         albumImages
-            .distinctBy { it.largeUrl }
+            .distinctBy { "${it.type.orEmpty()}:${it.id}:${it.largeUrl}" }
             .mapNotNull { image ->
-                albumMonthLabel(image.createdAt)?.let { label -> label to image }
+                albumMonthLabelForImage(image)?.let { label -> label to image }
             }
             .groupBy({ it.first }, { it.second })
             .mapValues { entry -> entry.value.distinctBy { it.largeUrl } }
@@ -9946,7 +10034,7 @@ private fun MineAlbumTimeline(
             body = when {
                 albumLoading -> "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
                 !albumError.isNullOrBlank() -> albumError
-                else -> "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u3002"
+                else -> "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
             },
         )
         return
@@ -9963,6 +10051,7 @@ private fun MineAlbumTimeline(
                 onImageClick = { groupImages, index ->
                     onOpenAlbumViewer(AlbumViewerState(groupImages, index))
                 },
+                onVideoClick = onMediaClick,
             )
         }
     }
@@ -10024,21 +10113,29 @@ private fun enrichAlbumImagesFromPosts(images: List<FeedImage>, posts: List<Feed
         }
     }
     return images.map { image ->
+        val post = findPostForAlbumImage(posts, image)
         val match = albumImageMatchKeys(image)
             .firstNotNullOfOrNull { key -> imageByKey[key] }
-            ?: return@map image
-        val mergedLiveVideo = image.livePhotoVideoUrl ?: match.livePhotoVideoUrl
+        val mergedLiveVideo = image.livePhotoVideoUrl ?: match?.livePhotoVideoUrl
+        val mergedStream = image.videoStreamUrl
+            ?: match?.videoStreamUrl
+            ?: post?.media?.takeIf { it.type == MediaType.Video && it.isStreamPlayable() }?.streamUrl
+        if (match == null && mergedStream == null && mergedLiveVideo == null) {
+            return@map image
+        }
         image.copy(
             livePhotoVideoUrl = mergedLiveVideo,
+            videoStreamUrl = mergedStream,
             type = when {
-                match.type == "livephoto" && !mergedLiveVideo.isNullOrBlank() -> "livephoto"
-                match.type == "gif" -> "gif"
-                image.type.isNullOrBlank() -> match.type
+                mergedStream != null -> "video"
+                match?.type == "livephoto" && !mergedLiveVideo.isNullOrBlank() -> "livephoto"
+                match?.type == "gif" -> "gif"
+                image.type.isNullOrBlank() -> match?.type
                 else -> image.type
             },
-            width = image.width ?: match.width,
-            height = image.height ?: match.height,
-            downloadUrls = (image.downloadUrls + match.downloadUrls).distinct(),
+            width = image.width ?: match?.width,
+            height = image.height ?: match?.height,
+            downloadUrls = (image.downloadUrls + (match?.downloadUrls ?: emptyList())).distinct(),
         )
     }
 }
@@ -10054,6 +10151,7 @@ private fun MineAlbumMonthSection(
     dateLabel: Pair<String, String>,
     images: List<FeedImage>,
     onImageClick: (List<FeedImage>, Int) -> Unit,
+    onVideoClick: (FeedMedia) -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -10094,6 +10192,7 @@ private fun MineAlbumMonthSection(
                                 image = image,
                                 size = cellSize,
                                 onClick = { onImageClick(images, currentIndex) },
+                                onVideoClick = onVideoClick,
                             )
                         }
                     }
@@ -10108,12 +10207,15 @@ private fun MineAlbumTile(
     image: FeedImage,
     size: androidx.compose.ui.unit.Dp,
     onClick: () -> Unit,
+    onVideoClick: (FeedMedia) -> Unit,
 ) {
     Box(
         modifier = Modifier
             .size(size)
             .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
+            .clickable {
+                image.toAlbumFeedMedia()?.let(onVideoClick) ?: onClick()
+            }
     ) {
         RemoteImage(
             url = image.thumbnailUrl.ifBlank { image.largeUrl },
@@ -10121,7 +10223,21 @@ private fun MineAlbumTile(
             contentScale = ContentScale.Crop,
             animated = image.isGif,
         )
-        if (image.isLivePhoto || image.isGif) {
+        if (image.isAlbumVideo) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.18f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_video_play),
+                    contentDescription = "视频",
+                    modifier = Modifier.size(28.dp),
+                    tint = Color.White.copy(alpha = 0.92f),
+                )
+            }
+        } else if (image.isLivePhoto || image.isGif) {
             Surface(
                 modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
                 shape = CircleShape,
@@ -10153,6 +10269,21 @@ private fun filterOutRetweetedOnlyImages(images: List<FeedImage>, posts: List<Fe
 private fun albumMonthLabel(createdAt: String?): Pair<String, String>? {
     val label = albumDateLabel(createdAt)
     return label.takeUnless { it.first == "\u5168\u90E8" }
+}
+
+private fun albumMonthLabelForImage(image: FeedImage): Pair<String, String>? {
+    albumMonthLabel(image.createdAt)?.let { return it }
+    return image.statusId?.let(::albumMonthLabelFromMid)
+}
+
+private fun albumMonthLabelFromMid(mid: String): Pair<String, String>? {
+    val id = mid.trim().toLongOrNull() ?: return null
+    val seconds = (id shr 22) + 515_483_463L
+    if (seconds < 1_000_000_000L || seconds > 4_102_444_800L) return null
+    val date = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply {
+        timeZone = java.util.TimeZone.getTimeZone("Asia/Shanghai")
+    }.format(java.util.Date(seconds * 1000))
+    return albumMonthLabel(date)
 }
 
 private fun albumGroupSortKey(label: Pair<String, String>): Long {

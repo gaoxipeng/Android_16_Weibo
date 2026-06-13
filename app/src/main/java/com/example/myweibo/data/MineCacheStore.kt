@@ -189,6 +189,7 @@ class MineCacheStore(context: Context) {
             .put("large_url", largeUrl)
             .put("download_urls", JSONArray(downloadUrls))
             .put("live_photo_video_url", livePhotoVideoUrl)
+            .put("video_stream_url", videoStreamUrl)
             .put("type", type)
             .put("created_at", createdAt)
             .put("status_id", statusId)
@@ -207,6 +208,7 @@ class MineCacheStore(context: Context) {
                         largeUrl = item.optString("large_url"),
                         downloadUrls = item.optJSONArray("download_urls").toStringList(),
                         livePhotoVideoUrl = item.optNullableString("live_photo_video_url"),
+                        videoStreamUrl = item.optNullableString("video_stream_url"),
                         createdAt = item.optNullableString("created_at"),
                         statusId = item.optNullableString("status_id"),
                         width = item.optInt("width").takeIf { it > 0 },
