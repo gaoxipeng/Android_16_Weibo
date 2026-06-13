@@ -8,6 +8,7 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -213,6 +214,7 @@ import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
+import com.example.myweibo.data.SearchSettingsStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FriendListTab
@@ -285,6 +287,30 @@ private enum class SearchWeiboSort(val label: String) {
     Comprehensive("综合"),
     Realtime("实时"),
 }
+
+private fun storedSearchMode(value: String): SearchMode =
+    when (value) {
+        SearchSettingsStore.MODE_USER -> SearchMode.User
+        else -> SearchMode.Weibo
+    }
+
+private fun SearchMode.storageValue(): String =
+    when (this) {
+        SearchMode.Weibo -> SearchSettingsStore.MODE_WEIBO
+        SearchMode.User -> SearchSettingsStore.MODE_USER
+    }
+
+private fun storedSearchWeiboSort(value: String): SearchWeiboSort =
+    when (value) {
+        SearchSettingsStore.SORT_REALTIME -> SearchWeiboSort.Realtime
+        else -> SearchWeiboSort.Comprehensive
+    }
+
+private fun SearchWeiboSort.storageValue(): String =
+    when (this) {
+        SearchWeiboSort.Comprehensive -> SearchSettingsStore.SORT_COMPREHENSIVE
+        SearchWeiboSort.Realtime -> SearchSettingsStore.SORT_REALTIME
+    }
 
 private enum class MineContentTab(val label: String) {
     Posts("\u5FAE\u535A"),
@@ -390,6 +416,7 @@ private data class DetailSnapshot(
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
     val albumViewerState: AlbumViewerState? = null,
+    val instanceKey: Int = 0,
 )
 
 private data class ArticleOverlayState(
@@ -399,12 +426,23 @@ private data class ArticleOverlayState(
     val error: String? = null,
 )
 
+private data class FollowListTabCache(
+    val users: List<RelationUser>,
+    val page: Int,
+    val hasMore: Boolean,
+    val errorMsg: String?,
+)
+
+private fun followListTabCacheKey(instanceKey: Int, uid: String, tab: FriendListTab): String =
+    "$instanceKey|$uid|${tab.name}"
+
 private data class FollowListOverlayState(
     val uid: String,
     val screenName: String,
     val avatarUrl: String?,
     val description: String?,
     val tab: FriendListTab,
+    val instanceKey: Int = 0,
 )
 
 private data class ScrollRestore(
@@ -418,6 +456,7 @@ private data class NavRestoreState(
     val minePostsScroll: ScrollRestore = ScrollRestore(),
     val mineAlbumScroll: ScrollRestore = ScrollRestore(),
     val minePagerPage: Int = 0,
+    val searchScroll: ScrollRestore = ScrollRestore(),
     val visitedProfile: VisitedProfileSnapshot? = null,
     val detail: DetailSnapshot? = null,
     val followListOverlay: FollowListOverlayState? = null,
@@ -523,6 +562,7 @@ fun WeiboApp() {
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
+    val searchSettingsStore = remember { SearchSettingsStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -533,6 +573,7 @@ fun WeiboApp() {
     val visitedAlbumListState = rememberLazyListState()
     val followListFollowingListState = rememberLazyListState()
     val followListFansListState = rememberLazyListState()
+    val searchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val profileHeaderHeights = remember { mutableStateMapOf<String, Dp>() }
 
@@ -550,6 +591,7 @@ fun WeiboApp() {
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
+    var activeDetailInstanceKey by remember { mutableIntStateOf(0) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
@@ -560,7 +602,8 @@ fun WeiboApp() {
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
-    var searchWeiboSort by remember { mutableStateOf(SearchWeiboSort.Comprehensive) }
+    var searchMode by remember { mutableStateOf(storedSearchMode(searchSettingsStore.readMode())) }
+    var searchWeiboSort by remember { mutableStateOf(storedSearchWeiboSort(searchSettingsStore.readWeiboSort())) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
@@ -611,6 +654,7 @@ fun WeiboApp() {
     var pendingOpenAccountLogin by remember { mutableStateOf(false) }
     var articleOverlay by remember { mutableStateOf<ArticleOverlayState?>(null) }
     var followListOverlay by remember { mutableStateOf<FollowListOverlayState?>(null) }
+    val followListTabCaches = remember { mutableStateMapOf<String, FollowListTabCache>() }
 
     fun scrollLazyListState(listState: LazyListState, scroll: ScrollRestore) {
         scope.launch {
@@ -707,6 +751,8 @@ fun WeiboApp() {
         visitedAlbumJob?.cancel()
         if (incrementGeneration) {
             visitedProfileLoadGeneration += 1
+            visitedListScrollResetGeneration = visitedProfileLoadGeneration
+        } else {
             visitedListScrollResetGeneration = visitedProfileLoadGeneration
         }
         visitedUserId = snapshot.userId
@@ -885,6 +931,7 @@ fun WeiboApp() {
             scrollIndex = lastDetailScroll.index,
             scrollOffset = lastDetailScroll.offset,
             albumViewerState = albumViewerState,
+            instanceKey = activeDetailInstanceKey,
         )
     }
 
@@ -895,6 +942,7 @@ fun WeiboApp() {
         commentsHasMore = snapshot.commentsHasMore
         commentSort = snapshot.commentSort
         albumViewerState = snapshot.albumViewerState
+        activeDetailInstanceKey = snapshot.instanceKey
         lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
         detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
     }
@@ -979,6 +1027,10 @@ fun WeiboApp() {
             mineAlbumListState.firstVisibleItemScrollOffset,
         ),
         minePagerPage = minePagerPage,
+        searchScroll = ScrollRestore(
+            searchListState.firstVisibleItemIndex,
+            searchListState.firstVisibleItemScrollOffset,
+        ),
         visitedProfile = currentVisitedProfileSnapshot(),
         detail = currentDetailSnapshot(),
         followListOverlay = followListOverlay,
@@ -1005,7 +1057,6 @@ fun WeiboApp() {
         mediaPreview = null
         articleOverlay = null
         albumViewerState = null
-        followListOverlay = null
 
         if (state.visitedProfile != null) {
             restoreVisitedProfileSnapshot(state.visitedProfile, incrementGeneration = false)
@@ -1016,6 +1067,7 @@ fun WeiboApp() {
         scrollLazyListState(feedListState, state.feedScroll)
         scrollLazyListState(minePostsListState, state.minePostsScroll)
         scrollLazyListState(mineAlbumListState, state.mineAlbumScroll)
+        scrollLazyListState(searchListState, state.searchScroll)
 
         followListOverlay = state.followListOverlay
         if (state.followListOverlay != null) {
@@ -1061,7 +1113,7 @@ fun WeiboApp() {
     }
 
     fun closeFollowList() {
-        followListOverlay = null
+        navigateBack()
     }
 
     fun openFollowList(
@@ -1071,13 +1123,17 @@ fun WeiboApp() {
         description: String?,
         tab: FriendListTab,
     ) {
-        followListOverlay = FollowListOverlayState(
-            uid = uid,
-            screenName = screenName,
-            avatarUrl = avatarUrl,
-            description = description,
-            tab = tab,
-        )
+        pushNavigation {
+            val instanceKey = navStack.size
+            followListOverlay = FollowListOverlayState(
+                uid = uid,
+                screenName = screenName,
+                avatarUrl = avatarUrl,
+                description = description,
+                tab = tab,
+                instanceKey = instanceKey,
+            )
+        }
     }
 
     fun pushMediaPreview(media: FeedMedia) {
@@ -1096,9 +1152,16 @@ fun WeiboApp() {
         val bareTopic = topic.removePrefix("#").removeSuffix("#").trim()
         val normalized = if (bareTopic.isBlank()) "" else "#$bareTopic#"
         if (normalized.isBlank()) return
-        searchPendingQuery = normalized
-        selectedTab = MainTab.Search
-        bottomBarExpanded = true
+        if (selectedTab == MainTab.Search && visitedUserId == null && selectedItem == null) {
+            searchPendingQuery = normalized
+            bottomBarExpanded = true
+            return
+        }
+        pushNavigation {
+            searchPendingQuery = normalized
+            selectedTab = MainTab.Search
+            bottomBarExpanded = true
+        }
     }
 
     fun openUser(idOrScreenName: String) {
@@ -1139,11 +1202,10 @@ fun WeiboApp() {
                 value == visitedUserId
         }
         if (isSameUser) {
-            followListOverlay = null
+            closeFollowList()
             return
         }
         pushNavigation {
-            followListOverlay = null
             selectedItem = null
             comments = emptyList()
             commentsCursor = null
@@ -1166,31 +1228,29 @@ fun WeiboApp() {
         navigateBack()
     }
 
-    BackHandler(enabled = true) {
-        if (followListOverlay != null) {
-            followListOverlay = null
-            lastHomeBackPressAt = 0L
-            return@BackHandler
+    fun handleRootBackPress() {
+        val now = System.currentTimeMillis()
+        if (now - lastHomeBackPressAt <= 2_000L) {
+            (context as? android.app.Activity)?.finish()
+        } else {
+            lastHomeBackPressAt = now
+            exitHintVisible = true
+            exitHintToken += 1
         }
+    }
+
+    BackHandler(enabled = true) {
         if (popNavigation()) {
             lastHomeBackPressAt = 0L
             return@BackHandler
         }
         when {
+            selectedTab == MainTab.Messages || selectedTab == MainTab.Compose -> Unit
             selectedTab != MainTab.Feed -> {
                 lastHomeBackPressAt = 0L
                 selectedTab = MainTab.Feed
             }
-            else -> {
-                val now = System.currentTimeMillis()
-                if (now - lastHomeBackPressAt <= 2_000L) {
-                    (context as? android.app.Activity)?.finish()
-                } else {
-                    lastHomeBackPressAt = now
-                    exitHintVisible = true
-                    exitHintToken += 1
-                }
-            }
+            else -> handleRootBackPress()
         }
     }
 
@@ -1546,6 +1606,7 @@ fun WeiboApp() {
     fun openDetailInternal(item: FeedItem) {
         pushNavigation {
             val resolved = resolveFeedItem(item)
+            activeDetailInstanceKey = navStack.size
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
@@ -1573,6 +1634,7 @@ fun WeiboApp() {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = viewer
             val resolved = resolveFeedItem(item)
+            activeDetailInstanceKey = navStack.size
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
@@ -1824,6 +1886,20 @@ fun WeiboApp() {
             val keepFeedAlive = selectedTab == MainTab.Feed &&
                 visitedUserId != null &&
                 detailOverlayItem == null
+            val searchUiOnTop = selectedTab == MainTab.Search &&
+                visitedUserId == null &&
+                detailOverlayItem == null &&
+                followListOverlay == null &&
+                articleOverlay == null &&
+                mediaPreview == null &&
+                albumViewerState == null
+            val keepSearchAlive = selectedTab == MainTab.Search &&
+                (visitedUserId != null ||
+                    detailOverlayItem != null ||
+                    followListOverlay != null ||
+                    articleOverlay != null ||
+                    mediaPreview != null ||
+                    albumViewerState != null)
             val visitedProfileVisible = visitedUserId != null &&
                 selectedItem == null &&
                 albumViewerState == null
@@ -1845,6 +1921,7 @@ fun WeiboApp() {
                             cacheLoaded = cacheLoaded,
                             hasLoginCookie = hasLoginCookie,
                             emoticonMap = emoticonMap,
+                            feedUiOnTop = feedUiOnTop,
                             onRefresh = { refreshTimeline() },
                             onLoadMore = { loadMore() },
                             onOpenLoginSettings = ::openAccountLoginManagement,
@@ -1856,6 +1933,78 @@ fun WeiboApp() {
                             onLoadLongText = ::loadLongText,
                             onToggleLike = ::toggleStatusLike,
                             onUrlEntityClick = ::openUrlEntity,
+                        )
+                    }
+                }
+
+                followListOverlay?.let { overlay ->
+                    val followListUiOnTop = selectedItem == null &&
+                        articleOverlay == null &&
+                        mediaPreview == null &&
+                        albumViewerState == null &&
+                        (visitedUserId == null || visitedUserId == overlay.uid)
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .zIndex(550f)
+                            .graphicsLayer { alpha = if (followListUiOnTop) 1f else 0f }
+                            .blockHiddenTouches(followListUiOnTop),
+                    ) {
+                        key(overlay.uid, overlay.instanceKey) {
+                            FollowFansListScreen(
+                                session = session,
+                                overlay = overlay,
+                                followingListState = followListFollowingListState,
+                                fansListState = followListFansListState,
+                                tabCaches = followListTabCaches,
+                                backHandlerEnabled = followListUiOnTop,
+                                onBack = ::closeFollowList,
+                                onTabChange = { tab ->
+                                    followListOverlay = overlay.copy(tab = tab)
+                                },
+                                onUserClick = ::openUserFromFollowList,
+                                showMessage = ::showMessage,
+                                mineProfileId = mineProfile?.id,
+                            )
+                        }
+                    }
+                }
+
+                if (selectedTab == MainTab.Search && (searchUiOnTop || keepSearchAlive)) {
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .graphicsLayer { alpha = if (searchUiOnTop) 1f else 0f }
+                            .blockHiddenTouches(searchUiOnTop),
+                    ) {
+                        SearchScreen(
+                            session = session,
+                            hasLoginCookie = hasLoginCookie,
+                            pendingQuery = searchPendingQuery,
+                            onPendingQueryConsumed = { searchPendingQuery = null },
+                            emoticonMap = emoticonMap,
+                            listState = searchListState,
+                            resultsBackEnabled = searchUiOnTop,
+                            onItemClick = { item, _ -> openDetailFromSource(item, null) },
+                            onMediaClick = ::pushMediaPreview,
+                            onUserClick = ::openUser,
+                            resolveFeedItem = ::resolveFeedItem,
+                            isLongTextLoading = { it.statusId in longTextLoadingIds },
+                            onLoadLongText = ::loadLongText,
+                            onToggleLike = ::toggleStatusLike,
+                            onUrlEntityClick = ::openUrlEntity,
+                            onOpenLoginSettings = ::openAccountLoginManagement,
+                            mineProfileId = mineProfile?.id,
+                            searchMode = searchMode,
+                            onSearchModeChange = { mode ->
+                                searchMode = mode
+                                searchSettingsStore.writeMode(mode.storageValue())
+                            },
+                            weiboSort = searchWeiboSort,
+                            onWeiboSortChange = { sort ->
+                                searchWeiboSort = sort
+                                searchSettingsStore.writeWeiboSort(sort.storageValue())
+                            },
                         )
                     }
                 }
@@ -1872,7 +2021,7 @@ fun WeiboApp() {
                     val activeFollowList = followListOverlay
                     val profileOverFollowList = activeFollowList != null &&
                         visitedUserId != activeFollowList.uid
-                    key(visitedUserId) {
+                    key(visitedUserId, visitedProfileLoadGeneration) {
                         Box(
                             Modifier
                                 .fillMaxSize()
@@ -1882,6 +2031,10 @@ fun WeiboApp() {
                                 }
                                 .blockHiddenTouches(visitedProfileVisible),
                         ) {
+                            BackHandler(
+                                enabled = visitedProfileVisible,
+                                onBack = ::closeVisitedProfile,
+                            )
                             VisitedUserProfileContent(
                                     session = session,
                                     profile = visitedProfile,
@@ -1943,30 +2096,8 @@ fun WeiboApp() {
 
                 if (visitedUserId == null && selectedItem == null) {
                     when (selectedTab) {
-                        MainTab.Search -> SearchScreen(
-                            session = session,
-                            hasLoginCookie = hasLoginCookie,
-                            pendingQuery = searchPendingQuery,
-                            onPendingQueryConsumed = { searchPendingQuery = null },
-                            emoticonMap = emoticonMap,
-                            onItemClick = { item, _ -> openDetailFromSource(item, null) },
-                            onMediaClick = ::pushMediaPreview,
-                            onUserClick = ::openUser,
-                            resolveFeedItem = ::resolveFeedItem,
-                            isLongTextLoading = { it.statusId in longTextLoadingIds },
-                            onLoadLongText = ::loadLongText,
-                            onToggleLike = ::toggleStatusLike,
-                            onUrlEntityClick = ::openUrlEntity,
-                            onOpenLoginSettings = ::openAccountLoginManagement,
-                            mineProfileId = mineProfile?.id,
-                            weiboSort = searchWeiboSort,
-                            onWeiboSortChange = { searchWeiboSort = it },
-                        )
-
-                        MainTab.Messages -> PlaceholderScreen(
-                            title = "\u6D88\u606F",
-                            body = "\u6D88\u606F\u9875\u5C06\u627F\u8F7D\u8BC4\u8BBA\u3001\u70B9\u8D5E\u3001\u63D0\u53CA\u548C\u79C1\u4FE1\u5165\u53E3\u3002"
-                        )
+                        MainTab.Search -> Unit
+                        MainTab.Messages -> MessagesScreen(onRootBack = ::handleRootBackPress)
 
                         MainTab.Mine -> {
                             LaunchedEffect(mineProfile) {
@@ -2038,9 +2169,9 @@ fun WeiboApp() {
                             )
                         }
 
-                        MainTab.Compose -> PlaceholderScreen(
-                            title = "\u5199\u5FAE\u535A",
-                            body = "\u8FD9\u91CC\u540E\u7EED\u4F1A\u63A5\u5165\u5FAE\u535A\u53D1\u5E03\u63A5\u53E3\uFF0C\u652F\u6301\u539F\u751F\u7F16\u8F91\u548C\u53D1\u5E03\u3002"
+                        MainTab.Compose -> MobileWeiboWebScreen(
+                            pageUrl = "https://m.weibo.cn/compose/",
+                            onRootBack = ::handleRootBackPress,
                         )
 
                         MainTab.Feed -> Unit
@@ -2048,9 +2179,9 @@ fun WeiboApp() {
                 }
 
                 detailOverlayItem?.let { detailItem ->
-                    key(detailItem.id) {
+                    key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
-                        LaunchedEffect(detailItem.id, detailScrollPending?.first) {
+                        LaunchedEffect(detailItem.id, activeDetailInstanceKey, detailScrollPending?.first) {
                             val pending = detailScrollPending ?: return@LaunchedEffect
                             if (pending.first != detailItem.id) return@LaunchedEffect
                             var attempts = 0
@@ -2074,6 +2205,7 @@ fun WeiboApp() {
                                 .fillMaxSize()
                                 .zIndex(570f),
                         ) {
+                            BackHandler(onBack = { navigateBack() })
                             Surface(
                                 modifier = Modifier.fillMaxSize(),
                                 color = MaterialTheme.colorScheme.background,
@@ -2240,29 +2372,6 @@ fun WeiboApp() {
                         onBack = ::closeArticleOverlay,
                         onRetry = { loadArticleIntoOverlay(overlay.entity) },
                     )
-                }
-            }
-            followListOverlay?.let { overlay ->
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .zIndex(550f),
-                ) {
-                    key(overlay.uid) {
-                        FollowFansListScreen(
-                            session = session,
-                            overlay = overlay,
-                            followingListState = followListFollowingListState,
-                            fansListState = followListFansListState,
-                            onBack = ::closeFollowList,
-                            onTabChange = { tab ->
-                                followListOverlay = overlay.copy(tab = tab)
-                            },
-                            onUserClick = ::openUserFromFollowList,
-                            showMessage = ::showMessage,
-                            mineProfileId = mineProfile?.id,
-                        )
-                    }
                 }
             }
         }
@@ -2904,6 +3013,7 @@ private fun FollowFeedScreen(
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    feedUiOnTop: Boolean = true,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -2978,6 +3088,7 @@ private fun FollowFeedScreen(
                     onLoadLongText = onLoadLongText,
                     onToggleLike = onToggleLike,
                     onUrlEntityClick = onUrlEntityClick,
+                    menuBackEnabled = feedUiOnTop,
                 )
             }
 
@@ -3400,6 +3511,7 @@ private fun FeedCard(
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     showAuthorRow: Boolean = true,
+    menuBackEnabled: Boolean = true,
     onBoundsChange: (Rect) -> Unit = {},
 ) {
     ElevatedCard(
@@ -3439,7 +3551,10 @@ private fun FeedCard(
                             avatarClickable = true,
                         )
                     }
-                    FeedCardActionMenu(item = item)
+                    FeedCardActionMenu(
+                        item = item,
+                        backHandlerEnabled = menuBackEnabled,
+                    )
                 }
             }
             Column(
@@ -3661,6 +3776,7 @@ private fun CommentSortActionMenu(
 @Composable
 private fun FeedCardActionMenu(
     item: FeedItem,
+    backHandlerEnabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -3674,8 +3790,12 @@ private fun FeedCardActionMenu(
         expanded = false
     }
 
+    LaunchedEffect(backHandlerEnabled) {
+        if (!backHandlerEnabled) dismissMenu()
+    }
+
     if (expanded) {
-        BackHandler { dismissMenu() }
+        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
     }
 
     Box {
@@ -6691,6 +6811,7 @@ private fun CommentImageStrip(
 private fun SearchModeActionMenu(
     selected: SearchMode,
     onSelected: (SearchMode) -> Unit,
+    backHandlerEnabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val density = LocalDensity.current
@@ -6700,8 +6821,12 @@ private fun SearchModeActionMenu(
         expanded = false
     }
 
+    LaunchedEffect(backHandlerEnabled) {
+        if (!backHandlerEnabled) dismissMenu()
+    }
+
     if (expanded) {
-        BackHandler { dismissMenu() }
+        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
     }
 
     val metaColor = weiboMetaTextColor()
@@ -6767,6 +6892,7 @@ private fun SearchModeActionMenu(
 private fun SearchWeiboSortActionMenu(
     selected: SearchWeiboSort,
     onSelected: (SearchWeiboSort) -> Unit,
+    backHandlerEnabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val density = LocalDensity.current
@@ -6776,8 +6902,12 @@ private fun SearchWeiboSortActionMenu(
         expanded = false
     }
 
+    LaunchedEffect(backHandlerEnabled) {
+        if (!backHandlerEnabled) dismissMenu()
+    }
+
     if (expanded) {
-        BackHandler { dismissMenu() }
+        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
     }
 
     val metaColor = weiboMetaTextColor()
@@ -6848,6 +6978,7 @@ private fun SearchCapsuleField(
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
+    menuBackEnabled: Boolean = true,
 ) {
     val shape = RoundedCornerShape(22.dp)
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
@@ -6872,6 +7003,7 @@ private fun SearchCapsuleField(
             SearchModeActionMenu(
                 selected = mode,
                 onSelected = onModeChange,
+                backHandlerEnabled = menuBackEnabled,
             )
             Spacer(Modifier.width(8.dp))
             BasicTextField(
@@ -6973,6 +7105,8 @@ private fun SearchScreen(
     pendingQuery: String?,
     onPendingQueryConsumed: () -> Unit,
     emoticonMap: Map<String, String>,
+    listState: LazyListState,
+    resultsBackEnabled: Boolean,
     onItemClick: (FeedItem, Rect?) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     onUserClick: (String) -> Unit,
@@ -6983,6 +7117,8 @@ private fun SearchScreen(
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
     onOpenLoginSettings: () -> Unit,
     mineProfileId: String?,
+    searchMode: SearchMode,
+    onSearchModeChange: (SearchMode) -> Unit,
     weiboSort: SearchWeiboSort,
     onWeiboSortChange: (SearchWeiboSort) -> Unit,
 ) {
@@ -6990,11 +7126,9 @@ private fun SearchScreen(
     val showMessage = LocalUiMessenger.current
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
-    val listState = rememberLazyListState()
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var queryInput by remember { mutableStateOf("") }
     var activeQuery by remember { mutableStateOf<String?>(null) }
-    var searchMode by remember { mutableStateOf(SearchMode.Weibo) }
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
     var hotSearchLoading by remember { mutableStateOf(false) }
     var hotSearchError by remember { mutableStateOf<String?>(null) }
@@ -7007,6 +7141,25 @@ private fun SearchScreen(
     var searchGeneration by remember { mutableIntStateOf(0) }
     var initialResultsReady by remember { mutableStateOf(false) }
     var searchPullRefreshing by remember { mutableStateOf(false) }
+
+    fun clearSearchResults() {
+        queryInput = ""
+        activeQuery = null
+        resultItems = emptyList()
+        userResultItems = emptyList()
+        resultError = null
+        resultNextPage = null
+        resultLoading = false
+        resultLoadingMore = false
+        initialResultsReady = false
+        scope.launch { runCatching { listState.scrollToItem(0) } }
+    }
+
+    BackHandler(enabled = activeQuery != null && resultsBackEnabled) {
+        clearSearchResults()
+        focusManager.clearFocus(force = true)
+        keyboardController?.hide()
+    }
 
     fun normalizeTopic(raw: String): String =
         raw.trim()
@@ -7202,7 +7355,7 @@ private fun SearchScreen(
             mode = searchMode,
             onModeChange = { mode ->
                 if (mode != searchMode) {
-                    searchMode = mode
+                    onSearchModeChange(mode)
                     resultItems = emptyList()
                     userResultItems = emptyList()
                     resultError = null
@@ -7212,22 +7365,13 @@ private fun SearchScreen(
                 }
             },
             onSearch = { submitQuery(queryInput) },
-            onClear = {
-                queryInput = ""
-                activeQuery = null
-                resultItems = emptyList()
-                userResultItems = emptyList()
-                resultError = null
-                resultNextPage = null
-                resultLoading = false
-                resultLoadingMore = false
-                initialResultsReady = false
-            },
+            onClear = ::clearSearchResults,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .padding(start = 18.dp, end = 18.dp, bottom = searchFieldBottom)
                 .zIndex(2f),
+            menuBackEnabled = resultsBackEnabled,
         )
 
         if (!hasLoginCookie) {
@@ -7393,6 +7537,7 @@ private fun SearchScreen(
                                     onLoadLongText = onLoadLongText,
                                     onToggleLike = onToggleLike,
                                     onUrlEntityClick = onUrlEntityClick,
+                                    menuBackEnabled = resultsBackEnabled,
                                 )
                             }
                         }
@@ -7439,6 +7584,7 @@ private fun SearchScreen(
                             SearchWeiboSortActionMenu(
                                 selected = weiboSort,
                                 onSelected = ::changeWeiboSort,
+                                backHandlerEnabled = resultsBackEnabled,
                             )
                         }
                     }
@@ -7447,6 +7593,114 @@ private fun SearchScreen(
         }
         }
     }
+}
+
+@Composable
+private fun MobileWeiboWebScreen(
+    pageUrl: String,
+    onRootBack: () -> Unit,
+    scrollToTopOnPageFinished: (String?) -> Boolean = { true },
+) {
+    val context = LocalContext.current
+    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val bottomNavSpace = 96.dp
+    val bottomBarGap = 8.dp
+    val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
+    val bottomInset = if (imeBottom > 0.dp) imeBottom + bottomBarGap else bottomNavSpace + bottomBarGap
+    val mobileUserAgent =
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
+            "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
+
+    val webView = remember(pageUrl) {
+        WebView(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                loadsImagesAutomatically = true
+                useWideViewPort = true
+                loadWithOverviewMode = false
+                mediaPlaybackRequiresUserGesture = false
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                userAgentString = mobileUserAgent
+            }
+            webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.fitMobileWebViewport(scrollToTop = scrollToTopOnPageFinished(url))
+                }
+            }
+            loadUrl(pageUrl)
+        }
+    }
+
+    DisposableEffect(webView) {
+        onDispose {
+            webView.stopLoading()
+            webView.destroy()
+        }
+    }
+
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    LaunchedEffect(imeVisible, bottomInset) {
+        delay(120)
+        webView.fitMobileWebViewport(scrollToTop = false)
+    }
+
+    BackHandler {
+        if (webView.canGoBack()) {
+            webView.goBack()
+        } else {
+            onRootBack()
+        }
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .padding(top = topInset, bottom = bottomInset),
+    ) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { webView },
+        )
+    }
+}
+
+@Composable
+private fun MessagesScreen(
+    onRootBack: () -> Unit,
+) {
+    MobileWeiboWebScreen(
+        pageUrl = "https://m.weibo.cn/message",
+        onRootBack = onRootBack,
+        scrollToTopOnPageFinished = { url -> url?.contains("/chat", ignoreCase = true) != true },
+    )
+}
+
+private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
+    evaluateJavascript(
+        """
+        (function() {
+            var meta = document.querySelector('meta[name="viewport"]');
+            if (!meta) {
+                meta = document.createElement('meta');
+                meta.name = 'viewport';
+                document.head.appendChild(meta);
+            }
+            meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
+            var height = window.innerHeight;
+            document.documentElement.style.height = height + 'px';
+            document.body.style.minHeight = height + 'px';
+            ${if (scrollToTop) "window.scrollTo(0, 0);" else ""}
+        })();
+        """.trimIndent(),
+        null,
+    )
 }
 
 @Composable
@@ -7823,6 +8077,7 @@ private fun MineScreen(
                                 }
                             },
                     ) {
+                    key(profile?.id, profile?.description) {
                         MineProfileHeader(
                             profile = profile,
                             hasLoginCookie = hasLoginCookie,
@@ -7838,6 +8093,7 @@ private fun MineScreen(
                             onFollowClick = onFollowClick,
                             onOpenFollowList = openFollowListForProfile,
                         )
+                    }
                     }
                 }
 
@@ -7880,7 +8136,6 @@ private fun MineScreen(
                                 state = postsListState,
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(bottom = 96.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp),
                             ) {
                                 if (posts.isEmpty()) {
                                     item {
@@ -8655,6 +8910,11 @@ private fun ProfileCoverBanner(
     }
 }
 
+private val ProfileHeaderCardRadius = 8.dp
+private val ProfileHeaderAvatarFrameSize = 92.dp
+private val ProfileHeaderCoverAspect = 2.55f
+private val ProfileHeaderCardCoverOverlap = 22.dp
+
 @Composable
 private fun MineProfileHeader(
     profile: UserProfile?,
@@ -8667,122 +8927,158 @@ private fun MineProfileHeader(
     onFollowClick: () -> Unit = {},
     onOpenFollowList: ((FriendListTab) -> Unit)? = null,
 ) {
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(3f)
-                    .background(
-                        Brush.linearGradient(
-                            colors = listOf(
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
-                                Color.White.copy(alpha = 0.42f),
-                                StatusQuotedBackground,
-                            )
-                        )
+    val avatarExposeAboveCard = ProfileHeaderAvatarFrameSize / 3f
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .wrapContentHeight(unbounded = true),
+        ) {
+            val coverHeight = maxWidth / ProfileHeaderCoverAspect
+
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(coverHeight)
+                        .background(
+                            Brush.linearGradient(
+                                colors = listOf(
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
+                                    Color.White.copy(alpha = 0.42f),
+                                    StatusQuotedBackground,
+                                ),
+                            ),
+                        ),
+                ) {
+                    ProfileCoverBanner(
+                        coverUrls = profile?.coverUrls.orEmpty(),
+                        modifier = Modifier.fillMaxSize(),
+                        onOpenSettings = onOpenSettings,
                     )
-            ) {
-                ProfileCoverBanner(
-                    coverUrls = profile?.coverUrls.orEmpty(),
-                    modifier = Modifier.fillMaxSize(),
-                    onOpenSettings = onOpenSettings,
-                )
+                }
+
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .offset(y = -ProfileHeaderCardCoverOverlap)
+                        .zIndex(1f),
+                    shape = RoundedCornerShape(ProfileHeaderCardRadius),
+                    color = Color.White,
+                    shadowElevation = 0.dp,
+                    tonalElevation = 0.dp,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .offset(y = -avatarExposeAboveCard),
+                            verticalAlignment = Alignment.Top,
+                        ) {
+                            Spacer(Modifier.width(ProfileHeaderAvatarFrameSize))
+                            Spacer(Modifier.width(14.dp))
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(
+                                        top = (ProfileHeaderAvatarFrameSize - 28.dp) / 2,
+                                    ),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                            ) {
+                                Text(
+                                    text = profile?.screenName ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = profile?.description?.takeIf { it.isNotBlank() }
+                                        ?: if (hasLoginCookie) "\u4E2A\u4EBA\u7B80\u4ECB\u6682\u672A\u83B7\u53D6" else "\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A",
+                                    modifier = Modifier.fillMaxWidth(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            MineInlineStats(
+                                profile = profile,
+                                modifier = Modifier.weight(1f),
+                                onOpenFollowList = onOpenFollowList,
+                            )
+                            if (showFollowActions && profile?.id?.isNotBlank() == true) {
+                                ProfileFollowCapsuleButton(
+                                    following = profile.following,
+                                    loading = followLoading,
+                                    onClick = onFollowClick,
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 16.dp, top = 0.dp, end = 16.dp, bottom = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                    .padding(start = 16.dp)
+                    .width(ProfileHeaderAvatarFrameSize)
+                    .offset(
+                        y = coverHeight - ProfileHeaderCardCoverOverlap - avatarExposeAboveCard,
+                    )
+                    .zIndex(2f),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Surface(
-                        modifier = Modifier.padding(top = 0.dp),
-                        shape = CircleShape,
-                        color = MaterialTheme.colorScheme.surface,
-                        shadowElevation = 2.dp,
-                    ) {
-                        RemoteImage(
-                            url = profile?.avatarUrl,
-                            modifier = Modifier
-                                .size(84.dp)
-                                .padding(4.dp)
-                                .clip(CircleShape)
-                                .clickable(
-                                    enabled = onAvatarClick != null &&
-                                        !profile?.avatarUrl.isNullOrBlank(),
-                                    onClick = { onAvatarClick?.invoke() },
-                                ),
-                            contentScale = ContentScale.Crop,
-                        )
-                    }
-                    Spacer(Modifier.width(14.dp))
-                    Column(
-                        modifier = Modifier.weight(1f).padding(bottom = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(3.dp),
-                    ) {
-                        Text(
-                            text = profile?.screenName ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = profile?.description?.takeIf { it.isNotBlank() }
-                                ?: if (hasLoginCookie) "\u4E2A\u4EBA\u7B80\u4ECB\u6682\u672A\u83B7\u53D6" else "\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 2.dp,
+                ) {
+                    RemoteImage(
+                        url = profile?.avatarUrl,
+                        modifier = Modifier
+                            .size(84.dp)
+                            .padding(4.dp)
+                            .clip(CircleShape)
+                            .clickable(
+                                enabled = onAvatarClick != null &&
+                                    !profile?.avatarUrl.isNullOrBlank(),
+                                onClick = { onAvatarClick?.invoke() },
+                            ),
+                        contentScale = ContentScale.Crop,
+                    )
                 }
-
                 profile?.verifiedReason?.takeIf { it.isNotBlank() }?.let { reason ->
+                    Spacer(Modifier.height(6.dp))
                     Text(
                         text = reason,
+                        modifier = Modifier.fillMaxWidth(),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
                     )
                 }
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    MineInlineStats(
-                        profile = profile,
-                        modifier = Modifier.weight(1f),
-                        onOpenFollowList = onOpenFollowList,
-                    )
-                    if (showFollowActions && profile?.id?.isNotBlank() == true) {
-                        ProfileFollowCapsuleButton(
-                            following = profile.following,
-                            loading = followLoading,
-                            onClick = onFollowClick,
-                        )
-                    }
-                }
             }
+        }
 
-            loadError?.let {
-                Text(
-                    text = it,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
+        loadError?.let {
+            Text(
+                text = it,
+                modifier = Modifier.padding(horizontal = 16.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
@@ -8879,6 +9175,8 @@ private fun FollowFansListScreen(
     overlay: FollowListOverlayState,
     followingListState: LazyListState,
     fansListState: LazyListState,
+    tabCaches: MutableMap<String, FollowListTabCache>,
+    backHandlerEnabled: Boolean = true,
     onBack: () -> Unit,
     onTabChange: (FriendListTab) -> Unit,
     onUserClick: (String) -> Unit,
@@ -8893,7 +9191,7 @@ private fun FollowFansListScreen(
     )
     val coroutineScope = rememberCoroutineScope()
 
-    BackHandler(onBack = onBack)
+    BackHandler(enabled = backHandlerEnabled, onBack = onBack)
 
     LaunchedEffect(overlay.tab) {
         val target = tabs.indexOf(overlay.tab).coerceAtLeast(0)
@@ -8987,6 +9285,8 @@ private fun FollowFansListScreen(
                     session = session,
                     uid = overlay.uid,
                     tab = tabs[page],
+                    instanceKey = overlay.instanceKey,
+                    tabCaches = tabCaches,
                     listState = when (tabs[page]) {
                         FriendListTab.Following -> followingListState
                         FriendListTab.Fans -> fansListState
@@ -9005,20 +9305,32 @@ private fun FollowListTabPage(
     session: WeiboWebSession,
     uid: String,
     tab: FriendListTab,
+    instanceKey: Int,
+    tabCaches: MutableMap<String, FollowListTabCache>,
     listState: LazyListState,
     onUserClick: (String) -> Unit,
     showMessage: (String, String) -> Unit,
     mineProfileId: String?,
 ) {
     val scope = rememberCoroutineScope()
-    var users by remember(uid, tab) { mutableStateOf<List<RelationUser>>(emptyList()) }
-    var page by remember(uid, tab) { mutableIntStateOf(1) }
-    var hasMore by remember(uid, tab) { mutableStateOf(true) }
-    var loading by remember(uid, tab) { mutableStateOf(true) }
-    var refreshing by remember(uid, tab) { mutableStateOf(false) }
-    var loadingMore by remember(uid, tab) { mutableStateOf(false) }
-    var errorMsg by remember(uid, tab) { mutableStateOf<String?>(null) }
-    val loadMutex = remember(uid, tab) { Mutex() }
+    val cacheKey = followListTabCacheKey(instanceKey, uid, tab)
+    var users by remember(instanceKey, uid, tab) { mutableStateOf<List<RelationUser>>(emptyList()) }
+    var page by remember(instanceKey, uid, tab) { mutableIntStateOf(1) }
+    var hasMore by remember(instanceKey, uid, tab) { mutableStateOf(true) }
+    var loading by remember(instanceKey, uid, tab) { mutableStateOf(true) }
+    var refreshing by remember(instanceKey, uid, tab) { mutableStateOf(false) }
+    var loadingMore by remember(instanceKey, uid, tab) { mutableStateOf(false) }
+    var errorMsg by remember(instanceKey, uid, tab) { mutableStateOf<String?>(null) }
+    val loadMutex = remember(instanceKey, uid, tab) { Mutex() }
+
+    fun persistCache() {
+        tabCaches[cacheKey] = FollowListTabCache(
+            users = users,
+            page = page,
+            hasMore = hasMore,
+            errorMsg = errorMsg,
+        )
+    }
 
     suspend fun loadFirstPage() {
         runCatching {
@@ -9028,11 +9340,13 @@ private fun FollowListTabPage(
             users = result.items
             hasMore = result.hasNextPage && result.items.isNotEmpty()
             page = 1
+            persistCache()
         }.onFailure { error ->
             if (error is CancellationException) throw error
             users = emptyList()
             errorMsg = error.message ?: "加载失败"
             hasMore = false
+            persistCache()
         }
     }
 
@@ -9049,7 +9363,15 @@ private fun FollowListTabPage(
         }
     }
 
-    LaunchedEffect(uid, tab) {
+    LaunchedEffect(instanceKey, uid, tab) {
+        tabCaches[cacheKey]?.let { cache ->
+            users = cache.users
+            page = cache.page
+            hasMore = cache.hasMore
+            errorMsg = cache.errorMsg
+            loading = false
+            return@LaunchedEffect
+        }
         loading = true
         loadingMore = false
         users = emptyList()
@@ -9082,6 +9404,7 @@ private fun FollowListTabPage(
                             result.items.isNotEmpty() &&
                             users.size > beforeSize
                         page = nextPage
+                        persistCache()
                     } catch (_: CancellationException) {
                         // Tab switched or composition left while loading.
                     } catch (error: Exception) {
