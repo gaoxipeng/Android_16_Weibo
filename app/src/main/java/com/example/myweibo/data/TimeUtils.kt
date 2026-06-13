@@ -19,6 +19,11 @@ private val YEAR_DATE_TIME_FORMATTER = SimpleDateFormat("yyyy-MM-dd HH:mm", Loca
     timeZone = TimeZone.getTimeZone(WEIBO_TZ)
 }
 
+fun parseWeiboCreatedAtMillis(rawCreatedAt: String?): Long? {
+    if (rawCreatedAt == null) return null
+    return runCatching { WEIBO_DATE_PARSER.parse(rawCreatedAt.trim())?.time }.getOrNull()
+}
+
 fun formatWeiboTime(rawCreatedAt: String?): String {
     if (rawCreatedAt == null) return ""
 

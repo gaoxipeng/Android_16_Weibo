@@ -23,19 +23,12 @@ data class FeedItem(
     val liked: Boolean = false,
     val images: List<FeedImage>,
     val media: FeedMedia?,
+    /** 转发评论等正文短链配图，展示为蓝色「查看图片」 */
+    val inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
     val retweetedStatus: FeedItem? = null,
     /** 微博 web 接口常见字段：edit_count / edit_at / edited / is_edit */
     val isEdited: Boolean = false,
     val editCount: Int = 0,
-)
-
-data class EditHistoryEntry(
-    val id: String,
-    val text: String,
-    val createdAt: String?,
-    val editedAt: String?,
-    val version: Int? = null,
-    val images: List<FeedImage> = emptyList(),
 )
 
 data class FeedImage(
