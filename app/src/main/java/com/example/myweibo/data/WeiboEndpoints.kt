@@ -15,6 +15,8 @@ object WeiboEndpoints {
     const val FRIENDS = "/ajax/friendships/friends"
     const val SET_LIKE = "/ajax/statuses/setLike"
     const val CANCEL_LIKE = "/ajax/statuses/cancelLike"
+    const val SEARCH_BAND = "/ajax/side/searchBand"
+    const val SEARCH_SIDE = "/ajax/side/search"
 
     fun timelinePath(kind: TimelineKind): String =
         when (kind) {

@@ -1507,4 +1507,145 @@ object WeiboJsonParser {
         }
         return null
     }
+
+    fun parseHotSearch(raw: String): List<HotSearchItem> {
+        val root = JSONObject(raw)
+        val realtime = root.optJSONObject("data")?.optJSONArray("realtime") ?: JSONArray()
+        return buildList {
+            for (index in 0 until realtime.length()) {
+                val item = realtime.optJSONObject(index) ?: continue
+                if (item.optInt("is_ad", 0) == 1) continue
+                val word = item.optNullableString("word")?.trim().orEmpty()
+                if (word.isBlank()) continue
+                add(
+                    HotSearchItem(
+                        word = word,
+                        label = item.optNullableString("labelName")
+                            ?: item.optNullableString("iconDesc")
+                            ?: item.optNullableString("small_icon_desc")
+                            ?: "",
+                        heat = item.optLong("num", 0L),
+                    ),
+                )
+            }
+        }
+    }
+
+    fun parseSearchSuggest(raw: String): SearchSuggestResult {
+        val root = JSONObject(raw)
+        val data = root.optJSONObject("data") ?: return SearchSuggestResult()
+        val hotQueries = buildList {
+            val hotquery = data.optJSONArray("hotquery") ?: JSONArray()
+            for (index in 0 until hotquery.length()) {
+                val item = hotquery.optJSONObject(index) ?: continue
+                item.optNullableString("suggestion")?.trim()?.takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }
+        val users = buildList {
+            val userArray = data.optJSONArray("users")
+                ?: data.optJSONObject("user")?.let { JSONArray().put(it) }
+                ?: JSONArray()
+            for (index in 0 until userArray.length()) {
+                val user = userArray.optJSONObject(index) ?: continue
+                val id = userId(user)
+                if (id.isBlank()) continue
+                add(
+                    SearchUserItem(
+                        id = id,
+                        screenName = user.optNullableString("screen_name") ?: user.optNullableString("name").orEmpty(),
+                        name = user.optNullableString("name") ?: user.optNullableString("screen_name").orEmpty(),
+                        avatarUrl = user.optNullableString("avatar_large")
+                            ?: user.optNullableString("profile_image_url"),
+                        description = plainText(user.optNullableString("description").orEmpty()),
+                        followersCount = user.optNullableString("followers_count_str")
+                            ?: formatCount(user.opt("followers_count")),
+                    ),
+                )
+            }
+        }
+        return SearchSuggestResult(hotQueries = hotQueries, users = users)
+    }
+
+    fun parseMweiboTopicTimeline(raw: String, page: Int = 1): TimelinePage {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 0) != 1) return TimelinePage(items = emptyList())
+        val data = root.optJSONObject("data") ?: return TimelinePage(items = emptyList())
+        val cards = data.optJSONArray("cards") ?: JSONArray()
+        val cardlistInfo = data.optJSONObject("cardlistInfo")
+        val items = buildList {
+            for (index in 0 until cards.length()) {
+                val card = cards.optJSONObject(index) ?: continue
+                collectMweiboCards(card).forEach { mblog ->
+                    if (mblog.optInt("isAd", 0) == 1) return@forEach
+                    parseStatus(normalizeMweiboStatus(mblog), allowRetweeted = true)?.let(::add)
+                }
+            }
+        }
+        val total = cardlistInfo?.optLong("total", 0L) ?: 0L
+        val pageSize = cardlistInfo?.opt("page_size")?.toString()?.toLongOrNull() ?: 10L
+        val currentPage = cardlistInfo?.optInt("page", page) ?: page
+        val hasMore = total > currentPage * pageSize
+        return TimelinePage(
+            items = items,
+            nextCursor = if (hasMore) (currentPage + 1).toString() else null,
+        )
+    }
+
+    private fun collectMweiboCards(card: JSONObject): List<JSONObject> {
+        return when (card.optInt("card_type", -1)) {
+            9 -> listOfNotNull(card.optJSONObject("mblog"))
+            11 -> buildList {
+                val group = card.optJSONArray("card_group") ?: return@buildList
+                for (index in 0 until group.length()) {
+                    val sub = group.optJSONObject(index) ?: continue
+                    if (sub.optInt("card_type", -1) == 9) {
+                        sub.optJSONObject("mblog")?.let(::add)
+                    }
+                }
+            }
+            else -> emptyList()
+        }
+    }
+
+    private fun normalizeMweiboStatus(mblog: JSONObject): JSONObject {
+        val normalized = JSONObject(mblog.toString())
+        if (normalized.optNullableString("idstr").isNullOrBlank()) {
+            normalized.put("idstr", normalized.opt("id")?.toString().orEmpty())
+        }
+        val pageInfo = normalized.optJSONObject("page_info")
+        if (pageInfo != null && pageInfo.optNullableString("object_type").isNullOrBlank()) {
+            when (pageInfo.optNullableString("type")) {
+                "video" -> pageInfo.put("object_type", "video")
+                "live" -> pageInfo.put("object_type", "live")
+            }
+        }
+        if (normalized.optJSONArray("pic_ids") == null) {
+            val pics = normalized.optJSONArray("pics") ?: return normalized
+            val picIds = JSONArray()
+            val picInfos = JSONObject()
+            for (index in 0 until pics.length()) {
+                val pic = pics.optJSONObject(index) ?: continue
+                val pid = pic.optNullableString("pid") ?: continue
+                picIds.put(pid)
+                picInfos.put(
+                    pid,
+                    JSONObject()
+                        .put("thumbnail", JSONObject().put("url", pic.optNullableString("url").orEmpty()))
+                        .put(
+                            "large",
+                            JSONObject().put(
+                                "url",
+                                pic.optJSONObject("large")?.optNullableString("url")
+                                    ?: pic.optNullableString("url").orEmpty(),
+                            ),
+                        ),
+                )
+            }
+            if (picIds.length() > 0) {
+                normalized.put("pic_ids", picIds)
+                normalized.put("pic_infos", picInfos)
+            }
+        }
+        return normalized
+    }
 }

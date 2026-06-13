@@ -168,7 +168,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
@@ -209,6 +213,7 @@ import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FriendListTab
+import com.example.myweibo.data.HotSearchItem
 import com.example.myweibo.data.RelationUser
 import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
@@ -412,6 +417,7 @@ private fun FeedImage.albumStatusCacheKey(): String =
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
+private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
 
 private data class VideoPeekRequest(
     val media: FeedMedia,
@@ -536,6 +542,7 @@ fun WeiboApp() {
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
+    var searchPendingQuery by remember { mutableStateOf<String?>(null) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
@@ -1057,6 +1064,14 @@ fun WeiboApp() {
 
     fun closeVisitedProfile() {
         navigateBack()
+    }
+
+    fun openSearchTopic(topic: String) {
+        val normalized = topic.removePrefix("#").removeSuffix("#").trim()
+        if (normalized.isBlank()) return
+        searchPendingQuery = normalized
+        selectedTab = MainTab.Search
+        bottomBarExpanded = true
     }
 
     fun openUser(idOrScreenName: String) {
@@ -1698,6 +1713,7 @@ fun WeiboApp() {
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
+        LocalTopicClickHandler provides ::openSearchTopic,
     ) {
     MyWeiboScaffold(
         selectedTab = selectedTab,
@@ -1854,9 +1870,21 @@ fun WeiboApp() {
 
                 if (visitedUserId == null && selectedItem == null) {
                     when (selectedTab) {
-                        MainTab.Search -> PlaceholderScreen(
-                            title = "\u641C\u7D22",
-                            body = "\u641C\u7D22\u9875\u5C06\u63A5\u5165\u5FAE\u535A\u641C\u7D22\u63A5\u53E3\uFF0C\u7528\u4E8E\u67E5\u627E\u7528\u6237\u3001\u8BDD\u9898\u548C\u5FAE\u535A\u5185\u5BB9\u3002"
+                        MainTab.Search -> SearchScreen(
+                            session = session,
+                            hasLoginCookie = hasLoginCookie,
+                            pendingQuery = searchPendingQuery,
+                            onPendingQueryConsumed = { searchPendingQuery = null },
+                            emoticonMap = emoticonMap,
+                            onItemClick = { item, _ -> openDetailFromSource(item, null) },
+                            onMediaClick = ::pushMediaPreview,
+                            onUserClick = ::openUser,
+                            resolveFeedItem = ::resolveFeedItem,
+                            isLongTextLoading = { it.statusId in longTextLoadingIds },
+                            onLoadLongText = ::loadLongText,
+                            onToggleLike = ::toggleStatusLike,
+                            onUrlEntityClick = ::openUrlEntity,
+                            onOpenLoginSettings = ::openAccountLoginManagement,
                         )
 
                         MainTab.Messages -> PlaceholderScreen(
@@ -3165,8 +3193,29 @@ private fun EmoticonText(
                     }
                 }
                 token.startsWith("#") && token.endsWith("#") -> {
-                    withStyle(SpanStyle(color = WeiboTopicBlue)) {
-                        append(token)
+                    val topic = token.removePrefix("#").removeSuffix("#")
+                    val onTopicClick = LocalTopicClickHandler.current
+                    if (onTopicClick != null) {
+                        withLink(
+                            LinkAnnotation.Clickable(
+                                tag = "topic:$topic",
+                                linkInteractionListener = { onTopicClick(topic) },
+                            ),
+                        ) {
+                            withStyle(
+                                SpanStyle(
+                                    color = WeiboTopicBlue,
+                                    fontWeight = FontWeight.Medium,
+                                    textDecoration = TextDecoration.None,
+                                ),
+                            ) {
+                                append(token)
+                            }
+                        }
+                    } else {
+                        withStyle(SpanStyle(color = WeiboTopicBlue)) {
+                            append(token)
+                        }
                     }
                 }
                 else -> append(token)
@@ -6549,6 +6598,421 @@ private fun CommentImageStrip(
                 showLiveBadge = true,
                 onOpenViewer = { onImageClick(it) },
             )
+        }
+    }
+}
+
+@Composable
+private fun SearchCapsuleField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    onSearch: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "搜索微博、话题和用户",
+) {
+    val shape = RoundedCornerShape(22.dp)
+    Surface(
+        modifier = modifier,
+        shape = shape,
+        color = HintCapsuleWhite,
+        shadowElevation = 0.dp,
+        border = BorderStroke(1.dp, HintCapsuleBorderColor),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(vertical = 11.dp),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = HintCapsuleText),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { onSearch() }),
+                decorationBox = { innerTextField ->
+                    if (value.isEmpty()) {
+                        Text(
+                            text = placeholder,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    innerTextField()
+                },
+            )
+            if (value.isNotEmpty()) {
+                TextButton(onClick = onClear) {
+                    Text("清除", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HotSearchRow(
+    rank: Int,
+    item: HotSearchItem,
+    onClick: () -> Unit,
+) {
+    val rankColor = when (rank) {
+        1 -> Color(0xFFFF6B00)
+        2 -> Color(0xFFFFA726)
+        3 -> Color(0xFF6CB4EE)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val displayWord = item.word.removePrefix("#").removeSuffix("#")
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = rank.toString(),
+            modifier = Modifier.width(22.dp),
+            color = rankColor,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            text = displayWord,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (item.label.isNotBlank()) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                shape = RoundedCornerShape(6.dp),
+            ) {
+                Text(
+                    text = item.label,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchScreen(
+    session: WeiboWebSession,
+    hasLoginCookie: Boolean,
+    pendingQuery: String?,
+    onPendingQueryConsumed: () -> Unit,
+    emoticonMap: Map<String, String>,
+    onItemClick: (FeedItem, Rect?) -> Unit,
+    onMediaClick: (FeedMedia) -> Unit,
+    onUserClick: (String) -> Unit,
+    resolveFeedItem: (FeedItem) -> FeedItem,
+    isLongTextLoading: (FeedItem) -> Boolean,
+    onLoadLongText: (FeedItem) -> Unit,
+    onToggleLike: (FeedItem) -> Unit,
+    onUrlEntityClick: (FeedUrlEntity) -> Unit,
+    onOpenLoginSettings: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val listState = rememberLazyListState()
+    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    var queryInput by remember { mutableStateOf("") }
+    var activeQuery by remember { mutableStateOf<String?>(null) }
+    var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
+    var hotSearchLoading by remember { mutableStateOf(false) }
+    var hotSearchError by remember { mutableStateOf<String?>(null) }
+    var resultItems by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
+    var resultLoading by remember { mutableStateOf(false) }
+    var resultLoadingMore by remember { mutableStateOf(false) }
+    var resultError by remember { mutableStateOf<String?>(null) }
+    var resultNextPage by remember { mutableStateOf<String?>(null) }
+
+    fun normalizeTopic(raw: String): String =
+        raw.removePrefix("#").removeSuffix("#").trim()
+
+    fun submitQuery(raw: String) {
+        val normalized = normalizeTopic(raw)
+        if (normalized.isBlank()) return
+        queryInput = normalized
+        activeQuery = normalized
+    }
+
+    suspend fun reloadHotSearch() {
+        if (!hasLoginCookie) return
+        hotSearchLoading = true
+        hotSearchError = null
+        runCatching { session.loadHotSearch() }
+            .onSuccess { hotSearchItems = it }
+            .onFailure { hotSearchError = it.message ?: "热搜加载失败" }
+        hotSearchLoading = false
+    }
+
+    suspend fun reloadResults(reset: Boolean) {
+        val query = activeQuery ?: return
+        if (!hasLoginCookie) return
+        if (reset) {
+            resultLoading = true
+            resultError = null
+            resultNextPage = null
+        } else {
+            if (resultNextPage == null || resultLoadingMore) return
+            resultLoadingMore = true
+        }
+        val page = if (reset) 1 else resultNextPage?.toIntOrNull() ?: return
+        runCatching { session.loadTopicSearch(query, page) }
+            .onSuccess { pageResult ->
+                resultItems = if (reset) pageResult.items else resultItems + pageResult.items
+                resultNextPage = pageResult.nextCursor
+            }
+            .onFailure { error ->
+                if (reset) {
+                    resultError = error.message ?: "搜索失败"
+                    resultItems = emptyList()
+                }
+            }
+        resultLoading = false
+        resultLoadingMore = false
+    }
+
+    LaunchedEffect(hasLoginCookie) {
+        if (hasLoginCookie) reloadHotSearch()
+    }
+
+    LaunchedEffect(pendingQuery) {
+        val pending = pendingQuery?.let(::normalizeTopic)?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        submitQuery(pending)
+        onPendingQueryConsumed()
+    }
+
+    LaunchedEffect(activeQuery, hasLoginCookie) {
+        if (activeQuery != null && hasLoginCookie) {
+            reloadResults(reset = true)
+        }
+    }
+
+    LaunchedEffect(listState, activeQuery, resultNextPage, resultLoadingMore) {
+        if (activeQuery == null) return@LaunchedEffect
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            info.totalItemsCount > 0 && last >= info.totalItemsCount - 3
+        }
+            .distinctUntilChanged()
+            .filter { it }
+            .collect {
+                if (resultNextPage != null && !resultLoadingMore && !resultLoading) {
+                    reloadResults(reset = false)
+                }
+            }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+    ) {
+        SearchCapsuleField(
+            value = queryInput,
+            onValueChange = { queryInput = it },
+            onSearch = { submitQuery(queryInput) },
+            onClear = {
+                queryInput = ""
+                activeQuery = null
+                resultItems = emptyList()
+                resultError = null
+                resultNextPage = null
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = topInset + 8.dp, start = 16.dp, end = 16.dp, bottom = 12.dp),
+        )
+
+        if (!hasLoginCookie) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center,
+            ) {
+                EmptyState(
+                    title = "需要登录微博",
+                    body = "登录后即可查看热搜与话题搜索结果。",
+                    actionLabel = "打开登录",
+                    onAction = onOpenLoginSettings,
+                )
+            }
+            return@Column
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 96.dp),
+        ) {
+            if (activeQuery == null) {
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "热搜",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        TextButton(
+                            onClick = { scope.launch { reloadHotSearch() } },
+                            enabled = !hotSearchLoading,
+                        ) {
+                            Text(if (hotSearchLoading) "刷新中" else "刷新")
+                        }
+                    }
+                }
+                when {
+                    hotSearchLoading && hotSearchItems.isEmpty() -> {
+                        item {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(32.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                CircularProgressIndicator()
+                            }
+                        }
+                    }
+                    hotSearchError != null && hotSearchItems.isEmpty() -> {
+                        item {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = hotSearchError.orEmpty(),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                TextButton(onClick = { scope.launch { reloadHotSearch() } }) {
+                                    Text("重试")
+                                }
+                            }
+                        }
+                    }
+                    hotSearchItems.isEmpty() -> {
+                        item {
+                            Text(
+                                text = "暂无热搜",
+                                modifier = Modifier.padding(vertical = 16.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    else -> {
+                        itemsIndexed(hotSearchItems, key = { _, item -> item.word }) { index, item ->
+                            HotSearchRow(
+                                rank = index + 1,
+                                item = item,
+                                onClick = { submitQuery(item.word) },
+                            )
+                            if (index < hotSearchItems.lastIndex) {
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+                            }
+                        }
+                    }
+                }
+            } else {
+                item {
+                    Column(
+                        modifier = Modifier.padding(bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            text = "#${activeQuery}#",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = WeiboTopicBlue,
+                        )
+                        Text(
+                            text = "话题相关微博",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                when {
+                    resultLoading && resultItems.isEmpty() -> {
+                        item {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(32.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                CircularProgressIndicator()
+                            }
+                        }
+                    }
+                    resultError != null && resultItems.isEmpty() -> {
+                        item {
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = resultError.orEmpty(),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                TextButton(onClick = { scope.launch { reloadResults(reset = true) } }) {
+                                    Text("重试")
+                                }
+                            }
+                        }
+                    }
+                    resultItems.isEmpty() -> {
+                        item {
+                            Text(
+                                text = "暂无相关内容",
+                                modifier = Modifier.padding(vertical = 16.dp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    else -> {
+                        items(resultItems, key = { it.id }) { item ->
+                            val resolved = resolveFeedItem(item)
+                            FeedCard(
+                                item = resolved,
+                                onClick = { onItemClick(resolved, null) },
+                                onMediaClick = onMediaClick,
+                                emoticonMap = emoticonMap,
+                                onUserClick = onUserClick,
+                                isLongTextLoading = isLongTextLoading,
+                                onLoadLongText = onLoadLongText,
+                                onToggleLike = onToggleLike,
+                                onUrlEntityClick = onUrlEntityClick,
+                            )
+                        }
+                    }
+                }
+                if (resultLoadingMore) {
+                    item {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(16.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                        }
+                    }
+                }
+            }
         }
     }
 }

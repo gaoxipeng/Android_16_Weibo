@@ -177,3 +177,23 @@ data class NativeUiMessage(
     val title: String,
     val detail: String
 )
+
+data class HotSearchItem(
+    val word: String,
+    val label: String = "",
+    val heat: Long = 0L,
+)
+
+data class SearchUserItem(
+    val id: String,
+    val screenName: String,
+    val name: String,
+    val avatarUrl: String?,
+    val description: String,
+    val followersCount: String,
+)
+
+data class SearchSuggestResult(
+    val hotQueries: List<String> = emptyList(),
+    val users: List<SearchUserItem> = emptyList(),
+)

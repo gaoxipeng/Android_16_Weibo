@@ -62,6 +62,37 @@ class WeiboWebSession(context: Context) {
         return WeiboJsonParser.parseTimeline(raw)
     }
 
+    suspend fun loadHotSearch(): List<HotSearchItem> {
+        val raw = fetchJson(
+            WeiboEndpoints.SEARCH_BAND,
+            mapOf("last_tab" to "hot"),
+        )
+        return WeiboJsonParser.parseHotSearch(raw)
+    }
+
+    suspend fun loadSearchSuggest(query: String): SearchSuggestResult {
+        val raw = fetchJson(
+            WeiboEndpoints.SEARCH_SIDE,
+            mapOf("q" to query.trim()),
+        )
+        return WeiboJsonParser.parseSearchSuggest(raw)
+    }
+
+    suspend fun loadTopicSearch(topic: String, page: Int = 1, channelType: String = "1"): TimelinePage {
+        val normalized = topic.removePrefix("#").removeSuffix("#").trim()
+        if (normalized.isBlank()) return TimelinePage(items = emptyList())
+        val containerId = "231522type=$channelType&q=#$normalized#"
+        val url = buildString {
+            append("https://m.weibo.cn/api/container/getIndex?")
+            append("containerid=").append(URLEncoder.encode(containerId, "UTF-8"))
+            append("&page_type=searchall")
+            append("&v_p=42")
+            append("&page=").append(page)
+        }
+        val raw = fetchAbsoluteJson(url, WEIBO_HOME, "https://m.weibo.cn")
+        return WeiboJsonParser.parseMweiboTopicTimeline(raw, page)
+    }
+
     suspend fun loadUserTimeline(uid: String, page: Int = 1): TimelinePage {
         val raw = loadUserTimelineRaw(uid, page)
         return WeiboJsonParser.parseUserTimeline(raw, uid, page)
