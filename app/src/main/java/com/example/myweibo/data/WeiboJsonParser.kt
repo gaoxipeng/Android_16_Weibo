@@ -51,6 +51,55 @@ object WeiboJsonParser {
         return parseStatus(status, allowRetweeted = true)
     }
 
+    fun parseEditHistory(raw: String): List<EditHistoryEntry> {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 1) <= 0) {
+            throw IllegalStateException(root.optNullableString("msg") ?: "加载编辑历史失败")
+        }
+        val data = root.optJSONObject("data") ?: root
+        val list = data.optJSONArray("list")
+            ?: data.optJSONArray("edit_list")
+            ?: data.optJSONArray("editList")
+            ?: data.optJSONArray("versions")
+            ?: root.optJSONArray("list")
+            ?: JSONArray()
+        return buildList {
+            for (index in 0 until list.length()) {
+                val entry = list.optJSONObject(index) ?: continue
+                parseEditHistoryEntry(entry, index)?.let(::add)
+            }
+        }
+    }
+
+    fun parseEditHistoryCompat(raw: String): List<EditHistoryEntry> {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 1) <= 0) {
+            throw IllegalStateException(
+                root.optNullableString("msg")
+                    ?: root.optNullableString("message")
+                    ?: root.optNullableString("errmsg")
+                    ?: "加载编辑历史失败"
+            )
+        }
+        val data = root.optJSONObject("data") ?: root
+        val list = data.optJSONArray("list")
+            ?: data.optJSONArray("edit_list")
+            ?: data.optJSONArray("editList")
+            ?: data.optJSONArray("edit_history")
+            ?: data.optJSONArray("editHistory")
+            ?: data.optJSONArray("versions")
+            ?: data.optJSONArray("statuses")
+            ?: data.optJSONObject("history")?.optJSONArray("list")
+            ?: root.optJSONArray("list")
+            ?: JSONArray()
+        return buildList {
+            for (index in 0 until list.length()) {
+                val entry = list.optJSONObject(index) ?: continue
+                parseEditHistoryEntryCompat(entry, index)?.let(::add)
+            }
+        }
+    }
+
     fun parseComments(raw: String): List<CommentItem> {
         val root = JSONObject(raw)
         val data = root.optJSONArray("data")
@@ -83,6 +132,7 @@ object WeiboJsonParser {
                             ?.optNullableString("screen_name"),
                         replyToAuthorId = userId(comment.optJSONObject("reply_comment")?.optJSONObject("user"))
                             .takeIf { it.isNotBlank() },
+                        moreInfoText = comment.optJSONObject("more_info")?.optNullableString("text"),
                     )
                 )
             }
@@ -231,6 +281,8 @@ object WeiboJsonParser {
                             ?.optNullableString("screen_name"),
                         replyToAuthorId = userId(obj.optJSONObject("reply_comment")?.optJSONObject("user"))
                             .takeIf { it.isNotBlank() },
+                        comments = parseNestedComments(obj.optJSONArray("comments")),
+                        moreInfoText = obj.optJSONObject("more_info")?.optNullableString("text"),
                     )
                 )
             }
@@ -316,7 +368,50 @@ object WeiboJsonParser {
             statusesCount = formatCount(user.opt("statuses_count")),
             photosCount = user.opt("photos_count")?.let(::formatCount),
             coverUrls = parseProfileCoverUrls(user),
+            following = user.optTruthy("following"),
+            followMe = user.optTruthy("follow_me"),
         )
+    }
+
+    fun mergeFollowMutationProfile(
+        raw: String,
+        existing: UserProfile,
+        expectedFollowing: Boolean,
+    ): UserProfile {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 0) != 1 && !root.optBoolean("result", false)) {
+            throw IllegalStateException(root.optNullableString("msg") ?: "\u5173\u6CE8\u64CD\u4F5C\u5931\u8D25")
+        }
+        val parsed = runCatching { parseUserProfile(raw) }.getOrNull()
+        return if (parsed != null && parsed.id.isNotBlank()) {
+            existing.copy(
+                following = expectedFollowing,
+                followMe = parsed.followMe,
+            )
+        } else {
+            existing.copy(following = expectedFollowing)
+        }
+    }
+
+    fun assertMutationSuccess(raw: String, defaultError: String) {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 0) != 1 && !root.optBoolean("result", false)) {
+            throw IllegalStateException(root.optNullableString("msg") ?: defaultError)
+        }
+    }
+
+    fun bumpDisplayCount(value: String, delta: Int): String {
+        if (delta == 0) return value
+        val trimmed = value.trim()
+        val wanMatch = Regex("""^([\d.]+)万$""").find(trimmed)
+        val count = when {
+            wanMatch != null -> {
+                val num = wanMatch.groupValues[1].toDoubleOrNull() ?: return value
+                (num * 10_000).toLong()
+            }
+            else -> trimmed.toLongOrNull() ?: return value
+        }
+        return formatCount((count + delta).coerceAtLeast(0))
     }
 
     fun profileCoverImages(urls: List<String>): List<FeedImage> =
@@ -471,6 +566,7 @@ object WeiboJsonParser {
                 pid?.let(::pidToLargeUrl),
             ).distinct(),
             createdAt = createdAt,
+            statusId = item.optBlankString("mid"),
         )
     }
 
@@ -603,6 +699,7 @@ object WeiboJsonParser {
         val isLongText = status.isLongTextPreview()
         val displayText = if (isLongText) stripLongTextPreviewLabel(rawText) else rawText
 
+        val (isEdited, editCount) = status.parseEditMetadata()
         val item = FeedItem(
             id = id,
             statusId = status.optNullableString("mblogid") ?: id,
@@ -619,9 +716,12 @@ object WeiboJsonParser {
             repostsCount = formatCount(status.opt("reposts_count")),
             commentsCount = formatCount(status.opt("comments_count")),
             likesCount = formatCount(status.opt("attitudes_count")),
+            liked = status.optBoolean("attitudes_status"),
             images = images,
             media = resolvedMedia,
             retweetedStatus = retweeted,
+            isEdited = isEdited,
+            editCount = editCount,
         )
         val embeddedLongText = status.optJSONObject("longText")
             ?.takeIf { hasLongTextPayload(it) }
@@ -775,6 +875,7 @@ object WeiboJsonParser {
             coverUrl = cover?.let(::normalizeUrl),
             streamUrl = streamUrl,
             downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
+            durationSeconds = parseMediaDuration(pageInfo, mediaInfo),
         )
     }
 
@@ -796,9 +897,54 @@ object WeiboJsonParser {
                 coverUrl = cover?.let(::normalizeUrl),
                 streamUrl = streamUrl,
                 downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
+                durationSeconds = parseMediaDuration(data, mediaInfo),
             )
         }
         return null
+    }
+
+    private fun parseMediaDuration(vararg sources: JSONObject): Int? {
+        for (source in sources) {
+            parseDurationSeconds(source)?.let { return it }
+        }
+        return null
+    }
+
+    private fun parseDurationSeconds(json: JSONObject): Int? {
+        json.optIntOrNull("duration")?.let { return normalizeDurationSeconds(it) }
+        json.optIntOrNull("video_duration")?.let { return normalizeDurationSeconds(it) }
+        json.optIntOrNull("duration_time")?.let { return normalizeDurationSeconds(it) }
+        json.optNullableString("duration_time")?.let { parseDurationTimeString(it) }?.let { return it }
+        json.optNullableString("duration_label")?.let { parseDurationTimeString(it) }?.let { return it }
+        json.optNullableString("video_duration")?.let { parseDurationTimeString(it) }?.let { return it }
+        return null
+    }
+
+    private fun normalizeDurationSeconds(raw: Int): Int? {
+        if (raw <= 0) return null
+        val seconds = if (raw > 10_000) raw / 1000 else raw
+        return seconds.takeIf { it > 0 }
+    }
+
+    private fun parseDurationTimeString(raw: String): Int? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        trimmed.toIntOrNull()?.let { return normalizeDurationSeconds(it) }
+        val parts = trimmed.split(":")
+        return when (parts.size) {
+            2 -> {
+                val minutes = parts[0].toIntOrNull() ?: return null
+                val seconds = parts[1].toIntOrNull() ?: return null
+                (minutes * 60 + seconds).takeIf { it > 0 }
+            }
+            3 -> {
+                val hours = parts[0].toIntOrNull() ?: return null
+                val minutes = parts[1].toIntOrNull() ?: return null
+                val seconds = parts[2].toIntOrNull() ?: return null
+                (hours * 3600 + minutes * 60 + seconds).takeIf { it > 0 }
+            }
+            else -> null
+        }
     }
 
     private fun progressiveVideoUrl(mediaInfo: JSONObject): String? {
@@ -1013,6 +1159,95 @@ object WeiboJsonParser {
         if (!has(name) || isNull(name)) return null
         val value = opt(name)?.toString()?.trim().orEmpty()
         return value.takeIf { it.isNotBlank() && it != "0" }
+    }
+
+    private fun JSONObject.optTruthy(name: String): Boolean {
+        if (!has(name) || isNull(name)) return false
+        return when (val value = opt(name)) {
+            is Boolean -> value
+            is Number -> value.toInt() != 0
+            else -> value.toString().trim() in setOf("1", "true", "TRUE")
+        }
+    }
+
+    private fun JSONObject.parseEditMetadata(): Pair<Boolean, Int> {
+        val editCount = optIntOrNull("edit_count")
+            ?: optIntOrNull("editCount")
+            ?: 0
+        val editAt = optNullableString("edit_at") ?: optNullableString("editAt")
+        val editedFlag = optTruthy("edited") || optTruthy("is_edit") || optTruthy("isEdit")
+        val isEdited = editCount > 0 || editAt != null || editedFlag
+        return isEdited to editCount
+    }
+
+    private fun JSONObject.optIntOrNull(name: String): Int? {
+        if (!has(name) || isNull(name)) return null
+        return when (val value = opt(name)) {
+            is Number -> value.toInt()
+            else -> value.toString().trim().toIntOrNull()
+        }
+    }
+
+    private fun parseEditHistoryEntryCompat(entry: JSONObject, index: Int): EditHistoryEntry? {
+        val status = entry.optJSONObject("status")
+            ?: entry.optJSONObject("mblog")
+            ?: entry.optJSONObject("item")
+            ?: entry
+        val id = status.optNullableString("idstr")
+            ?: entry.optNullableString("idstr")
+            ?: status.optNullableString("id")
+            ?: entry.optNullableString("id")
+            ?: status.optNullableString("mid")
+            ?: entry.optNullableString("mid")
+            ?: index.toString()
+        val htmlText = status.optNullableString("text") ?: entry.optNullableString("text") ?: ""
+        val rawText = status.optNullableString("text_raw")
+            ?: status.optNullableString("raw_text")
+            ?: entry.optNullableString("text_raw")
+            ?: entry.optNullableString("raw_text")
+            ?: htmlText
+        val text = plainText(rawText).ifBlank { plainText(htmlText) }
+        if (text.isBlank()) return null
+        return EditHistoryEntry(
+            id = id,
+            text = text,
+            createdAt = status.optNullableString("created_at") ?: entry.optNullableString("created_at"),
+            editedAt = entry.optNullableString("edit_at")
+                ?: entry.optNullableString("editAt")
+                ?: status.optNullableString("edit_at")
+                ?: status.optNullableString("editAt"),
+            version = entry.optIntOrNull("version")
+                ?: entry.optIntOrNull("edit_count")
+                ?: entry.optIntOrNull("editCount")
+                ?: status.optIntOrNull("version")
+                ?: status.optIntOrNull("edit_count")
+                ?: status.optIntOrNull("editCount"),
+            images = parseImages(status),
+        )
+    }
+
+    private fun parseEditHistoryEntry(entry: JSONObject, index: Int): EditHistoryEntry? {
+        val id = entry.optNullableString("idstr")
+            ?: entry.optNullableString("id")
+            ?: entry.optNullableString("mid")
+            ?: index.toString()
+        val htmlText = entry.optNullableString("text") ?: ""
+        val rawText = entry.optNullableString("text_raw")
+            ?: entry.optNullableString("raw_text")
+            ?: htmlText
+        val text = plainText(rawText).ifBlank { plainText(htmlText) }
+        if (text.isBlank()) return null
+        val images = parseImages(entry)
+        return EditHistoryEntry(
+            id = id,
+            text = text,
+            createdAt = entry.optNullableString("created_at"),
+            editedAt = entry.optNullableString("edit_at") ?: entry.optNullableString("editAt"),
+            version = entry.optIntOrNull("version")
+                ?: entry.optIntOrNull("edit_count")
+                ?: entry.optIntOrNull("editCount"),
+            images = images,
+        )
     }
 
     private fun userId(user: JSONObject?): String =

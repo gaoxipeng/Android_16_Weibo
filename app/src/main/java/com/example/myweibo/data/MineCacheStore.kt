@@ -137,6 +137,9 @@ class MineCacheStore(context: Context) {
             .put("reposts_count", repostsCount)
             .put("comments_count", commentsCount)
             .put("likes_count", likesCount)
+            .put("liked", liked)
+            .put("is_edited", isEdited)
+            .put("edit_count", editCount)
             .put("images", images.toFeedImagesJsonArray())
             .put("media", media?.toJson())
             .put("retweeted_status", retweetedStatus?.toJson())
@@ -166,6 +169,9 @@ class MineCacheStore(context: Context) {
             repostsCount = optString("reposts_count", "0"),
             commentsCount = optString("comments_count", "0"),
             likesCount = optString("likes_count", "0"),
+            liked = optBoolean("liked"),
+            isEdited = optBoolean("is_edited"),
+            editCount = optInt("edit_count"),
             images = optJSONArray("images").toFeedImages(),
             media = optJSONObject("media")?.toFeedMedia(),
             retweetedStatus = optJSONObject("retweeted_status")?.toFeedItem(),
@@ -182,6 +188,7 @@ class MineCacheStore(context: Context) {
             .put("download_urls", JSONArray(downloadUrls))
             .put("live_photo_video_url", livePhotoVideoUrl)
             .put("created_at", createdAt)
+            .put("status_id", statusId)
             .put("width", width)
             .put("height", height)
 
@@ -198,6 +205,7 @@ class MineCacheStore(context: Context) {
                         downloadUrls = item.optJSONArray("download_urls").toStringList(),
                         livePhotoVideoUrl = item.optNullableString("live_photo_video_url"),
                         createdAt = item.optNullableString("created_at"),
+                        statusId = item.optNullableString("status_id"),
                         width = item.optInt("width").takeIf { it > 0 },
                         height = item.optInt("height").takeIf { it > 0 },
                     )
@@ -213,6 +221,7 @@ class MineCacheStore(context: Context) {
             .put("cover_url", coverUrl)
             .put("stream_url", streamUrl)
             .put("download_url", downloadUrl)
+            .put("duration_seconds", durationSeconds)
 
     private fun JSONObject.toFeedMedia(): FeedMedia? {
         val streamUrl = optNullableString("stream_url") ?: return null
@@ -222,6 +231,7 @@ class MineCacheStore(context: Context) {
             coverUrl = optNullableString("cover_url"),
             streamUrl = streamUrl,
             downloadUrl = optNullableString("download_url"),
+            durationSeconds = optInt("duration_seconds").takeIf { it > 0 },
         )
     }
 

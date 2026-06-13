@@ -20,9 +20,22 @@ data class FeedItem(
     val repostsCount: String,
     val commentsCount: String,
     val likesCount: String,
+    val liked: Boolean = false,
     val images: List<FeedImage>,
     val media: FeedMedia?,
-    val retweetedStatus: FeedItem? = null
+    val retweetedStatus: FeedItem? = null,
+    /** 微博 web 接口常见字段：edit_count / edit_at / edited / is_edit */
+    val isEdited: Boolean = false,
+    val editCount: Int = 0,
+)
+
+data class EditHistoryEntry(
+    val id: String,
+    val text: String,
+    val createdAt: String?,
+    val editedAt: String?,
+    val version: Int? = null,
+    val images: List<FeedImage> = emptyList(),
 )
 
 data class FeedImage(
@@ -32,6 +45,7 @@ data class FeedImage(
     val downloadUrls: List<String> = emptyList(),
     val livePhotoVideoUrl: String? = null,
     val createdAt: String? = null,
+    val statusId: String? = null,
     val width: Int? = null,
     val height: Int? = null,
     val type: String? = null,
@@ -58,7 +72,9 @@ data class FeedMedia(
     val title: String,
     val coverUrl: String?,
     val streamUrl: String,
-    val downloadUrl: String? = null
+    val downloadUrl: String? = null,
+    /** 视频时长（秒），来自 page_info/media_info 的 duration 等字段 */
+    val durationSeconds: Int? = null,
 )
 
 enum class MediaType {
@@ -92,6 +108,7 @@ data class CommentItem(
     val comments: List<CommentItem> = emptyList(),
     val replyToAuthor: String? = null,
     val replyToAuthorId: String? = null,
+    val moreInfoText: String? = null,
 )
 
 data class UserProfile(
@@ -106,6 +123,8 @@ data class UserProfile(
     val statusesCount: String,
     val photosCount: String? = null,
     val coverUrls: List<String> = emptyList(),
+    val following: Boolean = false,
+    val followMe: Boolean = false,
 ) {
     val coverUrl: String?
         get() = coverUrls.firstOrNull()
