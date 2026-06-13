@@ -25,6 +25,8 @@ data class FeedItem(
     val media: FeedMedia?,
     /** 转发评论等正文短链配图，展示为蓝色「查看图片」 */
     val inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
+    /** 正文中的可点击链接（文章、网页等） */
+    val urlEntities: List<FeedUrlEntity> = emptyList(),
     val retweetedStatus: FeedItem? = null,
     /** 微博 web 接口常见字段：edit_count / edit_at / edited / is_edit */
     val isEdited: Boolean = false,
@@ -68,7 +70,40 @@ data class FeedMedia(
     val downloadUrl: String? = null,
     /** 视频时长（秒），来自 page_info/media_info 的 duration 等字段 */
     val durationSeconds: Int? = null,
-)
+    /** 直播状态：1=直播中，3=回放，0=未开播 */
+    val liveStatus: Int? = null,
+    /** 直播回放地址 replay_hd */
+    val replayUrl: String? = null,
+) {
+    fun resolvedPlaybackUrl(): String? = when {
+        type != MediaType.Live -> streamUrl.takeIf { it.isNotBlank() }
+        liveStatus == 3 -> replayUrl?.takeIf { it.isNotBlank() } ?: streamUrl.takeIf { it.isNotBlank() }
+        liveStatus == 1 -> streamUrl.takeIf { it.isNotBlank() }
+        liveStatus == null && !replayUrl.isNullOrBlank() -> replayUrl
+        liveStatus == null -> streamUrl.takeIf { it.isNotBlank() }
+        else -> null
+    }
+
+    fun isLiveBroadcast(): Boolean = type == MediaType.Live && (liveStatus == 1 || (liveStatus == null && replayUrl.isNullOrBlank()))
+
+    fun isLiveReplay(): Boolean = type == MediaType.Live && (liveStatus == 3 || (liveStatus == null && !replayUrl.isNullOrBlank()))
+
+    fun isLivePlayable(): Boolean =
+        type == MediaType.Live && !resolvedPlaybackUrl().isNullOrBlank() && (liveStatus == null || liveStatus in setOf(1, 3))
+
+    fun isStreamPlayable(): Boolean = when (type) {
+        MediaType.Video -> streamUrl.isNotBlank()
+        MediaType.Live -> isLivePlayable()
+        else -> false
+    }
+
+    fun liveBadgeLabel(): String? = when {
+        type != MediaType.Live -> null
+        isLiveBroadcast() -> "直播"
+        isLiveReplay() -> "回放"
+        else -> "未开播"
+    }
+}
 
 enum class MediaType {
     Video,

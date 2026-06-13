@@ -32,11 +32,17 @@ class VideoPipActivity : ComponentActivity() {
 
         val streamUrl = intent.getStringExtra(EXTRA_STREAM_URL).orEmpty()
         val downloadUrl = intent.getStringExtra(EXTRA_DOWNLOAD_URL)
+        val replayUrl = intent.getStringExtra(EXTRA_REPLAY_URL)
+        val liveStatus = intent.getIntExtra(EXTRA_LIVE_STATUS, Int.MIN_VALUE).takeIf { it != Int.MIN_VALUE }
         val dashXml = intent.getStringExtra(EXTRA_DASH_XML)
         val aspectRatio = intent.getFloatExtra(EXTRA_ASPECT_RATIO, 16f / 9f)
         val startPositionMs = intent.getLongExtra(EXTRA_POSITION_MS, 0L)
         val speed = intent.getFloatExtra(EXTRA_SPEED, 1f)
-        val candidates = listOfNotNull(dashXml?.let(::dashDataUri), streamUrl, downloadUrl)
+        val primaryUrl = when (liveStatus) {
+            3 -> replayUrl?.takeIf { it.isNotBlank() } ?: streamUrl
+            else -> streamUrl
+        }
+        val candidates = listOfNotNull(dashXml?.let(::dashDataUri), primaryUrl, downloadUrl, replayUrl)
             .flatMap(::videoUrlCandidates)
             .distinct()
 
@@ -60,7 +66,7 @@ class VideoPipActivity : ComponentActivity() {
             }
             exoPlayer.setMediaSource(buildMediaSource(url))
             exoPlayer.prepare()
-            if (startPositionMs > 0) exoPlayer.seekTo(startPositionMs)
+            if (startPositionMs > 0 && liveStatus != 1) exoPlayer.seekTo(startPositionMs)
             exoPlayer.setPlaybackSpeed(speed)
             exoPlayer.playWhenReady = true
         }
@@ -149,6 +155,8 @@ class VideoPipActivity : ComponentActivity() {
     companion object {
         const val EXTRA_STREAM_URL = "stream_url"
         const val EXTRA_DOWNLOAD_URL = "download_url"
+        const val EXTRA_REPLAY_URL = "replay_url"
+        const val EXTRA_LIVE_STATUS = "live_status"
         const val EXTRA_DASH_XML = "dash_xml"
         const val EXTRA_ASPECT_RATIO = "aspect_ratio"
         const val EXTRA_POSITION_MS = "position_ms"
@@ -165,10 +173,13 @@ class VideoPipActivity : ComponentActivity() {
             speed: Float,
             aspectRatio: Float,
         ) {
+            val playbackUrl = media.resolvedPlaybackUrl() ?: media.streamUrl
             context.startActivity(
                 Intent(context, VideoPipActivity::class.java).apply {
-                    putExtra(EXTRA_STREAM_URL, media.streamUrl)
+                    putExtra(EXTRA_STREAM_URL, playbackUrl)
                     media.downloadUrl?.let { putExtra(EXTRA_DOWNLOAD_URL, it) }
+                    media.replayUrl?.let { putExtra(EXTRA_REPLAY_URL, it) }
+                    media.liveStatus?.let { putExtra(EXTRA_LIVE_STATUS, it) }
                     putExtra(EXTRA_ASPECT_RATIO, aspectRatio)
                     putExtra(EXTRA_POSITION_MS, positionMs)
                     putExtra(EXTRA_SPEED, speed)

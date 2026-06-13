@@ -372,6 +372,27 @@ class WeiboWebSession(context: Context) {
         )
     }
 
+    suspend fun loadFriends(uid: String, page: Int, tab: FriendListTab): RelationPage {
+        val targetUid = uid.trim()
+        require(targetUid.isNotBlank()) { "无效的用户 UID" }
+        val params = linkedMapOf(
+            "uid" to targetUid,
+            "page" to page.toString(),
+        )
+        if (tab == FriendListTab.Fans) {
+            params["relate"] = "fans"
+            params["count"] = "20"
+            params["type"] = "fans"
+            params["fansSortType"] = "followTime"
+        }
+        val raw = fetchJson(
+            path = WeiboEndpoints.FRIENDS,
+            params = params,
+            referer = "https://weibo.com/u/$targetUid",
+        )
+        return WeiboJsonParser.parseFriendsPage(raw)
+    }
+
     suspend fun setStatusLike(likeId: String, mblogId: String? = null) {
         val id = likeId.trim()
         require(id.isNotBlank() && id != "0" && id.all(Char::isDigit)) { "无效的微博 ID" }
@@ -491,6 +512,19 @@ class WeiboWebSession(context: Context) {
             })
         }
     }
+
+    suspend fun loadArticle(articleId: String): WeiboArticle {
+        val showUrl = articleShowUrl(articleId)
+        val detailUrl = "https://card.weibo.com/article/m/aj/detail?id=$articleId"
+        val raw = fetchAbsoluteJson(detailUrl, showUrl, "https://card.weibo.com")
+        return WeiboArticleParser.parseDetail(raw, articleId)
+    }
+
+    suspend fun fetchAbsoluteJson(
+        url: String,
+        referer: String,
+        origin: String = referer,
+    ): String = nativeFetchAbsoluteJson(url, referer, origin)
 
     suspend fun fetchJson(
         path: String,
@@ -900,6 +934,7 @@ class WeiboWebSession(context: Context) {
             "https://www.weibo.com/",
             "https://passport.weibo.cn/",
             "https://m.weibo.cn/",
+            "https://card.weibo.com/",
         )
         private const val DESKTOP_CHROME_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +

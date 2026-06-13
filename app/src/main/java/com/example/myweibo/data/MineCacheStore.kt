@@ -222,16 +222,22 @@ class MineCacheStore(context: Context) {
             .put("stream_url", streamUrl)
             .put("download_url", downloadUrl)
             .put("duration_seconds", durationSeconds)
+            .put("live_status", liveStatus)
+            .put("replay_url", replayUrl)
 
     private fun JSONObject.toFeedMedia(): FeedMedia? {
-        val streamUrl = optNullableString("stream_url") ?: return null
+        val streamUrl = optNullableString("stream_url")
+        val replayUrl = optNullableString("replay_url")
+        if (streamUrl.isNullOrBlank() && replayUrl.isNullOrBlank()) return null
         return FeedMedia(
             type = runCatching { MediaType.valueOf(optString("type")) }.getOrDefault(MediaType.Video),
             title = optString("title", "\u5FAE\u535A\u89C6\u9891"),
             coverUrl = optNullableString("cover_url"),
-            streamUrl = streamUrl,
+            streamUrl = streamUrl.orEmpty(),
             downloadUrl = optNullableString("download_url"),
             durationSeconds = optInt("duration_seconds").takeIf { it > 0 },
+            liveStatus = optInt("live_status").takeIf { has("live_status") && !isNull("live_status") },
+            replayUrl = replayUrl,
         )
     }
 

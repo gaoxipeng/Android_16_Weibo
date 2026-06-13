@@ -12,6 +12,7 @@ object WeiboEndpoints {
     const val PROFILE_IMAGE_WALL = "/ajax/profile/getImageWall"
     const val FOLLOW_CREATE = "/ajax/friendships/create"
     const val FOLLOW_DESTROY = "/ajax/friendships/destory"
+    const val FRIENDS = "/ajax/friendships/friends"
     const val SET_LIKE = "/ajax/statuses/setLike"
     const val CANCEL_LIKE = "/ajax/statuses/cancelLike"
 

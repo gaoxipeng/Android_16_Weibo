@@ -6,6 +6,7 @@ import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.widget.ImageView
 import android.widget.Toast
@@ -206,8 +207,12 @@ import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.ImageSaveHelper
+import com.example.myweibo.data.FriendListTab
+import com.example.myweibo.data.RelationUser
+import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.FeedItem
+import com.example.myweibo.data.FeedUrlEntity
 import com.example.myweibo.data.ProfileLookup
 import com.example.myweibo.data.FeedMedia
 import com.example.myweibo.data.MediaType
@@ -223,6 +228,8 @@ import com.example.myweibo.data.WeiboStatusActions
 import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
 import com.example.myweibo.data.WeiboWebSession
+import com.example.myweibo.data.WeiboArticle
+import com.example.myweibo.data.resolveArticleId
 import com.example.myweibo.data.formatWeiboTime
 import com.example.myweibo.data.collectEmoticons
 import com.example.myweibo.data.mergeFeedTimelinePages
@@ -238,6 +245,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.URL
@@ -345,6 +354,20 @@ private data class DetailSnapshot(
     val albumViewerState: AlbumViewerState? = null,
 )
 
+private data class ArticleOverlayState(
+    val entity: FeedUrlEntity,
+    val article: WeiboArticle? = null,
+    val loading: Boolean = false,
+    val error: String? = null,
+)
+
+private data class FollowListOverlayState(
+    val uid: String,
+    val screenName: String,
+    val avatarUrl: String?,
+    val tab: FriendListTab,
+)
+
 private fun FeedImage.albumStatusCacheKey(): String =
     statusId?.takeIf { it.isNotBlank() } ?: largeUrl
 
@@ -386,6 +409,7 @@ private data class ImagePeekRequest(
     val anchorBounds: Rect,
     val pressOffset: Offset,
     val onDismiss: () -> Unit,
+    val onOpenFullscreen: (Int) -> Unit,
 )
 
 private class ImagePeekController {
@@ -405,7 +429,20 @@ private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekContr
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
 
 private fun videoPlaybackKey(media: FeedMedia): String =
-    media.streamUrl.ifBlank { media.downloadUrl.orEmpty() }.ifBlank { media.coverUrl.orEmpty() }
+    media.resolvedPlaybackUrl()
+        ?: media.streamUrl.ifBlank { media.replayUrl.orEmpty() }
+        .ifBlank { media.downloadUrl.orEmpty() }
+        .ifBlank { media.coverUrl.orEmpty() }
+
+private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
+    val url = avatarUrl?.takeIf { it.isNotBlank() } ?: return null
+    return FeedImage(
+        id = url,
+        thumbnailUrl = url,
+        largeUrl = url,
+        downloadUrls = listOf(url),
+    )
+}
 
 /*
 private enum class LegacyMainTab(val label: String) {
@@ -507,6 +544,51 @@ fun WeiboApp() {
     var exitHintVisible by remember { mutableStateOf(false) }
     var exitHintToken by remember { mutableIntStateOf(0) }
     var pendingOpenAccountLogin by remember { mutableStateOf(false) }
+    var articleOverlay by remember { mutableStateOf<ArticleOverlayState?>(null) }
+    var followListOverlay by remember { mutableStateOf<FollowListOverlayState?>(null) }
+    var followListProfileVisit by remember { mutableStateOf(false) }
+
+    fun openUrlEntity(entity: FeedUrlEntity) {
+        val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
+        articleOverlay = ArticleOverlayState(entity = entity, loading = articleId != null)
+        if (articleId == null) return
+        scope.launch {
+            runCatching { session.loadArticle(articleId) }
+                .onSuccess { article ->
+                    articleOverlay = ArticleOverlayState(
+                        entity = entity,
+                        article = article,
+                        loading = false,
+                    )
+                }
+                .onFailure { error ->
+                    articleOverlay = ArticleOverlayState(
+                        entity = entity,
+                        loading = false,
+                        error = error.message ?: "文章加载失败",
+                    )
+                }
+        }
+    }
+
+    fun closeArticleOverlay() {
+        articleOverlay = null
+    }
+
+    fun closeFollowList() {
+        followListProfileVisit = false
+        followListOverlay = null
+    }
+
+    fun openFollowList(uid: String, screenName: String, avatarUrl: String?, tab: FriendListTab) {
+        followListProfileVisit = false
+        followListOverlay = FollowListOverlayState(
+            uid = uid,
+            screenName = screenName,
+            avatarUrl = avatarUrl,
+            tab = tab,
+        )
+    }
 
     fun openAccountLoginManagement() {
         selectedTab = MainTab.Mine
@@ -852,6 +934,15 @@ fun WeiboApp() {
         )
     }
 
+    fun openUserFromFollowList(userId: String) {
+        if (followListOverlay == null) {
+            openUser(userId)
+            return
+        }
+        followListProfileVisit = true
+        openUser(userId)
+    }
+
     fun applyProfilePagerPage(page: Int) {
         if (visitedUserId != null) {
             visitedMinePagerPage = page
@@ -905,6 +996,19 @@ fun WeiboApp() {
 
     BackHandler(enabled = true) {
         when {
+            followListProfileVisit && visitedUserId != null -> {
+                lastHomeBackPressAt = 0L
+                followListProfileVisit = false
+                closeVisitedProfile()
+            }
+            followListOverlay != null -> {
+                lastHomeBackPressAt = 0L
+                closeFollowList()
+            }
+            articleOverlay != null -> {
+                lastHomeBackPressAt = 0L
+                closeArticleOverlay()
+            }
             mediaPreview != null -> {
                 lastHomeBackPressAt = 0L
                 mediaPreview = null
@@ -1474,6 +1578,20 @@ fun WeiboApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    LaunchedEffect(selectedTab, visitedUserId, selectedItem, mediaPreview, articleOverlay, followListOverlay, albumViewerState) {
+        val homeFeedOnTop = selectedTab == MainTab.Feed &&
+            visitedUserId == null &&
+            selectedItem == null &&
+            mediaPreview == null &&
+            articleOverlay == null &&
+            followListOverlay == null &&
+            albumViewerState == null
+        if (!homeFeedOnTop) {
+            videoPlaybackCoordinator.pauseAll()
+            videoPlaybackCoordinator.activeKey = null
+        }
+    }
+
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
@@ -1523,7 +1641,8 @@ fun WeiboApp() {
                     Box(
                         Modifier
                             .fillMaxSize()
-                            .graphicsLayer { alpha = feedVisibleAlpha },
+                            .graphicsLayer { alpha = feedVisibleAlpha }
+                            .blockHiddenTouches(feedUiOnTop),
                     ) {
                         FollowFeedScreen(
                             session = session,
@@ -1543,6 +1662,7 @@ fun WeiboApp() {
                             isLongTextLoading = { it.statusId in longTextLoadingIds },
                             onLoadLongText = ::loadLongText,
                             onToggleLike = ::toggleStatusLike,
+                            onUrlEntityClick = ::openUrlEntity,
                         )
                     }
                 }
@@ -1556,68 +1676,71 @@ fun WeiboApp() {
                             visitedAlbumListState.scrollToItem(0)
                         }
                     }
-                    key(visitedProfileLoadGeneration) {
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .graphicsLayer { alpha = if (visitedProfileVisible) 1f else 0f },
-                        ) {
-                            MineScreen(
-                                session = session,
-                                profile = visitedProfile,
-                                profileHeaderHeight = profileHeaderHeights[visitedUserId.orEmpty()] ?: 0.dp,
-                                onProfileHeaderHeightChange = { height ->
-                                    visitedUserId?.let { profileHeaderHeights[it] = height }
-                                },
-                                isLoading = visitedProfileLoading,
-                                loadError = null,
-                                hasLoginCookie = hasLoginCookie,
-                                posts = visitedPosts,
-                                postsError = null,
-                                postsLoadingMore = visitedPostsLoadingMore,
-                                albumImages = visitedAlbumImages,
-                                albumLoading = visitedAlbumLoading,
-                                albumLoadingMore = visitedAlbumLoadingMore,
-                                postsHasMore = visitedPostsHasMore,
-                                albumHasMore = visitedAlbumHasMore,
-                                emoticonMap = emoticonMap,
-                                emoticonCount = emoticonMap.size,
-                                emoticonSyncing = emoticonSyncing,
-                                postsListState = visitedPostsListState,
-                                albumListState = visitedAlbumListState,
-                                albumError = visitedAlbumError,
-                                initialPagerPage = visitedMinePagerPage,
-                                onMinePagerPageChanged = { visitedMinePagerPage = it },
-                                onRefresh = {
-                                    when {
-                                        visitedProfile != null ->
-                                            loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
-                                        visitedUserId?.all(Char::isDigit) == true ->
-                                            loadVisitedUserProfile(ProfileLookup.Uid(visitedUserId!!), keepContent = true)
-                                        visitedUserScreenName.isNotBlank() ->
-                                            loadVisitedUserProfile(
-                                                ProfileLookup.ScreenName(visitedUserScreenName),
-                                                keepContent = true,
-                                            )
-                                    }
-                                },
-                                onLoadMorePosts = { loadMoreVisitedPosts() },
-                                onLoadMoreAlbum = { loadMoreVisitedAlbum() },
-                                onSyncEmoticons = { syncEmoticons() },
-                                onItemClick = ::openDetail,
-                                onOpenAlbumViewer = { albumViewerState = it },
-                                onMediaClick = { mediaPreview = it },
-                                onUserClick = ::openUser,
-                                isLongTextLoading = { it.statusId in longTextLoadingIds },
-                                onLoadLongText = ::loadLongText,
-                                onToggleLike = ::toggleStatusLike,
-                                enableSettings = false,
-                                showFollowActions = hasLoginCookie &&
-                                    visitedProfile?.id?.isNotBlank() == true &&
-                                    visitedProfile?.id != mineProfile?.id,
-                                followLoading = visitedFollowLoading,
-                                onFollowClick = { toggleVisitedFollow() },
-                            )
+                    if (followListOverlay == null) {
+                        key(visitedProfileLoadGeneration) {
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .zIndex(1f)
+                                    .graphicsLayer { alpha = if (visitedProfileVisible) 1f else 0f }
+                                    .blockHiddenTouches(visitedProfileVisible),
+                            ) {
+                                VisitedUserProfileContent(
+                                    session = session,
+                                    profile = visitedProfile,
+                                    profileHeaderHeight = profileHeaderHeights[visitedUserId.orEmpty()] ?: 0.dp,
+                                    onProfileHeaderHeightChange = { height ->
+                                        visitedUserId?.let { profileHeaderHeights[it] = height }
+                                    },
+                                    isLoading = visitedProfileLoading,
+                                    hasLoginCookie = hasLoginCookie,
+                                    posts = visitedPosts,
+                                    postsLoadingMore = visitedPostsLoadingMore,
+                                    albumImages = visitedAlbumImages,
+                                    albumLoading = visitedAlbumLoading,
+                                    albumLoadingMore = visitedAlbumLoadingMore,
+                                    postsHasMore = visitedPostsHasMore,
+                                    albumHasMore = visitedAlbumHasMore,
+                                    emoticonMap = emoticonMap,
+                                    emoticonCount = emoticonMap.size,
+                                    emoticonSyncing = emoticonSyncing,
+                                    postsListState = visitedPostsListState,
+                                    albumListState = visitedAlbumListState,
+                                    albumError = visitedAlbumError,
+                                    initialPagerPage = visitedMinePagerPage,
+                                    onMinePagerPageChanged = { visitedMinePagerPage = it },
+                                    onRefresh = {
+                                        when {
+                                            visitedProfile != null ->
+                                                loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
+                                            visitedUserId?.all(Char::isDigit) == true ->
+                                                loadVisitedUserProfile(ProfileLookup.Uid(visitedUserId!!), keepContent = true)
+                                            visitedUserScreenName.isNotBlank() ->
+                                                loadVisitedUserProfile(
+                                                    ProfileLookup.ScreenName(visitedUserScreenName),
+                                                    keepContent = true,
+                                                )
+                                        }
+                                    },
+                                    onLoadMorePosts = { loadMoreVisitedPosts() },
+                                    onLoadMoreAlbum = { loadMoreVisitedAlbum() },
+                                    onSyncEmoticons = { syncEmoticons() },
+                                    onItemClick = ::openDetail,
+                                    onOpenAlbumViewer = { albumViewerState = it },
+                                    onMediaClick = { mediaPreview = it },
+                                    onUserClick = ::openUser,
+                                    isLongTextLoading = { it.statusId in longTextLoadingIds },
+                                    onLoadLongText = ::loadLongText,
+                                    onToggleLike = ::toggleStatusLike,
+                                    onUrlEntityClick = ::openUrlEntity,
+                                    onOpenFollowList = ::openFollowList,
+                                    showFollowActions = hasLoginCookie &&
+                                        visitedProfile?.id?.isNotBlank() == true &&
+                                        visitedProfile?.id != mineProfile?.id,
+                                    followLoading = visitedFollowLoading,
+                                    onFollowClick = { toggleVisitedFollow() },
+                                )
+                            }
                         }
                     }
                 }
@@ -1677,6 +1800,10 @@ fun WeiboApp() {
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
+                                onUrlEntityClick = ::openUrlEntity,
+                                onOpenFollowList = { uid, screenName, avatarUrl, tab ->
+                                    openFollowList(uid, screenName, avatarUrl, tab)
+                                },
                                 storedAccounts = storedAccounts,
                                 activeAccountId = activeAccountId,
                                 onSwitchAccount = ::switchStoredAccount,
@@ -1740,6 +1867,7 @@ fun WeiboApp() {
                                     onUserClick = ::openUser,
                                     onExpandNestedComments = ::expandNestedComments,
                                     nestedCommentsLoadingIds = nestedCommentsLoadingIds,
+                                    onUrlEntityClick = ::openUrlEntity,
                                 )
                             }
                         }
@@ -1824,6 +1952,7 @@ fun WeiboApp() {
                     anchorBounds = request.anchorBounds,
                     pressOffset = request.pressOffset,
                     onDismiss = { imagePeekController.dismiss() },
+                    onOpenFullscreen = request.onOpenFullscreen,
                 )
             }
             videoPeekController.activeRequest?.let { request ->
@@ -1871,6 +2000,100 @@ fun WeiboApp() {
                             )
                         },
                     )
+                }
+            }
+            articleOverlay?.let { overlay ->
+                Box(Modifier.fillMaxSize().zIndex(600f)) {
+                    ArticleReaderOverlay(
+                        state = overlay,
+                        onBack = ::closeArticleOverlay,
+                        onRetry = { openUrlEntity(overlay.entity) },
+                    )
+                }
+            }
+            followListOverlay?.let { overlay ->
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(550f),
+                ) {
+                    key(overlay.uid) {
+                        FollowFansListScreen(
+                            session = session,
+                            overlay = overlay,
+                            onTabChange = { tab ->
+                                followListOverlay = overlay.copy(tab = tab)
+                            },
+                            onUserClick = ::openUserFromFollowList,
+                            showMessage = ::showMessage,
+                            mineProfileId = mineProfile?.id,
+                        )
+                    }
+                }
+            }
+            if (visitedUserId != null && followListProfileVisit) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(560f),
+                ) {
+                    key(visitedProfileLoadGeneration) {
+                        VisitedUserProfileContent(
+                            session = session,
+                            profile = visitedProfile,
+                            profileHeaderHeight = profileHeaderHeights[visitedUserId.orEmpty()] ?: 0.dp,
+                            onProfileHeaderHeightChange = { height ->
+                                visitedUserId?.let { profileHeaderHeights[it] = height }
+                            },
+                            isLoading = visitedProfileLoading,
+                            hasLoginCookie = hasLoginCookie,
+                            posts = visitedPosts,
+                            postsLoadingMore = visitedPostsLoadingMore,
+                            albumImages = visitedAlbumImages,
+                            albumLoading = visitedAlbumLoading,
+                            albumLoadingMore = visitedAlbumLoadingMore,
+                            postsHasMore = visitedPostsHasMore,
+                            albumHasMore = visitedAlbumHasMore,
+                            emoticonMap = emoticonMap,
+                            emoticonCount = emoticonMap.size,
+                            emoticonSyncing = emoticonSyncing,
+                            postsListState = visitedPostsListState,
+                            albumListState = visitedAlbumListState,
+                            albumError = visitedAlbumError,
+                            initialPagerPage = visitedMinePagerPage,
+                            onMinePagerPageChanged = { visitedMinePagerPage = it },
+                            onRefresh = {
+                                when {
+                                    visitedProfile != null ->
+                                        loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
+                                    visitedUserId?.all(Char::isDigit) == true ->
+                                        loadVisitedUserProfile(ProfileLookup.Uid(visitedUserId!!), keepContent = true)
+                                    visitedUserScreenName.isNotBlank() ->
+                                        loadVisitedUserProfile(
+                                            ProfileLookup.ScreenName(visitedUserScreenName),
+                                            keepContent = true,
+                                        )
+                                }
+                            },
+                            onLoadMorePosts = { loadMoreVisitedPosts() },
+                            onLoadMoreAlbum = { loadMoreVisitedAlbum() },
+                            onSyncEmoticons = { syncEmoticons() },
+                            onItemClick = ::openDetail,
+                            onOpenAlbumViewer = { albumViewerState = it },
+                            onMediaClick = { mediaPreview = it },
+                            onUserClick = ::openUser,
+                            isLongTextLoading = { it.statusId in longTextLoadingIds },
+                            onLoadLongText = ::loadLongText,
+                            onToggleLike = ::toggleStatusLike,
+                            onUrlEntityClick = ::openUrlEntity,
+                            onOpenFollowList = ::openFollowList,
+                            showFollowActions = hasLoginCookie &&
+                                visitedProfile?.id?.isNotBlank() == true &&
+                                visitedProfile?.id != mineProfile?.id,
+                            followLoading = visitedFollowLoading,
+                            onFollowClick = { toggleVisitedFollow() },
+                        )
+                    }
                 }
             }
         }
@@ -2454,6 +2677,29 @@ private fun LiquidSelectedPill(
 }
 
 @Composable
+private fun Modifier.consumeTouchEvents(): Modifier = clickable(
+    indication = null,
+    interactionSource = remember { MutableInteractionSource() },
+    onClick = {},
+)
+
+private fun Modifier.blockHiddenTouches(visible: Boolean): Modifier =
+    if (visible) {
+        this
+    } else {
+        then(
+            Modifier.pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        event.changes.forEach { it.consume() }
+                    }
+                }
+            },
+        )
+    }
+
+@Composable
 private fun AppPullToRefreshBox(
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
@@ -2557,6 +2803,7 @@ private fun FollowFeedScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -2630,6 +2877,7 @@ private fun FollowFeedScreen(
                     isLongTextLoading = isLongTextLoading,
                     onLoadLongText = onLoadLongText,
                     onToggleLike = onToggleLike,
+                    onUrlEntityClick = onUrlEntityClick,
                 )
             }
 
@@ -2763,12 +3011,15 @@ private fun resolveEmoticonMap(
     item: Map<String, String>,
 ): Map<String, String> = if (item.isEmpty()) global else global + item
 
-private fun buildStatusTokenRegex(inlineImageLinks: Map<String, List<FeedImage>>): Regex {
-    val imageUrlPattern = inlineImageLinks.keys
+private fun buildStatusTokenRegex(
+    inlineImageLinks: Map<String, List<FeedImage>>,
+    urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
+): Regex {
+    val urlPattern = (inlineImageLinks.keys + urlEntities.keys)
         .sortedByDescending { it.length }
         .joinToString("|") { Regex.escape(it) }
     val base = """\[[^\[\]]+\]|@[\p{L}\p{N}_\-.·\u00B7\u30FB]+|#[^#\n]+#"""
-    val pattern = if (imageUrlPattern.isNotEmpty()) "$base|$imageUrlPattern" else base
+    val pattern = if (urlPattern.isNotEmpty()) "$base|$urlPattern" else base
     return Regex(pattern)
 }
 
@@ -2785,6 +3036,8 @@ private fun EmoticonText(
     onTrailingClick: (() -> Unit)? = null,
     inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
     onInlineImageClick: ((List<FeedImage>) -> Unit)? = null,
+    urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     maxLines: Int = Int.MAX_VALUE,
     overflow: TextOverflow = TextOverflow.Clip,
 ) {
@@ -2848,7 +3101,7 @@ private fun EmoticonText(
             }
         }
         var last = 0
-        val tokenRegex = buildStatusTokenRegex(inlineImageLinks)
+        val tokenRegex = buildStatusTokenRegex(inlineImageLinks, urlEntities)
         tokenRegex.findAll(text).forEach { match ->
             if (match.range.first > last) {
                 append(text.substring(last, match.range.first))
@@ -2875,6 +3128,30 @@ private fun EmoticonText(
                 inlineImageLinks.containsKey(token) -> {
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
                         append("\u67E5\u770B\u56FE\u7247")
+                    }
+                }
+                urlEntities.containsKey(token) && onUrlEntityClick != null -> {
+                    val entity = urlEntities.getValue(token)
+                    val linkStyle = SpanStyle(
+                        color = primaryColor,
+                        fontWeight = FontWeight.Medium,
+                        textDecoration = TextDecoration.None,
+                    )
+                    withLink(
+                        LinkAnnotation.Clickable(
+                            tag = "url-entity:${entity.shortUrl}",
+                            linkInteractionListener = { onUrlEntityClick(entity) },
+                        ),
+                    ) {
+                        withStyle(linkStyle) {
+                            append(entity.title)
+                        }
+                    }
+                }
+                urlEntities.containsKey(token) -> {
+                    val entity = urlEntities.getValue(token)
+                    withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
+                        append(entity.title)
                     }
                 }
                 emoticonMap.containsKey(token) && inlineContent.containsKey(token) -> {
@@ -3000,6 +3277,7 @@ private fun FeedCard(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     showAuthorRow: Boolean = true,
     onBoundsChange: (Rect) -> Unit = {},
 ) {
@@ -3056,6 +3334,8 @@ private fun FeedCard(
                     onLoadLongText = onLoadLongText,
                     inlineImageLinks = item.inlineImageLinks,
                     onInlineImageClick = { inlineImagePreview = it },
+                    urlEntities = item.urlEntities.associateBy { entity -> entity.shortUrl },
+                    onUrlEntityClick = onUrlEntityClick,
                 )
             }
             item.retweetedStatus?.let { retweeted ->
@@ -3067,6 +3347,7 @@ private fun FeedCard(
                     onUserClick = onUserClick,
                     isLongTextLoading = isLongTextLoading(retweeted),
                     onLoadLongText = onLoadLongText,
+                    onUrlEntityClick = onUrlEntityClick,
                 )
             }
             MediaStrip(
@@ -3102,6 +3383,8 @@ private fun StatusTextSection(
     onLeadingAuthorClick: (() -> Unit)? = null,
     inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
     onInlineImageClick: ((List<FeedImage>) -> Unit)? = null,
+    urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
     EmoticonText(
         modifier = Modifier.fillMaxWidth(),
@@ -3123,6 +3406,8 @@ private fun StatusTextSection(
         },
         inlineImageLinks = inlineImageLinks,
         onInlineImageClick = onInlineImageClick,
+        urlEntities = urlEntities,
+        onUrlEntityClick = onUrlEntityClick,
     )
 }
 
@@ -3135,6 +3420,7 @@ private fun QuotedStatus(
     onUserClick: ((String) -> Unit)? = null,
     isLongTextLoading: Boolean = false,
     onLoadLongText: ((FeedItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
     val resolvedMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
@@ -3163,6 +3449,10 @@ private fun QuotedStatus(
                     } else {
                         null
                     },
+                    inlineImageLinks = item.inlineImageLinks,
+                    onInlineImageClick = null,
+                    urlEntities = item.urlEntities.associateBy { entity -> entity.shortUrl },
+                    onUrlEntityClick = onUrlEntityClick,
                 )
             }
             MediaStrip(images = item.images, media = item.media, onMediaClick = onMediaClick)
@@ -3211,7 +3501,6 @@ private fun CommentSortActionMenu(
                 color = metaColor,
             )
             SettingsExpandIndicator(
-                expanded = expanded,
                 modifier = Modifier.size(16.dp),
                 tint = metaColor,
             )
@@ -3284,10 +3573,8 @@ private fun FeedCardActionMenu(
             contentAlignment = Alignment.Center,
         ) {
             SettingsExpandIndicator(
-                expanded = expanded,
                 modifier = Modifier.size(18.dp),
                 tint = weiboMetaTextColor(),
-                rotateOnExpand = false,
             )
         }
 
@@ -3414,7 +3701,7 @@ private fun FeedImageCell(
     previewUrl: String? = null,
     contentScale: ContentScale = ContentScale.Crop,
     showLiveBadge: Boolean = true,
-    onOpenViewer: () -> Unit,
+    onOpenViewer: (Int) -> Unit,
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
@@ -3453,6 +3740,10 @@ private fun FeedImageCell(
                     longPressTriggered = false
                     longPressOffset = null
                 },
+                onOpenFullscreen = { index ->
+                    imagePeekController.dismiss()
+                    onOpenViewer(index)
+                },
             ),
         )
     }
@@ -3473,7 +3764,7 @@ private fun FeedImageCell(
             .background(MaterialTheme.colorScheme.surfaceContainerHighest)
             .pointerInput(image.id) {
                 detectTapGestures(
-                    onTap = { onOpenViewer() },
+                    onTap = { onOpenViewer(imageIndex) },
                     onLongPress = { offset ->
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         longPressOffset = offset
@@ -3601,6 +3892,7 @@ private fun ImageActionOverlay(
     anchorBounds: Rect,
     pressOffset: Offset,
     onDismiss: () -> Unit,
+    onOpenFullscreen: (Int) -> Unit,
 ) {
     val onMessage = LocalUiMessenger.current
     val context = LocalContext.current
@@ -3704,6 +3996,11 @@ private fun ImageActionOverlay(
                         )
                         .clip(previewShape)
                         .background(Color.Black)
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = { onOpenFullscreen(pagerState.currentPage) },
+                            )
+                        }
                         .pointerInput(Unit) {
                             detectVerticalDragGestures(
                                 onVerticalDrag = { _, amount ->
@@ -4123,8 +4420,8 @@ private fun MediaStrip(
                                         }
                                     ),
                                 contentScale = if (images.size == 1) ContentScale.FillWidth else ContentScale.Crop,
-                                onOpenViewer = {
-                                    viewerIndex = images.indexOf(image)
+                                onOpenViewer = { index ->
+                                    viewerIndex = index
                                     viewerOpen = true
                                 },
                             )
@@ -5064,7 +5361,7 @@ private fun InlineVideoPlayer(
                         if (cancelledByMoveBeforeLongPress) {
                             return@awaitEachGesture
                         }
-                        if (media.type == MediaType.Video) {
+                        if (media.isStreamPlayable()) {
                             videoCoordinator.activeKey = playbackKey
                         } else {
                             onClick()
@@ -5072,7 +5369,7 @@ private fun InlineVideoPlayer(
                         return@awaitEachGesture
                     }
 
-                    if (media.type != MediaType.Video) {
+                    if (!media.isStreamPlayable()) {
                         onClick()
                         return@awaitEachGesture
                     }
@@ -5117,7 +5414,7 @@ private fun InlineVideoPlayer(
                 }
             },
     ) {
-        if (inlinePlaying && media.type == MediaType.Video) {
+        if (inlinePlaying && media.isStreamPlayable()) {
             WeiboVideoSurface(
                 media = media,
                 isFullscreen = false,
@@ -5147,7 +5444,17 @@ private fun InlineVideoPlayer(
                     tint = Color.White,
                 )
             }
-            if (media.type == MediaType.Video) {
+            if (media.liveBadgeLabel() != null) {
+                Text(
+                    text = media.liveBadgeLabel().orEmpty(),
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 6.dp, end = 10.dp),
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            } else if (media.type == MediaType.Video) {
                 VideoPlayHintBadge(
                     durationSeconds = media.durationSeconds,
                     modifier = Modifier
@@ -5183,14 +5490,72 @@ private fun WeiboVideoSurface(
     val onMessage = LocalUiMessenger.current
     val scope = rememberCoroutineScope()
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
-    val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
-    val videoCandidates = remember(media.streamUrl, media.downloadUrl) {
-        listOfNotNull(media.streamUrl, media.downloadUrl)
-            .flatMap(::videoUrlCandidates)
-            .distinct()
+    val isLiveBroadcast = media.isLiveBroadcast()
+    val isLiveReplay = media.isLiveReplay()
+    val hideProgressControls = isLiveBroadcast
+    val playbackUrl = media.resolvedPlaybackUrl().orEmpty()
+    val isPlaybackUnavailable = media.type == MediaType.Live && !media.isLivePlayable()
+    val effectiveResumePosition = resumePosition && !isLiveBroadcast
+    val effectiveSavePosition = savePositionOnDispose && !isLiveBroadcast
+    val playbackKey = remember(media.streamUrl, media.replayUrl, media.liveStatus, media.downloadUrl, media.coverUrl) {
+        videoPlaybackKey(media)
     }
+    val videoCandidates = remember(media.streamUrl, media.replayUrl, media.liveStatus, media.downloadUrl, media.type) {
+        when {
+            isLiveReplay -> listOfNotNull(
+                media.replayUrl?.takeIf { it.isNotBlank() },
+                media.streamUrl.takeIf { it.isNotBlank() },
+            )
+            isLiveBroadcast -> listOfNotNull(media.streamUrl.takeIf { it.isNotBlank() })
+            media.type == MediaType.Live -> emptyList()
+            else -> listOfNotNull(media.streamUrl, media.downloadUrl)
+        }.flatMap(::videoUrlCandidates).distinct()
+    }
+    val fullscreenTopInset = if (isFullscreen) {
+        WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    } else {
+        0.dp
+    }
+
+    if (isPlaybackUnavailable || playbackUrl.isBlank()) {
+        Box(
+            modifier = modifier.background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            RemoteImage(
+                url = media.coverUrl,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.35f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = media.liveBadgeLabel() ?: "直播暂不可播放",
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            if (controlsEnabled && !isFullscreen) {
+                GlassTextButton(
+                    text = "全屏",
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(10.dp)
+                        .width(54.dp)
+                        .height(28.dp),
+                    onClick = onFullscreen,
+                )
+            }
+        }
+        return
+    }
+
     var videoIndex by remember(videoCandidates) { mutableStateOf(0) }
-    val videoUrl = videoCandidates.getOrElse(videoIndex) { media.streamUrl }
+    val videoUrl = videoCandidates.getOrElse(videoIndex) { playbackUrl }
     var playbackError by remember(videoUrl) { mutableStateOf<String?>(null) }
     var isBuffering by remember(videoUrl) { mutableStateOf(true) }
     var positionMs by remember(videoUrl) { mutableStateOf(0L) }
@@ -5202,11 +5567,6 @@ private fun WeiboVideoSurface(
     var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
     var downloading by remember(videoUrl) { mutableStateOf(false) }
     var aspectRatio by remember(videoUrl) { mutableFloatStateOf(16f / 9f) }
-    val fullscreenTopInset = if (isFullscreen) {
-        WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    } else {
-        0.dp
-    }
     val trackViewportPause = !isFullscreen && controlsEnabled
     val screenHeightPx = remember(context) {
         context.resources.displayMetrics.heightPixels.toFloat()
@@ -5240,9 +5600,16 @@ private fun WeiboVideoSurface(
         playerCache[videoUrl]?.also { it.playWhenReady = true }
             ?: androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
                 playerCache[videoUrl] = this
-                setMediaSource(buildVideoMediaSource(context, videoUrl))
+                setMediaSource(
+                    buildVideoMediaSource(
+                        context = context,
+                        url = videoUrl,
+                        useCache = !isLiveBroadcast && !(isLiveReplay && videoUrl.contains("m3u8", ignoreCase = true)),
+                        omitOrigin = isLiveBroadcast || videoUrl.contains("m3u8", ignoreCase = true),
+                    ),
+                )
                 prepare()
-                if (resumePosition) {
+                if (effectiveResumePosition) {
                     videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
                 }
                 playWhenReady = true
@@ -5275,8 +5642,7 @@ private fun WeiboVideoSurface(
         videoCoordinator.registerPauseHandler(pauseHandler)
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
-                isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING ||
-                    playbackState == androidx.media3.common.Player.STATE_IDLE
+                isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING
                 isPlaying = player.isPlaying
             }
 
@@ -5305,7 +5671,7 @@ private fun WeiboVideoSurface(
         player.addListener(listener)
         onDispose {
             videoCoordinator.unregisterPauseHandler(pauseHandler)
-            if (savePositionOnDispose) {
+            if (effectiveSavePosition) {
                 val currentPosition = player.currentPosition.coerceAtLeast(0L)
                 if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
                     videoCoordinator.positions[playbackKey] = currentPosition
@@ -5377,6 +5743,7 @@ private fun WeiboVideoSurface(
                                     }
                                 },
                                 onPress = {
+                                    if (isLiveBroadcast) return@detectTapGestures
                                     val releasedEarly = withTimeoutOrNull(360L) { tryAwaitRelease() }
                                     if (releasedEarly == null) {
                                         showControls()
@@ -5451,7 +5818,7 @@ private fun WeiboVideoSurface(
         }
 
         AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && isFullscreen,
+            visible = controlsEnabled && controlsVisible && isFullscreen && !isLiveBroadcast,
             enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
             exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
             modifier = Modifier
@@ -5512,7 +5879,7 @@ private fun WeiboVideoSurface(
         }
 
         AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible,
+            visible = controlsEnabled && controlsVisible && !hideProgressControls,
             enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it },
             exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { it },
             modifier = Modifier
@@ -5838,6 +6205,7 @@ private fun DetailScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
@@ -5889,6 +6257,7 @@ private fun DetailScreen(
                             isLongTextLoading = isLongTextLoading,
                             onLoadLongText = onLoadLongText,
                             onToggleLike = onToggleLike,
+                            onUrlEntityClick = onUrlEntityClick,
                             showAuthorRow = false,
                         )
                         Row(
@@ -5978,7 +6347,7 @@ private fun DetailStickyAuthorHeader(
                     .padding(top = 12.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.Top,
             ) {
-                Box(modifier = Modifier.weight(1f)) {
+                Box(modifier = Modifier.weight(1f).fillMaxHeight().consumeTouchEvents()) {
                     AuthorRow(
                         item = item,
                         onUserClick = onUserClick,
@@ -6194,7 +6563,7 @@ private fun CommentImageStrip(
                 previewUrl = image.thumbnailUrl,
                 contentScale = ContentScale.Crop,
                 showLiveBadge = true,
-                onOpenViewer = { onImageClick(index) },
+                onOpenViewer = { onImageClick(it) },
             )
         }
     }
@@ -6270,6 +6639,7 @@ private fun MineScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     enableSettings: Boolean = true,
     storedAccounts: List<StoredWeiboAccount> = emptyList(),
     activeAccountId: String? = null,
@@ -6284,9 +6654,22 @@ private fun MineScreen(
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
+    onOpenFollowList: ((String, String, String?, FriendListTab) -> Unit)? = null,
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
+    var avatarViewerOpen by remember { mutableStateOf(false) }
+    val avatarImage = remember(profile?.avatarUrl) { profileAvatarFeedImage(profile?.avatarUrl) }
+    val openAvatarViewer = {
+        if (avatarImage != null) avatarViewerOpen = true
+    }
+    val openFollowListForProfile: ((FriendListTab) -> Unit)? = onOpenFollowList?.let { callback ->
+        { tab ->
+            profile?.id?.takeIf { it.isNotBlank() }?.let { uid ->
+                callback(uid, profile.screenName, profile.avatarUrl, tab)
+            }
+        }
+    }
     val pagerState = rememberPagerState(
         initialPage = initialPagerPage.coerceIn(0, MineContentTab.entries.lastIndex),
         pageCount = { MineContentTab.entries.size },
@@ -6451,6 +6834,7 @@ private fun MineScreen(
         else -> Dp.Unspecified
     }
 
+    Box(Modifier.fillMaxSize()) {
     Column(
         Modifier
             .fillMaxSize()
@@ -6487,11 +6871,18 @@ private fun MineScreen(
                                 url = profile?.avatarUrl,
                                 modifier = Modifier
                                     .size(32.dp)
-                                    .clip(CircleShape),
+                                    .clip(CircleShape)
+                                    .clickable(
+                                        enabled = avatarImage != null,
+                                        onClick = openAvatarViewer,
+                                    ),
                                 contentScale = ContentScale.Crop,
                             )
                             Column(
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .consumeTouchEvents(),
                                 verticalArrangement = Arrangement.Center,
                             ) {
                                 Text(
@@ -6561,9 +6952,11 @@ private fun MineScreen(
                             } else {
                                 null
                             },
+                            onAvatarClick = openAvatarViewer,
                             showFollowActions = showFollowActions,
                             followLoading = followLoading,
                             onFollowClick = onFollowClick,
+                            onOpenFollowList = openFollowListForProfile,
                         )
                     }
                 }
@@ -6628,6 +7021,7 @@ private fun MineScreen(
                                             isLongTextLoading = isLongTextLoading,
                                             onLoadLongText = onLoadLongText,
                                             onToggleLike = onToggleLike,
+                                            onUrlEntityClick = onUrlEntityClick,
                                         )
                                     }
                                     if (postsLoadingMore) {
@@ -6683,6 +7077,15 @@ private fun MineScreen(
                 }
             }
         }
+    }
+
+    if (avatarViewerOpen && avatarImage != null) {
+        FullscreenImageViewer(
+            images = listOf(avatarImage),
+            initialIndex = 0,
+            onDismiss = { avatarViewerOpen = false },
+        )
+    }
     }
 }
 
@@ -6835,10 +7238,10 @@ private fun weiboMetaTextColor(): Color =
 
 @Composable
 private fun SettingsExpandIndicator(
-    expanded: Boolean,
-    modifier: Modifier = Modifier,
+    expanded: Boolean = false,
+    modifier: Modifier = Modifier.size(20.dp),
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
-    rotateOnExpand: Boolean = true,
+    rotateOnExpand: Boolean = false,
 ) {
     val rotation by animateFloatAsState(
         targetValue = if (rotateOnExpand && expanded) 180f else 0f,
@@ -6848,9 +7251,7 @@ private fun SettingsExpandIndicator(
     Icon(
         painter = painterResource(R.drawable.ic_chevron_down),
         contentDescription = null,
-        modifier = modifier
-            .size(20.dp)
-            .graphicsLayer { rotationZ = rotation },
+        modifier = modifier.graphicsLayer { rotationZ = rotation },
         tint = tint,
     )
 }
@@ -6927,7 +7328,7 @@ private fun SettingsAccountCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                SettingsExpandIndicator(expanded = expanded)
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
 
             AnimatedVisibility(visible = expanded) {
@@ -7090,7 +7491,7 @@ private fun SettingsEmoticonCard(
                         strokeWidth = 2.dp,
                     )
                 } else {
-                    SettingsExpandIndicator(expanded = expanded)
+                    SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
                 }
             }
 
@@ -7380,9 +7781,11 @@ private fun MineProfileHeader(
     hasLoginCookie: Boolean,
     loadError: String?,
     onOpenSettings: (() -> Unit)?,
+    onAvatarClick: (() -> Unit)? = null,
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
+    onOpenFollowList: ((FriendListTab) -> Unit)? = null,
 ) {
     ElevatedCard(
         shape = RoundedCornerShape(8.dp),
@@ -7427,7 +7830,15 @@ private fun MineProfileHeader(
                     ) {
                         RemoteImage(
                             url = profile?.avatarUrl,
-                            modifier = Modifier.size(84.dp).padding(4.dp).clip(CircleShape),
+                            modifier = Modifier
+                                .size(84.dp)
+                                .padding(4.dp)
+                                .clip(CircleShape)
+                                .clickable(
+                                    enabled = onAvatarClick != null &&
+                                        !profile?.avatarUrl.isNullOrBlank(),
+                                    onClick = { onAvatarClick?.invoke() },
+                                ),
                             contentScale = ContentScale.Crop,
                         )
                     }
@@ -7472,6 +7883,7 @@ private fun MineProfileHeader(
                     MineInlineStats(
                         profile = profile,
                         modifier = Modifier.weight(1f),
+                        onOpenFollowList = onOpenFollowList,
                     )
                     if (showFollowActions && profile?.id?.isNotBlank() == true) {
                         ProfileFollowCapsuleButton(
@@ -7496,6 +7908,561 @@ private fun MineProfileHeader(
 }
 
 private val WeiboFollowOrange = Color(0xFFFF8200)
+
+@Composable
+private fun VisitedUserProfileContent(
+    session: WeiboWebSession,
+    profile: UserProfile?,
+    profileHeaderHeight: Dp,
+    onProfileHeaderHeightChange: (Dp) -> Unit,
+    isLoading: Boolean,
+    hasLoginCookie: Boolean,
+    posts: List<FeedItem>,
+    postsLoadingMore: Boolean,
+    albumImages: List<FeedImage>,
+    albumLoading: Boolean,
+    albumLoadingMore: Boolean,
+    postsHasMore: Boolean,
+    albumHasMore: Boolean,
+    emoticonMap: Map<String, String>,
+    emoticonCount: Int,
+    emoticonSyncing: Boolean,
+    postsListState: LazyListState,
+    albumListState: LazyListState,
+    albumError: String?,
+    initialPagerPage: Int,
+    onMinePagerPageChanged: (Int) -> Unit,
+    onRefresh: () -> Unit,
+    onLoadMorePosts: () -> Unit,
+    onLoadMoreAlbum: () -> Unit,
+    onSyncEmoticons: () -> Unit,
+    onItemClick: (FeedItem) -> Unit,
+    onOpenAlbumViewer: (AlbumViewerState) -> Unit,
+    onMediaClick: (FeedMedia) -> Unit,
+    onUserClick: (String) -> Unit,
+    isLongTextLoading: (FeedItem) -> Boolean,
+    onLoadLongText: (FeedItem) -> Unit,
+    onToggleLike: (FeedItem) -> Unit,
+    onUrlEntityClick: (FeedUrlEntity) -> Unit,
+    onOpenFollowList: (String, String, String?, FriendListTab) -> Unit,
+    showFollowActions: Boolean,
+    followLoading: Boolean,
+    onFollowClick: () -> Unit,
+) {
+    MineScreen(
+        session = session,
+        profile = profile,
+        profileHeaderHeight = profileHeaderHeight,
+        onProfileHeaderHeightChange = onProfileHeaderHeightChange,
+        isLoading = isLoading,
+        loadError = null,
+        hasLoginCookie = hasLoginCookie,
+        posts = posts,
+        postsError = null,
+        postsLoadingMore = postsLoadingMore,
+        albumImages = albumImages,
+        albumLoading = albumLoading,
+        albumLoadingMore = albumLoadingMore,
+        postsHasMore = postsHasMore,
+        albumHasMore = albumHasMore,
+        emoticonMap = emoticonMap,
+        emoticonCount = emoticonCount,
+        emoticonSyncing = emoticonSyncing,
+        postsListState = postsListState,
+        albumListState = albumListState,
+        albumError = albumError,
+        initialPagerPage = initialPagerPage,
+        onMinePagerPageChanged = onMinePagerPageChanged,
+        onRefresh = onRefresh,
+        onLoadMorePosts = onLoadMorePosts,
+        onLoadMoreAlbum = onLoadMoreAlbum,
+        onSyncEmoticons = onSyncEmoticons,
+        onItemClick = onItemClick,
+        onOpenAlbumViewer = onOpenAlbumViewer,
+        onMediaClick = onMediaClick,
+        onUserClick = onUserClick,
+        isLongTextLoading = isLongTextLoading,
+        onLoadLongText = onLoadLongText,
+        onToggleLike = onToggleLike,
+        onUrlEntityClick = onUrlEntityClick,
+        onOpenFollowList = onOpenFollowList,
+        enableSettings = false,
+        showFollowActions = showFollowActions,
+        followLoading = followLoading,
+        onFollowClick = onFollowClick,
+    )
+}
+
+@Composable
+private fun FollowFansListScreen(
+    session: WeiboWebSession,
+    overlay: FollowListOverlayState,
+    onTabChange: (FriendListTab) -> Unit,
+    onUserClick: (String) -> Unit,
+    showMessage: (String, String) -> Unit,
+    mineProfileId: String?,
+) {
+    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val compactBarContentHeight = 48.dp
+    val tabs = FriendListTab.entries
+    val pagerState = rememberPagerState(
+        initialPage = tabs.indexOf(overlay.tab).coerceAtLeast(0),
+        pageCount = { tabs.size },
+    )
+    val coroutineScope = rememberCoroutineScope()
+    val followingListState = rememberLazyListState()
+    val fansListState = rememberLazyListState()
+
+    LaunchedEffect(overlay.tab) {
+        val target = tabs.indexOf(overlay.tab).coerceAtLeast(0)
+        if (pagerState.currentPage != target) {
+            pagerState.scrollToPage(target)
+        }
+    }
+
+    LaunchedEffect(pagerState) {
+        snapshotFlow { pagerState.currentPage }
+            .distinctUntilChanged()
+            .collect { page ->
+                val tab = tabs[page]
+                if (tab != overlay.tab) onTabChange(tab)
+            }
+    }
+
+    val tabScrollPosition by remember {
+        derivedStateOf { pagerState.currentPage + pagerState.currentPageOffsetFraction }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(topInset + compactBarContentHeight)
+                    .background(Color.White)
+                    .padding(
+                        top = topInset,
+                        start = 16.dp,
+                        end = 16.dp,
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                RemoteImage(
+                    url = overlay.avatarUrl,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(CircleShape),
+                    contentScale = ContentScale.Crop,
+                )
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .consumeTouchEvents(),
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Text(
+                        text = overlay.screenName.ifBlank { "微博用户" },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = overlay.uid,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            FollowListContentTabs(
+                scrollPosition = tabScrollPosition,
+                onTabSelected = { tab ->
+                    val sameTab = tab == tabs[pagerState.currentPage]
+                    if (sameTab) {
+                        coroutineScope.launch {
+                            when (tab) {
+                                FriendListTab.Following -> followingListState.animateScrollToItem(0)
+                                FriendListTab.Fans -> fansListState.animateScrollToItem(0)
+                            }
+                        }
+                    } else {
+                        coroutineScope.launch {
+                            pagerState.animateScrollToPage(tabs.indexOf(tab))
+                        }
+                    }
+                },
+            )
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                beyondViewportPageCount = 1,
+            ) { page ->
+                FollowListTabPage(
+                    session = session,
+                    uid = overlay.uid,
+                    tab = tabs[page],
+                    listState = when (tabs[page]) {
+                        FriendListTab.Following -> followingListState
+                        FriendListTab.Fans -> fansListState
+                    },
+                    onUserClick = onUserClick,
+                    showMessage = showMessage,
+                    mineProfileId = mineProfileId,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FollowListTabPage(
+    session: WeiboWebSession,
+    uid: String,
+    tab: FriendListTab,
+    listState: LazyListState,
+    onUserClick: (String) -> Unit,
+    showMessage: (String, String) -> Unit,
+    mineProfileId: String?,
+) {
+    val scope = rememberCoroutineScope()
+    var users by remember(uid, tab) { mutableStateOf<List<RelationUser>>(emptyList()) }
+    var page by remember(uid, tab) { mutableIntStateOf(1) }
+    var hasMore by remember(uid, tab) { mutableStateOf(true) }
+    var loading by remember(uid, tab) { mutableStateOf(true) }
+    var refreshing by remember(uid, tab) { mutableStateOf(false) }
+    var loadingMore by remember(uid, tab) { mutableStateOf(false) }
+    var errorMsg by remember(uid, tab) { mutableStateOf<String?>(null) }
+    val loadMutex = remember(uid, tab) { Mutex() }
+
+    suspend fun loadFirstPage() {
+        runCatching {
+            session.loadFriends(uid, 1, tab)
+        }.onSuccess { result ->
+            errorMsg = result.errorMsg
+            users = result.items
+            hasMore = result.hasNextPage && result.items.isNotEmpty()
+            page = 1
+        }.onFailure { error ->
+            if (error is CancellationException) throw error
+            users = emptyList()
+            errorMsg = error.message ?: "加载失败"
+            hasMore = false
+        }
+    }
+
+    fun refreshList() {
+        scope.launch {
+            refreshing = true
+            loadMutex.withLock {
+                loadingMore = false
+                errorMsg = null
+                loadFirstPage()
+            }
+            runCatching { listState.animateScrollToItem(0) }
+            refreshing = false
+        }
+    }
+
+    LaunchedEffect(uid, tab) {
+        loading = true
+        loadingMore = false
+        users = emptyList()
+        page = 1
+        hasMore = true
+        errorMsg = null
+        loadFirstPage()
+        loading = false
+    }
+
+    LaunchedEffect(listState, uid, tab) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            info.totalItemsCount > 0 && last >= info.totalItemsCount - 3
+        }
+            .distinctUntilChanged()
+            .filter { it }
+            .collect {
+                loadMutex.withLock {
+                    if (loading || loadingMore || refreshing || !hasMore || errorMsg != null) return@withLock
+                    val nextPage = page + 1
+                    loadingMore = true
+                    try {
+                        val result = session.loadFriends(uid, nextPage, tab)
+                        errorMsg = result.errorMsg
+                        val beforeSize = users.size
+                        users = (users + result.items).distinctBy { it.id }
+                        hasMore = result.hasNextPage &&
+                            result.items.isNotEmpty() &&
+                            users.size > beforeSize
+                        page = nextPage
+                    } catch (_: CancellationException) {
+                        // Tab switched or composition left while loading.
+                    } catch (error: Exception) {
+                        showMessage("加载失败", error.message ?: "请稍后重试")
+                    } finally {
+                        loadingMore = false
+                    }
+                }
+            }
+    }
+
+    AppPullToRefreshBox(
+        isRefreshing = refreshing,
+        onRefresh = ::refreshList,
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 24.dp),
+        ) {
+            when {
+                loading && users.isEmpty() -> {
+                    item {
+                        Box(
+                            Modifier.fillMaxWidth().padding(48.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator()
+                        }
+                    }
+                }
+                users.isEmpty() -> {
+                    item {
+                        Box(
+                            Modifier.fillMaxWidth().padding(24.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = errorMsg ?: if (tab == FriendListTab.Fans) {
+                                    "还没有粉丝"
+                                } else {
+                                    "还没有关注"
+                                },
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                else -> {
+                    items(users, key = { it.id }) { user ->
+                        RelationUserRow(
+                            user = user,
+                            showFollowButton = !mineProfileId.isNullOrBlank() && user.id != mineProfileId,
+                            onClick = { onUserClick(user.id) },
+                            session = session,
+                            onFollowChanged = { updated ->
+                                users = users.map { if (it.id == updated.id) updated else it }
+                            },
+                            showMessage = showMessage,
+                        )
+                    }
+                    if (loadingMore) {
+                        item {
+                            MineLoadingMoreIndicator()
+                        }
+                    }
+                    if (!hasMore && users.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "已经到底了",
+                                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FollowListContentTabs(
+    scrollPosition: Float,
+    onTabSelected: (FriendListTab) -> Unit,
+) {
+    val tabs = FriendListTab.entries
+    val accent = Color(0xFFFF4F9A)
+    val density = LocalDensity.current
+    val indicatorWidth = 22.dp
+    val tabCentersPx = remember { FloatArray(tabs.size) { Float.NaN } }
+    var layoutReady by remember { mutableStateOf(false) }
+    val highlightedIndex = scrollPosition
+        .roundToInt()
+        .coerceIn(0, tabs.lastIndex)
+
+    val indicatorCenterPx = if (!layoutReady || tabs.size == 1) {
+        tabCentersPx.firstOrNull { !it.isNaN() } ?: 0f
+    } else {
+        val position = scrollPosition.coerceIn(0f, tabs.lastIndex.toFloat())
+        val left = position.toInt()
+        val right = (left + 1).coerceAtMost(tabs.lastIndex)
+        val fraction = position - left
+        tabCentersPx[left] + (tabCentersPx[right] - tabCentersPx[left]) * fraction
+    }
+    val indicatorOffset = with(density) { indicatorCenterPx.toDp() - indicatorWidth / 2 }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 12.dp, top = 2.dp, bottom = 2.dp),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(22.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            tabs.forEachIndexed { index, tab ->
+                val isSelected = index == highlightedIndex
+                Column(
+                    modifier = Modifier
+                        .onGloballyPositioned { coords ->
+                            tabCentersPx[index] = coords.positionInParent().x + coords.size.width / 2f
+                            if (!layoutReady && tabCentersPx.all { !it.isNaN() }) {
+                                layoutReady = true
+                            }
+                        }
+                        .clip(RoundedCornerShape(3.dp))
+                        .clickable { onTabSelected(tab) }
+                        .padding(horizontal = 2.dp, vertical = 4.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = tab.label,
+                        fontSize = 14.sp,
+                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (isSelected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(3.dp))
+                }
+            }
+        }
+
+        if (layoutReady) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .offset(x = indicatorOffset)
+                    .width(indicatorWidth)
+                    .height(3.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(accent),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RelationUserRow(
+    user: RelationUser,
+    showFollowButton: Boolean,
+    onClick: () -> Unit,
+    session: WeiboWebSession,
+    onFollowChanged: (RelationUser) -> Unit,
+    showMessage: (String, String) -> Unit,
+) {
+    var following by remember(user.id) { mutableStateOf(user.following) }
+    var followLoading by remember(user.id) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(user.following) {
+        following = user.following
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            RemoteImage(
+                url = user.avatarLarge?.takeIf { it.isNotBlank() } ?: user.avatarUrl,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = user.name,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                user.description?.takeIf { it.isNotBlank() }?.let { description ->
+                    Text(
+                        text = description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "${user.followersCountStr?.takeIf { it.isNotBlank() } ?: user.followersCount} 粉丝",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    user.location?.takeIf { it.isNotBlank() }?.let { location ->
+                        Text(
+                            text = location,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+            if (showFollowButton) {
+                Spacer(Modifier.width(8.dp))
+                ProfileFollowCapsuleButton(
+                    following = following,
+                    loading = followLoading,
+                    onClick = {
+                        scope.launch {
+                            followLoading = true
+                            val wasFollowing = following
+                            val profile = user.copy(following = following).toUserProfile()
+                            runCatching {
+                                if (wasFollowing) {
+                                    session.unfollowUser(user.id, profile)
+                                } else {
+                                    session.followUser(user.id, profile)
+                                }
+                            }.onSuccess {
+                                following = !wasFollowing
+                                onFollowChanged(user.copy(following = !wasFollowing))
+                            }.onFailure { error ->
+                                showMessage("关注操作失败", error.message ?: "请稍后重试")
+                            }
+                            followLoading = false
+                        }
+                    },
+                )
+            }
+        }
+        HorizontalDivider(
+            modifier = Modifier.padding(start = 76.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.08f),
+        )
+    }
+}
 
 @Composable
 private fun ProfileFollowCapsuleButton(
@@ -7536,20 +8503,49 @@ private fun ProfileFollowCapsuleButton(
 private fun MineInlineStats(
     profile: UserProfile?,
     modifier: Modifier = Modifier,
+    onOpenFollowList: ((FriendListTab) -> Unit)? = null,
 ) {
+    val canOpenList = onOpenFollowList != null && !profile?.id.isNullOrBlank()
     Row(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        MineInlineStat(value = profile?.followersCount ?: "--", label = "\u7C89\u4E1D")
-        MineInlineStat(value = profile?.followingCount ?: "--", label = "\u5173\u6CE8")
+        MineInlineStat(
+            value = profile?.followersCount ?: "--",
+            label = "\u7C89\u4E1D",
+            onClick = if (canOpenList) {
+                { onOpenFollowList(FriendListTab.Fans) }
+            } else {
+                null
+            },
+        )
+        MineInlineStat(
+            value = profile?.followingCount ?: "--",
+            label = "\u5173\u6CE8",
+            onClick = if (canOpenList) {
+                { onOpenFollowList(FriendListTab.Following) }
+            } else {
+                null
+            },
+        )
         MineInlineStat(value = profile?.statusesCount ?: "--", label = "\u5FAE\u535A")
     }
 }
 
 @Composable
-private fun MineInlineStat(value: String, label: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+private fun MineInlineStat(
+    value: String,
+    label: String,
+    onClick: (() -> Unit)? = null,
+) {
+    Row(
+        modifier = if (onClick != null) {
+            Modifier.clickable(onClick = onClick)
+        } else {
+            Modifier
+        },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(value, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.width(3.dp))
         Text(
@@ -8094,6 +9090,146 @@ private fun HiddenSessionWebView(session: WeiboWebSession) {
     )
 }
 
+private fun wrapArticleHtml(content: String): String = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; margin: 0; line-height: 1.7; color: #333; word-break: break-word; }
+    img { max-width: 100%; height: auto; }
+    a { color: #ff8200; }
+    </style>
+    </head>
+    <body>$content</body>
+    </html>
+""".trimIndent()
+
+@Composable
+private fun ArticleReaderOverlay(
+    state: ArticleOverlayState,
+    onBack: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val title = state.article?.title ?: state.entity.title
+    val htmlContent = state.article?.htmlContent
+    val fallbackUrl = state.entity.url.takeIf {
+        state.article == null && !state.loading && state.error == null
+    }
+
+    BackHandler(onBack = onBack)
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = topInset)
+                    .padding(horizontal = 8.dp, vertical = 8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onBack) { Text("返回") }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 8.dp),
+                    ) {
+                        Text(
+                            text = title,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        state.article?.authorName?.let { author ->
+                            Text(
+                                text = author,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+            HorizontalDivider()
+            Box(Modifier.fillMaxSize()) {
+                when {
+                    state.loading -> {
+                        CircularProgressIndicator(Modifier.align(Alignment.Center))
+                    }
+                    state.error != null -> {
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Text(
+                                text = state.error,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            TextButton(onClick = onRetry) { Text("重试") }
+                        }
+                    }
+                    htmlContent != null -> {
+                        key(state.article?.id) {
+                            AndroidView(
+                                modifier = Modifier.fillMaxSize(),
+                                factory = { context ->
+                                    WebView(context).apply {
+                                        settings.javaScriptEnabled = false
+                                        settings.domStorageEnabled = false
+                                        settings.loadsImagesAutomatically = true
+                                        settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                                    }
+                                },
+                                update = { webView ->
+                                    val baseUrl = state.article?.showUrl ?: "https://card.weibo.com/"
+                                    webView.loadDataWithBaseURL(
+                                        baseUrl,
+                                        wrapArticleHtml(htmlContent),
+                                        "text/html",
+                                        "UTF-8",
+                                        null,
+                                    )
+                                },
+                            )
+                        }
+                    }
+                    fallbackUrl != null -> {
+                        AndroidView(
+                            modifier = Modifier.fillMaxSize(),
+                            factory = { context ->
+                                WebView(context).apply {
+                                    settings.javaScriptEnabled = true
+                                    settings.domStorageEnabled = true
+                                    settings.loadsImagesAutomatically = true
+                                }
+                            },
+                            update = { webView ->
+                                if (webView.url != fallbackUrl) {
+                                    webView.loadUrl(fallbackUrl)
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun FullscreenMediaPreview(media: FeedMedia, onDismiss: () -> Unit) {
     val context = LocalContext.current
@@ -8389,9 +9525,11 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
 private fun buildVideoMediaSource(
     context: android.content.Context,
     url: String,
+    useCache: Boolean = true,
+    omitOrigin: Boolean = false,
 ): androidx.media3.exoplayer.source.MediaSource {
     val mediaItem = androidx.media3.common.MediaItem.fromUri(android.net.Uri.parse(url))
-    val factory = weiboDataSourceFactory(context)
+    val factory = weiboDataSourceFactory(context, useCache = useCache, omitOrigin = omitOrigin)
     return when {
         url.startsWith("data:application/dash+xml", ignoreCase = true) ||
             url.contains(".mpd", ignoreCase = true) ->
@@ -8416,12 +9554,18 @@ private fun getVideoCache(context: android.content.Context): androidx.media3.dat
     }
 }
 
-private fun weiboDataSourceFactory(context: android.content.Context): androidx.media3.datasource.DataSource.Factory {
+private fun weiboDataSourceFactory(
+    context: android.content.Context,
+    useCache: Boolean = true,
+    omitOrigin: Boolean = false,
+): androidx.media3.datasource.DataSource.Factory {
     val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
     val headers = buildMap {
         put("Accept", "*/*")
         put("Referer", "https://weibo.com/")
-        put("Origin", "https://weibo.com")
+        if (!omitOrigin) {
+            put("Origin", "https://weibo.com")
+        }
         put("User-Agent", DESKTOP_CHROME_USER_AGENT)
         if (cookie.isNotBlank()) put("Cookie", cookie)
     }
@@ -8432,6 +9576,7 @@ private fun weiboDataSourceFactory(context: android.content.Context): androidx.m
         .setConnectTimeoutMs(12_000)
         .setReadTimeoutMs(20_000)
     val upstream = androidx.media3.datasource.DefaultDataSource.Factory(context, httpFactory)
+    if (!useCache) return upstream
     return androidx.media3.datasource.cache.CacheDataSource.Factory()
         .setCache(getVideoCache(context))
         .setUpstreamDataSourceFactory(upstream)
