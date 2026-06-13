@@ -8,6 +8,7 @@ object WeiboEndpoints {
     const val STATUS_LONG_TEXT = "/ajax/statuses/longtext"
     const val STATUS_DETAIL = "/ajax/statuses/show"
     const val PROFILE_INFO = "/ajax/profile/info"
+    const val PROFILE_DETAIL = "/ajax/profile/detail"
     const val USER_TIMELINE = "/ajax/statuses/mymblog"
     const val PROFILE_IMAGE_WALL = "/ajax/profile/getImageWall"
     const val FOLLOW_CREATE = "/ajax/friendships/create"

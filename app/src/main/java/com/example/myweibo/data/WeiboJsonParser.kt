@@ -408,6 +408,11 @@ object WeiboJsonParser {
                 ?: fallback?.optNullableString("avatar"),
             description = user.optNullableString("description"),
             location = user.optNullableString("location"),
+            ipLocation = normalizeUserIpLocation(
+                user.optNullableString("ip_location")
+                    ?: user.optNullableString("region_name")
+                    ?: data.optNullableString("ip_location"),
+            ),
             verifiedReason = user.optNullableString("verified_reason"),
             followingCount = formatCount(
                 user.opt("friends_count")
@@ -421,6 +426,23 @@ object WeiboJsonParser {
             following = user.optTruthy("following"),
             followMe = user.optTruthy("follow_me"),
         )
+    }
+
+    fun mergeProfileDetail(profile: UserProfile, raw: String): UserProfile {
+        val data = JSONObject(raw).optJSONObject("data") ?: return profile
+        val ipLocation = normalizeUserIpLocation(data.optNullableString("ip_location")) ?: profile.ipLocation
+        return profile.copy(ipLocation = ipLocation)
+    }
+
+    private fun normalizeUserIpLocation(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return raw.trim()
+            .removePrefix("IP属地：")
+            .removePrefix("IP属地:")
+            .removePrefix("来自")
+            .removePrefix("发布于")
+            .trim()
+            .takeIf { it.isNotBlank() }
     }
 
     fun mergeFollowMutationProfile(

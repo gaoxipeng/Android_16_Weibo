@@ -8953,9 +8953,14 @@ private fun ProfileCoverBanner(
 }
 
 private val ProfileHeaderCardRadius = 8.dp
-private val ProfileHeaderAvatarFrameSize = 92.dp
+private val ProfileHeaderAvatarImageSize = 100.dp
+private val ProfileHeaderAvatarInset = 4.dp
+private val ProfileHeaderAvatarFrameSize = ProfileHeaderAvatarImageSize + ProfileHeaderAvatarInset * 2
 private val ProfileHeaderCoverAspect = 2.55f
 private val ProfileHeaderCardCoverOverlap = 22.dp
+private val ProfileHeaderStatsSpacing = 8.dp
+private val ProfileHeaderNameLineHeight = 28.dp
+private val ProfileHeaderNameTopLift = 12.dp
 
 @Composable
 private fun MineProfileHeader(
@@ -9014,22 +9019,59 @@ private fun MineProfileHeader(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                            .padding(
+                                start = 16.dp,
+                                end = 16.dp,
+                                bottom = ProfileHeaderStatsSpacing,
+                            ),
                     ) {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .offset(y = -avatarExposeAboveCard),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.Top,
                         ) {
-                            Spacer(Modifier.width(ProfileHeaderAvatarFrameSize))
+                            Column(
+                                modifier = Modifier.width(ProfileHeaderAvatarFrameSize),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                            ) {
+                                // 头像约 1/3 在卡片外，占位只需卡片内露出的 2/3，避免撑高整行
+                                Spacer(Modifier.height(ProfileHeaderAvatarFrameSize - avatarExposeAboveCard))
+                                val verifiedReason = profile?.verifiedReason?.takeIf { it.isNotBlank() }
+                                val ipLocation = profile?.ipLocation?.takeIf { it.isNotBlank() }
+                                if (verifiedReason != null || ipLocation != null) {
+                                    Spacer(Modifier.height(6.dp))
+                                }
+                                verifiedReason?.let { reason ->
+                                    Text(
+                                        text = reason,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                                ipLocation?.let { location ->
+                                    if (verifiedReason != null) {
+                                        Spacer(Modifier.height(4.dp))
+                                    }
+                                    Text(
+                                        text = "IP\u5C5E\u5730\uFF1A$location",
+                                        modifier = Modifier.fillMaxWidth(),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                            }
                             Spacer(Modifier.width(14.dp))
                             Column(
                                 modifier = Modifier
                                     .weight(1f)
                                     .padding(
-                                        top = (ProfileHeaderAvatarFrameSize - 28.dp) / 2,
+                                        top = (
+                                            ProfileHeaderAvatarFrameSize -
+                                                avatarExposeAboveCard -
+                                                ProfileHeaderNameLineHeight
+                                            ) / 2 - ProfileHeaderNameTopLift,
                                     ),
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
@@ -9049,6 +9091,8 @@ private fun MineProfileHeader(
                                 )
                             }
                         }
+
+                        Spacer(Modifier.height(ProfileHeaderStatsSpacing))
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -9072,45 +9116,31 @@ private fun MineProfileHeader(
                 }
             }
 
-            Column(
+            Surface(
                 modifier = Modifier
                     .padding(start = 16.dp)
-                    .width(ProfileHeaderAvatarFrameSize)
+                    .size(ProfileHeaderAvatarFrameSize)
                     .offset(
                         y = coverHeight - ProfileHeaderCardCoverOverlap - avatarExposeAboveCard,
                     )
                     .zIndex(2f),
-                horizontalAlignment = Alignment.CenterHorizontally,
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surface,
+                shadowElevation = 2.dp,
             ) {
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surface,
-                    shadowElevation = 2.dp,
-                ) {
-                    RemoteImage(
-                        url = profile?.avatarUrl,
-                        modifier = Modifier
-                            .size(84.dp)
-                            .padding(4.dp)
-                            .clip(CircleShape)
-                            .clickable(
-                                enabled = onAvatarClick != null &&
-                                    !profile?.avatarUrl.isNullOrBlank(),
-                                onClick = { onAvatarClick?.invoke() },
-                            ),
-                        contentScale = ContentScale.Crop,
-                    )
-                }
-                profile?.verifiedReason?.takeIf { it.isNotBlank() }?.let { reason ->
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = reason,
-                        modifier = Modifier.fillMaxWidth(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                    )
-                }
+                RemoteImage(
+                    url = profile?.avatarUrl,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(ProfileHeaderAvatarInset)
+                        .clip(CircleShape)
+                        .clickable(
+                            enabled = onAvatarClick != null &&
+                                !profile?.avatarUrl.isNullOrBlank(),
+                            onClick = { onAvatarClick?.invoke() },
+                        ),
+                    contentScale = ContentScale.Crop,
+                )
             }
         }
 

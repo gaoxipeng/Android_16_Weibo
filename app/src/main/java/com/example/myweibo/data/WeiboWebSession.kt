@@ -576,7 +576,7 @@ class WeiboWebSession(context: Context) {
                 throw error
             }
         }
-        return WeiboJsonParser.parseUserProfile(raw)
+        return enrichUserProfileWithDetail(WeiboJsonParser.parseUserProfile(raw))
     }
 
     suspend fun loadCurrentUserProfile(): UserProfile {
@@ -595,7 +595,19 @@ class WeiboWebSession(context: Context) {
                 origin = "https://m.weibo.cn",
             )
         }
-        return WeiboJsonParser.parseUserProfile(raw, config)
+        return enrichUserProfileWithDetail(WeiboJsonParser.parseUserProfile(raw, config))
+    }
+
+    private suspend fun enrichUserProfileWithDetail(profile: UserProfile): UserProfile {
+        val uid = profile.id.takeIf { it.isNotBlank() } ?: return profile
+        if (!profile.ipLocation.isNullOrBlank()) return profile
+        return runCatching {
+            val detailRaw = fetchJson(
+                WeiboEndpoints.PROFILE_DETAIL,
+                linkedMapOf("uid" to uid),
+            )
+            WeiboJsonParser.mergeProfileDetail(profile, detailRaw)
+        }.getOrDefault(profile)
     }
 
     private suspend fun loadCurrentUserConfig(): JSONObject {

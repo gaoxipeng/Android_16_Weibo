@@ -146,6 +146,7 @@ data class UserProfile(
     val avatarUrl: String?,
     val description: String?,
     val location: String?,
+    val ipLocation: String? = null,
     val verifiedReason: String?,
     val followingCount: String,
     val followersCount: String,

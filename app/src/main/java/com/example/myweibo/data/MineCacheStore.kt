@@ -87,6 +87,7 @@ class MineCacheStore(context: Context) {
             .put("avatar_url", avatarUrl)
             .put("description", description)
             .put("location", location)
+            .put("ip_location", ipLocation)
             .put("verified_reason", verifiedReason)
             .put("following_count", followingCount)
             .put("followers_count", followersCount)
@@ -109,6 +110,7 @@ class MineCacheStore(context: Context) {
             avatarUrl = json.optNullableString("avatar_url"),
             description = json.optNullableString("description"),
             location = json.optNullableString("location"),
+            ipLocation = json.optNullableString("ip_location"),
             verifiedReason = json.optNullableString("verified_reason"),
             followingCount = json.optString("following_count", "--"),
             followersCount = json.optString("followers_count", "--"),
