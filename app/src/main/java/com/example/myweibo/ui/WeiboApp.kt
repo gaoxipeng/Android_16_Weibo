@@ -813,20 +813,20 @@ fun WeiboApp() {
         visitedMinePagerPage = 0
     }
 
-    fun loadVisitedUserAlbum(uid: String, loadGeneration: Int) {
+    fun loadVisitedUserAlbum(uid: String, loadGeneration: Int, force: Boolean = false) {
+        if (!force && visitedAlbumImages.isNotEmpty()) return
+        if (visitedAlbumLoading || visitedAlbumLoadingMore) return
         visitedAlbumJob?.cancel()
         visitedAlbumJob = scope.launch {
             visitedAlbumLoading = true
             visitedAlbumError = null
+            if (force) {
+                visitedAlbumImages = emptyList()
+                visitedAlbumNextCursor = null
+                visitedAlbumHasMore = true
+            }
             try {
-                val page = session.loadUserAlbumImages(
-                    uid = uid,
-                    onPageLoaded = { images ->
-                        if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
-                            visitedAlbumImages = enrichAlbumImagesFromPosts(images, visitedPosts)
-                        }
-                    },
-                )
+                val page = session.loadUserAlbumImages(uid = uid)
                 if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
                     visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, visitedPosts)
                     visitedAlbumNextCursor = page.nextCursor
@@ -849,6 +849,11 @@ fun WeiboApp() {
                 }
             }
         }
+    }
+
+    fun ensureVisitedAlbumLoaded() {
+        val uid = visitedProfile?.id?.takeIf { it.isNotBlank() } ?: return
+        loadVisitedUserAlbum(uid, visitedProfileLoadGeneration)
     }
 
     fun loadVisitedUserProfile(lookup: ProfileLookup, keepContent: Boolean = false) {
@@ -905,7 +910,9 @@ fun WeiboApp() {
                                 visitedPostsPage = 1
                                 visitedPostsHasMore = page.nextCursor != null
                             }
-                        loadVisitedUserAlbum(profile.id, loadGeneration)
+                        if (visitedMinePagerPage == MineContentTab.Album.ordinal) {
+                            loadVisitedUserAlbum(profile.id, loadGeneration, force = true)
+                        }
                     }
                     .onFailure {
                         if (loadGeneration != visitedProfileLoadGeneration) return@onFailure
@@ -1368,6 +1375,43 @@ fun WeiboApp() {
         }
     }
 
+    fun loadMineAlbumFirstPage(force: Boolean = false) {
+        val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
+        if (!force && mineAlbumImages.isNotEmpty()) return
+        if (mineAlbumLoading || mineAlbumLoadingMore) return
+        mineAlbumJob?.cancel()
+        mineAlbumJob = scope.launch {
+            mineAlbumLoading = true
+            mineAlbumError = null
+            if (force) {
+                mineAlbumImages = emptyList()
+                mineAlbumNextCursor = null
+                mineAlbumHasMore = true
+            }
+            try {
+                val page = session.loadUserAlbumImages(uid = uid)
+                mineAlbumImages = filterOutRetweetedOnlyImages(
+                    enrichAlbumImagesFromPosts(page.images, minePosts),
+                    minePosts,
+                )
+                mineAlbumNextCursor = page.nextCursor
+                mineAlbumHasMore = page.nextCursor != null
+                mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
+                    "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
+                } else {
+                    null
+                }
+                mineCacheStore.writeAlbum(page)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                mineAlbumError = error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u76F8\u518C"
+            } finally {
+                mineAlbumLoading = false
+            }
+        }
+    }
+
     fun refreshMineProfile() {
         mineHasLoginCookie = session.hasLoginCookie()
         if (!mineHasLoginCookie) {
@@ -1399,39 +1443,8 @@ fun WeiboApp() {
                         .onFailure {
                             minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
                         }
-                    mineAlbumJob?.cancel()
-                    mineAlbumJob = scope.launch {
-                        mineAlbumLoading = true
-                        mineAlbumError = null
-                        try {
-                            val page = session.loadUserAlbumImages(
-                                uid = profile.id,
-                                onPageLoaded = { images ->
-                                    mineAlbumImages = filterOutRetweetedOnlyImages(
-                                        enrichAlbumImagesFromPosts(images, minePosts),
-                                        minePosts,
-                                    )
-                                },
-                            )
-                            mineAlbumImages = filterOutRetweetedOnlyImages(
-                                enrichAlbumImagesFromPosts(page.images, minePosts),
-                                minePosts,
-                            )
-                            mineAlbumNextCursor = page.nextCursor
-                            mineAlbumHasMore = page.nextCursor != null
-                            mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
-                                "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
-                            } else {
-                                null
-                            }
-                            mineCacheStore.writeAlbum(page)
-                        } catch (error: CancellationException) {
-                            throw error
-                        } catch (error: Throwable) {
-                            mineAlbumError = error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u76F8\u518C"
-                        } finally {
-                            mineAlbumLoading = false
-                        }
+                    if (minePagerPage == MineContentTab.Album.ordinal) {
+                        loadMineAlbumFirstPage(force = true)
                     }
                 }
                 .onFailure {
@@ -2085,6 +2098,7 @@ fun WeiboApp() {
                                     albumError = visitedAlbumError,
                                     initialPagerPage = visitedMinePagerPage,
                                     onMinePagerPageChanged = { visitedMinePagerPage = it },
+                                    onAlbumTabSelected = ::ensureVisitedAlbumLoaded,
                                     onRefresh = {
                                         when {
                                             visitedProfile != null ->
@@ -2157,6 +2171,7 @@ fun WeiboApp() {
                                 albumError = mineAlbumError,
                                 initialPagerPage = minePagerPage,
                                 onMinePagerPageChanged = { minePagerPage = it },
+                                onAlbumTabSelected = { loadMineAlbumFirstPage() },
                                 onRefresh = { refreshMineProfile() },
                                 onLoadMorePosts = { loadMoreMinePosts() },
                                 onLoadMoreAlbum = { loadMoreMineAlbum() },
@@ -4135,7 +4150,12 @@ private fun FeedImageCell(
             },
     ) {
         RemoteImage(
-            url = previewUrl ?: image.largeUrl,
+            url = previewUrl ?: image.thumbnailUrl.ifBlank { image.largeUrl },
+            fallbackUrls = if (previewUrl != null) {
+                emptyList()
+            } else {
+                listOfNotNull(image.largeUrl.takeIf { it.isNotBlank() && it != image.thumbnailUrl })
+            },
             modifier = Modifier.fillMaxSize(),
             contentScale = contentScale,
             animated = image.isGif,
@@ -7892,6 +7912,7 @@ private fun MineScreen(
     albumError: String? = null,
     initialPagerPage: Int = 0,
     onMinePagerPageChanged: (Int) -> Unit = {},
+    onAlbumTabSelected: () -> Unit = {},
     onRefresh: () -> Unit,
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
@@ -7968,7 +7989,13 @@ private fun MineScreen(
 
     LaunchedEffect(pagerState) {
         snapshotFlow { pagerState.currentPage }
-            .collect { page -> onMinePagerPageChanged(page) }
+            .distinctUntilChanged()
+            .collect { page ->
+                onMinePagerPageChanged(page)
+                if (MineContentTab.entries[page] == MineContentTab.Album) {
+                    onAlbumTabSelected()
+                }
+            }
     }
 
     if (showSettings) {
@@ -8258,7 +8285,7 @@ private fun MineScreen(
                 HorizontalPager(
                     state = pagerState,
                     modifier = Modifier.fillMaxWidth().weight(1f),
-                    beyondViewportPageCount = 1,
+                    beyondViewportPageCount = 0,
                 ) { page ->
                     when (MineContentTab.entries[page]) {
                         MineContentTab.Posts -> {
@@ -9268,6 +9295,7 @@ private fun VisitedUserProfileContent(
     albumError: String?,
     initialPagerPage: Int,
     onMinePagerPageChanged: (Int) -> Unit,
+    onAlbumTabSelected: () -> Unit,
     onRefresh: () -> Unit,
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
@@ -9309,6 +9337,7 @@ private fun VisitedUserProfileContent(
         albumError = albumError,
         initialPagerPage = initialPagerPage,
         onMinePagerPageChanged = onMinePagerPageChanged,
+        onAlbumTabSelected = onAlbumTabSelected,
         onRefresh = onRefresh,
         onLoadMorePosts = onLoadMorePosts,
         onLoadMoreAlbum = onLoadMoreAlbum,

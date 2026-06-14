@@ -1032,9 +1032,10 @@ object WeiboJsonParser {
             for (index in 0 until picIds.length()) {
                 val picId = picIds.optString(index).takeIf { it.isNotBlank() } ?: continue
                 val info = picInfos.optJSONObject(picId) ?: continue
-                val thumbnail = imageUrl(info, "large")
-                    ?: imageUrl(info, "bmiddle")
+                val thumbnail = imageUrl(info, "bmiddle")
+                    ?: imageUrl(info, "orj360")
                     ?: imageUrl(info, "thumbnail")
+                    ?: imageUrl(info, "large")
                     ?: continue
                 val large = imageUrl(info, "largest")
                     ?: imageUrl(info, "mw2000")
@@ -1084,9 +1085,10 @@ object WeiboJsonParser {
                 val item = items.optJSONObject(index) ?: continue
                 if (item.optNullableString("type") != "pic") continue
                 val data = item.optJSONObject("data") ?: continue
-                val thumbnail = imageUrl(data, "large")
-                    ?: imageUrl(data, "bmiddle")
+                val thumbnail = imageUrl(data, "bmiddle")
+                    ?: imageUrl(data, "orj360")
                     ?: imageUrl(data, "thumbnail")
+                    ?: imageUrl(data, "large")
                     ?: continue
                 val largeInfo = data.optJSONObject("largest")
                     ?: data.optJSONObject("mw2000")
