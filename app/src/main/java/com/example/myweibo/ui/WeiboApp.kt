@@ -204,10 +204,12 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInWindow
@@ -266,6 +268,7 @@ import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -276,6 +279,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.URL
@@ -353,6 +357,72 @@ private fun likeFailureMessage(error: Throwable): String {
     } else {
         message.ifBlank { "\u8BF7\u7A0D\u540E\u91CD\u8BD5" }
     }
+}
+
+private fun commentFailureMessage(error: Throwable): String {
+    val message = error.message.orEmpty()
+    return when {
+        error is TimeoutCancellationException ->
+            "\u56FE\u7247\u4E0A\u4F20\u6216\u8BC4\u8BBA\u53D1\u9001\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5"
+        message.contains("image-upload-redirected-to-html") ||
+            message.contains("weibo-native-post-failed:302") ||
+            message.contains("\u56FE\u7247\u4E0A\u4F20\u5931\u8D25:302") ->
+            "\u56FE\u7247\u4E0A\u4F20\u88AB\u5FAE\u535A\u91CD\u5B9A\u5411\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u540E\u518D\u8BD5"
+        else -> message.ifBlank { "\u8BF7\u7A0D\u540E\u91CD\u8BD5" }
+    }
+}
+
+private fun addMentionSuggestion(
+    target: MutableList<MentionSuggestion>,
+    seen: MutableSet<String>,
+    id: String?,
+    name: String?,
+    avatarUrl: String?,
+) {
+    val cleanName = name?.trim().orEmpty()
+    if (cleanName.isBlank()) return
+    val cleanId = id?.trim().orEmpty()
+    val key = cleanId.ifBlank { cleanName }
+    if (key.isBlank() || !seen.add(key)) return
+    target += MentionSuggestion(
+        id = cleanId,
+        name = cleanName.removePrefix("@"),
+        avatarUrl = avatarUrl,
+    )
+}
+
+private fun collectMentionSuggestions(
+    feedItems: List<FeedItem>,
+    comments: List<CommentItem>,
+    mineProfile: UserProfile?,
+    visitedProfile: UserProfile?,
+    selectedItem: FeedItem?,
+): List<MentionSuggestion> {
+    val seen = linkedSetOf<String>()
+    val result = mutableListOf<MentionSuggestion>()
+
+    fun addProfile(profile: UserProfile?) {
+        if (profile != null) {
+            addMentionSuggestion(result, seen, profile.id, profile.screenName, profile.avatarUrl)
+        }
+    }
+
+    fun addFeedItem(item: FeedItem?) {
+        if (item == null) return
+        addMentionSuggestion(result, seen, item.authorId, item.authorName, item.authorAvatarUrl)
+        addFeedItem(item.retweetedStatus)
+    }
+
+    addFeedItem(selectedItem)
+    comments.forEach { comment ->
+        addMentionSuggestion(result, seen, comment.authorId, comment.authorName, comment.authorAvatarUrl)
+        addMentionSuggestion(result, seen, comment.replyToAuthorId, comment.replyToAuthor, null)
+    }
+    addProfile(visitedProfile)
+    addProfile(mineProfile)
+    feedItems.take(30).forEach(::addFeedItem)
+
+    return result.take(16)
 }
 
 private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
@@ -450,6 +520,12 @@ private data class CommentComposeTarget(
     val placeholder: String
         get() = replyTo?.authorName?.let { "回复 @$it" } ?: "写评论..."
 }
+
+private data class MentionSuggestion(
+    val id: String,
+    val name: String,
+    val avatarUrl: String?,
+)
 
 private const val DETAIL_SECTION_HEADER_INDEX = 1
 
@@ -650,6 +726,7 @@ fun WeiboApp() {
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
+    var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -668,6 +745,7 @@ fun WeiboApp() {
     var commentsHasMore by remember { mutableStateOf(true) }
     var commentComposeTarget by remember { mutableStateOf<CommentComposeTarget?>(null) }
     var commentSubmitting by remember { mutableStateOf(false) }
+    var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
     var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
@@ -708,6 +786,8 @@ fun WeiboApp() {
     var emoticonMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var recentCommentEmoticons by remember { mutableStateOf<List<String>>(emptyList()) }
     var emoticonSyncing by remember { mutableStateOf(false) }
+    var chatMentionSuggestions by remember { mutableStateOf<List<MentionSuggestion>>(emptyList()) }
+    var chatMentionSuggestionsLoaded by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
     var visitedUserScreenName by remember { mutableStateOf("") }
     var visitedProfile by remember { mutableStateOf<UserProfile?>(null) }
@@ -1721,31 +1801,47 @@ fun WeiboApp() {
         commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), replyTo)
     }
 
-    fun submitComment(target: CommentComposeTarget, text: String, alsoRepost: Boolean) {
+    fun submitComment(target: CommentComposeTarget, text: String, photoUris: List<Uri>, alsoRepost: Boolean) {
         if (commentSubmitting) return
-        scope.launch {
+        val job = scope.launch {
             commentSubmitting = true
-            runCatching {
-                session.postStatusComment(
-                    item = target.status,
-                    text = text,
-                    replyToCommentId = target.replyTo?.id,
-                    alsoRepost = alsoRepost,
-                )
-            }.onSuccess {
-                commentComposeTarget = null
-                showMessage("评论已发布", if (target.isReply) "已回复 @${target.replyTo?.authorName}" else "已发送到评论区")
-                val updated = target.status.copy(
-                    commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
-                )
-                applyExpandedItem(updated)
-                selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
-                reloadComments()
-            }.onFailure { error ->
-                showMessage("评论发布失败", error.message ?: "请稍后重试")
+            try {
+                runCatching {
+                    withTimeout(45_000) {
+                        val picId = photoUris.firstOrNull()?.let { uri ->
+                            session.uploadCommentImage(uri)
+                        }
+                        session.postStatusComment(
+                            item = target.status,
+                            text = text,
+                            replyToCommentId = target.replyTo?.id,
+                            alsoRepost = alsoRepost,
+                            picId = picId,
+                        )
+                    }
+                }.onSuccess {
+                    commentComposeTarget = null
+                    operationCapsuleHint = if (target.isReply) {
+                        "已回复 @${target.replyTo?.authorName}"
+                    } else {
+                        "评论已发布"
+                    }
+                    val updated = target.status.copy(
+                        commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
+                    )
+                    applyExpandedItem(updated)
+                    selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
+                    reloadComments()
+                }.onFailure { error ->
+                    if (error is CancellationException && error !is TimeoutCancellationException) throw error
+                    operationCapsuleHint = commentFailureMessage(error)
+                }
+            } finally {
+                commentSubmitting = false
+                commentSubmitJob = null
             }
-            commentSubmitting = false
         }
+        commentSubmitJob = job
     }
 
     fun reloadReposts() {
@@ -2028,6 +2124,21 @@ fun WeiboApp() {
         if (items.isEmpty() && hasLoginCookie) {
             refreshTimeline()
         }
+    }
+
+    LaunchedEffect(commentComposeTarget != null) {
+        if (commentComposeTarget == null || chatMentionSuggestionsLoaded) return@LaunchedEffect
+        chatMentionSuggestionsLoaded = true
+        runCatching { session.loadRecentChatContacts() }
+            .onSuccess { users ->
+                chatMentionSuggestions = users.map {
+                    MentionSuggestion(
+                        id = it.id,
+                        name = it.screenName.ifBlank { it.name },
+                        avatarUrl = it.avatarLarge ?: it.avatarUrl,
+                    )
+                }
+            }
     }
 
     DisposableEffect(Unit) {
@@ -2334,6 +2445,7 @@ fun WeiboApp() {
                                     onLoadMoreAlbum = { loadMoreVisitedAlbum() },
                                     onSyncEmoticons = { syncEmoticons() },
                                     onItemClick = ::openDetail,
+                                    onCommentLongClick = ::openCommentComposer,
                                     onOpenAlbumViewer = ::pushAlbumViewer,
                                     onMediaClick = ::pushMediaPreview,
                                     onUserClick = ::openUser,
@@ -2395,6 +2507,7 @@ fun WeiboApp() {
                                 onLoadMoreAlbum = { loadMoreMineAlbum() },
                                 onSyncEmoticons = { syncEmoticons() },
                                 onItemClick = ::openDetail,
+                                onCommentLongClick = ::openCommentComposer,
                                 onOpenAlbumViewer = ::pushAlbumViewer,
                                 onMediaClick = ::pushMediaPreview,
                                 onUserClick = ::openUser,
@@ -2523,21 +2636,44 @@ fun WeiboApp() {
                     val activeAvatarUrl = storedAccounts
                         .firstOrNull { it.id == activeAccountId }
                         ?.avatarUrl
+                    val mentionSuggestions = remember(
+                        chatMentionSuggestions,
+                        items,
+                        comments,
+                        mineProfile,
+                        visitedProfile,
+                        selectedItem,
+                    ) {
+                        val contextual = collectMentionSuggestions(
+                            feedItems = items,
+                            comments = comments,
+                            mineProfile = mineProfile,
+                            visitedProfile = visitedProfile,
+                            selectedItem = selectedItem,
+                        )
+                        (chatMentionSuggestions + contextual).distinctBy {
+                            it.id.ifBlank { it.name }
+                        }
+                    }
                     CommentComposerDialog(
                         target = target,
                         avatarUrl = mineProfile?.avatarUrl ?: activeAvatarUrl,
                         submitting = commentSubmitting,
                         emoticonMap = emoticonMap,
                         recentEmoticons = recentCommentEmoticons,
+                        mentionSuggestions = mentionSuggestions,
                         onEmoticonUsed = { phrase ->
                             recentCommentEmoticons = emoticonCacheStore.touchRecent(phrase).filter { it in emoticonMap }
                         },
                         onDismiss = {
-                            if (!commentSubmitting) {
-                                commentComposeTarget = null
+                            if (commentSubmitting) {
+                                commentSubmitJob?.cancel()
+                                commentSubmitJob = null
+                                commentSubmitting = false
                             }
+                            commentComposeTarget = null
                         },
-                        onSubmit = { text, alsoRepost -> submitComment(target, text, alsoRepost) },
+                        onSubmit = { text, photoUris, alsoRepost -> submitComment(target, text, photoUris, alsoRepost) },
                     )
                 }
             }
@@ -2546,24 +2682,38 @@ fun WeiboApp() {
                 HiddenSessionWebView(session)
             }
 
-            if (selectedItem == null) {
-                val feedRefreshTopInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-                AnimatedVisibility(
-                    visible = selectedTab == MainTab.Feed &&
-                        visitedUserId == null &&
-                        feedRefreshHint != null,
-                    enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
-                    exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { fullHeight -> -fullHeight / 2 },
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = feedRefreshTopInset + 10.dp),
+            val capsuleHint = operationCapsuleHint
+                ?: if (
+                    selectedTab == MainTab.Feed &&
+                    selectedItem == null &&
+                    visitedUserId == null &&
+                    feedRefreshHint != null
                 ) {
-                    feedRefreshHint?.let { hint ->
-                        FeedRefreshCapsuleHint(
-                            message = hint,
-                            onDismiss = { feedRefreshHint = null },
-                        )
-                    }
+                    feedRefreshHint
+                } else {
+                    null
+                }
+            val feedRefreshTopInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+            AnimatedVisibility(
+                visible = capsuleHint != null,
+                enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
+                exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { fullHeight -> -fullHeight / 2 },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = feedRefreshTopInset + 10.dp)
+                    .zIndex(90f),
+            ) {
+                capsuleHint?.let { hint ->
+                    FeedRefreshCapsuleHint(
+                        message = hint,
+                        onDismiss = {
+                            if (operationCapsuleHint != null) {
+                                operationCapsuleHint = null
+                            } else {
+                                feedRefreshHint = null
+                            }
+                        },
+                    )
                 }
             }
 
@@ -3125,7 +3275,7 @@ private fun FloatingBottomBar(
                 }
                 Popup(
                     alignment = Alignment.BottomStart,
-                    offset = IntOffset(timelineMenuOffsetX, -with(density) { 94.dp.roundToPx() }),
+                    offset = IntOffset(timelineMenuOffsetX, -with(density) { 80.dp.roundToPx() }),
                     onDismissRequest = { timelineMenuExpanded = false },
                     properties = PopupProperties(focusable = false),
                 ) {
@@ -7304,18 +7454,20 @@ private fun CommentComposerDialog(
     submitting: Boolean,
     emoticonMap: Map<String, String>,
     recentEmoticons: List<String>,
+    mentionSuggestions: List<MentionSuggestion>,
     onEmoticonUsed: (String) -> Unit,
     onDismiss: () -> Unit,
-    onSubmit: (String, Boolean) -> Unit,
+    onSubmit: (String, List<Uri>, Boolean) -> Unit,
 ) {
-    var text by remember(target) { mutableStateOf("") }
+    var text by remember(target) { mutableStateOf(TextFieldValue("")) }
     var alsoRepost by remember(target) { mutableStateOf(false) }
     var emoticonPanelVisible by remember(target) { mutableStateOf(false) }
+    var mentionPanelVisible by remember(target) { mutableStateOf(false) }
     var selectedPhotoUris by remember(target) { mutableStateOf<List<Uri>>(emptyList()) }
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
-    val canSubmit = text.trim().isNotEmpty() && !submitting
+    val canSubmit = (text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
     val sendColor = Color(0xFFFFB36B)
     val cardColor = Color(0xFFFFFBFF)
     val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.72f)
@@ -7335,14 +7487,49 @@ private fun CommentComposerDialog(
         selectedPhotoUris = uris.take(9)
     }
 
+    fun insertAtCursor(value: String, requestKeyboard: Boolean = false) {
+        val selection = text.selection
+        val start = min(selection.start, selection.end).coerceIn(0, text.text.length)
+        val end = max(selection.start, selection.end).coerceIn(0, text.text.length)
+        val nextText = (text.text.substring(0, start) + value + text.text.substring(end)).take(600)
+        val nextCursor = (start + value.length).coerceAtMost(nextText.length)
+        text = TextFieldValue(
+            text = nextText,
+            selection = TextRange(nextCursor),
+        )
+        if (requestKeyboard) {
+            emoticonPanelVisible = false
+            runCatching { focusRequester.requestFocus() }
+            keyboard?.show()
+        }
+    }
+
     fun appendEmoticon(phrase: String) {
-        text = (text + phrase).take(600)
+        insertAtCursor(phrase)
         onEmoticonUsed(phrase)
+    }
+
+    fun insertMention() {
+        mentionPanelVisible = true
+        insertAtCursor("@", requestKeyboard = true)
+    }
+
+    fun insertMentionUser(user: MentionSuggestion) {
+        val selection = text.selection
+        val cursor = min(selection.start, selection.end).coerceIn(0, text.text.length)
+        val value = if (cursor > 0 && text.text.getOrNull(cursor - 1) == '@') {
+            "${user.name} "
+        } else {
+            "@${user.name} "
+        }
+        mentionPanelVisible = false
+        insertAtCursor(value, requestKeyboard = true)
     }
 
     fun openEmoticons() {
         emoticonPanelVisible = !emoticonPanelVisible
         if (emoticonPanelVisible) {
+            mentionPanelVisible = false
             keyboard?.hide()
             focusManager.clearFocus()
         }
@@ -7356,11 +7543,9 @@ private fun CommentComposerDialog(
 
     Dialog(
         onDismissRequest = {
-            if (!submitting) {
-                focusManager.clearFocus()
-                keyboard?.hide()
-                onDismiss()
-            }
+            focusManager.clearFocus()
+            keyboard?.hide()
+            onDismiss()
         },
         properties = DialogProperties(
             usePlatformDefaultWidth = false,
@@ -7375,11 +7560,9 @@ private fun CommentComposerDialog(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
                     onClick = {
-                        if (!submitting) {
-                            focusManager.clearFocus()
-                            keyboard?.hide()
-                            onDismiss()
-                        }
+                        focusManager.clearFocus()
+                        keyboard?.hide()
+                        onDismiss()
                     },
                 ),
             contentAlignment = Alignment.BottomCenter,
@@ -7421,6 +7604,13 @@ private fun CommentComposerDialog(
                         )
                     }
 
+                    AnimatedVisibility(visible = mentionPanelVisible && mentionSuggestions.isNotEmpty()) {
+                        MentionSuggestionPanel(
+                            users = mentionSuggestions,
+                            onSelect = ::insertMentionUser,
+                        )
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.Top,
@@ -7443,7 +7633,14 @@ private fun CommentComposerDialog(
                         BasicTextField(
                             value = text,
                             onValueChange = { value ->
-                                text = value.take(600)
+                                text = if (value.text.length <= 600) {
+                                    value
+                                } else {
+                                    value.copy(
+                                        text = value.text.take(600),
+                                        selection = TextRange(600),
+                                    )
+                                }
                             },
                             enabled = !submitting,
                             modifier = Modifier
@@ -7455,7 +7652,7 @@ private fun CommentComposerDialog(
                             keyboardActions = KeyboardActions(
                                 onSend = {
                                     if (canSubmit) {
-                                        onSubmit(text, alsoRepost)
+                                        onSubmit(text.text, selectedPhotoUris, alsoRepost)
                                     }
                                 },
                             ),
@@ -7468,7 +7665,7 @@ private fun CommentComposerDialog(
                                         .background(inputColor)
                                         .padding(horizontal = 12.dp, vertical = 8.dp),
                                 ) {
-                                    if (text.isEmpty()) {
+                                    if (text.text.isEmpty()) {
                                         Text(
                                             text = target.placeholder,
                                             style = inputTextStyle.copy(
@@ -7510,10 +7707,17 @@ private fun CommentComposerDialog(
                             contentDescription = "表情",
                         )
                         Spacer(Modifier.width(6.dp))
+                        CommentComposerTextButton(
+                            text = "@",
+                            onClick = { insertMention() },
+                            contentDescription = "@",
+                        )
+                        Spacer(Modifier.width(6.dp))
                         CommentComposerIconButton(
                             iconRes = R.drawable.ic_comment_photo,
                             onClick = {
                                 emoticonPanelVisible = false
+                                mentionPanelVisible = false
                                 photoPickerLauncher.launch("image/*")
                             },
                             contentDescription = "照片",
@@ -7573,7 +7777,7 @@ private fun CommentComposerDialog(
                                     interactionSource = remember { MutableInteractionSource() },
                                     onClick = {
                                         if (canSubmit) {
-                                            onSubmit(text, alsoRepost)
+                                            onSubmit(text.text, selectedPhotoUris, alsoRepost)
                                         }
                                     },
                                 ),
@@ -7615,6 +7819,56 @@ private fun CommentComposerDialog(
 }
 
 @Composable
+private fun MentionSuggestionPanel(
+    users: List<MentionSuggestion>,
+    onSelect: (MentionSuggestion) -> Unit,
+) {
+    LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.56f))
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        items(users, key = { it.id.ifBlank { it.name } }) { user ->
+            Column(
+                modifier = Modifier
+                    .width(58.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = { onSelect(user) },
+                    )
+                    .padding(vertical = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                RemoteImage(
+                    url = user.avatarUrl,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .clip(CircleShape),
+                    contentScale = ContentScale.Crop,
+                    maxDecodeDim = 96,
+                )
+                Text(
+                    text = user.name,
+                    fontSize = 11.sp,
+                    lineHeight = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun LocalUriThumbnail(
     uri: Uri,
     modifier: Modifier = Modifier,
@@ -7639,7 +7893,8 @@ private fun CommentEmoticonPanel(
     allEntries: List<Pair<String, String>>,
     onSelect: (String) -> Unit,
 ) {
-    val recentPhrases = recentEntries.map { it.first }.toSet()
+    val displayedRecentEntries = recentEntries.take(14)
+    val recentPhrases = displayedRecentEntries.map { it.first }.toSet()
     val remainingEntries = allEntries.filter { it.first !in recentPhrases }
     Column(
         modifier = Modifier
@@ -7661,13 +7916,13 @@ private fun CommentEmoticonPanel(
             )
             return@Column
         }
-        if (recentEntries.isNotEmpty()) {
+        if (displayedRecentEntries.isNotEmpty()) {
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 maxItemsInEachRow = 7,
             ) {
-                recentEntries.forEach { (phrase, url) ->
+                displayedRecentEntries.forEach { (phrase, url) ->
                     CommentEmoticonTile(
                         phrase = phrase,
                         url = url,
@@ -7727,6 +7982,33 @@ private fun CommentEmoticonTile(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun CommentComposerTextButton(
+    text: String,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            fontSize = 20.sp,
+            lineHeight = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -8636,6 +8918,7 @@ private fun MobileWeiboWebScreen(
     pageUrl: String,
     onRootBack: () -> Unit,
     scrollToTopOnPageFinished: (String?) -> Boolean = { true },
+    userAgent: String? = null,
 ) {
     val context = LocalContext.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
@@ -8674,7 +8957,7 @@ private fun MobileWeiboWebScreen(
                 loadWithOverviewMode = false
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                userAgentString = mobileUserAgent
+                userAgentString = userAgent ?: mobileUserAgent
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -8736,9 +9019,11 @@ private fun MessagesScreen(
     onRootBack: () -> Unit,
 ) {
     MobileWeiboWebScreen(
-        pageUrl = "https://m.weibo.cn/message",
+        pageUrl = "https://api.weibo.com/chat#/chat",
         onRootBack = onRootBack,
         scrollToTopOnPageFinished = { url -> url?.contains("/chat", ignoreCase = true) != true },
+        userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     )
 }
 
@@ -8857,6 +9142,7 @@ private fun MineScreen(
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
     onItemClick: (FeedItem) -> Unit,
+    onCommentLongClick: (FeedItem) -> Unit = {},
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     onUserClick: ((String) -> Unit)? = null,
@@ -9253,6 +9539,7 @@ private fun MineScreen(
                                             emoticonMap = emoticonMap,
                                             onUserClick = onUserClick,
                                             onRetweetClick = onItemClick,
+                                            onCommentLongClick = { onCommentLongClick(post) },
                                             isLongTextLoading = isLongTextLoading,
                                             onLoadLongText = onLoadLongText,
                                             onToggleLike = onToggleLike,
@@ -10569,6 +10856,7 @@ private fun VisitedUserProfileContent(
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
     onItemClick: (FeedItem) -> Unit,
+    onCommentLongClick: (FeedItem) -> Unit,
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     onUserClick: (String) -> Unit,
@@ -10611,6 +10899,7 @@ private fun VisitedUserProfileContent(
         onLoadMoreAlbum = onLoadMoreAlbum,
         onSyncEmoticons = onSyncEmoticons,
         onItemClick = onItemClick,
+        onCommentLongClick = onCommentLongClick,
         onOpenAlbumViewer = onOpenAlbumViewer,
         onMediaClick = onMediaClick,
         onUserClick = onUserClick,

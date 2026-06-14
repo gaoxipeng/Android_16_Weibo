@@ -67,6 +67,6 @@ class EmoticonCacheStore(context: Context) {
 
     private companion object {
         const val KEY_RECENT = "recent_emoticons"
-        const val RECENT_LIMIT = 21
+        const val RECENT_LIMIT = 14
     }
 }
