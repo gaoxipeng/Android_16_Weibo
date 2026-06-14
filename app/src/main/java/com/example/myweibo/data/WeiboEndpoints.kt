@@ -8,6 +8,7 @@ object WeiboEndpoints {
     const val STATUS_COMMENTS = "/ajax/statuses/buildComments"
     const val STATUS_LONG_TEXT = "/ajax/statuses/longtext"
     const val STATUS_DETAIL = "/ajax/statuses/show"
+    const val STATUS_REPOST_TIMELINE = "/ajax/statuses/repostTimeline"
     const val PROFILE_INFO = "/ajax/profile/info"
     const val PROFILE_DETAIL = "/ajax/profile/detail"
     const val USER_TIMELINE = "/ajax/statuses/mymblog"

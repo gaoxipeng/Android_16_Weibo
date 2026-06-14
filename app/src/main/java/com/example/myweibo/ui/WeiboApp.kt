@@ -6264,7 +6264,7 @@ private fun WeiboVideoSurface(
             controlsVisible = true
             return@LaunchedEffect
         }
-        delay(3_000)
+        delay(5_000)
         controlsVisible = false
     }
 
@@ -6676,10 +6676,9 @@ private fun VideoControls(
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
             )
-            TextButton(
+            IconButton(
                 onClick = onSpeedClick,
-                modifier = Modifier.width(30.dp),
-                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.size(width = 30.dp, height = 24.dp),
             ) {
                 Text(
                     text = speedLabel(speed),
@@ -6989,7 +6988,7 @@ private fun DetailScreen(
                     }
                 }
 
-                if (isLoadingSection && sectionItems.isEmpty() && listState.firstVisibleItemIndex > 0) {
+                if (isLoadingSection && sectionItems.isEmpty()) {
                     item {
                         Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                             AppLoadingIndicator()

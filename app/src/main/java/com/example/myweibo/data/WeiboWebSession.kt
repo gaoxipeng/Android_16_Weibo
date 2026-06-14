@@ -516,22 +516,109 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun loadReposts(item: FeedItem, page: Int = 1): RepostsPage {
+        if (page <= 1 && item.hasNoReposts()) {
+            return RepostsPage(items = emptyList(), nextPage = null)
+        }
+        val candidates = repostTimelineStatusIdCandidates(item)
+        runCatching { loadPcReposts(item, candidates, page) }
+            .getOrNull()
+            ?.takeIf { page > 1 || it.items.isNotEmpty() || item.hasNoReposts() }
+            ?.let { return it }
+
         ensureMweiboSession()
-        val statusId = item.statusId.takeIf { it.isNotBlank() } ?: item.id
-        require(statusId.isNotBlank()) { "无效的微博 ID" }
-        val url = Uri.Builder()
-            .scheme("https")
-            .authority("m.weibo.cn")
-            .appendPath("api")
-            .appendPath("statuses")
-            .appendPath("repostTimeline")
-            .appendQueryParameter("id", statusId)
-            .appendQueryParameter("page", page.toString())
-            .build()
-            .toString()
-        val referer = "https://m.weibo.cn/detail/$statusId"
-        val raw = nativeFetchMweiboJson(url, referer)
-        return WeiboJsonParser.parseMweiboReposts(raw, page)
+        var lastError: Throwable? = null
+        for ((index, statusId) in candidates.withIndex()) {
+            runCatching {
+                val url = Uri.Builder()
+                    .scheme("https")
+                    .authority("m.weibo.cn")
+                    .appendPath("api")
+                    .appendPath("statuses")
+                    .appendPath("repostTimeline")
+                    .appendQueryParameter("id", statusId)
+                    .appendQueryParameter("page", page.toString())
+                    .appendQueryParameter("count", "20")
+                    .build()
+                    .toString()
+                val referer = "https://m.weibo.cn/detail/${repostTimelineDetailRefererId(item, statusId)}"
+                val raw = nativeFetchMweiboJson(url, referer)
+                val parsed = WeiboJsonParser.parseMweiboReposts(raw, page)
+                if (page <= 1 &&
+                    parsed.items.isEmpty() &&
+                    !item.hasNoReposts() &&
+                    index < candidates.lastIndex
+                ) {
+                    throw IllegalStateException("empty-reposts-for-candidate:$statusId")
+                }
+                parsed
+            }.onSuccess { return it }
+                .onFailure { lastError = it }
+        }
+        throw lastError ?: IllegalStateException("转发列表加载失败，请稍后重试")
+    }
+
+    private suspend fun loadPcReposts(
+        item: FeedItem,
+        candidates: List<String>,
+        page: Int,
+    ): RepostsPage {
+        var lastError: Throwable? = null
+        for ((index, statusId) in candidates.withIndex()) {
+            val parameterSets = listOf(
+                linkedMapOf(
+                    "id" to statusId,
+                    "page" to page.toString(),
+                    "moduleID" to "feed",
+                    "count" to "20",
+                ),
+                linkedMapOf(
+                    "id" to statusId,
+                    "page" to page.toString(),
+                    "is_reload" to if (page <= 1) "1" else "0",
+                    "count" to "20",
+                ),
+                linkedMapOf(
+                    "id" to statusId,
+                    "page" to page.toString(),
+                ),
+            )
+            for (params in parameterSets) {
+                runCatching {
+                    val referer = "https://weibo.com/${item.authorId}/${repostTimelineDetailRefererId(item, statusId)}"
+                    val raw = runCatching {
+                        fetchJson(WeiboEndpoints.STATUS_REPOST_TIMELINE, params, referer)
+                    }.recoverCatching {
+                        webViewFetchJson(WeiboEndpoints.STATUS_REPOST_TIMELINE, params)
+                    }.getOrThrow()
+                    val parsed = WeiboJsonParser.parsePcReposts(raw, page)
+                    if (page <= 1 &&
+                        parsed.items.isEmpty() &&
+                        !item.hasNoReposts() &&
+                        index < candidates.lastIndex
+                    ) {
+                        throw IllegalStateException("empty-pc-reposts-for-candidate:$statusId")
+                    }
+                    parsed
+                }.onSuccess { return it }
+                    .onFailure { lastError = it }
+            }
+        }
+        throw lastError ?: IllegalStateException("PC转发列表加载失败")
+    }
+
+    /** m.weibo.cn 转发列表接口需要数字 mid/idstr，与评论接口一致优先用 item.id。 */
+    private fun repostTimelineStatusIdCandidates(item: FeedItem): List<String> {
+        val raw = listOf(item.statusId, item.id).distinct().filter { it.isNotBlank() }
+        require(raw.isNotEmpty()) { "无效的微博 ID" }
+        return raw
+    }
+
+    private fun repostTimelineDetailRefererId(item: FeedItem, timelineId: String): String =
+        item.statusId.takeIf { it.isNotBlank() } ?: timelineId
+
+    private fun FeedItem.hasNoReposts(): Boolean {
+        val value = repostsCount.trim()
+        return value == "0" || value == "--" || value.equals("null", ignoreCase = true)
     }
 
     suspend fun followUser(uid: String, current: UserProfile): UserProfile {
