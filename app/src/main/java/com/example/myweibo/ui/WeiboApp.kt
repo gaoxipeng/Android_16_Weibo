@@ -9736,6 +9736,12 @@ private fun SettingsScreen(
     var emoticonExpanded by remember { mutableStateOf(false) }
     var imageExpanded by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val versionName = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty().ifBlank { "1.2" }
+    }
 
     BackHandler {
         if (showHelp) {
@@ -9795,6 +9801,9 @@ private fun SettingsScreen(
                 }
                 item {
                     SettingsHelpEntryCard(onOpen = { showHelp = true })
+                }
+                item {
+                    SettingsAboutCard(versionName = versionName)
                 }
             }
         }
@@ -9957,6 +9966,48 @@ private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+@Composable
+private fun SettingsAboutCard(versionName: String) {
+    SettingsPlainCard {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Image(
+                painter = painterResource(R.drawable.ic_launcher_app),
+                contentDescription = null,
+                modifier = Modifier
+                    .size(52.dp)
+                    .clip(RoundedCornerShape(14.dp)),
+                contentScale = ContentScale.Crop,
+            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = "关于",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = "MyWeibo",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "版本 $versionName",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
