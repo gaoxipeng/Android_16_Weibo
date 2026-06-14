@@ -1586,7 +1586,7 @@ class WeiboWebSession(context: Context) {
 
     companion object {
         private const val WEIBO_HOME = "https://weibo.com/"
-        private const val WEIBO_CHAT_URL = "https://api.weibo.com/chat#/chat"
+        private const val WEIBO_CHAT_URL = "https://m.weibo.cn/message"
         private const val FRIENDS_CIRCLE_GID = "100097312739005"
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private val COOKIE_ORIGINS = listOf(

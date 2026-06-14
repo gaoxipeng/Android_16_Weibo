@@ -9019,11 +9019,9 @@ private fun MessagesScreen(
     onRootBack: () -> Unit,
 ) {
     MobileWeiboWebScreen(
-        pageUrl = "https://api.weibo.com/chat#/chat",
+        pageUrl = "https://m.weibo.cn/message",
         onRootBack = onRootBack,
-        scrollToTopOnPageFinished = { url -> url?.contains("/chat", ignoreCase = true) != true },
-        userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        scrollToTopOnPageFinished = { url -> url?.contains("/message", ignoreCase = true) != true },
     )
 }
 
