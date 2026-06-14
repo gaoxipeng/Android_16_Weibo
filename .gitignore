@@ -1,22 +1,54 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-.claude/
-.kotlin/
-/build
-/captures
-.idea/deploymentTargetSelector.xml
-.externalNativeBuild
-.cxx
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Local machine config
 local.properties
+
+# Android Studio / IntelliJ
+*.iml
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/deploymentTargetSelector.xml
+.idea/shelf/
+.idea/usage.statistics.xml
+.idea/contentModel.xml
+.idea/dictionaries/
+.idea/httpRequests/
+
+# Kotlin
+.kotlin/
+
+# Built artifacts
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+*.class
+/captures
+.externalNativeBuild/
+.cxx/
+
+# Signing (keep keystore.properties.example in repo)
 keystore.properties
 keystore/
 *.jks
 *.keystore
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / agent
+.claude/
+.vscode/
+
+# Third-party reference code (not part of this app)
+AndroidLiquidGlass-2.0.0/
