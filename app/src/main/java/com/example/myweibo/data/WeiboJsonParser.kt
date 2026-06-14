@@ -92,6 +92,78 @@ object WeiboJsonParser {
         }
     }
 
+    fun parseMweiboReposts(raw: String, page: Int = 1): RepostsPage {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 0) != 1) {
+            val message = root.optNullableString("msg")?.trim().orEmpty()
+            throw IllegalStateException(message.ifBlank { "转发列表加载失败，请稍后重试" })
+        }
+        val data = root.optJSONObject("data")
+            ?: throw IllegalStateException("转发列表返回数据为空")
+        val arr = data.optJSONArray("data") ?: JSONArray()
+        val items = buildList {
+            for (index in 0 until arr.length()) {
+                val repost = arr.optJSONObject(index) ?: continue
+                parseMweiboRepostItem(repost)?.let(::add)
+            }
+        }
+        val maxPage = data.optInt("max", 0)
+        val totalNumber = data.optLong("total_number", 0L)
+        val nextPage = when {
+            items.isEmpty() -> null
+            maxPage > 0 && page < maxPage -> page + 1
+            totalNumber > 0L && page * MWEIBO_REPOST_PAGE_SIZE < totalNumber -> page + 1
+            items.size >= MWEIBO_REPOST_PAGE_SIZE -> page + 1
+            else -> null
+        }
+        return RepostsPage(items = items, nextPage = nextPage)
+    }
+
+    private const val MWEIBO_REPOST_PAGE_SIZE = 10
+
+    private fun parseMweiboRepostItem(repost: JSONObject): CommentItem? {
+        val normalized = normalizeMweiboStatus(repost)
+        val user = normalized.optJSONObject("user")
+        val id = normalized.optNullableString("idstr")
+            ?: normalized.optNullableString("id")
+            ?: return null
+        val htmlText = normalized.optNullableString("text") ?: ""
+        val images = parseCommentImages(normalized)
+        val text = parseMweiboRepostText(normalized, htmlText, images)
+        return CommentItem(
+            id = id,
+            authorId = userId(user),
+            authorName = parseUserDisplayName(user),
+            authorAvatarUrl = user?.optNullableString("avatar_hd")
+                ?: user?.optNullableString("profile_image_url"),
+            text = text,
+            createdAt = normalized.optNullableString("created_at"),
+            likesCount = formatCount(normalized.opt("like_counts")),
+            emoticons = extractEmoticonsFromHtml(htmlText),
+            images = images,
+        )
+    }
+
+    private fun parseMweiboRepostText(
+        repost: JSONObject,
+        htmlText: String,
+        images: List<FeedImage>,
+    ): String {
+        val rawText = repost.optNullableString("raw_text")?.trim().orEmpty()
+        if (rawText.isNotBlank()) {
+            var text = rawText
+            text = stripEntityTokens(
+                text,
+                imageUrlTokensFromUrlStruct(repost.optJSONArray("url_struct"), rawText),
+            )
+            if (images.isNotEmpty()) {
+                text = stripOrphanMediaLinks(text)
+            }
+            return text
+        }
+        return parseCommentText(repost, images).ifBlank { plainText(htmlText) }
+    }
+
     private fun parseCommentText(comment: JSONObject, images: List<FeedImage>): String {
         val raw = comment.optNullableString("text_raw")
             ?: comment.optNullableString("text")
@@ -1116,6 +1188,17 @@ object WeiboJsonParser {
         }
     }
 
+    private fun parseVideoOrientation(mediaInfo: JSONObject): String? =
+        mediaInfo.optNullableString("video_orientation")?.trim()?.takeIf { it.isNotBlank() }
+
+    private fun parseMediaCoverDimensions(pageInfo: JSONObject, mediaInfo: JSONObject): Pair<Int?, Int?> {
+        val bigPic = mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")
+        val width = bigPic?.optInt("width")?.takeIf { it > 0 }
+        val height = bigPic?.optInt("height")?.takeIf { it > 0 }
+        if (width != null && height != null) return width to height
+        return null to null
+    }
+
     private fun parseMedia(status: JSONObject): FeedMedia? {
         val pageInfo = status.optJSONObject("page_info") ?: return parseMixVideo(status)
         val mediaInfo = pageInfo.optJSONObject("media_info") ?: return parseMixVideo(status)
@@ -1136,6 +1219,7 @@ object WeiboJsonParser {
             val cover = pageInfo.optNullableString("page_pic")
                 ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
                 ?: mediaInfo.optJSONObject("subscribe")?.optNullableString("cover")
+            val (coverWidth, coverHeight) = parseMediaCoverDimensions(pageInfo, mediaInfo)
             return FeedMedia(
                 type = MediaType.Live,
                 title = mediaInfo.optNullableString("video_title")
@@ -1147,12 +1231,16 @@ object WeiboJsonParser {
                 liveStatus = liveStatus,
                 downloadUrl = null,
                 durationSeconds = if (liveStatus == 3) parseMediaDuration(pageInfo, mediaInfo) else null,
+                videoOrientation = parseVideoOrientation(mediaInfo),
+                coverWidth = coverWidth,
+                coverHeight = coverHeight,
             )
         }
         val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: return parseMixVideo(status)
         val cover = pageInfo.optNullableString("page_pic")
             ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
             ?: mediaInfo.optJSONObject("subscribe")?.optNullableString("cover")
+        val (coverWidth, coverHeight) = parseMediaCoverDimensions(pageInfo, mediaInfo)
         return FeedMedia(
             type = type,
             title = mediaInfo.optNullableString("video_title")
@@ -1166,6 +1254,9 @@ object WeiboJsonParser {
             streamUrl = streamUrl,
             downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
             durationSeconds = parseMediaDuration(pageInfo, mediaInfo),
+            videoOrientation = parseVideoOrientation(mediaInfo),
+            coverWidth = coverWidth,
+            coverHeight = coverHeight,
         )
     }
 
@@ -1187,6 +1278,7 @@ object WeiboJsonParser {
             val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: continue
             val cover = data.optNullableString("page_pic")
                 ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
+            val (coverWidth, coverHeight) = parseMediaCoverDimensions(data, mediaInfo)
             return FeedMedia(
                 type = MediaType.Video,
                 title = mediaInfo.optNullableString("video_title")
@@ -1196,6 +1288,9 @@ object WeiboJsonParser {
                 streamUrl = streamUrl,
                 downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
                 durationSeconds = parseMediaDuration(data, mediaInfo),
+                videoOrientation = parseVideoOrientation(mediaInfo),
+                coverWidth = coverWidth,
+                coverHeight = coverHeight,
             )
         }
         return null

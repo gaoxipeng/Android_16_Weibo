@@ -88,6 +88,12 @@ data class FeedMedia(
     val liveStatus: Int? = null,
     /** 直播回放地址 replay_hd */
     val replayUrl: String? = null,
+    /** 视频方向：vertical / horizontal，来自 media_info.video_orientation */
+    val videoOrientation: String? = null,
+    /** 封面图宽度，来自 big_pic_info */
+    val coverWidth: Int? = null,
+    /** 封面图高度，来自 big_pic_info */
+    val coverHeight: Int? = null,
 ) {
     fun resolvedPlaybackUrl(): String? = when {
         type != MediaType.Live -> streamUrl.takeIf { it.isNotBlank() }
@@ -152,6 +158,11 @@ data class CommentItem(
     val replyToAuthorId: String? = null,
     val moreInfoText: String? = null,
     val nestedNextCursor: String? = null,
+)
+
+data class RepostsPage(
+    val items: List<CommentItem>,
+    val nextPage: Int?,
 )
 
 data class UserProfile(

@@ -4,14 +4,21 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -351,12 +358,15 @@ private val HintCapsuleWhite = Color.White
 private val HintCapsuleText = Color(0xFF1F1F1F)
 private val HintCapsulePlaceholder = Color(0xFFAAAAAA)
 private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
+private val SettingsBottomBarInset = 96.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
 private const val SingleImageMaxHeightToWidth = 0.7f
 private const val SingleImageMaxWidthFraction = 0.7f
+private const val VideoMaxHeightToWidth = 1f
+private const val VideoMaxWidthFraction = 1f
 
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
@@ -417,12 +427,21 @@ private data class AlbumViewerState(
     val albumScrollOffset: Int = 0,
 )
 
+private enum class DetailContentSection {
+    Comments,
+    Reposts,
+}
+
 private data class DetailSnapshot(
     val item: FeedItem,
     val comments: List<CommentItem>,
     val commentsCursor: String?,
     val commentsHasMore: Boolean,
     val commentSort: CommentSort,
+    val contentSection: DetailContentSection = DetailContentSection.Comments,
+    val reposts: List<CommentItem> = emptyList(),
+    val repostsNextPage: Int? = null,
+    val repostsHasMore: Boolean = true,
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
     val albumViewerState: AlbumViewerState? = null,
@@ -627,6 +646,11 @@ fun WeiboApp() {
     var commentsCursor by remember { mutableStateOf<String?>(null) }
     var commentsHasMore by remember { mutableStateOf(true) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
+    var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
+    var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
+    var repostsLoading by remember { mutableStateOf(false) }
+    var repostsNextPage by remember { mutableStateOf<Int?>(null) }
+    var repostsHasMore by remember { mutableStateOf(true) }
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
@@ -965,6 +989,10 @@ fun WeiboApp() {
             commentsCursor = commentsCursor,
             commentsHasMore = commentsHasMore,
             commentSort = commentSort,
+            contentSection = detailContentSection,
+            reposts = reposts,
+            repostsNextPage = repostsNextPage,
+            repostsHasMore = repostsHasMore,
             scrollIndex = lastDetailScroll.index,
             scrollOffset = lastDetailScroll.offset,
             albumViewerState = albumViewerState,
@@ -978,6 +1006,10 @@ fun WeiboApp() {
         commentsCursor = snapshot.commentsCursor
         commentsHasMore = snapshot.commentsHasMore
         commentSort = snapshot.commentSort
+        detailContentSection = snapshot.contentSection
+        reposts = snapshot.reposts
+        repostsNextPage = snapshot.repostsNextPage
+        repostsHasMore = snapshot.repostsHasMore
         albumViewerState = snapshot.albumViewerState
         activeDetailInstanceKey = snapshot.instanceKey
         lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
@@ -1660,6 +1692,50 @@ fun WeiboApp() {
         }
     }
 
+    fun reloadReposts() {
+        val item = selectedItem ?: return
+        scope.launch {
+            repostsLoading = true
+            repostsNextPage = null
+            repostsHasMore = true
+            runCatching { session.loadReposts(item, page = 1) }
+                .onSuccess { page ->
+                    reposts = page.items
+                    repostsNextPage = page.nextPage
+                    repostsHasMore = page.nextPage != null
+                }
+                .onFailure { error ->
+                    showMessage("\u8F6C\u53D1\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
+                }
+            repostsLoading = false
+        }
+    }
+
+    fun selectDetailContentSection(section: DetailContentSection) {
+        if (detailContentSection == section) return
+        detailContentSection = section
+        if (section == DetailContentSection.Reposts && reposts.isEmpty() && !repostsLoading) {
+            reloadReposts()
+        }
+    }
+
+    fun reloadDetailContent() {
+        when (detailContentSection) {
+            DetailContentSection.Comments -> reloadComments()
+            DetailContentSection.Reposts -> reloadReposts()
+        }
+    }
+
+    fun resetDetailContentState() {
+        comments = emptyList()
+        commentsCursor = null
+        commentsHasMore = true
+        detailContentSection = DetailContentSection.Comments
+        reposts = emptyList()
+        repostsNextPage = null
+        repostsHasMore = true
+    }
+
     fun openDetailInternal(item: FeedItem) {
         pushNavigation {
             val resolved = resolveFeedItem(item)
@@ -1667,9 +1743,7 @@ fun WeiboApp() {
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
-            comments = emptyList()
-            commentsCursor = null
-            commentsHasMore = true
+            resetDetailContentState()
             if (resolved.isLongText) {
                 loadLongText(resolved)
             }
@@ -1695,9 +1769,7 @@ fun WeiboApp() {
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
-            comments = emptyList()
-            commentsCursor = null
-            commentsHasMore = true
+            resetDetailContentState()
             if (resolved.isLongText) {
                 loadLongText(resolved)
             }
@@ -1750,7 +1822,29 @@ fun WeiboApp() {
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
                 }
+                .onFailure { error ->
+                    showMessage("评论加载失败", error.message ?: "微博接口无响应")
+                }
             commentsLoading = false
+        }
+    }
+
+    fun loadMoreReposts() {
+        val item = selectedItem ?: return
+        val page = repostsNextPage ?: return
+        if (repostsLoading || !repostsHasMore) return
+        scope.launch {
+            repostsLoading = true
+            runCatching { session.loadReposts(item, page) }
+                .onSuccess { result ->
+                    reposts = mergeCommentItems(reposts, result.items)
+                    repostsNextPage = result.nextPage
+                    repostsHasMore = result.nextPage != null
+                }
+                .onFailure { error ->
+                    showMessage("转发加载失败", error.message ?: "微博接口无响应")
+                }
+            repostsLoading = false
         }
     }
 
@@ -2302,17 +2396,23 @@ fun WeiboApp() {
                             ) {
                                 DetailScreen(
                                     item = detailItem,
+                                    contentSection = detailContentSection,
                                     comments = comments,
+                                    reposts = reposts,
                                     commentSort = commentSort,
                                     isLoadingComments = commentsLoading,
+                                    isLoadingReposts = repostsLoading,
                                     isLongTextLoading = { it.statusId in longTextLoadingIds },
                                     onLoadLongText = ::loadLongText,
                                     onToggleLike = ::toggleStatusLike,
                                     onBack = { navigateBack() },
-                                    onRefresh = { reloadComments() },
+                                    onRefresh = { reloadDetailContent() },
                                     onCommentSortChange = ::changeCommentSort,
                                     onLoadMoreComments = { loadMoreComments() },
+                                    onLoadMoreReposts = { loadMoreReposts() },
                                     commentsHasMore = commentsHasMore,
+                                    repostsHasMore = repostsHasMore,
+                                    onSelectContentSection = ::selectDetailContentSection,
                                     listState = detailListState,
                                     onMediaClick = ::pushMediaPreview,
                                     emoticonMap = emoticonMap,
@@ -2678,6 +2778,13 @@ private fun FloatingBottomBar(
                 onTabChangeState(tabs[targetIndex])
             }
 
+            fun commitExpandedTabTap(rawX: Float) {
+                val targetIndex = indexForX(rawX)
+                val targetTab = tabs[targetIndex]
+                if (targetTab == selectedTab && targetTab != MainTab.Feed) return
+                onTabChangeState(targetTab)
+            }
+
             LaunchedEffect(selectedIndex, restingPillWidthPx, gestureActive) {
                 if (!gestureActive) {
                     pillOffsetAnim.animateTo(
@@ -2823,33 +2930,48 @@ private fun FloatingBottomBar(
                 Box(
                     modifier = Modifier
                         .matchParentSize()
-                        .pointerInput(maxWidthPx, gesturePillWidthPx) {
+                        .pointerInput(maxWidthPx, gesturePillWidthPx, selectedIndex) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
-                                var targetIndex = indexForX(down.position.x)
-                                gestureActive = true
-                                scope.launch {
-                                    pillOffsetAnim.snapTo(
-                                        pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
-                                    )
-                                }
-                                updateGesturePill(down.position.x)
-                                down.consume()
+                                val startX = down.position.x
+                                var targetIndex = indexForX(startX)
+                                var dragStarted = false
+                                val touchSlop = viewConfiguration.touchSlop
 
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     val change = event.changes.firstOrNull { it.id == down.id }
                                         ?: event.changes.firstOrNull()
                                         ?: break
-                                    targetIndex = indexForX(change.position.x)
-                                    updateGesturePill(change.position.x)
-                                    change.consume()
+
                                     if (!change.pressed) {
+                                        if (dragStarted) {
+                                            finishGesture(targetIndex)
+                                        } else {
+                                            commitExpandedTabTap(startX)
+                                        }
                                         break
                                     }
-                                }
 
-                                finishGesture(targetIndex)
+                                    val deltaX = change.position.x - startX
+                                    if (!dragStarted) {
+                                        if (abs(deltaX) > touchSlop) {
+                                            dragStarted = true
+                                            gestureActive = true
+                                            scope.launch {
+                                                pillOffsetAnim.snapTo(
+                                                    pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
+                                                )
+                                            }
+                                            targetIndex = indexForX(change.position.x)
+                                            updateGesturePill(change.position.x)
+                                        }
+                                    } else {
+                                        targetIndex = indexForX(change.position.x)
+                                        updateGesturePill(change.position.x)
+                                    }
+                                    change.consume()
+                                }
                             }
                         },
                 )
@@ -3705,6 +3827,8 @@ private fun FeedCard(
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    onCommentClick: (() -> Unit)? = null,
+    onRepostClick: (() -> Unit)? = null,
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
     insetRounded: Boolean = false,
@@ -3793,7 +3917,8 @@ private fun FeedCard(
             StatusActions(
                 modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 item = item,
-                onCommentClick = onClick,
+                onRepostClick = onRepostClick ?: onClick,
+                onCommentClick = onCommentClick ?: onClick,
                 onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
             )
         }
@@ -3811,7 +3936,6 @@ private fun FeedCard(
                     .fillMaxWidth()
                     .padding(horizontal = FeedCardContentHorizontalPadding),
                 shape = RoundedCornerShape(8.dp),
-                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
                 colors = CardDefaults.elevatedCardColors(
                     containerColor = Color.White,
                 ),
@@ -3897,10 +4021,10 @@ private fun QuotedStatus(
             .fillMaxWidth()
             .border(0.5.dp, Color(0xFFE8E8E8), RoundedCornerShape(8.dp)),
         shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
         colors = CardDefaults.elevatedCardColors(
             containerColor = StatusQuotedBackground,
         ),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
     ) {
         Column(
             Modifier.padding(14.dp),
@@ -4128,11 +4252,15 @@ private fun AuthorRow(
     }
 }
 
-private fun singleImageDisplayAspectRatio(width: Int, height: Int): Float {
+private fun singleImageDisplayAspectRatio(
+    width: Int,
+    height: Int,
+    maxHeightToWidth: Float = SingleImageMaxHeightToWidth,
+): Float {
     if (width <= 0 || height <= 0) return 1f
     val naturalAspect = width.toFloat() / height
     val heightToWidth = height.toFloat() / width
-    val minAspectFromHeightCap = 1f / SingleImageMaxHeightToWidth
+    val minAspectFromHeightCap = 1f / maxHeightToWidth
     val aspect = if (heightToWidth <= 1.35f) {
         naturalAspect.coerceIn(0.75f, 3f)
     } else {
@@ -4145,6 +4273,22 @@ private fun singleImageDisplayAspectRatio(width: Int, height: Int): Float {
         naturalAspect.coerceAtLeast(minAspect)
     }
     return aspect.coerceAtLeast(minAspectFromHeightCap).coerceAtMost(3f)
+}
+
+private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float {
+    val width = media.coverWidth ?: when (media.videoOrientation) {
+        "vertical" -> 9
+        else -> 16
+    }
+    val height = media.coverHeight ?: when (media.videoOrientation) {
+        "vertical" -> 16
+        else -> 9
+    }
+    return singleImageDisplayAspectRatio(
+        width = width,
+        height = height,
+        maxHeightToWidth = VideoMaxHeightToWidth,
+    )
 }
 
 @Composable
@@ -5795,7 +5939,14 @@ private fun InlineVideoPlayer(
     val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
     val inlinePlaying = videoCoordinator.activeKey == playbackKey &&
         videoCoordinator.fullscreenKey != playbackKey
-    var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
+    val displayAspectRatio = remember(
+        media.streamUrl,
+        media.videoOrientation,
+        media.coverWidth,
+        media.coverHeight,
+    ) {
+        feedVideoDisplayAspectRatio(media)
+    }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
@@ -5833,21 +5984,25 @@ private fun InlineVideoPlayer(
         )
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(aspectRatio.coerceIn(0.56f, 1.78f))
-            .onGloballyPositioned { coordinates ->
-                anchorBounds = coordinates.boundsInWindow()
-            }
-            .graphicsLayer {
-                scaleX = peekScale
-                scaleY = peekScale
-                alpha = if (actionOpen) 0f else 1f
-            }
-            .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-            .pointerInput(media.streamUrl, media.type) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(VideoMaxWidthFraction)
+                .aspectRatio(displayAspectRatio)
+                .onGloballyPositioned { coordinates ->
+                    anchorBounds = coordinates.boundsInWindow()
+                }
+                .graphicsLayer {
+                    scaleX = peekScale
+                    scaleY = peekScale
+                    alpha = if (actionOpen) 0f else 1f
+                }
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color.Black)
+                .pointerInput(media.streamUrl, media.type) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var lastPosition = down.position
@@ -5933,7 +6088,8 @@ private fun InlineVideoPlayer(
             WeiboVideoSurface(
                 media = media,
                 isFullscreen = false,
-                onAspectRatio = { aspectRatio = it },
+                videoResizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
+                onAspectRatio = {},
                 onFullscreen = {
                     videoCoordinator.activeKey = null
                     onFullscreenRequest()
@@ -5986,6 +6142,7 @@ private fun InlineVideoPlayer(
                 style = MaterialTheme.typography.labelLarge,
             )
         }
+        }
     }
 }
 
@@ -6000,6 +6157,7 @@ private fun WeiboVideoSurface(
     controlsEnabled: Boolean = true,
     resumePosition: Boolean = true,
     savePositionOnDispose: Boolean = true,
+    videoResizeMode: Int = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
 ) {
     val context = LocalContext.current
     val onMessage = LocalUiMessenger.current
@@ -6281,12 +6439,12 @@ private fun WeiboVideoSurface(
                     .inflate(R.layout.view_video_player, null, false) as androidx.media3.ui.PlayerView).apply {
                     this.player = player
                     useController = false
-                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    resizeMode = videoResizeMode
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
                 }
             },
             update = {
-                it.resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                it.resizeMode = videoResizeMode
                 it.player = player
                 it.requestLayout()
             },
@@ -6609,6 +6767,7 @@ private val StatusLikeColor = Color(0xFFE94326)
 private fun StatusActions(
     item: FeedItem,
     modifier: Modifier = Modifier,
+    onRepostClick: (() -> Unit)? = null,
     onCommentClick: (() -> Unit)? = null,
     onToggleLike: (() -> Unit)? = null,
 ) {
@@ -6634,7 +6793,7 @@ private fun StatusActions(
             contentAlignment = Alignment.Center,
         ) {
             AssistChip(
-                onClick = {},
+                onClick = { onRepostClick?.invoke() },
                 modifier = Modifier.height(24.dp),
                 colors = AssistChipDefaults.assistChipColors(containerColor = Color.Transparent, labelColor = actionColor),
                 border = null,
@@ -6708,19 +6867,25 @@ private fun StatusActions(
 @Composable
 private fun DetailScreen(
     item: FeedItem,
+    contentSection: DetailContentSection,
     comments: List<CommentItem>,
+    reposts: List<CommentItem>,
     commentSort: CommentSort,
     isLoadingComments: Boolean,
+    isLoadingReposts: Boolean,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onCommentSortChange: (CommentSort) -> Unit,
+    onSelectContentSection: (DetailContentSection) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     emoticonMap: Map<String, String> = emptyMap(),
     onRetweetClick: ((FeedItem) -> Unit)? = null,
     onUserClick: ((String) -> Unit)? = null,
     commentsHasMore: Boolean = true,
+    repostsHasMore: Boolean = true,
     listState: LazyListState = rememberLazyListState(),
     onLoadMoreComments: () -> Unit = {},
+    onLoadMoreReposts: () -> Unit = {},
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
@@ -6735,21 +6900,35 @@ private fun DetailScreen(
             commentImagePreview = images to index.coerceIn(0, images.lastIndex)
         }
     }
+    val showingReposts = contentSection == DetailContentSection.Reposts
+    val sectionItems = if (showingReposts) reposts else comments
+    val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
+    val sectionHasMore = if (showingReposts) repostsHasMore else commentsHasMore
+    val onLoadMoreSection = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
 
-    LaunchedEffect(listState) {
+    LaunchedEffect(
+        listState,
+        contentSection,
+        sectionItems.size,
+        isLoadingSection,
+        sectionHasMore,
+    ) {
         snapshotFlow {
             val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
-            info.totalItemsCount > 0 && last >= info.totalItemsCount - 3
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            info.totalItemsCount to last
         }
-            .distinctUntilChanged()
-            .filter { it }
-            .collect { onLoadMoreComments() }
+            .filter { (total, last) -> total > 0 && last >= total - 3 }
+            .collect {
+                if (sectionHasMore && !isLoadingSection) {
+                    onLoadMoreSection()
+                }
+            }
     }
 
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
-        isRefreshing = isLoadingComments,
+        isRefreshing = isLoadingSection,
         onRefresh = onRefresh,
         modifier = Modifier.fillMaxSize(),
     ) {
@@ -6779,6 +6958,8 @@ private fun DetailScreen(
                             onLoadLongText = onLoadLongText,
                             onToggleLike = onToggleLike,
                             onUrlEntityClick = onUrlEntityClick,
+                            onCommentClick = { onSelectContentSection(DetailContentSection.Comments) },
+                            onRepostClick = { onSelectContentSection(DetailContentSection.Reposts) },
                             showAuthorRow = false,
                             insetRounded = true,
                         )
@@ -6790,19 +6971,25 @@ private fun DetailScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                         ) {
                             Text(
-                                text = "评论 ${item.commentsCount}",
+                                text = if (showingReposts) {
+                                    "转发 ${item.repostsCount}"
+                                } else {
+                                    "评论 ${item.commentsCount}"
+                                },
                                 fontSize = CommentAuthorFontSize,
                                 fontWeight = FontWeight.SemiBold,
                             )
-                            CommentSortToggle(
-                                selected = commentSort,
-                                onSelected = onCommentSortChange,
-                            )
+                            if (!showingReposts) {
+                                CommentSortToggle(
+                                    selected = commentSort,
+                                    onSelected = onCommentSortChange,
+                                )
+                            }
                         }
                     }
                 }
 
-                if (isLoadingComments && comments.isEmpty() && listState.firstVisibleItemIndex > 0) {
+                if (isLoadingSection && sectionItems.isEmpty() && listState.firstVisibleItemIndex > 0) {
                     item {
                         Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                             AppLoadingIndicator()
@@ -6810,10 +6997,10 @@ private fun DetailScreen(
                     }
                 }
 
-                if (comments.isEmpty() && !isLoadingComments) {
+                if (sectionItems.isEmpty() && !isLoadingSection) {
                     item {
                         Text(
-                            text = "暂无评论",
+                            text = if (showingReposts) "暂无转发" else "暂无评论",
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 8.dp),
@@ -6825,16 +7012,24 @@ private fun DetailScreen(
                     }
                 }
 
-                itemsIndexed(comments, key = { _, comment -> comment.id }) { index, comment ->
+                itemsIndexed(sectionItems, key = { _, entry -> entry.id }) { index, entry ->
                     CommentRow(
-                        comment = comment,
+                        comment = entry,
                         onUserClick = onUserClick,
-                        onExpandNestedComments = onExpandNestedComments,
+                        onExpandNestedComments = if (showingReposts) null else onExpandNestedComments,
                         nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                         onCommentImageClick = openCommentImage,
                     )
-                    if (index < comments.lastIndex) {
+                    if (index < sectionItems.lastIndex) {
                         CommentDivider()
+                    }
+                }
+
+                if (isLoadingSection && sectionItems.isNotEmpty()) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                            AppLoadingIndicator()
+                        }
                     }
                 }
             }
@@ -7810,6 +8005,17 @@ private fun MobileWeiboWebScreen(
     val mobileUserAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
             "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
+    val fileUploadBridge = remember { MobileWebFileUploadBridge() }
+
+    val fileChooserLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val callback = fileUploadBridge.callback
+        fileUploadBridge.callback = null
+        callback?.onReceiveValue(
+            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data),
+        )
+    }
 
     val webView = remember(pageUrl) {
         WebView(context).apply {
@@ -7839,7 +8045,20 @@ private fun MobileWeiboWebScreen(
     }
 
     DisposableEffect(webView) {
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?,
+            ): Boolean = fileUploadBridge.handleShowFileChooser(
+                filePathCallback = filePathCallback,
+                fileChooserParams = fileChooserParams,
+                launchChooser = fileChooserLauncher::launch,
+            )
+        }
         onDispose {
+            fileUploadBridge.cancelPendingUpload()
+            webView.webChromeClient = null
             webView.stopLoading()
             webView.destroy()
         }
@@ -7880,6 +8099,35 @@ private fun MessagesScreen(
         onRootBack = onRootBack,
         scrollToTopOnPageFinished = { url -> url?.contains("/chat", ignoreCase = true) != true },
     )
+}
+
+private class MobileWebFileUploadBridge {
+    var callback: ValueCallback<Array<Uri>>? = null
+
+    fun cancelPendingUpload() {
+        callback?.onReceiveValue(null)
+        callback = null
+    }
+
+    fun handleShowFileChooser(
+        filePathCallback: ValueCallback<Array<Uri>>?,
+        fileChooserParams: WebChromeClient.FileChooserParams?,
+        launchChooser: (Intent) -> Unit,
+    ): Boolean {
+        cancelPendingUpload()
+        callback = filePathCallback
+        val intent = fileChooserParams?.createIntent() ?: run {
+            cancelPendingUpload()
+            return false
+        }
+        return try {
+            launchChooser(intent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            cancelPendingUpload()
+            false
+        }
+    }
 }
 
 private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
@@ -8496,47 +8744,275 @@ private fun SettingsScreen(
     var accountExpanded by remember { mutableStateOf(false) }
     var emoticonExpanded by remember { mutableStateOf(false) }
     var imageExpanded by remember { mutableStateOf(false) }
-    val emoticonCount = emoticonMap.size
+    var showHelp by remember { mutableStateOf(false) }
 
-    SettingsPageShell(title = "设置", onBack = onBack) {
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+    BackHandler {
+        if (showHelp) {
+            showHelp = false
+        } else {
+            onBack()
+        }
+    }
+
+    SettingsPageShell(title = if (showHelp) "使用说明" else "设置", onBack = onBack) {
+        if (showHelp) {
+            SettingsHelpContent()
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    start = 16.dp,
+                    top = 12.dp,
+                    end = 16.dp,
+                    bottom = SettingsBottomBarInset,
+                ),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item {
+                    SettingsAccountCard(
+                        expanded = accountExpanded,
+                        onExpandedChange = { accountExpanded = it },
+                        accounts = accounts,
+                        activeAccountId = activeAccountId,
+                        hasLoginCookie = hasLoginCookie,
+                        onSwitchAccount = onSwitchAccount,
+                        onAddAccount = onAddAccount,
+                    )
+                }
+                item {
+                    SettingsEmoticonCard(
+                        expanded = emoticonExpanded,
+                        onExpandedChange = { emoticonExpanded = it },
+                        emoticonMap = emoticonMap,
+                        emoticonSyncing = emoticonSyncing,
+                        onSyncEmoticons = onSyncEmoticons,
+                    )
+                }
+                item {
+                    SettingsImageCard(
+                        expanded = imageExpanded,
+                        onExpandedChange = { imageExpanded = it },
+                        quality = feedThumbnailQuality,
+                        onQualityChange = onFeedThumbnailQualityChange,
+                    )
+                }
+                item {
+                    SettingsPlaybackCard(
+                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                    )
+                }
+                item {
+                    SettingsHelpEntryCard(onOpen = { showHelp = true })
+                }
+            }
+        }
+    }
+}
+
+private data class HelpSection(
+    val title: String,
+    val items: List<String>,
+)
+
+private val appHelpSections = listOf(
+    HelpSection(
+        title = "开始使用",
+        items = listOf(
+            "本应用通过微博网页登录态读取数据，首次使用请到「我的 → 设置 → 账号管理」完成登录。",
+            "登录后可浏览首页信息流、搜索、个人主页，以及写微博、查看消息等网页功能。",
+            "若首页为空，请确认已登录，并在首页下拉刷新或再次点击底部「首页」同步内容。",
+        ),
+    ),
+    HelpSection(
+        title = "底部导航",
+        items = listOf(
+            "底部共有五个入口：首页、消息、搜索、写微博、我的。",
+            "向下滚动列表时，底部栏会自动收起到左侧小胶囊；单击小胶囊可展开。",
+            "展开后点击空白区域可再次收起；点击其他 Tab 时选中块会滑向目标位置。",
+            "在小胶囊上长按并左右拖动，可快速切换 Tab；松手后停留在目标页。",
+            "双击小胶囊：在首页刷新信息流；在「我的」回到顶部并刷新资料。",
+            "再次点击当前选中的「首页」，也会从顶部刷新关注流。",
+            "长按底部「首页」按钮，可在「最新微博」与「朋友圈」之间切换。",
+            "在「消息」「写微博」页按系统返回键，优先网页内后退；无法后退时留在当前页。",
+            "在其他 Tab 按返回键会先回到首页；在首页连按两次返回键退出应用。",
+        ),
+    ),
+    HelpSection(
+        title = "首页信息流",
+        items = listOf(
+            "在首页下拉可刷新关注流；滚动到底部会自动加载更多。",
+            "点击微博卡片进入详情；点击头像或 @昵称 进入用户主页。",
+            "点击正文中的 #话题# 会跳转到搜索页并自动搜索该话题。",
+            "长微博可点「阅读全文」展开；正文里的「查看图片」链接可直接看图。",
+            "点击卡片中的链接卡片，会在应用内打开文章阅读页。",
+            "点击评论区域进入详情；长按「赞」区域可快速点赞或取消赞。",
+            "点击卡片右上角菜单，可跳转官方微博或分享链接。",
+            "刷新完成后，顶部会短暂显示本次更新条数提示。",
+        ),
+    ),
+    HelpSection(
+        title = "图片与视频",
+        items = listOf(
+            "点击信息流中的图片进入全屏查看；多张图片可左右滑动切换。",
+            "长按图片会弹出预览菜单，可保存、保存全部或分享；松手后可进入全屏。",
+            "全屏看图支持双指缩放、拖动；在边缘时可左右切换图片。",
+            "向下拖动图片可关闭全屏；长按全屏图片同样可保存或分享。",
+            "Live Photo 会在全屏时自动播放动态效果。",
+            "点击视频可 inline 播放；长按视频可预览，松手进入全屏。",
+            "全屏视频支持画中画；可在设置中控制切到后台后是否继续播放声音。",
+            "从「我的」或用户主页进入相册，可按日期浏览并查看原图，部分图片可关联到原微博。",
+        ),
+    ),
+    HelpSection(
+        title = "微博详情与评论",
+        items = listOf(
+            "详情页下拉可刷新微博与评论；评论列表滚动到底会自动加载更多。",
+            "点击评论排序按钮，可在「按时间」与「按热度」之间切换。",
+            "支持楼中楼评论展开；评论中的图片、链接、话题与首页规则一致。",
+            "详情页同样支持点赞、查看媒体、跳转用户主页等操作。",
+        ),
+    ),
+    HelpSection(
+        title = "搜索",
+        items = listOf(
+            "搜索框左侧按钮用于切换「微博 / 用户」搜索模式，点击即可循环切换。",
+            "搜索微博时，结果页可切换「综合 / 实时」排序。",
+            "未登录时无法加载热搜与搜索结果，请先到设置中登录。",
+            "输入关键词后搜索；在结果页按返回键可清空结果并回到搜索首页。",
+            "搜索结果中的微博、用户交互方式与首页、个人主页一致。",
+        ),
+    ),
+    HelpSection(
+        title = "写微博与消息",
+        items = listOf(
+            "「写微博」「消息」使用移动版微博网页，登录态与首页共用。",
+            "写微博时可从相册选择图片发布；网页内返回优先于切 Tab。",
+            "消息页可查看私信与通知，交互规则与官方移动网页一致。",
+        ),
+    ),
+    HelpSection(
+        title = "我的与用户主页",
+        items = listOf(
+            "「我的」顶部封面、头像均可点击放大查看；封面右上角齿轮进入设置。",
+            "个人页可在「微博 / 相册」两个标签间切换；相册按月份分组展示。",
+            "点击粉丝、关注等统计项，可打开关注 / 粉丝列表并查看其他用户。",
+            "访问他人主页时，交互与「我的」类似，但通常不提供设置入口。",
+            "列表滚动到顶部附近时，顶部资料区会随滚动逐渐收起。",
+        ),
+    ),
+    HelpSection(
+        title = "设置项说明",
+        items = listOf(
+            "账号管理：登录、添加账号、切换已保存账号；切换后会重新加载对应账号数据。",
+            "表情同步：拉取微博表情到本地，改善正文与评论中的表情显示。",
+            "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
+            "后台播放声音：关闭后，切到后台或打开其他页面时会自动暂停视频声音。",
+        ),
+    ),
+)
+
+@Composable
+private fun SettingsPlainCard(
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    val shape = RoundedCornerShape(8.dp)
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
+        shape = shape,
+        color = Color.White,
+        shadowElevation = 0.dp,
+        tonalElevation = 0.dp,
+        content = content,
+    )
+}
+
+@Composable
+private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
+    SettingsPlainCard(onClick = onOpen) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
+            Text(
+                text = "使用说明",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = "了解底部导航、手势操作与各页面功能",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsHelpContent() {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(
+            start = 16.dp,
+            top = 4.dp,
+            end = 16.dp,
+            bottom = SettingsBottomBarInset,
+        ),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Text(
+                text = "本页汇总了当前版本的主要交互方式。部分功能依赖微博网页接口，若官方调整页面，个别入口可能失效。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        appHelpSections.forEach { section ->
             item {
-                SettingsAccountCard(
-                    expanded = accountExpanded,
-                    onExpandedChange = { accountExpanded = it },
-                    accounts = accounts,
-                    activeAccountId = activeAccountId,
-                    hasLoginCookie = hasLoginCookie,
-                    onSwitchAccount = onSwitchAccount,
-                    onAddAccount = onAddAccount,
-                )
+                SettingsHelpSectionCard(section = section)
             }
-            item {
-                SettingsEmoticonCard(
-                    expanded = emoticonExpanded,
-                    onExpandedChange = { emoticonExpanded = it },
-                    emoticonMap = emoticonMap,
-                    emoticonSyncing = emoticonSyncing,
-                    onSyncEmoticons = onSyncEmoticons,
-                )
-            }
-            item {
-                SettingsImageCard(
-                    expanded = imageExpanded,
-                    onExpandedChange = { imageExpanded = it },
-                    quality = feedThumbnailQuality,
-                    onQualityChange = onFeedThumbnailQualityChange,
-                )
-            }
-            item {
-                SettingsPlaybackCard(
-                    backgroundPlaybackEnabled = backgroundPlaybackEnabled,
-                    onBackgroundPlaybackChange = onBackgroundPlaybackChange,
-                )
+        }
+    }
+}
+
+@Composable
+private fun SettingsHelpSectionCard(section: HelpSection) {
+    SettingsPlainCard {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = section.title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            section.items.forEach { item ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "•",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        text = item,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -8555,12 +9031,7 @@ private fun SettingsImageCard(
         FeedThumbnailQuality.High -> "当前为高清模式，优先加载最高可用规格"
     }
 
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
+    SettingsPlainCard {
         Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier
@@ -8653,12 +9124,7 @@ private fun SettingsPlaybackCard(
     backgroundPlaybackEnabled: Boolean,
     onBackgroundPlaybackChange: (Boolean) -> Unit,
 ) {
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
+    SettingsPlainCard {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -8742,12 +9208,7 @@ private fun SettingsAccountCard(
         else -> "未登录"
     }
 
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
+    SettingsPlainCard {
         Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier
@@ -8899,12 +9360,7 @@ private fun SettingsEmoticonCard(
         else -> "未同步"
     }
 
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
+    SettingsPlainCard {
         Column(modifier = Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier

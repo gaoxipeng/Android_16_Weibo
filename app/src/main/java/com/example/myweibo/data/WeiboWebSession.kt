@@ -515,6 +515,25 @@ class WeiboWebSession(context: Context) {
         return CommentsPage(items, nextCursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
+    suspend fun loadReposts(item: FeedItem, page: Int = 1): RepostsPage {
+        ensureMweiboSession()
+        val statusId = item.statusId.takeIf { it.isNotBlank() } ?: item.id
+        require(statusId.isNotBlank()) { "无效的微博 ID" }
+        val url = Uri.Builder()
+            .scheme("https")
+            .authority("m.weibo.cn")
+            .appendPath("api")
+            .appendPath("statuses")
+            .appendPath("repostTimeline")
+            .appendQueryParameter("id", statusId)
+            .appendQueryParameter("page", page.toString())
+            .build()
+            .toString()
+        val referer = "https://m.weibo.cn/detail/$statusId"
+        val raw = nativeFetchMweiboJson(url, referer)
+        return WeiboJsonParser.parseMweiboReposts(raw, page)
+    }
+
     suspend fun followUser(uid: String, current: UserProfile): UserProfile {
         val targetUid = uid.trim()
         require(targetUid.isNotBlank()) { "无效的用户 UID" }
