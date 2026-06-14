@@ -887,6 +887,35 @@ fun WeiboApp() {
         )
     }
 
+    fun restoreVisitedProfileScroll(snapshot: VisitedProfileSnapshot) {
+        scope.launch {
+            var attempts = 0
+            while (attempts < 24 && visitedPostsListState.layoutInfo.totalItemsCount == 0) {
+                delay(16)
+                attempts++
+            }
+            if (visitedPostsListState.firstVisibleItemIndex != snapshot.postsScrollIndex ||
+                visitedPostsListState.firstVisibleItemScrollOffset != snapshot.postsScrollOffset
+            ) {
+                runCatching {
+                    visitedPostsListState.scrollToItem(snapshot.postsScrollIndex, snapshot.postsScrollOffset)
+                }
+            }
+            attempts = 0
+            while (attempts < 24 && visitedAlbumListState.layoutInfo.totalItemsCount == 0) {
+                delay(16)
+                attempts++
+            }
+            if (visitedAlbumListState.firstVisibleItemIndex != snapshot.albumScrollIndex ||
+                visitedAlbumListState.firstVisibleItemScrollOffset != snapshot.albumScrollOffset
+            ) {
+                runCatching {
+                    visitedAlbumListState.scrollToItem(snapshot.albumScrollIndex, snapshot.albumScrollOffset)
+                }
+            }
+        }
+    }
+
     fun restoreVisitedProfileSnapshot(
         snapshot: VisitedProfileSnapshot,
         incrementGeneration: Boolean = true,
@@ -897,6 +926,16 @@ fun WeiboApp() {
             visitedListScrollResetGeneration = visitedProfileLoadGeneration
         } else {
             visitedListScrollResetGeneration = visitedProfileLoadGeneration
+        }
+        val sameProfileContext = !incrementGeneration &&
+            snapshot.userId == visitedUserId &&
+            snapshot.profile == visitedProfile &&
+            snapshot.posts === visitedPosts &&
+            snapshot.albumImages === visitedAlbumImages
+        if (sameProfileContext) {
+            visitedMinePagerPage = snapshot.pagerPage
+            restoreVisitedProfileScroll(snapshot)
+            return
         }
         visitedUserId = snapshot.userId
         visitedUserScreenName = snapshot.screenName
@@ -913,24 +952,7 @@ fun WeiboApp() {
         visitedAlbumLoading = false
         visitedAlbumError = null
         visitedMinePagerPage = snapshot.pagerPage
-        scope.launch {
-            var attempts = 0
-            while (attempts < 24 && visitedPostsListState.layoutInfo.totalItemsCount == 0) {
-                delay(16)
-                attempts++
-            }
-            runCatching {
-                visitedPostsListState.scrollToItem(snapshot.postsScrollIndex, snapshot.postsScrollOffset)
-            }
-            attempts = 0
-            while (attempts < 24 && visitedAlbumListState.layoutInfo.totalItemsCount == 0) {
-                delay(16)
-                attempts++
-            }
-            runCatching {
-                visitedAlbumListState.scrollToItem(snapshot.albumScrollIndex, snapshot.albumScrollOffset)
-            }
-        }
+        restoreVisitedProfileScroll(snapshot)
     }
 
     fun clearVisitedProfileState() {
@@ -1165,6 +1187,11 @@ fun WeiboApp() {
                 delay(16)
                 attempts++
             }
+            if (listState.firstVisibleItemIndex == viewer.albumScrollIndex &&
+                listState.firstVisibleItemScrollOffset == viewer.albumScrollOffset
+            ) {
+                return@launch
+            }
             runCatching {
                 listState.scrollToItem(viewer.albumScrollIndex, viewer.albumScrollOffset)
             }
@@ -1308,7 +1335,14 @@ fun WeiboApp() {
     }
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
-        pushNavigation { albumViewerState = viewer }
+        albumViewerState = viewer
+    }
+
+    fun dismissAlbumViewer() {
+        val viewer = albumViewerState ?: return
+        albumViewerState = null
+        restoreProfilePagerFromViewer(viewer)
+        restoreAlbumScrollFromViewer(viewer)
     }
 
     fun closeVisitedProfile() {
@@ -1387,10 +1421,6 @@ fun WeiboApp() {
         }
     }
 
-    fun dismissAlbumViewer() {
-        navigateBack()
-    }
-
     fun closeDetail() {
         navigateBack()
     }
@@ -1407,6 +1437,11 @@ fun WeiboApp() {
     }
 
     BackHandler(enabled = true) {
+        if (albumViewerState != null) {
+            dismissAlbumViewer()
+            lastHomeBackPressAt = 0L
+            return@BackHandler
+        }
         if (popNavigation()) {
             lastHomeBackPressAt = 0L
             return@BackHandler
@@ -9667,25 +9702,54 @@ private fun MineScreen(
                         }
 
                         MineContentTab.Album -> {
+                            val albumGrouped = remember(albumImages) {
+                                groupAlbumImagesByMonth(albumImages)
+                            }
                             LazyColumn(
                                 state = albumListState,
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(bottom = 96.dp),
                             ) {
-                                item {
-                                    MineAlbumTimeline(
-                                        albumImages = albumImages,
-                                        albumError = albumError,
-                                        albumLoading = albumLoading || albumLoadingMore || isLoading,
-                                        onOpenAlbumViewer = captureAlbumViewerOpen,
-                                        onMediaClick = onMediaClick,
-                                    )
+                                if (albumGrouped.isEmpty()) {
+                                    item(key = "album-empty") {
+                                        EmptyState(
+                                            title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
+                                            body = when {
+                                                albumLoading || albumLoadingMore || isLoading ->
+                                                    "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
+                                                !albumError.isNullOrBlank() -> albumError
+                                                else ->
+                                                    "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
+                                            },
+                                        )
+                                    }
+                                } else {
+                                    items(
+                                        items = albumGrouped,
+                                        key = { (dateLabel, images) ->
+                                            "album-${dateLabel.first}-${dateLabel.second}-${images.firstOrNull()?.largeUrl.orEmpty()}"
+                                        },
+                                    ) { (dateLabel, images) ->
+                                        MineAlbumMonthSection(
+                                            dateLabel = dateLabel,
+                                            images = images,
+                                            modifier = Modifier
+                                                .padding(horizontal = 12.dp)
+                                                .padding(bottom = 18.dp),
+                                            onImageClick = { groupImages, index ->
+                                                captureAlbumViewerOpen(
+                                                    AlbumViewerState(groupImages, index),
+                                                )
+                                            },
+                                            onVideoClick = onMediaClick,
+                                        )
+                                    }
                                 }
                                 if (albumLoadingMore) {
-                                    item { MineLoadingMoreIndicator() }
+                                    item(key = "album-loading-more") { MineLoadingMoreIndicator() }
                                 }
                                 if (!albumHasMore && albumImages.isNotEmpty()) {
-                                    item {
+                                    item(key = "album-end") {
                                         Text(
                                             text = "\u5DF2\u7ECF\u5230\u5E95\u4E86",
                                             modifier = Modifier.fillMaxWidth().padding(16.dp),
@@ -11782,22 +11846,7 @@ private fun MineAlbumTimeline(
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
 ) {
-    val albumGrouped = remember(albumImages) {
-        albumImages
-            .distinctBy { "${it.type.orEmpty()}:${it.id}:${it.largeUrl}" }
-            .mapNotNull { image ->
-                albumMonthLabelForImage(image)?.let { label -> label to image }
-            }
-            .groupBy({ it.first }, { it.second })
-            .mapValues { entry -> entry.value.distinctBy { it.largeUrl } }
-            .entries
-            .sortedWith(
-                compareByDescending<Map.Entry<Pair<String, String>, List<FeedImage>>> {
-                    albumGroupSortKey(it.key)
-                },
-            )
-            .associate { it.key to it.value }
-    }
+    val albumGrouped = remember(albumImages) { groupAlbumImagesByMonth(albumImages) }
 
     if (albumGrouped.isEmpty()) {
         EmptyState(
@@ -11826,6 +11875,25 @@ private fun MineAlbumTimeline(
             )
         }
     }
+}
+
+private fun groupAlbumImagesByMonth(
+    albumImages: List<FeedImage>,
+): List<Pair<Pair<String, String>, List<FeedImage>>> {
+    return albumImages
+        .distinctBy { "${it.type.orEmpty()}:${it.id}:${it.largeUrl}" }
+        .mapNotNull { image ->
+            albumMonthLabelForImage(image)?.let { label -> label to image }
+        }
+        .groupBy({ it.first }, { it.second })
+        .mapValues { entry -> entry.value.distinctBy { it.largeUrl } }
+        .entries
+        .sortedWith(
+            compareByDescending<Map.Entry<Pair<String, String>, List<FeedImage>>> {
+                albumGroupSortKey(it.key)
+            },
+        )
+        .map { it.key to it.value }
 }
 
 private suspend fun resolveAlbumImageStatus(
@@ -11923,9 +11991,10 @@ private fun MineAlbumMonthSection(
     images: List<FeedImage>,
     onImageClick: (List<FeedImage>, Int) -> Unit,
     onVideoClick: (FeedMedia) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.Top,
     ) {
@@ -12515,7 +12584,9 @@ private fun RemoteImage(
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     var candidateIndex by remember(candidates) { mutableStateOf(0) }
     val currentUrl = candidates.getOrNull(candidateIndex)
-    var bitmap by remember(currentUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var bitmap by remember(currentUrl, cacheCandidates) {
+        mutableStateOf(FeedBitmapCache.get(cacheCandidates))
+    }
     var failed by remember(currentUrl) { mutableStateOf(false) }
 
     LaunchedEffect(currentUrl, candidateIndex, maxDecodeDim, upgradeRevision, cacheCandidates) {
@@ -12524,7 +12595,7 @@ private fun RemoteImage(
             failed = false
             return@LaunchedEffect
         }
-        bitmap = null
+        if (bitmap != null) return@LaunchedEffect
         failed = false
         val target = currentUrl ?: return@LaunchedEffect
         runCatching {
@@ -12541,7 +12612,10 @@ private fun RemoteImage(
                 options.inSampleSize = Integer.highestOneBit(scale)
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
             }
-        }.onSuccess { bitmap = it }
+        }.onSuccess { loaded ->
+            bitmap = loaded
+            FeedBitmapCache.put(target, loaded)
+        }
             .onFailure {
                 if (candidateIndex < candidates.lastIndex) {
                     candidateIndex += 1
@@ -12665,7 +12739,7 @@ private fun WebView.detachFromParent(): WebView {
 }
 
 private object FeedBitmapCache {
-    private const val MaxEntries = 24
+    private const val MaxEntries = 192
     private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
             size > MaxEntries
