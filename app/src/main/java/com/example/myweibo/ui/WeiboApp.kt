@@ -74,6 +74,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
@@ -157,6 +158,7 @@ import dev.chrisbanes.haze.materials.HazeMaterials
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
@@ -170,6 +172,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
@@ -366,6 +370,7 @@ private val FeedCardItemSpacing = 8.dp
 private const val SingleImageMaxHeightToWidth = 0.7f
 private const val SingleImageMaxWidthFraction = 0.7f
 private const val VideoMaxHeightToWidth = 1f
+private val VideoControlCapsuleShape = RoundedCornerShape(percent = 50)
 private const val VideoMaxWidthFraction = 1f
 
 private class VideoPlaybackCoordinator {
@@ -430,6 +435,20 @@ private data class AlbumViewerState(
 private enum class DetailContentSection {
     Comments,
     Reposts,
+}
+
+private data class CommentComposeTarget(
+    val status: FeedItem,
+    val replyTo: CommentItem? = null,
+) {
+    val isReply: Boolean
+        get() = replyTo != null
+
+    val title: String
+        get() = if (isReply) "回复评论" else "发布评论"
+
+    val placeholder: String
+        get() = replyTo?.authorName?.let { "回复 @$it" } ?: "写评论..."
 }
 
 private const val DETAIL_SECTION_HEADER_INDEX = 1
@@ -647,6 +666,8 @@ fun WeiboApp() {
     var commentsLoading by remember { mutableStateOf(false) }
     var commentsCursor by remember { mutableStateOf<String?>(null) }
     var commentsHasMore by remember { mutableStateOf(true) }
+    var commentComposeTarget by remember { mutableStateOf<CommentComposeTarget?>(null) }
+    var commentSubmitting by remember { mutableStateOf(false) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
     var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
@@ -685,6 +706,7 @@ fun WeiboApp() {
     var mineAlbumError by remember { mutableStateOf<String?>(null) }
     var mineAlbumJob by remember { mutableStateOf<Job?>(null) }
     var emoticonMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var recentCommentEmoticons by remember { mutableStateOf<List<String>>(emptyList()) }
     var emoticonSyncing by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
     var visitedUserScreenName by remember { mutableStateOf("") }
@@ -1694,6 +1716,38 @@ fun WeiboApp() {
         }
     }
 
+    fun openCommentComposer(status: FeedItem, replyTo: CommentItem? = null) {
+        detailContentSection = DetailContentSection.Comments
+        commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), replyTo)
+    }
+
+    fun submitComment(target: CommentComposeTarget, text: String, alsoRepost: Boolean) {
+        if (commentSubmitting) return
+        scope.launch {
+            commentSubmitting = true
+            runCatching {
+                session.postStatusComment(
+                    item = target.status,
+                    text = text,
+                    replyToCommentId = target.replyTo?.id,
+                    alsoRepost = alsoRepost,
+                )
+            }.onSuccess {
+                commentComposeTarget = null
+                showMessage("评论已发布", if (target.isReply) "已回复 @${target.replyTo?.authorName}" else "已发送到评论区")
+                val updated = target.status.copy(
+                    commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
+                )
+                applyExpandedItem(updated)
+                selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
+                reloadComments()
+            }.onFailure { error ->
+                showMessage("评论发布失败", error.message ?: "请稍后重试")
+            }
+            commentSubmitting = false
+        }
+    }
+
     fun reloadReposts() {
         val item = selectedItem ?: return
         scope.launch {
@@ -1924,6 +1978,7 @@ fun WeiboApp() {
                         val synced = emotions.associate { it.phrase to it.url }
                         emoticonMap = synced
                         emoticonCacheStore.write(synced)
+                        recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in synced }
                         showMessage("表情同步完成", "已同步 ${synced.size} 个表情")
                     }
                 }
@@ -1944,6 +1999,7 @@ fun WeiboApp() {
         reloadStoredAccounts()
 
         emoticonMap = emoticonCacheStore.read()
+        recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in emoticonMap }
         timelineCacheStore.readFollowingTimeline()?.let { page ->
             items = sortFeedTimelineItems(page.items)
             nextCursor = page.nextCursor
@@ -2126,6 +2182,7 @@ fun WeiboApp() {
                             onUserClick = ::openUser,
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                             onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
+                            onCommentLongClick = { item -> openCommentComposer(item) },
                             onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
                             onMediaClick = ::pushMediaPreview,
                             resolveFeedItem = ::resolveFeedItem,
@@ -2452,6 +2509,7 @@ fun WeiboApp() {
                                     emoticonMap = emoticonMap,
                                     onRetweetClick = ::openDetail,
                                     onUserClick = ::openUser,
+                                    onComposeComment = ::openCommentComposer,
                                     onExpandNestedComments = ::loadNestedCommentsPage,
                                     nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                                     onUrlEntityClick = ::openUrlEntity,
@@ -2459,6 +2517,28 @@ fun WeiboApp() {
                             }
                         }
                     }
+                }
+
+                commentComposeTarget?.let { target ->
+                    val activeAvatarUrl = storedAccounts
+                        .firstOrNull { it.id == activeAccountId }
+                        ?.avatarUrl
+                    CommentComposerDialog(
+                        target = target,
+                        avatarUrl = mineProfile?.avatarUrl ?: activeAvatarUrl,
+                        submitting = commentSubmitting,
+                        emoticonMap = emoticonMap,
+                        recentEmoticons = recentCommentEmoticons,
+                        onEmoticonUsed = { phrase ->
+                            recentCommentEmoticons = emoticonCacheStore.touchRecent(phrase).filter { it in emoticonMap }
+                        },
+                        onDismiss = {
+                            if (!commentSubmitting) {
+                                commentComposeTarget = null
+                            }
+                        },
+                        onSubmit = { text, alsoRepost -> submitComment(target, text, alsoRepost) },
+                    )
                 }
             }
 
@@ -3359,6 +3439,7 @@ private fun FollowFeedScreen(
     onOpenLoginSettings: () -> Unit,
     onItemClick: (FeedItem, Rect?) -> Unit,
     onCommentClick: (FeedItem) -> Unit,
+    onCommentLongClick: (FeedItem) -> Unit,
     onRepostClick: (FeedItem) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     resolveFeedItem: (FeedItem) -> FeedItem = { it },
@@ -3442,6 +3523,7 @@ private fun FollowFeedScreen(
                     onToggleLike = onToggleLike,
                     onUrlEntityClick = onUrlEntityClick,
                     onCommentClick = { onCommentClick(resolved) },
+                    onCommentLongClick = { onCommentLongClick(resolved) },
                     onRepostClick = { onRepostClick(resolved) },
                     menuBackEnabled = feedUiOnTop,
                 )
@@ -3866,6 +3948,7 @@ private fun FeedCard(
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     onCommentClick: (() -> Unit)? = null,
+    onCommentLongClick: (() -> Unit)? = null,
     onRepostClick: (() -> Unit)? = null,
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
@@ -3951,12 +4034,14 @@ private fun FeedCard(
                 images = item.images,
                 media = item.media,
                 onMediaClick = onMediaClick,
+                onDetailClick = if (showAuthorRow) onClick else null,
             )
             StatusActions(
                 modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 item = item,
                 onRepostClick = onRepostClick ?: onClick,
                 onCommentClick = onCommentClick ?: onClick,
+                onCommentLongClick = onCommentLongClick,
                 onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
             )
         }
@@ -4092,7 +4177,12 @@ private fun QuotedStatus(
                     onUrlEntityClick = onUrlEntityClick,
                 )
             }
-            MediaStrip(images = item.images, media = item.media, onMediaClick = onMediaClick)
+            MediaStrip(
+                images = item.images,
+                media = item.media,
+                onMediaClick = onMediaClick,
+                onDetailClick = onClick,
+            )
         }
     }
 }
@@ -5054,6 +5144,7 @@ private fun MediaStrip(
     media: FeedMedia?,
     onMediaClick: (FeedMedia) -> Unit,
     modifier: Modifier = Modifier,
+    onDetailClick: (() -> Unit)? = null,
 ) {
     if (images.isEmpty() && media == null) return
 
@@ -5078,15 +5169,13 @@ private fun MediaStrip(
                         width = image.width ?: 0,
                         height = image.height ?: 0,
                     )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Start,
-                    ) {
+                    Box(modifier = Modifier.fillMaxWidth()) {
                         FeedImageCell(
                             image = image,
                             allImages = images,
                             imageIndex = 0,
                             modifier = Modifier
+                                .align(Alignment.TopStart)
                                 .fillMaxWidth(SingleImageMaxWidthFraction)
                                 .aspectRatio(aspect),
                             contentScale = ContentScale.Crop,
@@ -5095,6 +5184,23 @@ private fun MediaStrip(
                                 viewerOpen = true
                             },
                         )
+                        if (onDetailClick != null) {
+                            Box(
+                                modifier = Modifier.matchParentSize(),
+                                contentAlignment = Alignment.TopEnd,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(1f - SingleImageMaxWidthFraction)
+                                        .fillMaxHeight()
+                                        .clickable(
+                                            indication = null,
+                                            interactionSource = remember { MutableInteractionSource() },
+                                            onClick = onDetailClick,
+                                        ),
+                                )
+                            }
+                        }
                     }
                 } else {
                     rows.forEach { row ->
@@ -6521,7 +6627,7 @@ private fun WeiboVideoSurface(
                 modifier = Modifier
                     .padding(
                         end = 10.dp,
-                        top = if (isFullscreen) fullscreenTopInset + 10.dp else 10.dp,
+                        top = if (isFullscreen) fullscreenTopInset + 22.dp else 10.dp,
                     )
                     .width(66.dp)
                     .height(28.dp),
@@ -6540,7 +6646,7 @@ private fun WeiboVideoSurface(
             GlassTextButton(
                 text = if (downloading) "下载中" else "下载",
                 modifier = Modifier
-                    .padding(start = 10.dp, top = fullscreenTopInset + 10.dp)
+                    .padding(start = 10.dp, top = fullscreenTopInset + 22.dp)
                     .width(if (downloading) 66.dp else 54.dp)
                     .height(28.dp),
                 enabled = !downloading,
@@ -6596,7 +6702,7 @@ private fun WeiboVideoSurface(
             exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { it },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(start = 6.dp, end = 6.dp, bottom = if (isFullscreen) 24.dp else 8.dp)
+                .padding(start = 6.dp, end = 6.dp, bottom = if (isFullscreen) 40.dp else 8.dp)
                 .fillMaxWidth(),
         ) {
             VideoControls(
@@ -6758,21 +6864,23 @@ private fun CompactVideoScrubber(
         },
     ) {
         val y = size.height / 2f
-        val stroke = 3.dp.toPx()
-        drawLine(
+        val trackHeight = (size.height * 0.34f).coerceIn(3.dp.toPx(), 6.dp.toPx())
+        val trackTop = y - trackHeight / 2f
+        val radius = trackHeight / 2f
+        drawRoundRect(
             color = Color.White.copy(alpha = 0.26f),
-            start = Offset(0f, y),
-            end = Offset(size.width, y),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
+            topLeft = Offset(0f, trackTop),
+            size = Size(size.width, trackHeight),
+            cornerRadius = CornerRadius(radius, radius),
         )
-        drawLine(
-            color = Color(0xFFFF4F9A),
-            start = Offset(0f, y),
-            end = Offset(size.width * progress, y),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
-        )
+        if (progress > 0f) {
+            drawRoundRect(
+                color = Color(0xFFFF4F9A),
+                topLeft = Offset(0f, trackTop),
+                size = Size(size.width * progress, trackHeight),
+                cornerRadius = CornerRadius(radius, radius),
+            )
+        }
         drawCircle(
             color = Color.White,
             radius = 5.5.dp.toPx(),
@@ -6785,7 +6893,7 @@ private fun CompactVideoScrubber(
 private fun VideoControlGlassBackground(modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(VideoControlCapsuleShape)
             .blur(24.dp)
             .background(Color(0xFF3A3A3C).copy(alpha = 0.45f))
             .background(
@@ -6807,6 +6915,7 @@ private fun StatusActions(
     modifier: Modifier = Modifier,
     onRepostClick: (() -> Unit)? = null,
     onCommentClick: (() -> Unit)? = null,
+    onCommentLongClick: (() -> Unit)? = null,
     onToggleLike: (() -> Unit)? = null,
 ) {
     val actionColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.62f)
@@ -6844,13 +6953,22 @@ private fun StatusActions(
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center,
         ) {
-            AssistChip(
-                onClick = { onCommentClick?.invoke() },
-                modifier = Modifier.height(24.dp),
-                colors = AssistChipDefaults.assistChipColors(containerColor = Color.Transparent, labelColor = actionColor),
-                border = null,
-                label = { Text("评论 ${item.commentsCount}", fontSize = 11.sp, color = chipColor) },
-            )
+            Box(
+                modifier = Modifier
+                    .height(24.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .combinedClickable(
+                        onClick = { onCommentClick?.invoke() },
+                        onLongClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onCommentLongClick?.invoke()
+                        },
+                    )
+                    .padding(horizontal = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("评论 ${item.commentsCount}", fontSize = 11.sp, color = chipColor)
+            }
         }
         Box(
             modifier = Modifier
@@ -6927,6 +7045,7 @@ private fun DetailScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onComposeComment: ((FeedItem, CommentItem?) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
@@ -6997,6 +7116,7 @@ private fun DetailScreen(
                             onToggleLike = onToggleLike,
                             onUrlEntityClick = onUrlEntityClick,
                             onCommentClick = { onSelectContentSection(DetailContentSection.Comments) },
+                            onCommentLongClick = { onComposeComment?.invoke(item, null) },
                             onRepostClick = { onSelectContentSection(DetailContentSection.Reposts) },
                             showAuthorRow = false,
                             insetRounded = true,
@@ -7059,6 +7179,7 @@ private fun DetailScreen(
                         onExpandNestedComments = if (showingReposts) null else onExpandNestedComments,
                         nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                         onCommentImageClick = openCommentImage,
+                        onReplyClick = if (showingReposts) null else { comment -> onComposeComment?.invoke(item, comment) },
                     )
                     if (index < sectionItems.lastIndex) {
                         CommentDivider()
@@ -7177,6 +7298,466 @@ private fun CommentDivider() {
 }
 
 @Composable
+private fun CommentComposerDialog(
+    target: CommentComposeTarget,
+    avatarUrl: String?,
+    submitting: Boolean,
+    emoticonMap: Map<String, String>,
+    recentEmoticons: List<String>,
+    onEmoticonUsed: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onSubmit: (String, Boolean) -> Unit,
+) {
+    var text by remember(target) { mutableStateOf("") }
+    var alsoRepost by remember(target) { mutableStateOf(false) }
+    var emoticonPanelVisible by remember(target) { mutableStateOf(false) }
+    var selectedPhotoUris by remember(target) { mutableStateOf<List<Uri>>(emptyList()) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val canSubmit = text.trim().isNotEmpty() && !submitting
+    val sendColor = Color(0xFFFFB36B)
+    val cardColor = Color(0xFFFFFBFF)
+    val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.72f)
+    val inputTextStyle = MaterialTheme.typography.bodyMedium.copy(
+        color = MaterialTheme.colorScheme.onSurface,
+        lineHeight = 22.sp,
+    )
+    val recentEntries = remember(emoticonMap, recentEmoticons) {
+        recentEmoticons.mapNotNull { phrase -> emoticonMap[phrase]?.let { phrase to it } }
+    }
+    val allEntries = remember(emoticonMap) {
+        emoticonMap.entries.sortedBy { it.key }.map { it.key to it.value }
+    }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents(),
+    ) { uris ->
+        selectedPhotoUris = uris.take(9)
+    }
+
+    fun appendEmoticon(phrase: String) {
+        text = (text + phrase).take(600)
+        onEmoticonUsed(phrase)
+    }
+
+    fun openEmoticons() {
+        emoticonPanelVisible = !emoticonPanelVisible
+        if (emoticonPanelVisible) {
+            keyboard?.hide()
+            focusManager.clearFocus()
+        }
+    }
+
+    LaunchedEffect(target) {
+        delay(120)
+        runCatching { focusRequester.requestFocus() }
+        keyboard?.show()
+    }
+
+    Dialog(
+        onDismissRequest = {
+            if (!submitting) {
+                focusManager.clearFocus()
+                keyboard?.hide()
+                onDismiss()
+            }
+        },
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.18f))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        if (!submitting) {
+                            focusManager.clearFocus()
+                            keyboard?.hide()
+                            onDismiss()
+                        }
+                    },
+                ),
+            contentAlignment = Alignment.BottomCenter,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = {},
+                    ),
+                shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
+                color = cardColor,
+                tonalElevation = 1.dp,
+                shadowElevation = 8.dp,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    target.replyTo?.let { reply ->
+                        Text(
+                            text = "@${reply.authorName}: ${reply.text.trim().replace(Regex("\\s+"), " ").take(46)}",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(inputColor.copy(alpha = 0.48f))
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                    ) {
+                        RemoteImage(
+                            url = avatarUrl,
+                            modifier = Modifier
+                                .padding(top = 3.dp)
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    onClick = { openEmoticons() },
+                                ),
+                            contentScale = ContentScale.Crop,
+                            maxDecodeDim = 96,
+                        )
+                        BasicTextField(
+                            value = text,
+                            onValueChange = { value ->
+                                text = value.take(600)
+                            },
+                            enabled = !submitting,
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 58.dp, max = 138.dp)
+                                .focusRequester(focusRequester),
+                            textStyle = inputTextStyle,
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(
+                                onSend = {
+                                    if (canSubmit) {
+                                        onSubmit(text, alsoRepost)
+                                    }
+                                },
+                            ),
+                            decorationBox = { innerTextField ->
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 58.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(inputColor)
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                ) {
+                                    if (text.isEmpty()) {
+                                        Text(
+                                            text = target.placeholder,
+                                            style = inputTextStyle.copy(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.58f),
+                                            ),
+                                        )
+                                    }
+                                    innerTextField()
+                                }
+                            },
+                        )
+                    }
+                    if (selectedPhotoUris.isNotEmpty()) {
+                        LazyRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 44.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            items(selectedPhotoUris, key = { it.toString() }) { uri ->
+                                LocalUriThumbnail(
+                                    uri = uri,
+                                    modifier = Modifier
+                                        .size(54.dp)
+                                        .clip(RoundedCornerShape(8.dp)),
+                                )
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 44.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CommentComposerIconButton(
+                            iconRes = R.drawable.ic_comment_emoji,
+                            onClick = { openEmoticons() },
+                            contentDescription = "表情",
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        CommentComposerIconButton(
+                            iconRes = R.drawable.ic_comment_photo,
+                            onClick = {
+                                emoticonPanelVisible = false
+                                photoPickerLauncher.launch("image/*")
+                            },
+                            contentDescription = "照片",
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    onClick = { alsoRepost = !alsoRepost },
+                                )
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(14.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (alsoRepost) sendColor else Color.Transparent,
+                                    )
+                                    .border(
+                                        width = 1.dp,
+                                        color = if (alsoRepost) sendColor else MaterialTheme.colorScheme.outline.copy(alpha = 0.55f),
+                                        shape = CircleShape,
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (alsoRepost) {
+                                    Text(
+                                        text = "✓",
+                                        fontSize = 9.sp,
+                                        lineHeight = 9.sp,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                    )
+                                }
+                            }
+                            Text(
+                                text = "同时转发",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Spacer(Modifier.weight(1f))
+                        Surface(
+                            modifier = Modifier
+                                .height(32.dp)
+                                .widthIn(min = 66.dp)
+                                .clip(RoundedCornerShape(999.dp))
+                                .clickable(
+                                    enabled = canSubmit,
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    onClick = {
+                                        if (canSubmit) {
+                                            onSubmit(text, alsoRepost)
+                                        }
+                                    },
+                                ),
+                            shape = RoundedCornerShape(999.dp),
+                            color = if (canSubmit) sendColor else Color(0xFFFFD9B5).copy(alpha = 0.58f),
+                        ) {
+                            Box(
+                                modifier = Modifier.padding(horizontal = 16.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (submitting) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(15.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color.White,
+                                    )
+                                } else {
+                                    Text(
+                                        text = "发送",
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.White,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    AnimatedVisibility(visible = emoticonPanelVisible) {
+                        CommentEmoticonPanel(
+                            recentEntries = recentEntries,
+                            allEntries = allEntries,
+                            onSelect = ::appendEmoticon,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LocalUriThumbnail(
+    uri: Uri,
+    modifier: Modifier = Modifier,
+) {
+    AndroidView(
+        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        factory = { context ->
+            ImageView(context).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setImageURI(uri)
+            }
+        },
+        update = { imageView ->
+            imageView.setImageURI(uri)
+        },
+    )
+}
+
+@Composable
+private fun CommentEmoticonPanel(
+    recentEntries: List<Pair<String, String>>,
+    allEntries: List<Pair<String, String>>,
+    onSelect: (String) -> Unit,
+) {
+    val recentPhrases = recentEntries.map { it.first }.toSet()
+    val remainingEntries = allEntries.filter { it.first !in recentPhrases }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 260.dp)
+            .verticalScroll(rememberScrollState())
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.62f))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (allEntries.isEmpty()) {
+            Text(
+                text = "请先到设置中同步微博表情",
+                modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 13.sp,
+            )
+            return@Column
+        }
+        if (recentEntries.isNotEmpty()) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                maxItemsInEachRow = 7,
+            ) {
+                recentEntries.forEach { (phrase, url) ->
+                    CommentEmoticonTile(
+                        phrase = phrase,
+                        url = url,
+                        onSelect = onSelect,
+                    )
+                }
+            }
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.16f),
+            )
+        }
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            maxItemsInEachRow = 7,
+        ) {
+            remainingEntries.forEach { (phrase, url) ->
+                CommentEmoticonTile(
+                    phrase = phrase,
+                    url = url,
+                    onSelect = onSelect,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CommentEmoticonTile(
+    phrase: String,
+    url: String,
+    onSelect: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(42.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = { onSelect(phrase) },
+            )
+            .padding(vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(28.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            EmojiImage(url = url)
+        }
+        Text(
+            text = emoticonDisplayLabel(phrase),
+            fontSize = 8.sp,
+            lineHeight = 9.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun CommentComposerIconButton(
+    iconRes: Int,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onClick,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            painter = painterResource(iconRes),
+            contentDescription = contentDescription,
+            modifier = Modifier.size(20.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun CommentRow(
     comment: CommentItem,
     depth: Int = 0,
@@ -7184,6 +7765,7 @@ private fun CommentRow(
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
     onCommentImageClick: ((List<FeedImage>, Int) -> Unit)? = null,
+    onReplyClick: ((CommentItem) -> Unit)? = null,
 ) {
     val resolvedMap = comment.emoticons.ifEmpty { emptyMap() }
     val authorTarget = comment.authorId.takeIf { it.isNotBlank() } ?: comment.authorName
@@ -7197,6 +7779,7 @@ private fun CommentRow(
         onCommentImageClick?.invoke(comment.images, index)
     }
     val pictureCommentText = comment.text.trim() == "图片评论" && comment.images.isNotEmpty()
+    val haptic = LocalHapticFeedback.current
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -7217,7 +7800,24 @@ private fun CommentRow(
             )
             Spacer(Modifier.width(CommentAvatarTextGap))
             Column(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .then(
+                        if (onReplyClick != null) {
+                            Modifier.combinedClickable(
+                                onClick = {},
+                                onLongClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onReplyClick(comment)
+                                },
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() },
+                            )
+                        } else {
+                            Modifier
+                        },
+                    ),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -7286,6 +7886,7 @@ private fun CommentRow(
                 onExpandNestedComments = onExpandNestedComments,
                 nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                 onCommentImageClick = onCommentImageClick,
+                onReplyClick = onReplyClick,
             )
         }
         val nestedActionText = comment.moreInfoText

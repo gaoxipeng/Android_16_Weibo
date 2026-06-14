@@ -6,6 +6,8 @@ object WeiboEndpoints {
     const val FOLLOWING = "/ajax/feed/friendstimeline"
     const val GROUP_TIMELINE = "/ajax/feed/groupstimeline"
     const val STATUS_COMMENTS = "/ajax/statuses/buildComments"
+    const val COMMENT_CREATE = "/ajax/comments/create"
+    const val COMMENT_REPLY = "/ajax/comments/reply"
     const val STATUS_LONG_TEXT = "/ajax/statuses/longtext"
     const val STATUS_DETAIL = "/ajax/statuses/show"
     const val STATUS_REPOST_TIMELINE = "/ajax/statuses/repostTimeline"

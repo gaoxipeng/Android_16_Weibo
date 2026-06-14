@@ -515,6 +515,39 @@ class WeiboWebSession(context: Context) {
         return CommentsPage(items, nextCursor.takeUnless { it.isNullOrBlank() || it == "0" })
     }
 
+    suspend fun postStatusComment(
+        item: FeedItem,
+        text: String,
+        replyToCommentId: String? = null,
+        alsoRepost: Boolean = false,
+    ) {
+        val commentText = text.trim()
+        require(commentText.isNotBlank()) { "评论内容不能为空" }
+        val statusId = item.id.takeIf { it.isNotBlank() } ?: item.statusId
+        require(statusId.isNotBlank()) { "无效的微博 ID" }
+        val params = linkedMapOf(
+            "id" to statusId,
+            "comment" to commentText,
+            "pic_id" to "",
+            "is_repost" to if (alsoRepost) "1" else "0",
+            "comment_ori" to "0",
+            "is_comment" to "0",
+            "fp" to "",
+        )
+        val endpoint = if (!replyToCommentId.isNullOrBlank()) {
+            params["cid"] = replyToCommentId
+            WeiboEndpoints.COMMENT_REPLY
+        } else {
+            WeiboEndpoints.COMMENT_CREATE
+        }
+        val raw = postForm(
+            path = endpoint,
+            params = params,
+            referer = "https://weibo.com/detail/${item.statusId.takeIf { it.isNotBlank() } ?: statusId}",
+        )
+        WeiboJsonParser.assertMutationSuccess(raw, "评论发布失败")
+    }
+
     suspend fun loadReposts(item: FeedItem, page: Int = 1): RepostsPage {
         if (page <= 1 && item.hasNoReposts()) {
             return RepostsPage(items = emptyList(), nextPage = null)
