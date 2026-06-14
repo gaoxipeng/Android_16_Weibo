@@ -5409,12 +5409,12 @@ private fun FullscreenImageViewer(
     }
 
     LaunchedEffect(currentPage, currentImage?.albumStatusCacheKey(), relatedPosts, session, showStatusCaption) {
-        val activeSession = session
-        if (!showStatusCaption || currentImage == null || activeSession == null) {
+        if (!showStatusCaption || currentImage == null) {
             statusItem = null
             statusLoading = false
             return@LaunchedEffect
         }
+        val activeSession = session ?: return@LaunchedEffect
         resolvedStatusCache[currentImage.albumStatusCacheKey()]?.let { cached ->
             statusItem = cached
             statusLoading = false
@@ -9984,13 +9984,13 @@ private fun SettingsAboutCard(versionName: String) {
                 painter = painterResource(R.drawable.ic_launcher_app),
                 contentDescription = null,
                 modifier = Modifier
-                    .size(52.dp)
-                    .clip(RoundedCornerShape(14.dp)),
+                    .size(36.dp)
+                    .clip(RoundedCornerShape(10.dp)),
                 contentScale = ContentScale.Crop,
             )
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
                 Text(
                     text = "关于",
@@ -9998,13 +9998,8 @@ private fun SettingsAboutCard(versionName: String) {
                     fontWeight = FontWeight.SemiBold,
                 )
                 Text(
-                    text = "MyWeibo",
+                    text = "MyWeibo · 版本 $versionName",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    text = "版本 $versionName",
-                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
