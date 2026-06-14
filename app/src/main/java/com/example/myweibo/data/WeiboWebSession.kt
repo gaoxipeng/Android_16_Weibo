@@ -567,96 +567,48 @@ class WeiboWebSession(context: Context) {
             }
         }.getOrThrow()
 
-    suspend fun loadRecentChatContacts(): List<RelationUser> {
-        suspendCancellableCoroutine { continuation ->
-            webView.post {
-                webView.loadUrl(WEIBO_CHAT_URL)
-                continuation.resume(Unit)
+    suspend fun loadAllRelationUsers(
+        uid: String,
+        tab: FriendListTab,
+        maxPages: Int = RELATION_LIST_MAX_PAGES,
+    ): List<RelationUser> {
+        val targetUid = uid.trim()
+        require(targetUid.isNotBlank()) { "无效的用户 UID" }
+        val merged = linkedMapOf<String, RelationUser>()
+        var page = 1
+        while (page <= maxPages) {
+            val relationPage = loadFriends(targetUid, page, tab)
+            if (relationPage.items.isEmpty()) break
+            for (user in relationPage.items) {
+                val key = user.id.ifBlank { user.name }
+                if (key.isBlank()) continue
+                merged.putIfAbsent(key, user)
             }
+            if (!relationPage.hasNextPage) break
+            page++
         }
-        delay(2_200)
-        val payload = evaluateJson(
-            """
-            (function() {
-              const items = [];
-              const seen = new Set();
-              function add(id, name, avatar) {
-                id = String(id || '').trim();
-                name = String(name || '').trim().replace(/^@/, '');
-                avatar = String(avatar || '').trim();
-                const key = id || name;
-                if (!key || !name || seen.has(key)) return;
-                seen.add(key);
-                items.push({ id, name, avatar });
-              }
-              function pick(obj) {
-                if (!obj || typeof obj !== 'object') return;
-                const id = obj.uid || obj.idstr || obj.id || obj.user_id || obj.to_uid || obj.from_uid;
-                const name = obj.screen_name || obj.name || obj.nick || obj.nickname || obj.remark;
-                const avatar = obj.avatar_hd || obj.avatar_large || obj.profile_image_url || obj.avatar || obj.head || obj.icon;
-                add(id, name, avatar);
-              }
-              function walk(value, depth) {
-                if (!value || depth > 4 || items.length >= 24) return;
-                if (Array.isArray(value)) {
-                  value.slice(0, 80).forEach((item) => walk(item, depth + 1));
-                  return;
-                }
-                if (typeof value === 'object') {
-                  pick(value);
-                  Object.keys(value).slice(0, 80).forEach((key) => walk(value[key], depth + 1));
-                }
-              }
-              try {
-                for (let i = 0; i < localStorage.length; i++) {
-                  const key = localStorage.key(i);
-                  const raw = localStorage.getItem(key);
-                  if (!raw || raw.length > 200000) continue;
-                  try { walk(JSON.parse(raw), 0); } catch (_) {}
-                }
-              } catch (_) {}
-              try {
-                document.querySelectorAll('img').forEach((img) => {
-                  if (items.length >= 24) return;
-                  const avatar = img.currentSrc || img.src || '';
-                  const root = img.closest('li,div,a') || img.parentElement;
-                  const text = (root && root.innerText || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
-                  if (avatar && text && text.length <= 32) add('', text, avatar);
-                });
-              } catch (_) {}
-              return { items };
-            })()
-            """.trimIndent(),
+        return merged.values.toList()
+    }
+
+    suspend fun loadMentionSuggestionBundle(uid: String): MentionCandidateBundle {
+        val targetUid = uid.trim()
+        require(targetUid.isNotBlank()) { "无效的用户 UID" }
+        val following = loadAllRelationUsers(targetUid, FriendListTab.Following)
+        val fans = loadAllRelationUsers(targetUid, FriendListTab.Fans)
+        val mergedRelations = mergeRelationUsers(following, fans)
+        val avatarSuggestions = mergedRelations
+            .filter { it.following && it.followMe }
+            .mapNotNull { it.toMentionCandidate() }
+            .let { dedupeMentionCandidates(it, emptyList()) }
+            .take(MUTUAL_FOLLOW_MENTION_LIMIT)
+        val nameIndex = dedupeMentionCandidates(
+            mergedRelations.mapNotNull { it.toMentionCandidate() },
+            emptyList(),
         )
-        val array = payload.optJSONArray("items") ?: JSONArray()
-        return buildList {
-            val seen = mutableSetOf<String>()
-            for (index in 0 until array.length()) {
-                val item = array.optJSONObject(index) ?: continue
-                val name = item.optStringOrNull("name") ?: continue
-                val id = item.optStringOrNull("id").orEmpty()
-                val key = id.ifBlank { name }
-                if (!seen.add(key)) continue
-                add(
-                    RelationUser(
-                        id = id,
-                        name = name,
-                        screenName = name,
-                        avatarUrl = item.optStringOrNull("avatar"),
-                        avatarLarge = item.optStringOrNull("avatar"),
-                        description = null,
-                        followersCount = "--",
-                        followersCountStr = null,
-                        friendsCount = "--",
-                        following = false,
-                        followMe = false,
-                        verified = false,
-                        verifiedReason = null,
-                        location = null,
-                    ),
-                )
-            }
-        }
+        return MentionCandidateBundle(
+            avatarSuggestions = avatarSuggestions,
+            nameIndex = nameIndex,
+        )
     }
 
     suspend fun loadReposts(item: FeedItem, page: Int = 1): RepostsPage {
@@ -1586,7 +1538,8 @@ class WeiboWebSession(context: Context) {
 
     companion object {
         private const val WEIBO_HOME = "https://weibo.com/"
-        private const val WEIBO_CHAT_URL = "https://m.weibo.cn/message"
+        private const val MUTUAL_FOLLOW_MENTION_LIMIT = 40
+        private const val RELATION_LIST_MAX_PAGES = 100
         private const val FRIENDS_CIRCLE_GID = "100097312739005"
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private val COOKIE_ORIGINS = listOf(

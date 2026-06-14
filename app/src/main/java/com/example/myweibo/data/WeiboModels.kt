@@ -196,6 +196,17 @@ data class WeiboEmoticon(
     val url: String,
 )
 
+data class MentionCandidate(
+    val id: String,
+    val name: String,
+    val avatarUrl: String?,
+)
+
+data class MentionCandidateBundle(
+    val avatarSuggestions: List<MentionCandidate>,
+    val nameIndex: List<MentionCandidate>,
+)
+
 sealed class ProfileLookup {
     data class Uid(val uid: String) : ProfileLookup()
     data class ScreenName(val screenName: String) : ProfileLookup()

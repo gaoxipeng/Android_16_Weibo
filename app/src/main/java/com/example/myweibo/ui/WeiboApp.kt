@@ -229,8 +229,12 @@ import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
-import com.example.myweibo.data.SearchSettingsStore
 import com.example.myweibo.data.EmoticonCacheStore
+import com.example.myweibo.data.SearchSettingsStore
+import com.example.myweibo.data.MentionCandidate
+import com.example.myweibo.data.extractActiveMentionQuery
+import com.example.myweibo.data.filterMentionCandidatesByQuery
+import com.example.myweibo.data.mentionCandidateKey
 import com.example.myweibo.data.ImageSaveHelper
 import com.example.myweibo.data.FriendListTab
 import com.example.myweibo.data.HotSearchItem
@@ -374,59 +378,6 @@ private fun commentFailureMessage(error: Throwable): String {
     }
 }
 
-private fun addMentionSuggestion(
-    target: MutableList<MentionSuggestion>,
-    seen: MutableSet<String>,
-    id: String?,
-    name: String?,
-    avatarUrl: String?,
-) {
-    val cleanName = name?.trim().orEmpty()
-    if (cleanName.isBlank()) return
-    val cleanId = id?.trim().orEmpty()
-    val key = cleanId.ifBlank { cleanName }
-    if (key.isBlank() || !seen.add(key)) return
-    target += MentionSuggestion(
-        id = cleanId,
-        name = cleanName.removePrefix("@"),
-        avatarUrl = avatarUrl,
-    )
-}
-
-private fun collectMentionSuggestions(
-    feedItems: List<FeedItem>,
-    comments: List<CommentItem>,
-    mineProfile: UserProfile?,
-    visitedProfile: UserProfile?,
-    selectedItem: FeedItem?,
-): List<MentionSuggestion> {
-    val seen = linkedSetOf<String>()
-    val result = mutableListOf<MentionSuggestion>()
-
-    fun addProfile(profile: UserProfile?) {
-        if (profile != null) {
-            addMentionSuggestion(result, seen, profile.id, profile.screenName, profile.avatarUrl)
-        }
-    }
-
-    fun addFeedItem(item: FeedItem?) {
-        if (item == null) return
-        addMentionSuggestion(result, seen, item.authorId, item.authorName, item.authorAvatarUrl)
-        addFeedItem(item.retweetedStatus)
-    }
-
-    addFeedItem(selectedItem)
-    comments.forEach { comment ->
-        addMentionSuggestion(result, seen, comment.authorId, comment.authorName, comment.authorAvatarUrl)
-        addMentionSuggestion(result, seen, comment.replyToAuthorId, comment.replyToAuthor, null)
-    }
-    addProfile(visitedProfile)
-    addProfile(mineProfile)
-    feedItems.take(30).forEach(::addFeedItem)
-
-    return result.take(16)
-}
-
 private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
     start + (stop - start) * fraction
 
@@ -522,12 +473,6 @@ private data class CommentComposeTarget(
     val placeholder: String
         get() = replyTo?.authorName?.let { "回复 @$it" } ?: "写评论..."
 }
-
-private data class MentionSuggestion(
-    val id: String,
-    val name: String,
-    val avatarUrl: String?,
-)
 
 private const val DETAIL_SECTION_HEADER_INDEX = 1
 
@@ -788,8 +733,10 @@ fun WeiboApp() {
     var emoticonMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
     var recentCommentEmoticons by remember { mutableStateOf<List<String>>(emptyList()) }
     var emoticonSyncing by remember { mutableStateOf(false) }
-    var chatMentionSuggestions by remember { mutableStateOf<List<MentionSuggestion>>(emptyList()) }
-    var chatMentionSuggestionsLoaded by remember { mutableStateOf(false) }
+    var mentionAvatarSuggestions by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
+    var mentionNameIndex by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
+    var mentionSuggestionsLoaded by remember { mutableStateOf(false) }
+    var mentionSuggestionsLoading by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
     var visitedUserScreenName by remember { mutableStateOf("") }
     var visitedProfile by remember { mutableStateOf<UserProfile?>(null) }
@@ -2154,18 +2101,22 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(commentComposeTarget != null) {
-        if (commentComposeTarget == null || chatMentionSuggestionsLoaded) return@LaunchedEffect
-        chatMentionSuggestionsLoaded = true
-        runCatching { session.loadRecentChatContacts() }
-            .onSuccess { users ->
-                chatMentionSuggestions = users.map {
-                    MentionSuggestion(
-                        id = it.id,
-                        name = it.screenName.ifBlank { it.name },
-                        avatarUrl = it.avatarLarge ?: it.avatarUrl,
-                    )
-                }
+        if (commentComposeTarget == null || mentionSuggestionsLoaded) return@LaunchedEffect
+        mentionSuggestionsLoaded = true
+        mentionSuggestionsLoading = true
+        val uid = mineProfile?.id?.takeIf { it.isNotBlank() }
+            ?: activeAccountId?.takeIf { it.isNotBlank() }
+            ?: runCatching { session.loadCurrentUserProfile().id }.getOrNull()
+        if (uid.isNullOrBlank()) {
+            mentionSuggestionsLoading = false
+            return@LaunchedEffect
+        }
+        runCatching { session.loadMentionSuggestionBundle(uid) }
+            .onSuccess { bundle ->
+                mentionAvatarSuggestions = bundle.avatarSuggestions
+                mentionNameIndex = bundle.nameIndex
             }
+        mentionSuggestionsLoading = false
     }
 
     DisposableEffect(Unit) {
@@ -2670,32 +2621,15 @@ fun WeiboApp() {
                     val activeAvatarUrl = storedAccounts
                         .firstOrNull { it.id == activeAccountId }
                         ?.avatarUrl
-                    val mentionSuggestions = remember(
-                        chatMentionSuggestions,
-                        items,
-                        comments,
-                        mineProfile,
-                        visitedProfile,
-                        selectedItem,
-                    ) {
-                        val contextual = collectMentionSuggestions(
-                            feedItems = items,
-                            comments = comments,
-                            mineProfile = mineProfile,
-                            visitedProfile = visitedProfile,
-                            selectedItem = selectedItem,
-                        )
-                        (chatMentionSuggestions + contextual).distinctBy {
-                            it.id.ifBlank { it.name }
-                        }
-                    }
                     CommentComposerDialog(
                         target = target,
                         avatarUrl = mineProfile?.avatarUrl ?: activeAvatarUrl,
                         submitting = commentSubmitting,
                         emoticonMap = emoticonMap,
                         recentEmoticons = recentCommentEmoticons,
-                        mentionSuggestions = mentionSuggestions,
+                        mentionAvatarSuggestions = mentionAvatarSuggestions,
+                        mentionNameIndex = mentionNameIndex,
+                        mentionSuggestionsLoading = mentionSuggestionsLoading,
                         onEmoticonUsed = { phrase ->
                             recentCommentEmoticons = emoticonCacheStore.touchRecent(phrase).filter { it in emoticonMap }
                         },
@@ -7492,7 +7426,9 @@ private fun CommentComposerDialog(
     submitting: Boolean,
     emoticonMap: Map<String, String>,
     recentEmoticons: List<String>,
-    mentionSuggestions: List<MentionSuggestion>,
+    mentionAvatarSuggestions: List<MentionCandidate>,
+    mentionNameIndex: List<MentionCandidate>,
+    mentionSuggestionsLoading: Boolean,
     onEmoticonUsed: (String) -> Unit,
     onDismiss: () -> Unit,
     onSubmit: (String, List<Uri>, Boolean) -> Unit,
@@ -7500,7 +7436,6 @@ private fun CommentComposerDialog(
     var text by remember(target) { mutableStateOf(TextFieldValue("")) }
     var alsoRepost by remember(target) { mutableStateOf(false) }
     var emoticonPanelVisible by remember(target) { mutableStateOf(false) }
-    var mentionPanelVisible by remember(target) { mutableStateOf(false) }
     var selectedPhotoUris by remember(target) { mutableStateOf<List<Uri>>(emptyList()) }
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -7524,6 +7459,21 @@ private fun CommentComposerDialog(
     ) { uris ->
         selectedPhotoUris = uris.take(9)
     }
+    val mentionCursor = min(text.selection.start, text.selection.end)
+    val activeMentionQuery = extractActiveMentionQuery(text.text, mentionCursor)
+    val displayedMentionSuggestions = remember(
+        text.text,
+        text.selection.end,
+        mentionAvatarSuggestions,
+        mentionNameIndex,
+    ) {
+        when (val query = activeMentionQuery) {
+            null -> emptyList()
+            "" -> mentionAvatarSuggestions
+            else -> filterMentionCandidatesByQuery(mentionNameIndex, query)
+        }
+    }
+    val mentionPanelExpanded = activeMentionQuery != null
 
     fun insertAtCursor(value: String, requestKeyboard: Boolean = false) {
         val selection = text.selection
@@ -7548,26 +7498,38 @@ private fun CommentComposerDialog(
     }
 
     fun insertMention() {
-        mentionPanelVisible = true
         insertAtCursor("@", requestKeyboard = true)
     }
 
-    fun insertMentionUser(user: MentionSuggestion) {
-        val selection = text.selection
-        val cursor = min(selection.start, selection.end).coerceIn(0, text.text.length)
-        val value = if (cursor > 0 && text.text.getOrNull(cursor - 1) == '@') {
-            "${user.name} "
+    fun insertMentionUser(user: MentionCandidate) {
+        val cursor = min(text.selection.start, text.selection.end).coerceIn(0, text.text.length)
+        val before = text.text.substring(0, cursor)
+        val after = text.text.substring(cursor)
+        val atIndex = before.lastIndexOf('@')
+        val mention = "@${user.name} "
+        val nextText = if (atIndex >= 0) {
+            before.substring(0, atIndex) + mention + after
+        } else if (cursor > 0 && text.text.getOrNull(cursor - 1) == '@') {
+            before + "${user.name} " + after
         } else {
-            "@${user.name} "
+            before + mention + after
+        }.take(600)
+        val nextCursor = if (atIndex >= 0) {
+            (atIndex + mention.length).coerceAtMost(nextText.length)
+        } else {
+            (cursor + mention.length).coerceAtMost(nextText.length)
         }
-        mentionPanelVisible = false
-        insertAtCursor(value, requestKeyboard = true)
+        text = TextFieldValue(
+            text = nextText,
+            selection = TextRange(nextCursor),
+        )
+        runCatching { focusRequester.requestFocus() }
+        keyboard?.show()
     }
 
     fun openEmoticons() {
         emoticonPanelVisible = !emoticonPanelVisible
         if (emoticonPanelVisible) {
-            mentionPanelVisible = false
             keyboard?.hide()
             focusManager.clearFocus()
         }
@@ -7642,10 +7604,21 @@ private fun CommentComposerDialog(
                         )
                     }
 
-                    AnimatedVisibility(visible = mentionPanelVisible && mentionSuggestions.isNotEmpty()) {
+                    AnimatedVisibility(visible = mentionPanelExpanded && displayedMentionSuggestions.isNotEmpty()) {
                         MentionSuggestionPanel(
-                            users = mentionSuggestions,
+                            users = displayedMentionSuggestions,
+                            vertical = !activeMentionQuery.isNullOrBlank(),
                             onSelect = ::insertMentionUser,
+                        )
+                    }
+                    if (mentionSuggestionsLoading && mentionPanelExpanded && displayedMentionSuggestions.isEmpty()) {
+                        Text(
+                            text = "正在加载 @ 联系人…",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
 
@@ -7671,7 +7644,7 @@ private fun CommentComposerDialog(
                         BasicTextField(
                             value = text,
                             onValueChange = { value ->
-                                text = if (value.text.length <= 600) {
+                                val next = if (value.text.length <= 600) {
                                     value
                                 } else {
                                     value.copy(
@@ -7679,6 +7652,7 @@ private fun CommentComposerDialog(
                                         selection = TextRange(600),
                                     )
                                 }
+                                text = next
                             },
                             enabled = !submitting,
                             modifier = Modifier
@@ -7755,7 +7729,6 @@ private fun CommentComposerDialog(
                             iconRes = R.drawable.ic_comment_photo,
                             onClick = {
                                 emoticonPanelVisible = false
-                                mentionPanelVisible = false
                                 photoPickerLauncher.launch("image/*")
                             },
                             contentDescription = "照片",
@@ -7858,51 +7831,104 @@ private fun CommentComposerDialog(
 
 @Composable
 private fun MentionSuggestionPanel(
-    users: List<MentionSuggestion>,
-    onSelect: (MentionSuggestion) -> Unit,
+    users: List<MentionCandidate>,
+    vertical: Boolean = false,
+    onSelect: (MentionCandidate) -> Unit,
 ) {
-    LazyRow(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.56f))
-            .padding(horizontal = 8.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        items(users, key = { it.id.ifBlank { it.name } }) { user ->
-            Column(
-                modifier = Modifier
-                    .width(58.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                        onClick = { onSelect(user) },
-                    )
-                    .padding(vertical = 4.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                RemoteImage(
-                    url = user.avatarUrl,
-                    modifier = Modifier
-                        .size(38.dp)
-                        .clip(CircleShape),
-                    contentScale = ContentScale.Crop,
-                    maxDecodeDim = 96,
-                )
-                Text(
-                    text = user.name,
-                    fontSize = 11.sp,
-                    lineHeight = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+    val panelModifier = Modifier
+        .fillMaxWidth()
+        .clip(RoundedCornerShape(14.dp))
+        .background(MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.56f))
+        .padding(horizontal = 8.dp, vertical = 8.dp)
+
+    if (vertical) {
+        LazyColumn(
+            modifier = panelModifier.heightIn(max = 196.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            items(users, key = { mentionCandidateKey(it) }) { user ->
+                MentionSuggestionRow(user = user, onSelect = onSelect)
             }
         }
+    } else {
+        LazyRow(
+            modifier = panelModifier,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            items(users, key = { mentionCandidateKey(it) }) { user ->
+                MentionSuggestionAvatarTile(user = user, onSelect = onSelect)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MentionSuggestionAvatarTile(
+    user: MentionCandidate,
+    onSelect: (MentionCandidate) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(58.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = { onSelect(user) },
+            )
+            .padding(vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        RemoteImage(
+            url = user.avatarUrl,
+            modifier = Modifier
+                .size(38.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop,
+            maxDecodeDim = 96,
+        )
+        Text(
+            text = user.name,
+            fontSize = 11.sp,
+            lineHeight = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun MentionSuggestionRow(
+    user: MentionCandidate,
+    onSelect: (MentionCandidate) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = { onSelect(user) })
+            .padding(horizontal = 6.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        RemoteImage(
+            url = user.avatarUrl,
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop,
+            maxDecodeDim = 96,
+        )
+        Text(
+            text = user.name,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -9453,6 +9479,7 @@ private fun MineScreen(
                             if (showFollowActions && profile?.id?.isNotBlank() == true) {
                                 ProfileFollowCapsuleButton(
                                     following = profile.following,
+                                    followMe = profile.followMe,
                                     loading = followLoading,
                                     onClick = onFollowClick,
                                 )
@@ -9807,10 +9834,11 @@ private val appHelpSections = listOf(
         items = listOf(
             "在首页下拉可刷新关注流；滚动到底部会自动加载更多。",
             "点击微博卡片进入详情；点击头像或 @昵称 进入用户主页。",
+            "点击评论图标进入详情评论区；点击转发图标进入详情转发区。",
+            "长按评论图标可快速打开评论输入框；长按「赞」可快速点赞或取消赞。",
             "点击正文中的 #话题# 会跳转到搜索页并自动搜索该话题。",
             "长微博可点「阅读全文」展开；正文里的「查看图片」链接可直接看图。",
             "点击卡片中的链接卡片，会在应用内打开文章阅读页。",
-            "点击评论区域进入详情；长按「赞」区域可快速点赞或取消赞。",
             "点击卡片右上角菜单，可跳转官方微博或分享链接。",
             "刷新完成后，顶部会短暂显示本次更新条数提示。",
         ),
@@ -9833,8 +9861,20 @@ private val appHelpSections = listOf(
         items = listOf(
             "详情页下拉可刷新微博与评论；评论列表滚动到底会自动加载更多。",
             "点击评论排序按钮，可在「按时间」与「按热度」之间切换。",
-            "支持楼中楼评论展开；评论中的图片、链接、话题与首页规则一致。",
+            "支持楼中楼评论展开；长按评论行可回复该评论。",
+            "长按底部评论按钮或详情页评论入口，可打开评论输入弹窗。",
+            "评论弹窗支持文字、表情、图片；回复时可勾选「同时转发」。",
+            "评论中的图片、链接、话题与首页规则一致。",
             "详情页同样支持点赞、查看媒体、跳转用户主页等操作。",
+        ),
+    ),
+    HelpSection(
+        title = "评论 @ 提及",
+        items = listOf(
+            "在评论弹窗点击 @ 或输入 @ 后，会显示互相关注用户头像条（最多 40 人）。",
+            "@ 后继续输入昵称片段，会从全部关注与粉丝中匹配候选（最多 40 条）。",
+            "点击候选即可补全 @昵称；匹配结果按前缀优先排序。",
+            "关注/粉丝列表在首次打开评论弹窗时后台加载，数量较多时可能需要等待片刻。",
         ),
     ),
     HelpSection(
@@ -9850,9 +9890,9 @@ private val appHelpSections = listOf(
     HelpSection(
         title = "写微博与消息",
         items = listOf(
-            "「写微博」「消息」使用移动版微博网页，登录态与首页共用。",
+            "「写微博」「消息」使用移动版微博网页（m.weibo.cn），登录态与首页共用。",
             "写微博时可从相册选择图片发布；网页内返回优先于切 Tab。",
-            "消息页可查看私信与通知，交互规则与官方移动网页一致。",
+            "消息页地址为 m.weibo.cn/message，可查看私信与通知。",
         ),
     ),
     HelpSection(
@@ -9861,7 +9901,8 @@ private val appHelpSections = listOf(
             "「我的」顶部封面、头像均可点击放大查看；封面右上角齿轮进入设置。",
             "个人页可在「微博 / 相册」两个标签间切换；相册按月份分组展示。",
             "点击粉丝、关注等统计项，可打开关注 / 粉丝列表并查看其他用户。",
-            "访问他人主页时，交互与「我的」类似，但通常不提供设置入口。",
+            "在粉丝/关注列表页点击底部其他 Tab，会正常切换页面并关闭列表。",
+            "访问他人主页时，可关注/取关；互相关注时按钮显示「互相关注」。",
             "列表滚动到顶部附近时，顶部资料区会随滚动逐渐收起。",
         ),
     ),
@@ -9869,7 +9910,8 @@ private val appHelpSections = listOf(
         title = "设置项说明",
         items = listOf(
             "账号管理：登录、添加账号、切换已保存账号；切换后会重新加载对应账号数据。",
-            "表情同步：拉取微博表情到本地，改善正文与评论中的表情显示。",
+            "表情同步：从微博拉取表情配置到本地，改善正文与评论中的表情显示。",
+            "浏览信息流时，正文里出现的表情也会自动收录到本地，同步时不会删除这些表情。",
             "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
             "后台播放声音：关闭后，切到后台或打开其他页面时会自动暂停视频声音。",
         ),
@@ -10813,6 +10855,7 @@ private fun MineProfileHeader(
                             if (showFollowActions && profile?.id?.isNotBlank() == true) {
                                 ProfileFollowCapsuleButton(
                                     following = profile.following,
+                                    followMe = profile.followMe,
                                     loading = followLoading,
                                     onClick = onFollowClick,
                                 )
@@ -11357,11 +11400,13 @@ private fun RelationUserRow(
     showMessage: (String, String) -> Unit,
 ) {
     var following by remember(user.id) { mutableStateOf(user.following) }
+    var followMe by remember(user.id) { mutableStateOf(user.followMe) }
     var followLoading by remember(user.id) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(user.following) {
+    LaunchedEffect(user.following, user.followMe) {
         following = user.following
+        followMe = user.followMe
     }
 
     Column(
@@ -11417,21 +11462,28 @@ private fun RelationUserRow(
                 Spacer(Modifier.width(8.dp))
                 ProfileFollowCapsuleButton(
                     following = following,
+                    followMe = followMe,
                     loading = followLoading,
                     onClick = {
                         scope.launch {
                             followLoading = true
                             val wasFollowing = following
-                            val profile = user.copy(following = following).toUserProfile()
+                            val profile = user.copy(following = following, followMe = followMe).toUserProfile()
                             runCatching {
                                 if (wasFollowing) {
                                     session.unfollowUser(user.id, profile)
                                 } else {
                                     session.followUser(user.id, profile)
                                 }
-                            }.onSuccess {
-                                following = !wasFollowing
-                                onFollowChanged(user.copy(following = !wasFollowing))
+                            }.onSuccess { updatedProfile ->
+                                following = updatedProfile.following
+                                followMe = updatedProfile.followMe
+                                onFollowChanged(
+                                    user.copy(
+                                        following = updatedProfile.following,
+                                        followMe = updatedProfile.followMe,
+                                    ),
+                                )
                             }.onFailure { error ->
                                 showMessage("关注操作失败", error.message ?: "请稍后重试")
                             }
@@ -11451,9 +11503,16 @@ private fun RelationUserRow(
 @Composable
 private fun ProfileFollowCapsuleButton(
     following: Boolean,
+    followMe: Boolean = false,
     loading: Boolean,
     onClick: () -> Unit,
 ) {
+    val mutual = following && followMe
+    val label = when {
+        !following -> "+\u5173\u6CE8"
+        mutual -> "\u4E92\u76F8\u5173\u6CE8"
+        else -> "\u5DF2\u5173\u6CE8"
+    }
     Surface(
         onClick = onClick,
         enabled = !loading,
@@ -11462,7 +11521,10 @@ private fun ProfileFollowCapsuleButton(
         border = if (following) BorderStroke(1.dp, Color(0xFFE0E0E0)) else null,
     ) {
         Box(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+            modifier = Modifier.padding(
+                horizontal = if (mutual) 10.dp else 14.dp,
+                vertical = 6.dp,
+            ),
             contentAlignment = Alignment.Center,
         ) {
             if (loading) {
@@ -11473,9 +11535,11 @@ private fun ProfileFollowCapsuleButton(
                 )
             } else {
                 Text(
-                    text = if (following) "\u5DF2\u5173\u6CE8" else "+\u5173\u6CE8",
+                    text = label,
                     style = MaterialTheme.typography.labelMedium,
+                    fontSize = if (mutual) 12.sp else MaterialTheme.typography.labelMedium.fontSize,
                     fontWeight = FontWeight.Medium,
+                    maxLines = 1,
                     color = if (following) Color(0xFF636363) else Color.White,
                 )
             }
