@@ -230,6 +230,7 @@ import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.EmoticonCacheStore
+import com.example.myweibo.data.MentionSuggestionCacheStore
 import com.example.myweibo.data.SearchSettingsStore
 import com.example.myweibo.data.MentionCandidate
 import com.example.myweibo.data.extractActiveMentionQuery
@@ -649,6 +650,7 @@ fun WeiboApp() {
     val timelineCacheStore = remember { TimelineCacheStore(context) }
     val mineCacheStore = remember { MineCacheStore(context) }
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
+    val mentionSuggestionCacheStore = remember { MentionSuggestionCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
@@ -735,7 +737,8 @@ fun WeiboApp() {
     var emoticonSyncing by remember { mutableStateOf(false) }
     var mentionAvatarSuggestions by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
     var mentionNameIndex by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
-    var mentionSuggestionsLoaded by remember { mutableStateOf(false) }
+    var mentionSuggestionsUid by remember { mutableStateOf<String?>(null) }
+    var mentionSuggestionsRefreshedUid by remember { mutableStateOf<String?>(null) }
     var mentionSuggestionsLoading by remember { mutableStateOf(false) }
     var visitedUserId by remember { mutableStateOf<String?>(null) }
     var visitedUserScreenName by remember { mutableStateOf("") }
@@ -2058,6 +2061,39 @@ fun WeiboApp() {
         }
     }
 
+    suspend fun resolveMentionUid(): String? =
+        mineProfile?.id?.takeIf { it.isNotBlank() }
+            ?: activeAccountId?.takeIf { it.isNotBlank() }
+            ?: runCatching { session.loadCurrentUserProfile().id }.getOrNull()?.takeIf { it.isNotBlank() }
+
+    suspend fun applyMentionSuggestionCache(uid: String) {
+        mentionSuggestionCacheStore.read(uid)?.let { cached ->
+            mentionAvatarSuggestions = cached.avatarSuggestions
+            mentionNameIndex = cached.nameIndex
+        }
+    }
+
+    suspend fun refreshMentionSuggestions(showLoadingIfEmpty: Boolean) {
+        if (!hasLoginCookie) return
+        val uid = resolveMentionUid() ?: return
+        applyMentionSuggestionCache(uid)
+        val shouldShowLoading = showLoadingIfEmpty &&
+            mentionAvatarSuggestions.isEmpty() &&
+            mentionNameIndex.isEmpty()
+        if (shouldShowLoading) {
+            mentionSuggestionsLoading = true
+        }
+        runCatching { session.loadMentionSuggestionBundle(uid) }
+            .onSuccess { bundle ->
+                mentionAvatarSuggestions = bundle.avatarSuggestions
+                mentionNameIndex = bundle.nameIndex
+                mentionSuggestionCacheStore.write(uid, bundle)
+            }
+        mentionSuggestionsLoading = false
+        mentionSuggestionsUid = uid
+        mentionSuggestionsRefreshedUid = uid
+    }
+
     LaunchedEffect(Unit) {
         val savedActiveId = accountStore.readActiveAccountId()
         if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
@@ -2092,6 +2128,10 @@ fun WeiboApp() {
             mineAlbumNextCursor = page.nextCursor
             mineAlbumHasMore = page.nextCursor != null
         }
+        activeAccountId?.takeIf { it.isNotBlank() }?.let { uid ->
+            applyMentionSuggestionCache(uid)
+            mentionSuggestionsUid = uid
+        }
         hasLoginCookie = session.hasLoginCookie()
         mineHasLoginCookie = hasLoginCookie
         cacheLoaded = true
@@ -2100,23 +2140,22 @@ fun WeiboApp() {
         }
     }
 
-    LaunchedEffect(commentComposeTarget != null) {
-        if (commentComposeTarget == null || mentionSuggestionsLoaded) return@LaunchedEffect
-        mentionSuggestionsLoaded = true
-        mentionSuggestionsLoading = true
-        val uid = mineProfile?.id?.takeIf { it.isNotBlank() }
-            ?: activeAccountId?.takeIf { it.isNotBlank() }
-            ?: runCatching { session.loadCurrentUserProfile().id }.getOrNull()
-        if (uid.isNullOrBlank()) {
-            mentionSuggestionsLoading = false
+    LaunchedEffect(activeAccountId, mineProfile?.id, hasLoginCookie) {
+        if (!hasLoginCookie) {
+            mentionAvatarSuggestions = emptyList()
+            mentionNameIndex = emptyList()
+            mentionSuggestionsUid = null
+            mentionSuggestionsRefreshedUid = null
             return@LaunchedEffect
         }
-        runCatching { session.loadMentionSuggestionBundle(uid) }
-            .onSuccess { bundle ->
-                mentionAvatarSuggestions = bundle.avatarSuggestions
-                mentionNameIndex = bundle.nameIndex
-            }
-        mentionSuggestionsLoading = false
+        val uid = resolveMentionUid() ?: return@LaunchedEffect
+        if (uid == mentionSuggestionsRefreshedUid) return@LaunchedEffect
+        refreshMentionSuggestions(showLoadingIfEmpty = false)
+    }
+
+    LaunchedEffect(commentComposeTarget) {
+        if (commentComposeTarget == null || !hasLoginCookie) return@LaunchedEffect
+        refreshMentionSuggestions(showLoadingIfEmpty = true)
     }
 
     DisposableEffect(Unit) {
