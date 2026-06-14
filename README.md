@@ -1,4 +1,6 @@
-# MyWeibo
+# Android_16_Weibo
+
+一个无广告的微博安卓客户端。
 
 基于 Jetpack Compose 的第三方微博客户端，通过 WebView 登录态 + 微博 PC 端 `ajax` 接口读取数据，原生渲染信息流、详情、搜索与个人主页。
 
