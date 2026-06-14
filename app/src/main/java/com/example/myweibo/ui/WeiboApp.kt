@@ -432,6 +432,8 @@ private enum class DetailContentSection {
     Reposts,
 }
 
+private const val DETAIL_SECTION_HEADER_INDEX = 1
+
 private data class DetailSnapshot(
     val item: FeedItem,
     val comments: List<CommentItem>,
@@ -1726,29 +1728,59 @@ fun WeiboApp() {
         }
     }
 
-    fun resetDetailContentState() {
+    fun resetDetailContentState(initialSection: DetailContentSection = DetailContentSection.Comments) {
         comments = emptyList()
         commentsCursor = null
         commentsHasMore = true
-        detailContentSection = DetailContentSection.Comments
+        detailContentSection = initialSection
         reposts = emptyList()
         repostsNextPage = null
         repostsHasMore = true
     }
 
+    fun openDetailPrepared(
+        item: FeedItem,
+        initialSection: DetailContentSection,
+        scrollToContentSection: Boolean,
+    ) {
+        val resolved = resolveFeedItem(item)
+        activeDetailInstanceKey = navStack.size
+        val scroll = if (scrollToContentSection) {
+            ScrollRestore(index = DETAIL_SECTION_HEADER_INDEX)
+        } else {
+            ScrollRestore()
+        }
+        lastDetailScroll = scroll
+        detailScrollPending = resolved.id to scroll
+        selectedItem = resolved
+        resetDetailContentState(initialSection)
+        if (resolved.isLongText) {
+            loadLongText(resolved)
+        }
+        resolved.retweetedStatus?.takeIf { it.isLongText }?.let { loadLongText(it) }
+        when (initialSection) {
+            DetailContentSection.Comments -> reloadComments()
+            DetailContentSection.Reposts -> reloadReposts()
+        }
+    }
+
     fun openDetailInternal(item: FeedItem) {
         pushNavigation {
-            val resolved = resolveFeedItem(item)
-            activeDetailInstanceKey = navStack.size
-            lastDetailScroll = ScrollRestore()
-            detailScrollPending = resolved.id to ScrollRestore()
-            selectedItem = resolved
-            resetDetailContentState()
-            if (resolved.isLongText) {
-                loadLongText(resolved)
-            }
-            resolved.retweetedStatus?.takeIf { it.isLongText }?.let { loadLongText(it) }
-            reloadComments()
+            openDetailPrepared(
+                item = item,
+                initialSection = DetailContentSection.Comments,
+                scrollToContentSection = false,
+            )
+        }
+    }
+
+    fun openDetailToSection(item: FeedItem, section: DetailContentSection) {
+        pushNavigation {
+            openDetailPrepared(
+                item = item,
+                initialSection = section,
+                scrollToContentSection = true,
+            )
         }
     }
 
@@ -2093,6 +2125,8 @@ fun WeiboApp() {
                             onOpenLoginSettings = ::openAccountLoginManagement,
                             onUserClick = ::openUser,
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                            onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
+                            onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
                             onMediaClick = ::pushMediaPreview,
                             resolveFeedItem = ::resolveFeedItem,
                             isLongTextLoading = { it.statusId in longTextLoadingIds },
@@ -3324,6 +3358,8 @@ private fun FollowFeedScreen(
     onLoadMore: () -> Unit,
     onOpenLoginSettings: () -> Unit,
     onItemClick: (FeedItem, Rect?) -> Unit,
+    onCommentClick: (FeedItem) -> Unit,
+    onRepostClick: (FeedItem) -> Unit,
     onMediaClick: (FeedMedia) -> Unit,
     resolveFeedItem: (FeedItem) -> FeedItem = { it },
     isLongTextLoading: (FeedItem) -> Boolean = { false },
@@ -3405,6 +3441,8 @@ private fun FollowFeedScreen(
                     onLoadLongText = onLoadLongText,
                     onToggleLike = onToggleLike,
                     onUrlEntityClick = onUrlEntityClick,
+                    onCommentClick = { onCommentClick(resolved) },
+                    onRepostClick = { onRepostClick(resolved) },
                     menuBackEnabled = feedUiOnTop,
                 )
             }
@@ -3939,6 +3977,7 @@ private fun FeedCard(
                 colors = CardDefaults.elevatedCardColors(
                     containerColor = Color.White,
                 ),
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
             ) {
                 cardBody()
             }
@@ -6944,8 +6983,8 @@ private fun DetailScreen(
                     .fillMaxWidth(),
                 contentPadding = PaddingValues(bottom = 24.dp),
             ) {
-                item {
-                    Column(Modifier.padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                item(key = "detail-feed") {
+                    Box(Modifier.padding(top = 8.dp)) {
                         FeedCard(
                             item = item,
                             onClick = {},
@@ -6962,28 +7001,30 @@ private fun DetailScreen(
                             showAuthorRow = false,
                             insetRounded = true,
                         )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = CommentRowOuterStart, end = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = if (showingReposts) {
-                                    "转发 ${item.repostsCount}"
-                                } else {
-                                    "评论 ${item.commentsCount}"
-                                },
-                                fontSize = CommentAuthorFontSize,
-                                fontWeight = FontWeight.SemiBold,
+                    }
+                }
+                item(key = "detail-section-header") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = CommentRowOuterStart, end = 8.dp, top = 12.dp, bottom = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = if (showingReposts) {
+                                "转发 ${item.repostsCount}"
+                            } else {
+                                "评论 ${item.commentsCount}"
+                            },
+                            fontSize = CommentAuthorFontSize,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (!showingReposts) {
+                            CommentSortToggle(
+                                selected = commentSort,
+                                onSelected = onCommentSortChange,
                             )
-                            if (!showingReposts) {
-                                CommentSortToggle(
-                                    selected = commentSort,
-                                    onSelected = onCommentSortChange,
-                                )
-                            }
                         }
                     }
                 }

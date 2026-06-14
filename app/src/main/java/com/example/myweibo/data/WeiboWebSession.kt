@@ -520,41 +520,7 @@ class WeiboWebSession(context: Context) {
             return RepostsPage(items = emptyList(), nextPage = null)
         }
         val candidates = repostTimelineStatusIdCandidates(item)
-        runCatching { loadPcReposts(item, candidates, page) }
-            .getOrNull()
-            ?.takeIf { page > 1 || it.items.isNotEmpty() || item.hasNoReposts() }
-            ?.let { return it }
-
-        ensureMweiboSession()
-        var lastError: Throwable? = null
-        for ((index, statusId) in candidates.withIndex()) {
-            runCatching {
-                val url = Uri.Builder()
-                    .scheme("https")
-                    .authority("m.weibo.cn")
-                    .appendPath("api")
-                    .appendPath("statuses")
-                    .appendPath("repostTimeline")
-                    .appendQueryParameter("id", statusId)
-                    .appendQueryParameter("page", page.toString())
-                    .appendQueryParameter("count", "20")
-                    .build()
-                    .toString()
-                val referer = "https://m.weibo.cn/detail/${repostTimelineDetailRefererId(item, statusId)}"
-                val raw = nativeFetchMweiboJson(url, referer)
-                val parsed = WeiboJsonParser.parseMweiboReposts(raw, page)
-                if (page <= 1 &&
-                    parsed.items.isEmpty() &&
-                    !item.hasNoReposts() &&
-                    index < candidates.lastIndex
-                ) {
-                    throw IllegalStateException("empty-reposts-for-candidate:$statusId")
-                }
-                parsed
-            }.onSuccess { return it }
-                .onFailure { lastError = it }
-        }
-        throw lastError ?: IllegalStateException("转发列表加载失败，请稍后重试")
+        return loadPcReposts(item, candidates, page)
     }
 
     private suspend fun loadPcReposts(
@@ -606,7 +572,7 @@ class WeiboWebSession(context: Context) {
         throw lastError ?: IllegalStateException("PC转发列表加载失败")
     }
 
-    /** m.weibo.cn 转发列表接口需要数字 mid/idstr，与评论接口一致优先用 item.id。 */
+    /** PC 转发接口通常优先接受 mblogid/bid，失败时再尝试数字 mid/idstr。 */
     private fun repostTimelineStatusIdCandidates(item: FeedItem): List<String> {
         val raw = listOf(item.statusId, item.id).distinct().filter { it.isNotBlank() }
         require(raw.isNotEmpty()) { "无效的微博 ID" }

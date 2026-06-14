@@ -92,36 +92,6 @@ object WeiboJsonParser {
         }
     }
 
-    fun parseMweiboReposts(raw: String, page: Int = 1): RepostsPage {
-        val root = JSONObject(raw)
-        if (root.optInt("ok", 0) != 1) {
-            val message = root.optNullableString("msg")?.trim().orEmpty()
-            if (message.isEmpty() || message.contains("暂无") || message.contains("没有") || message.contains("为空")) {
-                return RepostsPage(items = emptyList(), nextPage = null)
-            }
-            throw IllegalStateException(message.ifBlank { "转发列表加载失败，请稍后重试" })
-        }
-        val data = root.optJSONObject("data")
-            ?: return RepostsPage(items = emptyList(), nextPage = null)
-        val arr = data.optJSONArray("data") ?: JSONArray()
-        val items = buildList {
-            for (index in 0 until arr.length()) {
-                val repost = arr.optJSONObject(index) ?: continue
-                parseMweiboRepostItem(repost)?.let(::add)
-            }
-        }
-        val maxPage = data.optInt("max", 0)
-        val totalNumber = data.optLong("total_number", 0L)
-        val nextPage = when {
-            items.isEmpty() -> null
-            maxPage > 0 && page < maxPage -> page + 1
-            totalNumber > 0L && page * MWEIBO_REPOST_PAGE_SIZE < totalNumber -> page + 1
-            items.size >= MWEIBO_REPOST_PAGE_SIZE -> page + 1
-            else -> null
-        }
-        return RepostsPage(items = items, nextPage = nextPage)
-    }
-
     fun parsePcReposts(raw: String, page: Int = 1): RepostsPage {
         val root = JSONObject(raw)
         if (root.has("ok") && root.optInt("ok", 1) != 1) {
@@ -147,7 +117,7 @@ object WeiboJsonParser {
         val items = buildList {
             for (index in 0 until arr.length()) {
                 val repost = arr.optJSONObject(index) ?: continue
-                parseMweiboRepostItem(repost)?.let(::add)
+                parseRepostItem(repost)?.let(::add)
             }
         }
         val nextCursor = data?.optNullableString("max_id")
@@ -166,10 +136,9 @@ object WeiboJsonParser {
         return RepostsPage(items = items, nextPage = nextPage)
     }
 
-    private const val MWEIBO_REPOST_PAGE_SIZE = 10
     private const val PC_REPOST_PAGE_SIZE = 20
 
-    private fun parseMweiboRepostItem(repost: JSONObject): CommentItem? {
+    private fun parseRepostItem(repost: JSONObject): CommentItem? {
         val normalized = normalizeMweiboStatus(repost)
         val user = normalized.optJSONObject("user")
         val id = normalized.optNullableString("idstr")
