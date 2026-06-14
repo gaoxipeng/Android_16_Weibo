@@ -40,6 +40,22 @@ fun FeedItem.collectEmoticons(): Map<String, String> {
     return map
 }
 
+fun List<FeedItem>.collectAllEmoticons(): Map<String, String> = buildMap {
+    for (item in this@collectAllEmoticons) {
+        putAll(item.collectEmoticons())
+    }
+}
+
+fun List<CommentItem>.collectAllCommentEmoticons(): Map<String, String> = buildMap {
+    fun walk(comment: CommentItem) {
+        putAll(comment.emoticons)
+        comment.comments.forEach(::walk)
+    }
+    for (comment in this@collectAllCommentEmoticons) {
+        walk(comment)
+    }
+}
+
 private fun weiboStatusIdToMillis(id: String): Long? {
     val numericId = id.trim().toLongOrNull() ?: return null
     val seconds = (numericId shr 22) + WEIBO_MID_EPOCH_OFFSET

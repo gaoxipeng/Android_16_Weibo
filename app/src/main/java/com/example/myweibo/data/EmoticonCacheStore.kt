@@ -41,6 +41,31 @@ class EmoticonCacheStore(context: Context) {
         }
     }
 
+    /**
+     * @param overwriteExisting true 时 incoming 覆盖已有同名条目（用于设置同步）；
+     *                          false 时仅补充缓存中尚未存在的条目（用于信息流发现）。
+     */
+    suspend fun merge(
+        incoming: Map<String, String>,
+        overwriteExisting: Boolean = false,
+    ): Map<String, String> {
+        if (incoming.isEmpty()) return read()
+        val cleaned = incoming.filter { (phrase, url) ->
+            phrase.isNotBlank() && url.isNotBlank()
+        }
+        if (cleaned.isEmpty()) return read()
+        val existing = read()
+        val merged = if (overwriteExisting) {
+            existing + cleaned
+        } else {
+            existing + cleaned.filterKeys { it !in existing }
+        }
+        if (merged != existing) {
+            write(merged)
+        }
+        return merged
+    }
+
     fun readRecent(limit: Int = RECENT_LIMIT): List<String> {
         val raw = prefs.getString(KEY_RECENT, null) ?: return emptyList()
         return runCatching {

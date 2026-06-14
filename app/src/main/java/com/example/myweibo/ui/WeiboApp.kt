@@ -262,6 +262,8 @@ import com.example.myweibo.data.WeiboArticle
 import com.example.myweibo.data.resolveArticleId
 import com.example.myweibo.data.formatWeiboTime
 import com.example.myweibo.data.collectEmoticons
+import com.example.myweibo.data.collectAllEmoticons
+import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.ui.theme.StatusQuotedBackground
@@ -860,6 +862,39 @@ fun WeiboApp() {
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
     }
 
+    fun absorbDiscoveredEmoticons(discovered: Map<String, String>) {
+        if (discovered.isEmpty()) return
+        scope.launch {
+            val merged = emoticonCacheStore.merge(discovered, overwriteExisting = false)
+            if (merged != emoticonMap) {
+                emoticonMap = merged
+            }
+        }
+    }
+
+    fun syncEmoticons() {
+        if (emoticonSyncing) return
+        scope.launch {
+            emoticonSyncing = true
+            runCatching { session.loadEmotions() }
+                .onSuccess { emotions ->
+                    if (emotions.isEmpty()) {
+                        showMessage("表情同步失败", "微博未返回表情配置，请确认已登录后重试")
+                    } else {
+                        val synced = emotions.associate { it.phrase to it.url }
+                        val merged = emoticonCacheStore.merge(synced, overwriteExisting = true)
+                        emoticonMap = merged
+                        recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in merged }
+                        showMessage("表情同步完成", "已同步 ${synced.size} 个表情")
+                    }
+                }
+                .onFailure { error ->
+                    showMessage("表情同步失败", error.message ?: "无法读取微博表情配置")
+                }
+            emoticonSyncing = false
+        }
+    }
+
     fun isLoginStateFailure(error: Throwable): Boolean {
         val message = error.message.orEmpty()
         return message.contains("未发现微博登录 Cookie") ||
@@ -1290,6 +1325,14 @@ fun WeiboApp() {
         navigateBack()
     }
 
+    fun dismissFollowListForTabSwitch() {
+        if (followListOverlay == null) return
+        followListOverlay = null
+        if (navStack.isNotEmpty()) {
+            navStack = navStack.dropLast(1)
+        }
+    }
+
     fun openFollowList(
         uid: String,
         screenName: String,
@@ -1444,6 +1487,7 @@ fun WeiboApp() {
                 .onSuccess { page ->
                     items = sortFeedTimelineItems(page.items)
                     nextCursor = page.nextCursor
+                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     hasLoginCookie = true
                     persistLoginSession()
                     if (page.items.isEmpty()) {
@@ -1485,6 +1529,7 @@ fun WeiboApp() {
                 .onSuccess { page ->
                     items = sortFeedTimelineItems(page.items)
                     nextCursor = page.nextCursor
+                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     hasLoginCookie = true
                     persistLoginSession()
                     if (page.items.isEmpty()) {
@@ -1528,6 +1573,7 @@ fun WeiboApp() {
                 .onSuccess { page ->
                     val (merged, appended) = mergeFeedTimelinePages(items, page.items)
                     items = merged
+                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     nextCursor = when {
                         page.items.isEmpty() -> null
                         appended == 0 -> null
@@ -1717,6 +1763,7 @@ fun WeiboApp() {
 
     fun applyExpandedItem(expanded: FeedItem) {
         expandedFeedItems = expandedFeedItems + (expanded.statusId to expanded)
+        absorbDiscoveredEmoticons(expanded.collectEmoticons())
         items = items.map { mergeExpandedIntoItem(it, expanded) }
         minePosts = minePosts.map { mergeExpandedIntoItem(it, expanded) }
         visitedPosts = visitedPosts.map { mergeExpandedIntoItem(it, expanded) }
@@ -1786,6 +1833,7 @@ fun WeiboApp() {
             runCatching { session.loadComments(item, commentSort) }
                 .onSuccess { page ->
                     comments = page.items
+                    absorbDiscoveredEmoticons(page.items.collectAllCommentEmoticons())
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
                 }
@@ -2001,6 +2049,7 @@ fun WeiboApp() {
             runCatching { session.loadMoreComments(item, cursor, commentSort) }
                 .onSuccess { page ->
                     comments = comments + page.items
+                    absorbDiscoveredEmoticons(page.items.collectAllCommentEmoticons())
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
                 }
@@ -2062,29 +2111,6 @@ fun WeiboApp() {
         }
     }
 
-    fun syncEmoticons() {
-        if (emoticonSyncing) return
-        scope.launch {
-            emoticonSyncing = true
-            runCatching { session.loadEmotions() }
-                .onSuccess { emotions ->
-                    if (emotions.isEmpty()) {
-                        showMessage("表情同步失败", "微博未返回表情配置，请确认已登录后重试")
-                    } else {
-                        val synced = emotions.associate { it.phrase to it.url }
-                        emoticonMap = synced
-                        emoticonCacheStore.write(synced)
-                        recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in synced }
-                        showMessage("表情同步完成", "已同步 ${synced.size} 个表情")
-                    }
-                }
-                .onFailure { error ->
-                    showMessage("表情同步失败", error.message ?: "无法读取微博表情配置")
-                }
-            emoticonSyncing = false
-        }
-    }
-
     LaunchedEffect(Unit) {
         val savedActiveId = accountStore.readActiveAccountId()
         if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
@@ -2099,6 +2125,7 @@ fun WeiboApp() {
         timelineCacheStore.readFollowingTimeline()?.let { page ->
             items = sortFeedTimelineItems(page.items)
             nextCursor = page.nextCursor
+            absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
         }
         mineCacheStore.readProfile()?.let { profile ->
             mineProfile = profile
@@ -2218,6 +2245,9 @@ fun WeiboApp() {
         isLoading = isLoading,
         snackbarHostState = snackbarHostState,
         onTabChange = { tab ->
+            if (tab != selectedTab) {
+                dismissFollowListForTabSwitch()
+            }
             if (tab == MainTab.Feed && selectedTab == MainTab.Feed && selectedItem == null) {
                 refreshTimelineFromTop()
             } else {
@@ -2306,11 +2336,15 @@ fun WeiboApp() {
                 }
 
                 followListOverlay?.let { overlay ->
+                    val followListBelongsToCurrentContext = when {
+                        visitedUserId != null -> visitedUserId == overlay.uid
+                        else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
+                    }
                     val followListUiOnTop = selectedItem == null &&
                         articleOverlay == null &&
                         mediaPreview == null &&
                         albumViewerState == null &&
-                        (visitedUserId == null || visitedUserId == overlay.uid)
+                        followListBelongsToCurrentContext
                     Box(
                         Modifier
                             .fillMaxSize()
@@ -2762,10 +2796,14 @@ fun WeiboApp() {
                     feedTabLabel = timelineKind.label,
                     selectedTimelineKind = timelineKind,
                     onTimelineKindChange = { kind ->
+                        dismissFollowListForTabSwitch()
                         selectedTab = MainTab.Feed
                         switchTimelineKind(kind)
                     },
                     onTabChange = { tab ->
+                        if (tab != selectedTab) {
+                            dismissFollowListForTabSwitch()
+                        }
                         if (tab == MainTab.Feed && selectedTab == MainTab.Feed) {
                             refreshTimelineFromTop()
                         } else {
