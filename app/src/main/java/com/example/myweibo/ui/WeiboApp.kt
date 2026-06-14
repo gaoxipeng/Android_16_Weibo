@@ -27,6 +27,7 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.DecayAnimationSpec
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateDecay
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -99,6 +100,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -230,6 +232,8 @@ import com.example.myweibo.data.ProfileLookup
 import com.example.myweibo.data.FeedMedia
 import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
+import com.example.myweibo.data.FeedThumbnailQuality
+import com.example.myweibo.data.ImageSettingsStore
 import com.example.myweibo.data.PlaybackSettingsStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
@@ -348,6 +352,11 @@ private val HintCapsuleText = Color(0xFF1F1F1F)
 private val HintCapsulePlaceholder = Color(0xFFAAAAAA)
 private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
+private val FeedCardContentHorizontalPadding = 12.dp
+private val FeedCardSectionSpacing = 10.dp
+private val FeedCardItemSpacing = 8.dp
+private const val SingleImageMaxHeightToWidth = 0.7f
+private const val SingleImageMaxWidthFraction = 0.7f
 
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
@@ -528,6 +537,22 @@ private class ImagePeekController {
 
 private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
+private val LocalFeedThumbnailQuality = staticCompositionLocalOf { FeedThumbnailQuality.Medium }
+private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
+
+private class FeedImageUpgradeNotifier {
+    var revision by mutableIntStateOf(0)
+        private set
+
+    fun notifyCacheUpdated() {
+        revision++
+    }
+}
+
+private fun feedImageUrlCandidates(image: FeedImage): List<String> =
+    (image.downloadUrls + image.largeUrl + image.thumbnailUrl)
+        .filter { it.isNotBlank() }
+        .distinct()
 
 private fun videoPlaybackKey(media: FeedMedia): String =
     media.resolvedPlaybackUrl()
@@ -565,6 +590,7 @@ fun WeiboApp() {
     val commentSortStore = remember { CommentSortStore(context) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
+    val imageSettingsStore = remember { ImageSettingsStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -580,6 +606,7 @@ fun WeiboApp() {
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
     var bottomBarExpanded by remember { mutableStateOf(true) }
+    var bottomBarAwaitingOutsideDismiss by remember { mutableStateOf(false) }
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
@@ -602,6 +629,7 @@ fun WeiboApp() {
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
+    var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
     var mediaPreview by remember { mutableStateOf<FeedMedia?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
     var searchMode by remember { mutableStateOf(storedSearchMode(searchSettingsStore.readMode())) }
@@ -1838,6 +1866,7 @@ fun WeiboApp() {
 
     LaunchedEffect(selectedTab, visitedUserId) {
         bottomBarExpanded = true
+        bottomBarAwaitingOutsideDismiss = false
     }
 
     LaunchedEffect(bottomBarListState) {
@@ -1847,8 +1876,9 @@ fun WeiboApp() {
         snapshotFlow {
             state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
         }.collect { scrollTotal ->
-            if (scrollTotal > lastScrollTotal + 24) {
+            if (scrollTotal > lastScrollTotal + 12) {
                 bottomBarExpanded = false
+                bottomBarAwaitingOutsideDismiss = false
             }
             lastScrollTotal = scrollTotal
         }
@@ -1910,10 +1940,13 @@ fun WeiboApp() {
         val hazeState = rememberHazeState()
         val imagePeekController = remember { ImagePeekController() }
         val videoPeekController = remember { VideoPeekController() }
+        val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
             LocalImagePeekController provides imagePeekController,
             LocalVideoPeekController provides videoPeekController,
+            LocalFeedThumbnailQuality provides feedThumbnailQuality,
+            LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
             Box(Modifier.fillMaxSize()) {
             Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
@@ -2207,6 +2240,11 @@ fun WeiboApp() {
                                     backgroundPlaybackEnabled = enabled
                                     playbackSettingsStore.writeBackgroundPlaybackEnabled(enabled)
                                 },
+                                feedThumbnailQuality = feedThumbnailQuality,
+                                onFeedThumbnailQualityChange = { quality ->
+                                    feedThumbnailQuality = quality
+                                    imageSettingsStore.writeThumbnailQuality(quality)
+                                },
                             )
                         }
 
@@ -2316,11 +2354,31 @@ fun WeiboApp() {
             }
 
             if (selectedItem == null && visitedUserId == null) {
+                if (bottomBarExpanded && bottomBarAwaitingOutsideDismiss) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(40f)
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() },
+                                onClick = {
+                                    bottomBarExpanded = false
+                                    bottomBarAwaitingOutsideDismiss = false
+                                },
+                            ),
+                    )
+                }
                 FloatingBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
                     hazeState = hazeState,
-                    onExpandRequest = { bottomBarExpanded = true },
+                    onExpandRequest = {
+                        if (!bottomBarExpanded) {
+                            bottomBarAwaitingOutsideDismiss = true
+                        }
+                        bottomBarExpanded = true
+                    },
                     onCollapsedTap = {
                         when (selectedTab) {
                             MainTab.Feed -> refreshTimelineFromTop()
@@ -2353,7 +2411,9 @@ fun WeiboApp() {
                             selectedTab = tab
                         }
                     },
-                    modifier = Modifier.align(Alignment.BottomCenter),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .zIndex(41f),
                 )
             }
 
@@ -2518,15 +2578,23 @@ private fun FloatingBottomBar(
     val tabs = MainTab.entries
     var liquidActive by remember { mutableStateOf(false) }
     var gestureActive by remember { mutableStateOf(false) }
-    var gesturePillXPx by remember { mutableFloatStateOf(0f) }
     var highlightedIndex by remember { mutableIntStateOf(-1) }
     var collapsedLongPressDragging by remember { mutableStateOf(false) }
     var timelineMenuExpanded by remember { mutableStateOf(false) }
+    val pillOffsetAnim = remember { Animatable(0f) }
+    val navPillSpring = spring<Float>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMedium,
+    )
+    val navChromeSpring = spring<Dp>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMedium,
+    )
 
-    LaunchedEffect(selectedTab) {
+    LaunchedEffect(selectedTab, gestureActive) {
         if (!gestureActive) {
             liquidActive = true
-            delay(260)
+            delay(220)
             liquidActive = false
         }
     }
@@ -2541,14 +2609,10 @@ private fun FloatingBottomBar(
         val selectedIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)
         val showExpandedChrome = expanded || gestureActive
         val animatedBarWidth by animateDpAsState(
-            targetValue = if (expanded) fullBarWidth else collapsedWidth,
-            animationSpec = spring(
-                dampingRatio = Spring.DampingRatioLowBouncy,
-                stiffness = Spring.StiffnessMediumLow,
-            ),
+            targetValue = if (expanded || gestureActive) fullBarWidth else collapsedWidth,
+            animationSpec = navChromeSpring,
             label = "bottom-bar-width",
         )
-        val barWidth = if (gestureActive) fullBarWidth else animatedBarWidth
 
         BoxWithConstraints(Modifier.width(fullBarWidth).height(72.dp)) {
             val barContentPadding = 8.dp
@@ -2591,54 +2655,53 @@ private fun FloatingBottomBar(
             }
 
             fun updateGesturePill(rawX: Float) {
-                gesturePillXPx = pillOffsetPxForX(rawX)
                 highlightedIndex = indexForX(rawX)
+                val offset = pillOffsetPxForX(rawX)
+                scope.launch {
+                    pillOffsetAnim.snapTo(offset)
+                }
             }
 
             fun resetGesture() {
                 gestureActive = false
                 collapsedLongPressDragging = false
                 highlightedIndex = -1
-                liquidActive = false
             }
 
             fun finishGesture(targetIndex: Int, requestExpand: Boolean = false) {
                 highlightedIndex = -1
                 collapsedLongPressDragging = false
-                liquidActive = true
                 if (requestExpand) {
                     onExpandRequestState()
                 }
+                gestureActive = false
                 onTabChangeState(tabs[targetIndex])
-                scope.launch {
-                    delay(120)
-                    gestureActive = false
-                }
-                scope.launch {
-                    delay(260)
-                    liquidActive = false
+            }
+
+            LaunchedEffect(selectedIndex, restingPillWidthPx, gestureActive) {
+                if (!gestureActive) {
+                    pillOffsetAnim.animateTo(
+                        pillOffsetPxForIndex(selectedIndex, restingPillWidthPx),
+                        navPillSpring,
+                    )
                 }
             }
 
-            val animatedPillOffset by animateDpAsState(
-                targetValue = with(density) { pillOffsetPxForIndex(selectedIndex).toDp() },
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioNoBouncy,
-                    stiffness = Spring.StiffnessMediumLow,
-                ),
-                label = "selected-nav-pill",
+            val animatedPillWidth by animateDpAsState(
+                targetValue = if (gestureActive) gesturePillWidth else restingPillWidth,
+                animationSpec = navChromeSpring,
+                label = "nav-pill-width",
             )
-            val pillWidthDp = if (gestureActive) gesturePillWidth else restingPillWidth
-            val pillHeightDp = if (gestureActive) 62.dp else 58.dp
-            val pillOffset = if (gestureActive) {
-                with(density) { gesturePillXPx.toDp() }
-            } else {
-                animatedPillOffset
-            }
+            val animatedPillHeight by animateDpAsState(
+                targetValue = if (gestureActive) 62.dp else 58.dp,
+                animationSpec = navChromeSpring,
+                label = "nav-pill-height",
+            )
+            val pillOffset = with(density) { pillOffsetAnim.value.toDp() }
             val highlightedTab = highlightedIndex.takeIf { it >= 0 }?.let { tabs[it] }
 
             Surface(
-                modifier = Modifier.width(barWidth).fillMaxHeight(),
+                modifier = Modifier.width(animatedBarWidth).fillMaxHeight(),
                 color = HintCapsuleWhite,
                 shadowElevation = 0.dp,
                 shape = glassShape,
@@ -2657,8 +2720,8 @@ private fun FloatingBottomBar(
                             modifier = Modifier
                                 .align(Alignment.CenterStart)
                                 .offset(x = pillOffset)
-                                .width(pillWidthDp)
-                                .height(pillHeightDp),
+                                .width(animatedPillWidth)
+                                .height(animatedPillHeight),
                         )
 
                         Row(
@@ -2728,8 +2791,12 @@ private fun FloatingBottomBar(
                                 if (offset.x > collapsedWidthPx) return@detectDragGesturesAfterLongPress
                                 collapsedLongPressDragging = true
                                 gestureActive = true
-                                liquidActive = true
                                 onExpandRequestState()
+                                scope.launch {
+                                    pillOffsetAnim.snapTo(
+                                        pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
+                                    )
+                                }
                                 updateGesturePill(offset.x)
                             },
                             onDrag = { change, _ ->
@@ -2745,10 +2812,7 @@ private fun FloatingBottomBar(
                             },
                             onDragCancel = {
                                 if (collapsedLongPressDragging) {
-                                    collapsedLongPressDragging = false
-                                    gestureActive = false
-                                    highlightedIndex = -1
-                                    liquidActive = false
+                                    resetGesture()
                                 }
                             },
                         )
@@ -2764,6 +2828,11 @@ private fun FloatingBottomBar(
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 var targetIndex = indexForX(down.position.x)
                                 gestureActive = true
+                                scope.launch {
+                                    pillOffsetAnim.snapTo(
+                                        pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
+                                    )
+                                }
                                 updateGesturePill(down.position.x)
                                 down.consume()
 
@@ -3638,32 +3707,31 @@ private fun FeedCard(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
+    insetRounded: Boolean = false,
     onBoundsChange: (Rect) -> Unit = {},
 ) {
-    ElevatedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(
-                start = 12.dp,
-                end = 12.dp,
-                top = if (showAuthorRow) 6.dp else 0.dp,
-                bottom = 6.dp,
-            )
-            .onGloballyPositioned { coordinates ->
-                onBoundsChange(coordinates.boundsInWindow())
-            },
-        shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
-        ),
-    ) {
-        val resolvedEmoticonMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
-        var inlineImagePreview by remember(item.statusId) { mutableStateOf<List<FeedImage>?>(null) }
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    val resolvedEmoticonMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
+    var inlineImagePreview by remember(item.statusId) { mutableStateOf<List<FeedImage>?>(null) }
+    val contentVerticalPadding = when {
+        insetRounded -> 14.dp
+        showAuthorRow -> 10.dp
+        else -> 0.dp
+    }
+    val cardBody: @Composable () -> Unit = {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    top = contentVerticalPadding,
+                    bottom = if (insetRounded) 14.dp else 10.dp,
+                ),
+            verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
+        ) {
             if (showAuthorRow) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = FeedCardContentHorizontalPadding),
                     verticalAlignment = Alignment.Top,
                 ) {
                     Box(
@@ -3684,8 +3752,11 @@ private fun FeedCard(
                 }
             }
             Column(
-                modifier = Modifier.clickable(onClick = onClick),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = FeedCardContentHorizontalPadding)
+                    .clickable(onClick = onClick),
+                verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
             ) {
                 StatusTextSection(
                     item = item,
@@ -3702,6 +3773,7 @@ private fun FeedCard(
             }
             item.retweetedStatus?.let { retweeted ->
                 QuotedStatus(
+                    modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                     item = retweeted,
                     onMediaClick = onMediaClick,
                     emoticonMap = emoticonMap,
@@ -3713,15 +3785,48 @@ private fun FeedCard(
                 )
             }
             MediaStrip(
+                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 images = item.images,
                 media = item.media,
                 onMediaClick = onMediaClick,
             )
             StatusActions(
+                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 item = item,
                 onCommentClick = onClick,
                 onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
             )
+        }
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { coordinates ->
+                onBoundsChange(coordinates.boundsInWindow())
+            },
+    ) {
+        if (insetRounded) {
+            ElevatedCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = FeedCardContentHorizontalPadding),
+                shape = RoundedCornerShape(8.dp),
+                elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
+                colors = CardDefaults.elevatedCardColors(
+                    containerColor = Color.White,
+                ),
+            ) {
+                cardBody()
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = FeedCardItemSpacing)
+                    .background(Color.White),
+            ) {
+                cardBody()
+            }
         }
         inlineImagePreview?.let { images ->
             FullscreenImageViewer(
@@ -3783,20 +3888,27 @@ private fun QuotedStatus(
     isLongTextLoading: Boolean = false,
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    modifier: Modifier = Modifier,
 ) {
     val resolvedMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
-    Surface(
-        color = StatusQuotedBackground,
+    ElevatedCard(
+        modifier = modifier
+            .fillMaxWidth()
+            .border(0.5.dp, Color(0xFFE8E8E8), RoundedCornerShape(8.dp)),
         shape = RoundedCornerShape(8.dp),
+        elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = StatusQuotedBackground,
+        ),
     ) {
         Column(
-            Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+            Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
         ) {
             Column(
                 modifier = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
-                verticalArrangement = Arrangement.spacedBy(4.dp),
+                verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
             ) {
                 StatusTextSection(
                     item = item,
@@ -3822,79 +3934,52 @@ private fun QuotedStatus(
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-private fun CommentSortActionMenu(
+private fun CommentSortLinesIcon(
+    modifier: Modifier = Modifier,
+    tint: Color,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        repeat(3) {
+            Box(
+                Modifier
+                    .width(12.dp)
+                    .height(1.5.dp)
+                    .background(tint, RoundedCornerShape(1.dp)),
+            )
+        }
+    }
+}
+
+@Composable
+private fun CommentSortToggle(
     selected: CommentSort,
     onSelected: (CommentSort) -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-    val density = LocalDensity.current
-    val haptic = LocalHapticFeedback.current
-
-    fun dismissMenu() {
-        expanded = false
-    }
-
-    if (expanded) {
-        BackHandler { dismissMenu() }
-    }
-
     val metaColor = weiboMetaTextColor()
-    Box {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
-                        expanded = !expanded
-                    },
-                )
-                .padding(horizontal = 4.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = selected.label,
-                style = MaterialTheme.typography.bodySmall,
-                color = metaColor,
-            )
-            SettingsExpandIndicator(
-                modifier = Modifier.size(16.dp),
-                tint = metaColor,
-            )
-        }
+    val nextSort = if (selected == CommentSort.Time) CommentSort.Hot else CommentSort.Time
 
-        if (expanded) {
-            Popup(
-                alignment = Alignment.TopEnd,
-                offset = IntOffset(0, with(density) { 30.dp.roundToPx() }),
-                onDismissRequest = { dismissMenu() },
-                properties = PopupProperties(focusable = false),
-            ) {
-                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
-                    CommentSort.entries.forEachIndexed { index, sort ->
-                        if (index > 0) {
-                            ImageActionMenuDivider()
-                        }
-                        ImageActionRow(
-                            label = sort.label,
-                            enabled = true,
-                            selected = sort == selected,
-                            onClick = {
-                                dismissMenu()
-                                if (sort != selected) {
-                                    onSelected(sort)
-                                }
-                            },
-                        )
-                    }
-                }
-            }
-        }
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = { onSelected(nextSort) },
+            )
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        CommentSortLinesIcon(tint = metaColor)
+        Text(
+            text = selected.label,
+            style = MaterialTheme.typography.bodySmall,
+            color = metaColor,
+        )
     }
 }
 
@@ -4047,16 +4132,59 @@ private fun singleImageDisplayAspectRatio(width: Int, height: Int): Float {
     if (width <= 0 || height <= 0) return 1f
     val naturalAspect = width.toFloat() / height
     val heightToWidth = height.toFloat() / width
-    if (heightToWidth <= 1.35f) {
-        return naturalAspect.coerceIn(0.75f, 3f)
+    val minAspectFromHeightCap = 1f / SingleImageMaxHeightToWidth
+    val aspect = if (heightToWidth <= 1.35f) {
+        naturalAspect.coerceIn(0.75f, 3f)
+    } else {
+        val minAspect = when {
+            heightToWidth <= 2f -> 0.72f
+            heightToWidth <= 3f -> 0.80f
+            heightToWidth <= 5f -> 0.86f
+            else -> 0.90f
+        }
+        naturalAspect.coerceAtLeast(minAspect)
     }
-    val minAspect = when {
-        heightToWidth <= 2f -> 0.62f
-        heightToWidth <= 3f -> 0.72f
-        heightToWidth <= 5f -> 0.82f
-        else -> 0.9f
+    return aspect.coerceAtLeast(minAspectFromHeightCap).coerceAtMost(3f)
+}
+
+@Composable
+private fun FeedImageThumbnailContent(
+    image: FeedImage,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop,
+    previewUrl: String? = null,
+) {
+    val thumbnailQuality = LocalFeedThumbnailQuality.current
+    val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
+    val cachedFullBitmap = remember(image.id, image.largeUrl, upgradeRevision) {
+        FeedBitmapCache.getForImage(image)
     }
-    return naturalAspect.coerceAtLeast(minAspect).coerceAtMost(3f)
+    val useCachedFullSize = thumbnailQuality != FeedThumbnailQuality.High && cachedFullBitmap != null
+    val displayUrl = remember(image, thumbnailQuality) { thumbnailQuality.displayUrl(image) }
+    val fallbackUrl = remember(image, thumbnailQuality) { thumbnailQuality.fallbackUrl(image) }
+
+    if (useCachedFullSize) {
+        Image(
+            bitmap = cachedFullBitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = modifier,
+            contentScale = contentScale,
+        )
+    } else {
+        RemoteImage(
+            url = previewUrl ?: displayUrl,
+            fallbackUrls = if (previewUrl != null) {
+                emptyList()
+            } else {
+                listOfNotNull(fallbackUrl)
+            },
+            cacheLookupUrls = feedImageUrlCandidates(image),
+            maxDecodeDim = thumbnailQuality.maxDecodeDim,
+            modifier = modifier,
+            contentScale = contentScale,
+            animated = image.isGif,
+        )
+    }
 }
 
 @Composable
@@ -4149,16 +4277,11 @@ private fun FeedImageCell(
                 )
             },
     ) {
-        RemoteImage(
-            url = previewUrl ?: image.thumbnailUrl.ifBlank { image.largeUrl },
-            fallbackUrls = if (previewUrl != null) {
-                emptyList()
-            } else {
-                listOfNotNull(image.largeUrl.takeIf { it.isNotBlank() && it != image.thumbnailUrl })
-            },
+        FeedImageThumbnailContent(
+            image = image,
+            previewUrl = previewUrl,
             modifier = Modifier.fillMaxSize(),
             contentScale = contentScale,
-            animated = image.isGif,
         )
         if (showLiveBadge && (image.isLivePhoto || image.isGif)) {
             Surface(
@@ -4747,13 +4870,14 @@ private fun MediaStrip(
     images: List<FeedImage>,
     media: FeedMedia?,
     onMediaClick: (FeedMedia) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     if (images.isEmpty() && media == null) return
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
 
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (images.isNotEmpty()) {
             val gridColumns = when (images.size) {
                 1 -> 1
@@ -4765,35 +4889,51 @@ private fun MediaStrip(
             val rows = images.chunked(gridColumns)
 
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                rows.forEach { row ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        row.forEach { image ->
-                            FeedImageCell(
-                                image = image,
-                                allImages = images,
-                                imageIndex = images.indexOf(image),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .aspectRatio(
-                                        if (images.size == 1) {
-                                            singleImageDisplayAspectRatio(
-                                                width = image.width ?: 0,
-                                                height = image.height ?: 0,
-                                            )
-                                        } else {
-                                            1f
-                                        }
-                                    ),
-                                contentScale = if (images.size == 1) ContentScale.FillWidth else ContentScale.Crop,
-                                onOpenViewer = { index ->
-                                    viewerIndex = index
-                                    viewerOpen = true
-                                },
-                            )
-                        }
-                        // Fill remaining columns with empty space
-                        repeat(gridColumns - row.size) {
-                            Spacer(Modifier.weight(1f))
+                if (images.size == 1) {
+                    val image = images.first()
+                    val aspect = singleImageDisplayAspectRatio(
+                        width = image.width ?: 0,
+                        height = image.height ?: 0,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Start,
+                    ) {
+                        FeedImageCell(
+                            image = image,
+                            allImages = images,
+                            imageIndex = 0,
+                            modifier = Modifier
+                                .fillMaxWidth(SingleImageMaxWidthFraction)
+                                .aspectRatio(aspect),
+                            contentScale = ContentScale.Crop,
+                            onOpenViewer = { index ->
+                                viewerIndex = index
+                                viewerOpen = true
+                            },
+                        )
+                    }
+                } else {
+                    rows.forEach { row ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            row.forEach { image ->
+                                FeedImageCell(
+                                    image = image,
+                                    allImages = images,
+                                    imageIndex = images.indexOf(image),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .aspectRatio(1f),
+                                    contentScale = ContentScale.Crop,
+                                    onOpenViewer = { index ->
+                                        viewerIndex = index
+                                        viewerOpen = true
+                                    },
+                                )
+                            }
+                            repeat(gridColumns - row.size) {
+                                Spacer(Modifier.weight(1f))
+                            }
                         }
                     }
                 }
@@ -4829,6 +4969,11 @@ private fun FullscreenImageViewer(
     statusCache: Map<String, FeedItem> = emptyMap(),
     onOpenStatus: ((FeedItem, Int, Map<String, FeedItem>) -> Unit)? = null,
 ) {
+    val upgradeNotifier = LocalFeedImageUpgradeNotifier.current
+    val dismissViewer = {
+        upgradeNotifier.notifyCacheUpdated()
+        onDismiss()
+    }
     val pagerState = rememberPagerState(pageCount = { images.size }, initialPage = initialIndex)
     val pagerFling = PagerDefaults.flingBehavior(
         state = pagerState,
@@ -4877,10 +5022,10 @@ private fun FullscreenImageViewer(
     }
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismissViewer,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        BackHandler { onDismiss() }
+        BackHandler { dismissViewer() }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -4895,7 +5040,7 @@ private fun FullscreenImageViewer(
                 ZoomableFullscreenImage(
                     image = images[page],
                     allImages = images,
-                    onDismiss = onDismiss,
+                    onDismiss = dismissViewer,
                     hasMultipleImages = images.size > 1,
                     onBlockPagerScroll = { blockPagerScroll = it },
                     onRequestPageChange = { delta ->
@@ -5055,21 +5200,15 @@ private fun ZoomableFullscreenImage(
     onBlockPagerScroll: (Boolean) -> Unit = {},
     onRequestPageChange: (Int) -> Unit = {},
 ) {
-    var targetScale by remember(image.largeUrl) { mutableStateOf(1f) }
-    val scale by animateFloatAsState(
-        targetValue = targetScale,
-        animationSpec = tween(durationMillis = 180),
-        label = "fullscreen-image-scale",
-    )
+    var scale by remember(image.largeUrl) { mutableFloatStateOf(1f) }
     var panOffsetX by remember(image.largeUrl) { mutableFloatStateOf(0f) }
     var panOffsetY by remember(image.largeUrl) { mutableFloatStateOf(0f) }
     var dismissTranslationY by remember(image.largeUrl) { mutableStateOf(0f) }
     var panInertiaJob by remember(image.largeUrl) { mutableStateOf<Job?>(null) }
     val dismissSnapAnim = remember(image.largeUrl) { Animatable(0f) }
     val scope = rememberCoroutineScope()
-    val currentTargetScale = rememberUpdatedState(targetScale)
     var bitmap by remember(image.largeUrl) {
-        mutableStateOf(FullscreenBitmapCache.get(image.largeUrl))
+        mutableStateOf(FeedBitmapCache.getForImage(image))
     }
     var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
     var actionMenuOffset by remember(image.largeUrl) { mutableStateOf<Offset?>(null) }
@@ -5081,15 +5220,18 @@ private fun ZoomableFullscreenImage(
         dismissSnapAnim.snapTo(0f)
         panOffsetX = 0f
         panOffsetY = 0f
+        scale = 1f
         onBlockPagerScroll(false)
         actionMenuOffset = null
         actionMenuVisible = false
-        FullscreenBitmapCache.get(image.largeUrl)?.let { cached ->
+        FeedBitmapCache.getForImage(image)?.let { cached ->
             bitmap = cached
             return@LaunchedEffect
         }
         bitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
-        bitmap?.let { FullscreenBitmapCache.put(image.largeUrl, it) }
+        bitmap?.let { loaded ->
+            FeedBitmapCache.putForImage(image, loaded)
+        }
     }
 
     LaunchedEffect(actionMenuVisible, actionMenuOffset) {
@@ -5170,9 +5312,10 @@ private fun ZoomableFullscreenImage(
                         var dismissing = false
                         var lockedAxis: FullscreenDragAxis? = null
                         var horizontalPageDragAccum = 0f
-                        var gestureScale = currentTargetScale.value
+                        var gestureScale = scale
+                        val boxCenterX = containerWidthPx / 2f
+                        val boxCenterY = containerHeightPx / 2f
                         val down = awaitFirstDown(requireUnconsumed = false)
-                        var lastCentroid: Offset? = null
                         var lastDistance = 0f
                         while (true) {
                             val event = awaitPointerEvent()
@@ -5181,42 +5324,38 @@ private fun ZoomableFullscreenImage(
 
                             if (pressed.size >= 2) {
                                 dismissTranslationY = 0f
+                                panInertiaJob?.cancel()
                                 val first = pressed[0].position
                                 val second = pressed[1].position
                                 val centroid = Offset((first.x + second.x) / 2f, (first.y + second.y) / 2f)
                                 val distance = hypot(first.x - second.x, first.y - second.y)
                                 if (lastDistance > 0f) {
-                                    val zoom = (distance / lastDistance).coerceIn(0.72f, 1.38f)
-                                    gestureScale = (gestureScale * zoom).coerceIn(1f, 5f)
-                                    targetScale = gestureScale
-                                    val previousCentroid = lastCentroid ?: centroid
-                                    val pan = centroid - previousCentroid
-                                    if (gestureScale > 1f) {
-                                        val layout = layoutFor(gestureScale)
-                                        val (cx, cy) = clampPan(
-                                            panOffsetX + pan.x,
-                                            panOffsetY + pan.y,
-                                            layout,
-                                        )
-                                        panOffsetX = cx
-                                        panOffsetY = cy
-                                        updatePagerScrollBlock(gestureScale, panOffsetX)
-                                        velocityTracker.addPosition(
-                                            pressed.first().uptimeMillis,
-                                            centroid,
-                                        )
-                                    }
+                                    val oldScale = gestureScale.coerceAtLeast(0.01f)
+                                    val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, 5f)
+                                    panOffsetX = centroid.x - boxCenterX -
+                                        (centroid.x - boxCenterX - panOffsetX) * (newScale / oldScale)
+                                    panOffsetY = centroid.y - boxCenterY -
+                                        (centroid.y - boxCenterY - panOffsetY) * (newScale / oldScale)
+                                    val layout = layoutFor(newScale)
+                                    val (cx, cy) = clampPan(panOffsetX, panOffsetY, layout)
+                                    panOffsetX = cx
+                                    panOffsetY = cy
+                                    scale = newScale
+                                    gestureScale = newScale
+                                    updatePagerScrollBlock(newScale, panOffsetX)
+                                    velocityTracker.addPosition(
+                                        pressed.first().uptimeMillis,
+                                        centroid,
+                                    )
                                 }
-                                lastCentroid = centroid
                                 lastDistance = distance
                                 event.changes.forEach { it.consume() }
                             } else {
-                                lastCentroid = null
                                 lastDistance = 0f
                                 val change = pressed.first()
                                 val totalDrag = change.position - down.position
                                 val delta = change.position - change.previousPosition
-                                gestureScale = currentTargetScale.value
+                                gestureScale = scale
                                 if (lockedAxis == null) {
                                     val absX = abs(totalDrag.x)
                                     val absY = abs(totalDrag.y)
@@ -5306,7 +5445,7 @@ private fun ZoomableFullscreenImage(
                             }
                         }
 
-                        gestureScale = currentTargetScale.value
+                        gestureScale = scale
                         val dismissDistance = dismissTranslationY + dismissSnapAnim.value
                         if (dismissing || dismissDistance != 0f) {
                             val velocity = velocityTracker.calculateVelocity()
@@ -5376,12 +5515,24 @@ private fun ZoomableFullscreenImage(
                             dismissTranslationY = 0f
                             scope.launch { dismissSnapAnim.snapTo(0f) }
                             onBlockPagerScroll(false)
-                            if (targetScale > 1f) {
-                                targetScale = 1f
+                            if (scale > 1f) {
+                                scope.launch {
+                                    animate(
+                                        initialValue = scale,
+                                        targetValue = 1f,
+                                        animationSpec = tween(180),
+                                    ) { value, _ -> scale = value }
+                                }
                                 panOffsetX = 0f
                                 panOffsetY = 0f
                             } else {
-                                targetScale = fillScreenScale
+                                scope.launch {
+                                    animate(
+                                        initialValue = scale,
+                                        targetValue = fillScreenScale,
+                                        animationSpec = tween(180),
+                                    ) { value, _ -> scale = value }
+                                }
                             }
                         },
                         onLongPress = { offset ->
@@ -5400,11 +5551,12 @@ private fun ZoomableFullscreenImage(
         ) {
             val dismissOffsetY = dismissTranslationY + dismissSnapAnim.value
             val dismissAlpha = (1f - abs(dismissOffsetY) / containerHeightPx * 0.75f).coerceIn(0.35f, 1f)
+            val currentScale = scale
             val imageModifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    scaleX = scale
-                    scaleY = scale
+                    scaleX = currentScale
+                    scaleY = currentScale
                     translationX = panOffsetX
                     translationY = panOffsetY + dismissOffsetY
                     alpha = dismissAlpha
@@ -6456,6 +6608,7 @@ private val StatusLikeColor = Color(0xFFE94326)
 @Composable
 private fun StatusActions(
     item: FeedItem,
+    modifier: Modifier = Modifier,
     onCommentClick: (() -> Unit)? = null,
     onToggleLike: (() -> Unit)? = null,
 ) {
@@ -6464,7 +6617,7 @@ private fun StatusActions(
     val haptic = LocalHapticFeedback.current
     val likeLabelColor = if (item.liked) StatusLikeColor else chipColor
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .height(26.dp)
             .graphicsLayer {
@@ -6627,6 +6780,7 @@ private fun DetailScreen(
                             onToggleLike = onToggleLike,
                             onUrlEntityClick = onUrlEntityClick,
                             showAuthorRow = false,
+                            insetRounded = true,
                         )
                         Row(
                             modifier = Modifier
@@ -6640,7 +6794,7 @@ private fun DetailScreen(
                                 fontSize = CommentAuthorFontSize,
                                 fontWeight = FontWeight.SemiBold,
                             )
-                            CommentSortActionMenu(
+                            CommentSortToggle(
                                 selected = commentSort,
                                 onSelected = onCommentSortChange,
                             )
@@ -6956,165 +7110,65 @@ private fun CommentImageStrip(
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-private fun SearchModeActionMenu(
+private fun SearchModeToggle(
     selected: SearchMode,
     onSelected: (SearchMode) -> Unit,
-    backHandlerEnabled: Boolean = true,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-    val density = LocalDensity.current
-    val haptic = LocalHapticFeedback.current
-
-    fun dismissMenu() {
-        expanded = false
-    }
-
-    LaunchedEffect(backHandlerEnabled) {
-        if (!backHandlerEnabled) dismissMenu()
-    }
-
-    if (expanded) {
-        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
-    }
-
     val metaColor = weiboMetaTextColor()
-    Box {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
-                        expanded = !expanded
-                    },
-                )
-                .padding(horizontal = 4.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = selected.label,
-                style = MaterialTheme.typography.bodySmall,
-                color = metaColor,
-            )
-            SettingsExpandIndicator(
-                modifier = Modifier.size(16.dp),
-                tint = metaColor,
-            )
-        }
+    val nextMode = if (selected == SearchMode.Weibo) SearchMode.User else SearchMode.Weibo
 
-        if (expanded) {
-            Popup(
-                alignment = Alignment.TopStart,
-                offset = IntOffset(0, with(density) { (-92).dp.roundToPx() }),
-                onDismissRequest = { dismissMenu() },
-                properties = PopupProperties(focusable = true),
-            ) {
-                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
-                    SearchMode.entries.forEachIndexed { index, mode ->
-                        if (index > 0) {
-                            ImageActionMenuDivider()
-                        }
-                        ImageActionRow(
-                            label = mode.label,
-                            enabled = true,
-                            selected = mode == selected,
-                            onClick = {
-                                dismissMenu()
-                                if (mode != selected) {
-                                    onSelected(mode)
-                                }
-                            },
-                        )
-                    }
-                }
-            }
-        }
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = { onSelected(nextMode) },
+            )
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        CommentSortLinesIcon(tint = metaColor)
+        Text(
+            text = selected.label,
+            style = MaterialTheme.typography.bodySmall,
+            color = metaColor,
+        )
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
-private fun SearchWeiboSortActionMenu(
+private fun SearchWeiboSortToggle(
     selected: SearchWeiboSort,
     onSelected: (SearchWeiboSort) -> Unit,
-    backHandlerEnabled: Boolean = true,
 ) {
-    var expanded by remember { mutableStateOf(false) }
-    val density = LocalDensity.current
-    val haptic = LocalHapticFeedback.current
-
-    fun dismissMenu() {
-        expanded = false
-    }
-
-    LaunchedEffect(backHandlerEnabled) {
-        if (!backHandlerEnabled) dismissMenu()
-    }
-
-    if (expanded) {
-        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
-    }
-
     val metaColor = weiboMetaTextColor()
-    Box {
-        Row(
-            modifier = Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
-                        expanded = !expanded
-                    },
-                )
-                .padding(horizontal = 4.dp, vertical = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = selected.label,
-                style = MaterialTheme.typography.bodySmall,
-                color = metaColor,
-            )
-            SettingsExpandIndicator(
-                modifier = Modifier.size(16.dp),
-                tint = metaColor,
-            )
-        }
+    val nextSort = if (selected == SearchWeiboSort.Comprehensive) {
+        SearchWeiboSort.Realtime
+    } else {
+        SearchWeiboSort.Comprehensive
+    }
 
-        if (expanded) {
-            Popup(
-                alignment = Alignment.TopEnd,
-                offset = IntOffset(0, with(density) { 30.dp.roundToPx() }),
-                onDismissRequest = { dismissMenu() },
-                properties = PopupProperties(focusable = false),
-            ) {
-                ImageActionFrostedCard(modifier = Modifier.width(112.dp)) {
-                    SearchWeiboSort.entries.forEachIndexed { index, sort ->
-                        if (index > 0) {
-                            ImageActionMenuDivider()
-                        }
-                        ImageActionRow(
-                            label = sort.label,
-                            enabled = true,
-                            selected = sort == selected,
-                            onClick = {
-                                dismissMenu()
-                                if (sort != selected) {
-                                    onSelected(sort)
-                                }
-                            },
-                        )
-                    }
-                }
-            }
-        }
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = { onSelected(nextSort) },
+            )
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        CommentSortLinesIcon(tint = metaColor)
+        Text(
+            text = selected.label,
+            style = MaterialTheme.typography.bodySmall,
+            color = metaColor,
+        )
     }
 }
 
@@ -7128,7 +7182,6 @@ private fun SearchCapsuleField(
     onClear: () -> Unit,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
-    menuBackEnabled: Boolean = true,
 ) {
     val shape = RoundedCornerShape(22.dp)
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
@@ -7150,10 +7203,9 @@ private fun SearchCapsuleField(
                 .padding(start = 16.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            SearchModeActionMenu(
+            SearchModeToggle(
                 selected = mode,
                 onSelected = onModeChange,
-                backHandlerEnabled = menuBackEnabled,
             )
             Spacer(Modifier.width(8.dp))
             BasicTextField(
@@ -7521,7 +7573,6 @@ private fun SearchScreen(
                 .fillMaxWidth()
                 .padding(start = 18.dp, end = 18.dp, bottom = searchFieldBottom)
                 .zIndex(2f),
-            menuBackEnabled = resultsBackEnabled,
         )
 
         if (!hasLoginCookie) {
@@ -7731,10 +7782,9 @@ private fun SearchScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         if (searchMode == SearchMode.Weibo) {
-                            SearchWeiboSortActionMenu(
+                            SearchWeiboSortToggle(
                                 selected = weiboSort,
                                 onSelected = ::changeWeiboSort,
-                                backHandlerEnabled = resultsBackEnabled,
                             )
                         }
                     }
@@ -7936,6 +7986,8 @@ private fun MineScreen(
     onPendingOpenAccountLoginConsumed: () -> Unit = {},
     backgroundPlaybackEnabled: Boolean = false,
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
+    feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
+    onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
@@ -8039,6 +8091,8 @@ private fun MineScreen(
                 emoticonSyncing = emoticonSyncing,
                 backgroundPlaybackEnabled = backgroundPlaybackEnabled,
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                feedThumbnailQuality = feedThumbnailQuality,
+                onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
                 onBack = {
                     showAccountManagement = false
                     showSettings = false
@@ -8432,6 +8486,8 @@ private fun SettingsScreen(
     emoticonSyncing: Boolean,
     backgroundPlaybackEnabled: Boolean,
     onBackgroundPlaybackChange: (Boolean) -> Unit,
+    feedThumbnailQuality: FeedThumbnailQuality,
+    onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
     onBack: () -> Unit,
     onSwitchAccount: (String) -> Unit,
     onAddAccount: () -> Unit,
@@ -8439,6 +8495,7 @@ private fun SettingsScreen(
 ) {
     var accountExpanded by remember { mutableStateOf(false) }
     var emoticonExpanded by remember { mutableStateOf(false) }
+    var imageExpanded by remember { mutableStateOf(false) }
     val emoticonCount = emoticonMap.size
 
     SettingsPageShell(title = "设置", onBack = onBack) {
@@ -8468,10 +8525,124 @@ private fun SettingsScreen(
                 )
             }
             item {
+                SettingsImageCard(
+                    expanded = imageExpanded,
+                    onExpandedChange = { imageExpanded = it },
+                    quality = feedThumbnailQuality,
+                    onQualityChange = onFeedThumbnailQualityChange,
+                )
+            }
+            item {
                 SettingsPlaybackCard(
                     backgroundPlaybackEnabled = backgroundPlaybackEnabled,
                     onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsImageCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    quality: FeedThumbnailQuality,
+    onQualityChange: (FeedThumbnailQuality) -> Unit,
+) {
+    val subtitle = when (quality) {
+        FeedThumbnailQuality.Low -> "当前为省流模式，优先加载 bmiddle 缩略图"
+        FeedThumbnailQuality.Medium -> "当前为标准模式，优先加载 large 大图"
+        FeedThumbnailQuality.High -> "当前为高清模式，优先加载最高可用规格"
+    }
+
+    ElevatedCard(
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color.White,
+        ),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "图片清晰度",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = quality.label,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    FeedThumbnailQuality.entries.forEach { option ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onQualityChange(option) }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            RadioButton(
+                                selected = quality == option,
+                                onClick = { onQualityChange(option) },
+                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = option.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (quality == option) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                                Text(
+                                    text = option.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -10246,11 +10417,10 @@ private fun MineAlbumTile(
                 image.toAlbumFeedMedia()?.let(onVideoClick) ?: onClick()
             }
     ) {
-        RemoteImage(
-            url = image.thumbnailUrl.ifBlank { image.largeUrl },
+        FeedImageThumbnailContent(
+            image = image,
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop,
-            animated = image.isGif,
         )
         if (image.isAlbumVideo) {
             Box(
@@ -10753,6 +10923,8 @@ private fun RemoteImage(
     contentScale: ContentScale = ContentScale.Crop,
     animated: Boolean = false,
     fallbackUrls: List<String> = emptyList(),
+    cacheLookupUrls: List<String> = emptyList(),
+    maxDecodeDim: Int = 480,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -10766,12 +10938,21 @@ private fun RemoteImage(
     val candidates = remember(url, fallbackUrls) {
         (listOfNotNull(url?.takeIf { it.isNotBlank() }) + fallbackUrls).distinct()
     }
+    val cacheCandidates = remember(candidates, cacheLookupUrls) {
+        (cacheLookupUrls + candidates).distinct()
+    }
+    val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     var candidateIndex by remember(candidates) { mutableStateOf(0) }
     val currentUrl = candidates.getOrNull(candidateIndex)
     var bitmap by remember(currentUrl) { mutableStateOf<android.graphics.Bitmap?>(null) }
     var failed by remember(currentUrl) { mutableStateOf(false) }
 
-    LaunchedEffect(currentUrl, candidateIndex) {
+    LaunchedEffect(currentUrl, candidateIndex, maxDecodeDim, upgradeRevision, cacheCandidates) {
+        FeedBitmapCache.get(cacheCandidates)?.let {
+            bitmap = it
+            failed = false
+            return@LaunchedEffect
+        }
         bitmap = null
         failed = false
         val target = currentUrl ?: return@LaunchedEffect
@@ -10783,7 +10964,7 @@ private fun RemoteImage(
                     inJustDecodeBounds = true
                 }
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                val maxDim = 480
+                val maxDim = maxDecodeDim.coerceAtLeast(1)
                 val scale = maxOf(1, (options.outWidth / maxDim).coerceAtMost(options.outHeight / maxDim))
                 options.inJustDecodeBounds = false
                 options.inSampleSize = Integer.highestOneBit(scale)
@@ -10912,7 +11093,7 @@ private fun WebView.detachFromParent(): WebView {
     return this
 }
 
-private object FullscreenBitmapCache {
+private object FeedBitmapCache {
     private const val MaxEntries = 24
     private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
@@ -10923,8 +11104,26 @@ private object FullscreenBitmapCache {
     fun get(url: String): android.graphics.Bitmap? = entries[url]
 
     @Synchronized
+    fun get(urls: List<String>): android.graphics.Bitmap? {
+        urls.forEach { url ->
+            get(url)?.let { return it }
+        }
+        return null
+    }
+
+    @Synchronized
+    fun getForImage(image: FeedImage): android.graphics.Bitmap? =
+        get(feedImageUrlCandidates(image))
+
+    @Synchronized
     fun put(url: String, bitmap: android.graphics.Bitmap) {
         entries[url] = bitmap
+    }
+
+    @Synchronized
+    fun putForImage(image: FeedImage, bitmap: android.graphics.Bitmap) {
+        feedImageUrlCandidates(image).firstOrNull()?.let { put(it, bitmap) }
+        image.largeUrl.takeIf { it.isNotBlank() }?.let { put(it, bitmap) }
     }
 }
 
@@ -10970,11 +11169,9 @@ private fun loadRemoteAnimatedDrawable(url: String): Drawable {
 }
 
 private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
-    val candidates = (image.downloadUrls + image.largeUrl + image.thumbnailUrl)
-        .filter { it.isNotBlank() }
-        .distinct()
+    val candidates = feedImageUrlCandidates(image)
     candidates.forEach { url ->
-        FullscreenBitmapCache.get(url)?.let { return it }
+        FeedBitmapCache.get(url)?.let { return it }
     }
     candidates.forEach { url ->
         runCatching {
@@ -10987,7 +11184,7 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
             opts.inSampleSize = Integer.highestOneBit(rawSample).coerceAtLeast(1)
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
         }.getOrNull()?.let { bitmap ->
-            FullscreenBitmapCache.put(url, bitmap)
+            FeedBitmapCache.putForImage(image, bitmap)
             return bitmap
         }
     }
