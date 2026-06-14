@@ -143,6 +143,7 @@ class MineCacheStore(context: Context) {
             .put("is_edited", isEdited)
             .put("edit_count", editCount)
             .put("images", images.toFeedImagesJsonArray())
+            .put("medias", medias.toFeedMediasJsonArray())
             .put("media", media?.toJson())
             .put("retweeted_status", retweetedStatus?.toJson())
 
@@ -175,7 +176,8 @@ class MineCacheStore(context: Context) {
             isEdited = optBoolean("is_edited"),
             editCount = optInt("edit_count"),
             images = optJSONArray("images").toFeedImages(),
-            media = optJSONObject("media")?.toFeedMedia(),
+            medias = optJSONArray("medias").toFeedMedias()
+                .ifEmpty { optJSONObject("media")?.toFeedMedia()?.let(::listOf).orEmpty() },
             retweetedStatus = optJSONObject("retweeted_status")?.toFeedItem(),
         )
 
@@ -216,6 +218,18 @@ class MineCacheStore(context: Context) {
                         type = item.optNullableString("type"),
                     )
                 )
+            }
+        }
+    }
+
+    private fun List<FeedMedia>.toFeedMediasJsonArray(): JSONArray =
+        JSONArray().also { array -> forEach { array.put(it.toJson()) } }
+
+    private fun JSONArray?.toFeedMedias(): List<FeedMedia> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) {
+                optJSONObject(index)?.toFeedMedia()?.let(::add)
             }
         }
     }

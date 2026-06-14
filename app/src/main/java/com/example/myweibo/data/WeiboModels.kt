@@ -22,7 +22,7 @@ data class FeedItem(
     val likesCount: String,
     val liked: Boolean = false,
     val images: List<FeedImage>,
-    val media: FeedMedia?,
+    val medias: List<FeedMedia> = emptyList(),
     /** 转发评论等正文短链配图，展示为蓝色「查看图片」 */
     val inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
     /** 正文中的可点击链接（文章、网页等） */
@@ -31,7 +31,10 @@ data class FeedItem(
     /** 微博 web 接口常见字段：edit_count / edit_at / edited / is_edit */
     val isEdited: Boolean = false,
     val editCount: Int = 0,
-)
+) {
+    val media: FeedMedia?
+        get() = medias.firstOrNull()
+}
 
 data class FeedImage(
     val id: String,

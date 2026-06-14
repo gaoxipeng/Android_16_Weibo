@@ -158,7 +158,7 @@ class WeiboWebSession(context: Context) {
             runCatching { loadStatusDetail(candidate) }
                 .getOrNull()
                 ?.takeIf { detail ->
-                    detail.text.isNotBlank() || detail.images.isNotEmpty() || detail.media != null
+                    detail.text.isNotBlank() || detail.images.isNotEmpty() || detail.medias.isNotEmpty()
                 }
                 ?.let { return it }
         }
@@ -457,7 +457,7 @@ class WeiboWebSession(context: Context) {
         val hasText = text.trim().isNotBlank()
         val textIsNotShorter = text.trim().length >= other.text.trim().length
         val hasSameImages = images.size >= other.images.size
-        val hasSameMedia = media != null || other.media == null
+        val hasSameMedia = medias.isNotEmpty() || other.medias.isEmpty()
         return hasText && textIsNotShorter && hasSameImages && hasSameMedia
     }
 

@@ -200,7 +200,7 @@ object WeiboJsonParser {
         status: JSONObject,
         sourceRaw: String,
         images: List<FeedImage>,
-        media: FeedMedia?,
+        medias: List<FeedMedia> = emptyList(),
         inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
         urlEntities: List<FeedUrlEntity> = emptyList(),
     ): String {
@@ -210,12 +210,12 @@ object WeiboJsonParser {
         val imageTokens = imageUrlTokensFromUrlStruct(urlStruct, sourceRaw)
             .filter { it !in preservedUrls }
         text = stripEntityTokens(text, imageTokens)
-        if (media != null) {
+        if (medias.isNotEmpty()) {
             val mediaTokens = mediaUrlTokensFromUrlStruct(urlStruct, sourceRaw, preservedUrls) +
                 mediaPageInfoTokens(status, sourceRaw)
             text = stripEntityTokens(text, mediaTokens)
         }
-        if ((images.isNotEmpty() || media != null) && inlineImageLinks.isEmpty() && urlEntities.isEmpty()) {
+        if ((images.isNotEmpty() || medias.isNotEmpty()) && inlineImageLinks.isEmpty() && urlEntities.isEmpty()) {
             text = stripOrphanMediaLinks(text)
         } else if (urlEntities.isNotEmpty() || inlineImageLinks.isNotEmpty()) {
             text = stripOrphanMediaLinksExcept(text, preservedUrls)
@@ -437,7 +437,7 @@ object WeiboJsonParser {
             data,
             sourceForParse,
             mergedImages,
-            media = null,
+            medias = emptyList(),
             mergedInlineImageLinks,
             mergedUrlEntities,
         )
@@ -1013,7 +1013,7 @@ object WeiboJsonParser {
         }
         val mediaBelongsToRetweeted =
             retweetedJson != null && shouldAttachMediaToRetweeted(status, retweetedJson)
-        val media = if (mediaBelongsToRetweeted) null else parseMedia(status)
+        val medias = if (mediaBelongsToRetweeted) emptyList() else parseMedias(status)
 
         val htmlText = status.optNullableString("text") ?: ""
         val rawText = status.optNullableString("text_raw")
@@ -1035,10 +1035,10 @@ object WeiboJsonParser {
             val normalized = normalizeRetweetedStatus(status, json)
             parseStatus(normalized, allowRetweeted = false)
         }
-        val resolvedMedia = when {
-            mediaBelongsToRetweeted -> null
-            retweeted?.media != null && media != null -> null
-            else -> media
+        val resolvedMedias = when {
+            mediaBelongsToRetweeted -> emptyList()
+            retweeted?.medias?.isNotEmpty() == true && medias.isNotEmpty() -> emptyList()
+            else -> medias
         }
 
         val (isEdited, editCount) = status.parseEditMetadata()
@@ -1052,7 +1052,7 @@ object WeiboJsonParser {
             createdAt = status.optNullableString("created_at"),
             source = plainText(status.optNullableString("source") ?: ""),
             ipLocation = parseIpLocation(status),
-            text = parseStatusText(status, displayText, images, resolvedMedia, inlineImageLinks, urlEntities),
+            text = parseStatusText(status, displayText, images, resolvedMedias, inlineImageLinks, urlEntities),
             isLongText = isLongText,
             emoticons = extractEmoticonsFromHtml(htmlText),
             repostsCount = formatCount(status.opt("reposts_count")),
@@ -1060,7 +1060,7 @@ object WeiboJsonParser {
             likesCount = formatCount(status.opt("attitudes_count")),
             liked = status.optBoolean("attitudes_status"),
             images = images,
-            media = resolvedMedia,
+            medias = resolvedMedias,
             inlineImageLinks = inlineImageLinks,
             urlEntities = urlEntities,
             retweetedStatus = retweeted,
@@ -1216,9 +1216,17 @@ object WeiboJsonParser {
         return null to null
     }
 
-    private fun parseMedia(status: JSONObject): FeedMedia? {
-        val pageInfo = status.optJSONObject("page_info") ?: return parseMixVideo(status)
-        val mediaInfo = pageInfo.optJSONObject("media_info") ?: return parseMixVideo(status)
+    private fun parseMedias(status: JSONObject): List<FeedMedia> {
+        val mixVideos = parseMixVideos(status)
+        if (mixVideos.isNotEmpty()) return mixVideos
+        return listOfNotNull(parsePageInfoMedia(status))
+    }
+
+    private fun parseMedia(status: JSONObject): FeedMedia? = parseMedias(status).firstOrNull()
+
+    private fun parsePageInfoMedia(status: JSONObject): FeedMedia? {
+        val pageInfo = status.optJSONObject("page_info") ?: return null
+        val mediaInfo = pageInfo.optJSONObject("media_info") ?: return null
         val type = when (pageInfo.optNullableString("object_type")) {
             "live" -> MediaType.Live
             "audio" -> MediaType.Audio
@@ -1231,7 +1239,7 @@ object WeiboJsonParser {
                 ?.let(::normalizeMediaUrl)
             val replayUrl = mediaInfo.optNullableString("replay_hd")?.let(::normalizeMediaUrl)
             if (liveStream.isNullOrBlank() && replayUrl.isNullOrBlank()) {
-                return parseMixVideo(status)
+                return null
             }
             val cover = pageInfo.optNullableString("page_pic")
                 ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
@@ -1253,7 +1261,7 @@ object WeiboJsonParser {
                 coverHeight = coverHeight,
             )
         }
-        val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: return parseMixVideo(status)
+        val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: return null
         val cover = pageInfo.optNullableString("page_pic")
             ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
             ?: mediaInfo.optJSONObject("subscribe")?.optNullableString("cover")
@@ -1285,32 +1293,35 @@ object WeiboJsonParser {
         }
     }
 
-    private fun parseMixVideo(status: JSONObject): FeedMedia? {
-        val items = status.optJSONObject("mix_media_info")?.optJSONArray("items") ?: return null
-        for (index in 0 until items.length()) {
-            val item = items.optJSONObject(index) ?: continue
-            if (item.optNullableString("type") != "video") continue
-            val data = item.optJSONObject("data") ?: continue
-            val mediaInfo = data.optJSONObject("media_info") ?: continue
-            val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: continue
-            val cover = data.optNullableString("page_pic")
-                ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
-            val (coverWidth, coverHeight) = parseMediaCoverDimensions(data, mediaInfo)
-            return FeedMedia(
-                type = MediaType.Video,
-                title = mediaInfo.optNullableString("video_title")
-                    ?: data.optNullableString("content1")
-                    ?: "微博视频",
-                coverUrl = cover?.let(::normalizeUrl),
-                streamUrl = streamUrl,
-                downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
-                durationSeconds = parseMediaDuration(data, mediaInfo),
-                videoOrientation = parseVideoOrientation(mediaInfo),
-                coverWidth = coverWidth,
-                coverHeight = coverHeight,
-            )
+    private fun parseMixVideos(status: JSONObject): List<FeedMedia> {
+        val items = status.optJSONObject("mix_media_info")?.optJSONArray("items") ?: return emptyList()
+        return buildList {
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                if (item.optNullableString("type") != "video") continue
+                val data = item.optJSONObject("data") ?: continue
+                val mediaInfo = data.optJSONObject("media_info") ?: continue
+                val streamUrl = progressiveVideoUrl(mediaInfo)?.let(::normalizeMediaUrl) ?: continue
+                val cover = data.optNullableString("page_pic")
+                    ?: mediaInfo.optJSONObject("big_pic_info")?.optJSONObject("pic_big")?.optNullableString("url")
+                val (coverWidth, coverHeight) = parseMediaCoverDimensions(data, mediaInfo)
+                add(
+                    FeedMedia(
+                        type = MediaType.Video,
+                        title = mediaInfo.optNullableString("video_title")
+                            ?: data.optNullableString("content1")
+                            ?: "微博视频",
+                        coverUrl = cover?.let(::normalizeUrl),
+                        streamUrl = streamUrl,
+                        downloadUrl = downloadVideoUrl(mediaInfo)?.let(::normalizeMediaUrl),
+                        durationSeconds = parseMediaDuration(data, mediaInfo),
+                        videoOrientation = parseVideoOrientation(mediaInfo),
+                        coverWidth = coverWidth,
+                        coverHeight = coverHeight,
+                    ),
+                )
+            }
         }
-        return null
     }
 
     private fun parseMediaDuration(vararg sources: JSONObject): Int? {
@@ -2180,7 +2191,6 @@ object WeiboJsonParser {
             commentsCount = parseSWeiboActionCount(card, "评论"),
             likesCount = parseSWeiboActionCount(card, "赞"),
             images = images,
-            media = null,
         )
     }
 

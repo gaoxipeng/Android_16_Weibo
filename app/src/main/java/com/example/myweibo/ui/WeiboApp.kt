@@ -4154,7 +4154,7 @@ private fun FeedCard(
             MediaStrip(
                 modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 images = item.images,
-                media = item.media,
+                medias = item.medias,
                 onMediaClick = onMediaClick,
                 onDetailClick = if (showAuthorRow) onClick else null,
             )
@@ -4301,7 +4301,7 @@ private fun QuotedStatus(
             }
             MediaStrip(
                 images = item.images,
-                media = item.media,
+                medias = item.medias,
                 onMediaClick = onMediaClick,
                 onDetailClick = onClick,
             )
@@ -5263,12 +5263,12 @@ private fun FeedImagePreviewContent(
 @Composable
 private fun MediaStrip(
     images: List<FeedImage>,
-    media: FeedMedia?,
+    medias: List<FeedMedia> = emptyList(),
     onMediaClick: (FeedMedia) -> Unit,
     modifier: Modifier = Modifier,
     onDetailClick: (() -> Unit)? = null,
 ) {
-    if (images.isEmpty() && media == null) return
+    if (images.isEmpty() && medias.isEmpty()) return
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
@@ -5359,7 +5359,7 @@ private fun MediaStrip(
             }
         }
 
-        if (media != null) {
+        medias.forEach { media ->
             InlineVideoPlayer(
                 media = media,
                 onClick = { onMediaClick(media) },
