@@ -572,6 +572,8 @@ private class VideoPlaybackCoordinator {
     }
 
     fun stashHandoffPlayer(playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer) {
+        player.pause()
+        player.playWhenReady = false
         handoffPlayers[playbackKey] = player
     }
 
@@ -1880,7 +1882,7 @@ fun WeiboApp() {
         if (mediaPreview?.let { videoPlaybackKey(it.media, it.playbackOwnerId) == nextKey } == true) {
             return
         }
-        videoPlaybackCoordinator.pausePeek()
+        videoPlaybackCoordinator.claimFullscreenPlayback(nextKey)
         pushNavigation { mediaPreview = MediaPreviewRequest(media, playbackOwnerId) }
     }
 
@@ -7653,7 +7655,36 @@ private fun InlineVideoPlayer(
                 onPlaybackEnded = { resetPeekState() },
                 onOpenFullscreenBehind = {
                     videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.activeKey = null
+                    videoCoordinator.claimFullscreenPlayback(playbackKey)
+                    onFullscreenRequest()
+                },
+                onEnterFullscreenHandoffComplete = {
+                    resetPeekState()
+                },
+            ),
+        )
+    }
+
+    fun openInlineFloatingPlayback() {
+        val bounds = anchorBounds ?: return
+        actionOpen = true
+        peekActive = true
+        videoCoordinator.beginPeekHandoff(playbackKey)
+        videoCoordinator.claimPeekPlayback(playbackKey)
+        videoPeekController.openFloating(
+            VideoPeekRequest(
+                media = media,
+                anchorBounds = bounds,
+                playbackOwnerId = playbackOwnerId,
+                onCancel = {
+                    videoCoordinator.cancelPeekHandoff(playbackKey)
+                    resetPeekState()
+                },
+                onRelease = {},
+                onPlaybackEnded = { resetPeekState() },
+                onOpenFullscreenBehind = {
+                    videoCoordinator.beginFullscreenHandoff(playbackKey)
+                    videoCoordinator.claimFullscreenPlayback(playbackKey)
                     onFullscreenRequest()
                 },
                 onEnterFullscreenHandoffComplete = {
@@ -7672,7 +7703,7 @@ private fun InlineVideoPlayer(
         }
         videoCoordinator.beginFullscreenHandoff(playbackKey)
         actionOpen = true
-        videoCoordinator.activeKey = null
+        videoCoordinator.claimFullscreenPlayback(playbackKey)
         videoPeekController.open(
             VideoPeekRequest(
                 media = media,
@@ -7682,13 +7713,13 @@ private fun InlineVideoPlayer(
                 onCancel = {
                     videoCoordinator.cancelFullscreenHandoff(playbackKey)
                     resetPeekState()
-                    videoCoordinator.activeKey = playbackKey
+                    videoCoordinator.requestInlinePlayback(playbackKey)
                 },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
                 onOpenFullscreenBehind = {
                     videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.activeKey = null
+                    videoCoordinator.claimFullscreenPlayback(playbackKey)
                     onFullscreenRequest()
                 },
                 onEnterFullscreenHandoffComplete = {
@@ -7833,9 +7864,8 @@ private fun InlineVideoPlayer(
                 videoResizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
                 onAspectRatio = {},
                 onFullscreen = { openInlineFullscreenTransition() },
-                onEnterPictureInPicture = {
-                    videoCoordinator.activeKey = null
-                },
+                onEnterFloatingPlayback = { openInlineFloatingPlayback() },
+                showPictureInPictureButton = false,
             )
         } else {
             RemoteImage(
@@ -8029,7 +8059,8 @@ private fun WeiboVideoSurface(
 
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
     val awaitingFullscreenHandoff =
-        isFullscreen && videoCoordinator.pendingFullscreenHandoffKey == playbackKey
+        videoCoordinator.pendingFullscreenHandoffKey == playbackKey &&
+            (isFullscreen || isPeekPlayback)
     val awaitingPeekHandoff =
         !isFullscreen && videoCoordinator.pendingPeekHandoffKey == playbackKey
 
@@ -8225,7 +8256,7 @@ private fun WeiboVideoSurface(
             player.removeListener(listener)
             val handoffToFullscreen = !isFullscreen &&
                 videoCoordinator.pendingFullscreenHandoffKey == playbackKey
-            val handoffToPeek = isFullscreen &&
+            val handoffToPeek = !isPeekPlayback &&
                 videoCoordinator.pendingPeekHandoffKey == playbackKey
             if (handoffToFullscreen || handoffToPeek) {
                 videoCoordinator.stashHandoffPlayer(playbackKey, player)
@@ -14152,6 +14183,7 @@ private fun AlbumVideoTile(
                 onOpenFullscreenBehind = {
                     resetPeekState()
                     videoCoordinator.beginFullscreenHandoff(playbackKey)
+                    videoCoordinator.claimFullscreenPlayback(playbackKey)
                     onVideoClick()
                 },
                 onEnterFullscreenHandoffComplete = {},
