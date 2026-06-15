@@ -2370,6 +2370,18 @@ fun WeiboApp() {
             val visitedProfileVisible = visitedUserId != null &&
                 selectedItem == null &&
                 albumViewerState == null
+            val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
+                when {
+                    visitedUserId != null -> visitedUserId == overlay.uid
+                    else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
+                }
+            } ?: false
+            val followListUiOnTop = followListOverlay != null &&
+                selectedItem == null &&
+                articleOverlay == null &&
+                mediaPreview == null &&
+                albumViewerState == null &&
+                followListBelongsToCurrentContext
             val feedVisibleAlpha = if (feedUiOnTop) 1f else 0f
 
             Box(Modifier.fillMaxSize()) {
@@ -2411,17 +2423,8 @@ fun WeiboApp() {
                     target = followListOverlay,
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(550f),
+                        .zIndex(if (followListUiOnTop) 550f else 400f),
                 ) { overlay ->
-                    val followListBelongsToCurrentContext = when {
-                        visitedUserId != null -> visitedUserId == overlay.uid
-                        else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
-                    }
-                    val followListUiOnTop = selectedItem == null &&
-                        articleOverlay == null &&
-                        mediaPreview == null &&
-                        albumViewerState == null &&
-                        followListBelongsToCurrentContext
                     Box(
                         Modifier
                             .fillMaxSize()
@@ -2502,14 +2505,10 @@ fun WeiboApp() {
                     target = visitedProfileNavTarget,
                     modifier = Modifier.fillMaxSize().zIndex(540f),
                 ) { uid ->
-                    val activeFollowList = followListOverlay
-                    val profileOverFollowList = activeFollowList != null &&
-                        uid != activeFollowList.uid
                     key(uid, visitedProfileLoadGeneration) {
                         Box(
                             Modifier
                                 .fillMaxSize()
-                                .zIndex(if (profileOverFollowList) 560f else 1f)
                                 .graphicsLayer {
                                     alpha = if (visitedProfileVisible) 1f else 0f
                                 }
@@ -9779,12 +9778,9 @@ private fun MineScreen(
                             val albumRows = remember(albumImages) {
                                 buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
                             }
-                            val stickyMonthLabel by remember(albumRows) {
+                            val stickyMonthLabel by remember(albumRows, albumListState) {
                                 derivedStateOf {
-                                    albumListState.layoutInfo.visibleItemsInfo
-                                        .sortedBy { it.index }
-                                        .mapNotNull { info -> albumRows.getOrNull(info.index)?.monthKey }
-                                        .firstOrNull()
+                                    resolveStickyAlbumMonthLabel(albumListState, albumRows)
                                 }
                             }
                             Box(modifier = Modifier.fillMaxSize()) {
@@ -9813,6 +9809,7 @@ private fun MineScreen(
                                             contentType = { "album_row" },
                                         ) { row ->
                                             MineAlbumGridRow(
+                                                dateLabel = row.dateLabel?.takeIf { stickyMonthLabel != row.monthKey },
                                                 monthImages = row.monthImages,
                                                 rowImages = row.rowImages,
                                                 rowStartIndex = row.rowStartIndex,
@@ -11931,10 +11928,29 @@ private fun MineLoadingMoreIndicator() {
 private data class AlbumGridRow(
     val key: String,
     val monthKey: Pair<String, String>,
+    val dateLabel: Pair<String, String>?,
     val monthImages: List<FeedImage>,
     val rowImages: List<FeedImage>,
     val rowStartIndex: Int,
 )
+
+private fun resolveStickyAlbumMonthLabel(
+    listState: LazyListState,
+    albumRows: List<AlbumGridRow>,
+): Pair<String, String>? {
+    if (albumRows.isEmpty()) return null
+    val topRowIndex = listState.layoutInfo.visibleItemsInfo
+        .mapNotNull { info -> info.index.takeIf { it in albumRows.indices } }
+        .minOrNull() ?: return null
+    val monthKey = albumRows[topRowIndex].monthKey
+    val firstRowIndex = albumRows.indexOfFirst { row ->
+        row.monthKey == monthKey && row.rowStartIndex == 0
+    }
+    if (firstRowIndex < 0) return null
+    val inlineLabelVisible = listState.firstVisibleItemIndex == firstRowIndex &&
+        listState.firstVisibleItemScrollOffset == 0
+    return if (inlineLabelVisible) null else monthKey
+}
 
 private data class AlbumPostLookup(
     val postByStatusId: Map<String, FeedItem>,
@@ -11986,6 +12002,7 @@ private fun buildAlbumGridRows(
                 AlbumGridRow(
                     key = "album-${dateLabel.first}-${dateLabel.second}-$rowStartIndex-${first?.id.orEmpty()}-${first?.largeUrl.orEmpty()}",
                     monthKey = dateLabel,
+                    dateLabel = dateLabel.takeIf { rowIndex == 0 },
                     monthImages = monthImages,
                     rowImages = rowImages,
                     rowStartIndex = rowStartIndex,
@@ -12141,6 +12158,7 @@ private fun AlbumMonthLabelColumn(
 
 @Composable
 private fun MineAlbumGridRow(
+    dateLabel: Pair<String, String>?,
     monthImages: List<FeedImage>,
     rowImages: List<FeedImage>,
     rowStartIndex: Int,
@@ -12153,7 +12171,11 @@ private fun MineAlbumGridRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Spacer(modifier = Modifier.width(42.dp))
+        if (dateLabel != null) {
+            AlbumMonthLabelColumn(dateLabel = dateLabel)
+        } else {
+            Spacer(modifier = Modifier.width(42.dp))
+        }
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
