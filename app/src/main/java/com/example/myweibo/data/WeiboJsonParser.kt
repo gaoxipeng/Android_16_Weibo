@@ -355,22 +355,8 @@ object WeiboJsonParser {
             .trim()
     }
 
-    private fun parseCommentImages(comment: JSONObject): List<FeedImage> {
-        val direct = parseImages(comment)
-        if (direct.isNotEmpty()) return direct
-
-        val seen = mutableSetOf<String>()
-        val urlStruct = comment.optJSONArray("url_struct") ?: return emptyList()
-        return buildList {
-            for (index in 0 until urlStruct.length()) {
-                val entity = urlStruct.optJSONObject(index) ?: continue
-                imagesFromParts(entity.optJSONArray("pic_ids"), entity.optJSONObject("pic_infos"))
-                    .forEach { image ->
-                        if (seen.add(image.id)) add(image)
-                    }
-            }
-        }
-    }
+    private fun parseCommentImages(comment: JSONObject): List<FeedImage> =
+        parseImages(comment)
 
     private fun parseNestedComments(arr: org.json.JSONArray?): List<CommentItem> {
         if (arr == null) return emptyList()
