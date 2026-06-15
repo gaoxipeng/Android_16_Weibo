@@ -794,6 +794,7 @@ private data class VideoPeekRequest(
     val anchorBounds: Rect,
     val playbackOwnerId: String,
     val expandFromAnchor: Boolean = false,
+    val fromFullscreen: Boolean = false,
     val dockImmediately: Boolean = false,
     val onCancel: () -> Unit,
     val onRelease: () -> Unit,
@@ -1892,16 +1893,17 @@ fun WeiboApp() {
             left = 0f,
             top = 0f,
             right = screenWidthPx,
-            bottom = screenHeightPx / 3f,
+            bottom = screenHeightPx,
         )
         videoPlaybackCoordinator.beginPeekHandoff(playbackKey)
         videoPlaybackCoordinator.claimPeekPlayback(playbackKey)
+        navigateBack()
         videoPeekController.openFloating(
             VideoPeekRequest(
                 media = media,
                 anchorBounds = anchorBounds,
                 playbackOwnerId = playbackOwnerId,
-                dockImmediately = true,
+                fromFullscreen = true,
                 onCancel = {
                     videoPlaybackCoordinator.cancelPeekHandoff(playbackKey)
                 },
@@ -1916,7 +1918,6 @@ fun WeiboApp() {
                 onEnterFullscreenHandoffComplete = {},
             ),
         )
-        navigateBack()
     }
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
@@ -3692,6 +3693,7 @@ fun WeiboApp() {
                     playbackOwnerId = request.playbackOwnerId,
                     anchorBounds = request.anchorBounds,
                     expandFromAnchor = request.expandFromAnchor,
+                    fromFullscreen = request.fromFullscreen,
                     dockImmediately = request.dockImmediately,
                     isFloating = videoPeekController.isFloating,
                     dismissReason = videoPeekController.pendingDismiss,
@@ -6137,6 +6139,7 @@ private fun VideoPeekOverlay(
     playbackOwnerId: String,
     anchorBounds: Rect,
     expandFromAnchor: Boolean = false,
+    fromFullscreen: Boolean = false,
     dockImmediately: Boolean = false,
     isFloating: Boolean,
     dismissReason: VideoPeekDismissReason?,
@@ -6152,17 +6155,27 @@ private fun VideoPeekOverlay(
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
-    val enterProgress = remember { Animatable(0f) }
-    val dockProgress = remember { Animatable(0f) }
+    val enterProgress = remember(fromFullscreen, dockImmediately) {
+        Animatable(
+            when {
+                fromFullscreen -> 0f
+                dockImmediately -> 1f
+                else -> 0f
+            },
+        )
+    }
+    val dockProgress = remember(dockImmediately) {
+        Animatable(if (dockImmediately) 1f else 0f)
+    }
     val fullscreenExpandProgress = remember { Animatable(0f) }
     var fullscreenOpened by remember { mutableStateOf(false) }
     val isDocked = isFloating || dockProgress.value > 0f
 
-    LaunchedEffect(expandFromAnchor) {
-        if (expandFromAnchor) {
-            enterProgress.snapTo(0f)
-        } else {
-            enterProgress.animateTo(
+    LaunchedEffect(expandFromAnchor, fromFullscreen, dockImmediately) {
+        when {
+            expandFromAnchor || fromFullscreen -> enterProgress.snapTo(0f)
+            dockImmediately -> enterProgress.snapTo(1f)
+            else -> enterProgress.animateTo(
                 targetValue = 1f,
                 animationSpec = spring(
                     dampingRatio = Spring.DampingRatioNoBouncy,
@@ -6172,9 +6185,9 @@ private fun VideoPeekOverlay(
         }
     }
 
-    LaunchedEffect(isFloating, dockImmediately) {
+    LaunchedEffect(isFloating, dockImmediately, fromFullscreen) {
         if (isFloating) {
-            if (enterProgress.value < 1f) {
+            if (!fromFullscreen && enterProgress.value < 1f) {
                 enterProgress.snapTo(1f)
             }
             if (dockImmediately) {
@@ -8320,7 +8333,7 @@ private fun WeiboVideoSurface(
         )
 
         AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && !isFullscreen && showFullscreenButton,
+            visible = controlsEnabled && controlsVisible && !isFullscreen && !isPeekPlayback && showFullscreenButton,
             enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
             exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
             modifier = Modifier.align(Alignment.TopStart),
@@ -8339,7 +8352,7 @@ private fun WeiboVideoSurface(
         }
 
         AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && (
+            visible = controlsEnabled && controlsVisible && !isPeekPlayback && (
                 onEnterFloatingPlayback != null ||
                 (showPictureInPictureButton && onEnterPictureInPicture != null)
                 ),
