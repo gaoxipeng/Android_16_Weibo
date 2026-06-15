@@ -1,12 +1,16 @@
 package com.example.myweibo.ui
 
+import android.content.ActivityNotFoundException
+import android.content.ComponentCallbacks2
+import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
-import android.content.ActivityNotFoundException
-import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
@@ -278,6 +282,8 @@ import com.example.myweibo.ui.theme.WeiboTopicBlue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -285,11 +291,14 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -399,8 +408,14 @@ private const val VideoMaxHeightToWidth = 1f
 private val VideoControlCapsuleShape = RoundedCornerShape(percent = 50)
 private const val VideoMaxWidthFraction = 1f
 private const val AlbumGridMaxDecodeDim = 320
-private const val FeedBitmapCacheMaxEntries = 96
-private const val AlbumBitmapCacheMaxEntries = 256
+private const val AlbumBitmapCacheMaxBytes = 96 * 1024 * 1024
+private const val AlbumGridMaxReadBytes = 768 * 1024
+private const val AlbumGridPrefetchConcurrency = 8
+private const val AlbumGridPrefetchBatchSize = 48
+private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
+private const val RemoteBytesCacheMaxTotal = 32 * 1024 * 1024
+private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
+private const val RemoteBytesAnimatedMaxRead = 12 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
 
 private fun navStackEnterTransition() =
@@ -664,6 +679,151 @@ private fun feedImageUrlCandidates(image: FeedImage): List<String> =
         .filter { it.isNotBlank() }
         .distinct()
 
+private fun downgradeSinaimgForAlbumGrid(url: String): String {
+    if (!url.contains("sinaimg.cn", ignoreCase = true)) return url
+    return url.replace(
+        Regex("""/(?:large|mw2000|woriginal|original|bmiddle)/""", RegexOption.IGNORE_CASE),
+        "/orj360/",
+    )
+}
+
+private fun albumGridUrlCandidates(image: FeedImage): List<String> = buildList {
+    image.thumbnailUrl.takeIf { it.isNotBlank() }
+        ?.let(::downgradeSinaimgForAlbumGrid)
+        ?.let(::add)
+    image.largeUrl.takeIf { it.isNotBlank() }
+        ?.let(::downgradeSinaimgForAlbumGrid)
+        ?.let(::add)
+    image.downloadUrls.forEach { url ->
+        if (url.isNotBlank()) {
+            add(downgradeSinaimgForAlbumGrid(url))
+        }
+    }
+}.distinct()
+
+private suspend fun loadAlbumGridBitmap(
+    image: FeedImage,
+    maxDecodeDim: Int = AlbumGridMaxDecodeDim,
+): Bitmap? {
+    AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.takeIfDrawable()?.let { return it }
+    for (url in albumGridUrlCandidates(image)) {
+        decodeCachedRemoteBitmap(url, maxDecodeDim)?.let { bitmap ->
+            AlbumThumbnailBitmapCache.putForImage(image, maxDecodeDim, bitmap)
+            return bitmap
+        }
+        val bitmap = runCatching {
+            withContext(Dispatchers.IO) {
+                val bytes = fetchRemoteBytes(
+                    url = url,
+                    connectTimeoutMs = 5000,
+                    readTimeoutMs = 5000,
+                    maxReadBytes = AlbumGridMaxReadBytes,
+                )
+                decodeBitmapFromBytes(bytes, maxDecodeDim)
+            }
+        }.getOrNull()
+        if (bitmap != null) {
+            AlbumThumbnailBitmapCache.putForImage(image, maxDecodeDim, bitmap)
+            return bitmap
+        }
+    }
+    return null
+}
+
+private suspend fun prefetchAlbumGridThumbnails(images: List<FeedImage>) {
+    val pending = images.filter { image ->
+        AlbumThumbnailBitmapCache.getForImage(image, AlbumGridMaxDecodeDim) == null
+    }
+    if (pending.isEmpty()) return
+    val semaphore = Semaphore(AlbumGridPrefetchConcurrency)
+    pending.take(AlbumGridPrefetchBatchSize).chunked(12).forEach { batch ->
+        coroutineScope {
+            batch.map { image ->
+                async(Dispatchers.IO) {
+                    semaphore.withPermit {
+                        loadAlbumGridBitmap(image)
+                    }
+                }
+            }.awaitAll()
+        }
+        yield()
+    }
+}
+
+private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
+    maxDecodeDim <= AlbumGridMaxDecodeDim -> 4 * 1024 * 1024
+    maxDecodeDim <= 960 -> 8 * 1024 * 1024
+    else -> 12 * 1024 * 1024
+}
+
+private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
+    if (bytes.isEmpty()) return null
+    decodeSampledBitmap(bytes, maxDecodeDim)?.let { return it }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        return runCatching {
+            val source = ImageDecoder.createSource(bytes)
+            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                val width = info.size.width
+                val height = info.size.height
+                if (width > 0 && height > 0) {
+                    val dim = maxDecodeDim.coerceAtLeast(1)
+                    val scale = maxOf(1, (width / dim).coerceAtMost(height / dim))
+                    val sample = Integer.highestOneBit(scale)
+                    decoder.setTargetSize(
+                        (width / sample).coerceAtLeast(1),
+                        (height / sample).coerceAtLeast(1),
+                    )
+                }
+            }
+        }.getOrNull()
+    }
+    return null
+}
+
+private fun decodeSampledBitmap(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
+    val options = BitmapFactory.Options().apply {
+        inJustDecodeBounds = true
+    }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    if (options.outWidth <= 0 || options.outHeight <= 0) return null
+    val dim = maxDecodeDim.coerceAtLeast(1)
+    val scale = maxOf(1, (options.outWidth / dim).coerceAtMost(options.outHeight / dim))
+    options.inJustDecodeBounds = false
+    options.inSampleSize = Integer.highestOneBit(scale)
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+}
+
+private fun Bitmap?.takeIfDrawable(): Bitmap? = this?.takeIf { !it.isRecycled }
+
+private fun trimImageCaches(keepFraction: Float) {
+    val fraction = keepFraction.coerceIn(0f, 1f)
+    AlbumThumbnailBitmapCache.trimToFraction(min(fraction + 0.25f, 1f))
+    FeedBitmapCache.trimToFraction(fraction)
+    RemoteBytesCache.trimToFraction(fraction)
+}
+
+private fun decodeCachedRemoteBitmap(url: String, maxDecodeDim: Int): Bitmap? {
+    val bytes = RemoteBytesCache.get(url) ?: return null
+    return decodeBitmapFromBytes(bytes, maxDecodeDim)
+}
+
+private suspend fun loadRemoteBitmap(
+    url: String,
+    maxDecodeDim: Int,
+    connectTimeoutMs: Int = 8000,
+    readTimeoutMs: Int = 8000,
+): Bitmap? {
+    decodeCachedRemoteBitmap(url, maxDecodeDim)?.let { return it }
+    val bytes = fetchRemoteBytes(
+        url = url,
+        connectTimeoutMs = connectTimeoutMs,
+        readTimeoutMs = readTimeoutMs,
+        maxReadBytes = remoteReadLimitForDecodeDim(maxDecodeDim),
+    )
+    return decodeBitmapFromBytes(bytes, maxDecodeDim)
+}
+
 private fun videoPlaybackKey(media: FeedMedia): String =
     media.resolvedPlaybackUrl()
         ?: media.streamUrl.ifBlank { media.replayUrl.orEmpty() }
@@ -722,6 +882,7 @@ fun WeiboApp() {
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
+    var albumFetchCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -856,6 +1017,10 @@ fun WeiboApp() {
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
+    }
+
+    fun showAlbumFetchTrace(page: AlbumPage) {
+        page.fetchTrace?.capsuleMessage()?.let { albumFetchCapsuleHint = it }
     }
 
     fun absorbDiscoveredEmoticons(discovered: Map<String, String>) {
@@ -1041,6 +1206,7 @@ fun WeiboApp() {
                     visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, lookup)
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
+                    showAlbumFetchTrace(page)
                     visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
                         "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                     } else {
@@ -1204,6 +1370,7 @@ fun WeiboApp() {
                     visitedAlbumImages = (visitedAlbumImages + enrichedPage).distinctBy { it.largeUrl }
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
+                    showAlbumFetchTrace(page)
                 }
             visitedAlbumLoadingMore = false
         }
@@ -1638,6 +1805,7 @@ fun WeiboApp() {
                 )
                 mineAlbumNextCursor = page.nextCursor
                 mineAlbumHasMore = page.nextCursor != null
+                showAlbumFetchTrace(page)
                 mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
                     "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                 } else {
@@ -1757,6 +1925,7 @@ fun WeiboApp() {
                     mineAlbumNextCursor = page.nextCursor
                     mineAlbumHasMore = page.nextCursor != null
                     mineAlbumError = null
+                    showAlbumFetchTrace(page)
                     mineCacheStore.writeAlbum(
                         AlbumPage(
                             images = mineAlbumImages,
@@ -2207,8 +2376,10 @@ fun WeiboApp() {
                 enrichAlbumImagesFromPosts(page.images, lookup),
                 minePosts,
             )
-            mineAlbumNextCursor = page.nextCursor
-            mineAlbumHasMore = page.nextCursor != null
+            mineAlbumNextCursor = page.nextCursor?.takeIf {
+                it.startsWith("wall:") || it.startsWith("waterfall:cursor:")
+            }
+            mineAlbumHasMore = mineAlbumNextCursor != null
         }
         activeAccountId?.takeIf { it.isNotBlank() }?.let { uid ->
             applyMentionSuggestionCache(uid)
@@ -2241,7 +2412,26 @@ fun WeiboApp() {
     }
 
     DisposableEffect(Unit) {
+        val trimCallback = object : ComponentCallbacks2 {
+            override fun onConfigurationChanged(newConfig: Configuration) = Unit
+
+            override fun onLowMemory() {
+                trimImageCaches(0f)
+            }
+
+            override fun onTrimMemory(level: Int) {
+                when (level) {
+                    ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW,
+                    ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL,
+                    ComponentCallbacks2.TRIM_MEMORY_COMPLETE,
+                    -> trimImageCaches(0.35f)
+                    ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> trimImageCaches(0.6f)
+                }
+            }
+        }
+        context.registerComponentCallbacks(trimCallback)
         onDispose {
+            context.unregisterComponentCallbacks(trimCallback)
             session.webView.destroy()
         }
     }
@@ -2780,6 +2970,7 @@ fun WeiboApp() {
             }
 
             val capsuleHint = operationCapsuleHint
+                ?: albumFetchCapsuleHint
                 ?: if (
                     selectedTab == MainTab.Feed &&
                     selectedItem == null &&
@@ -2803,11 +2994,12 @@ fun WeiboApp() {
                 capsuleHint?.let { hint ->
                     FeedRefreshCapsuleHint(
                         message = hint,
+                        autoDismissMillis = if (albumFetchCapsuleHint != null) 3200L else 2200L,
                         onDismiss = {
-                            if (operationCapsuleHint != null) {
-                                operationCapsuleHint = null
-                            } else {
-                                feedRefreshHint = null
+                            when {
+                                operationCapsuleHint != null -> operationCapsuleHint = null
+                                albumFetchCapsuleHint != null -> albumFetchCapsuleHint = null
+                                else -> feedRefreshHint = null
                             }
                         },
                     )
@@ -3426,9 +3618,10 @@ private fun FeedRefreshCapsuleHint(
     message: String,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
+    autoDismissMillis: Long = 2200L,
 ) {
     LaunchedEffect(message) {
-        delay(2200)
+        delay(autoDismissMillis)
         onDismiss()
     }
 
@@ -4684,7 +4877,7 @@ private fun FeedImageThumbnailContent(
     val thumbnailQuality = LocalFeedThumbnailQuality.current
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     val cachedFullBitmap = remember(image.id, image.largeUrl, upgradeRevision) {
-        FeedBitmapCache.getForImage(image)
+        FeedBitmapCache.getForImage(image)?.takeIfDrawable()
     }
     val useCachedFullSize = maxDecodeDimOverride == null &&
         thumbnailQuality != FeedThumbnailQuality.High &&
@@ -4694,8 +4887,9 @@ private fun FeedImageThumbnailContent(
     val decodeDim = maxDecodeDimOverride ?: thumbnailQuality.maxDecodeDim
 
     if (useCachedFullSize) {
+        val imageBitmap = remember(cachedFullBitmap) { cachedFullBitmap!!.asImageBitmap() }
         Image(
-            bitmap = cachedFullBitmap.asImageBitmap(),
+            bitmap = imageBitmap,
             contentDescription = null,
             modifier = modifier,
             contentScale = contentScale,
@@ -4707,7 +4901,6 @@ private fun FeedImageThumbnailContent(
             previewUrl = previewUrl,
             modifier = modifier,
             contentScale = contentScale,
-            animated = image.isGif,
         )
     } else {
         RemoteImage(
@@ -9519,6 +9712,12 @@ private fun MineScreen(
             .collect { onLoadMoreAlbum() }
     }
 
+    LaunchedEffect(albumImages) {
+        if (albumImages.isNotEmpty()) {
+            prefetchAlbumGridThumbnails(albumImages)
+        }
+    }
+
     val mineTabScrollPosition by remember {
         derivedStateOf {
             pagerState.currentPage + pagerState.currentPageOffsetFraction
@@ -12854,82 +13053,67 @@ private fun AlbumGridRemoteImage(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     previewUrl: String? = null,
-    animated: Boolean = false,
 ) {
-    if (animated) {
-        RemoteImage(
-            url = previewUrl ?: image.thumbnailUrl.ifBlank { image.largeUrl },
-            modifier = modifier,
-            contentScale = contentScale,
-            animated = true,
-            maxDecodeDim = maxDecodeDim,
-        )
-        return
-    }
-
-    val thumbnailQuality = LocalFeedThumbnailQuality.current
     val cacheKey = remember(image.id, image.largeUrl, maxDecodeDim) {
         AlbumThumbnailBitmapCache.cacheKey(image, maxDecodeDim)
     }
-    val candidates = remember(image, previewUrl, thumbnailQuality) {
-        if (previewUrl != null) {
-            listOf(previewUrl)
-        } else {
-            listOfNotNull(
-                thumbnailQuality.displayUrl(image).takeIf { it.isNotBlank() },
-                thumbnailQuality.fallbackUrl(image),
-            ).distinct()
-        }
-    }
-    var candidateIndex by remember(candidates) { mutableStateOf(0) }
-    val currentUrl = candidates.getOrNull(candidateIndex)
     var bitmap by remember(cacheKey) {
-        mutableStateOf(AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim))
+        mutableStateOf(AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.takeIfDrawable())
     }
     var failed by remember(cacheKey) { mutableStateOf(false) }
 
-    LaunchedEffect(cacheKey, currentUrl, candidateIndex, maxDecodeDim) {
-        AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.let {
+    SideEffect {
+        AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.takeIfDrawable()?.let { cached ->
+            if (bitmap !== cached) {
+                bitmap = cached
+                failed = false
+            }
+        }
+    }
+
+    LaunchedEffect(cacheKey, previewUrl) {
+        AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.takeIfDrawable()?.let {
             bitmap = it
             failed = false
             return@LaunchedEffect
         }
-        if (bitmap != null) return@LaunchedEffect
-        failed = false
-        val target = currentUrl ?: return@LaunchedEffect
-        runCatching {
-            withContext(Dispatchers.IO) {
-                val bytes = fetchRemoteBytes(target, connectTimeoutMs = 8000, readTimeoutMs = 8000)
-                val options = BitmapFactory.Options().apply {
-                    inJustDecodeBounds = true
+        if (bitmap?.takeIfDrawable() != null) return@LaunchedEffect
+        val loaded = if (previewUrl != null) {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    loadRemoteBitmap(
+                        url = previewUrl,
+                        maxDecodeDim = maxDecodeDim,
+                        connectTimeoutMs = 5000,
+                        readTimeoutMs = 5000,
+                    )
                 }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                val dim = maxDecodeDim.coerceAtLeast(1)
-                val scale = maxOf(1, (options.outWidth / dim).coerceAtMost(options.outHeight / dim))
-                options.inJustDecodeBounds = false
-                options.inSampleSize = Integer.highestOneBit(scale)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-            }
-        }.onSuccess { loaded ->
+            }.getOrNull()
+        } else {
+            loadAlbumGridBitmap(image, maxDecodeDim)
+        }
+        if (loaded != null) {
             bitmap = loaded
-            AlbumThumbnailBitmapCache.putForImage(image, maxDecodeDim, loaded)
-        }.onFailure {
-            if (candidateIndex < candidates.lastIndex) {
-                candidateIndex += 1
-            } else {
-                failed = true
+            failed = false
+            if (previewUrl == null) {
+                AlbumThumbnailBitmapCache.putForImage(image, maxDecodeDim, loaded)
             }
+            return@LaunchedEffect
+        }
+        if (bitmap?.takeIfDrawable() == null) {
+            failed = previewUrl != null || albumGridUrlCandidates(image).isNotEmpty()
         }
     }
+
+    val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
 
     Box(
         modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) {
-        val loaded = bitmap
-        if (loaded != null) {
+        if (imageBitmap != null) {
             Image(
-                bitmap = loaded.asImageBitmap(),
+                bitmap = imageBitmap,
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = contentScale,
@@ -12969,58 +13153,62 @@ private fun RemoteImage(
     val cacheCandidates = remember(candidates, cacheLookupUrls) {
         (cacheLookupUrls + candidates).distinct()
     }
-    val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
-    var candidateIndex by remember(candidates) { mutableStateOf(0) }
-    val currentUrl = candidates.getOrNull(candidateIndex)
-    var bitmap by remember(currentUrl, cacheCandidates) {
-        mutableStateOf(FeedBitmapCache.get(cacheCandidates))
+    val loadKey = remember(cacheCandidates, maxDecodeDim) {
+        cacheCandidates.joinToString("|") + "@$maxDecodeDim"
     }
-    var failed by remember(currentUrl) { mutableStateOf(false) }
+    val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
+    var bitmap by remember(loadKey) {
+        mutableStateOf(FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable())
+    }
+    var failed by remember(loadKey) { mutableStateOf(false) }
 
-    LaunchedEffect(currentUrl, candidateIndex, maxDecodeDim, upgradeRevision, cacheCandidates) {
-        FeedBitmapCache.get(cacheCandidates)?.let {
+    SideEffect {
+        FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let { cached ->
+            if (bitmap !== cached) {
+                bitmap = cached
+                failed = false
+            }
+        }
+    }
+
+    LaunchedEffect(loadKey, upgradeRevision) {
+        FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let {
             bitmap = it
             failed = false
             return@LaunchedEffect
         }
-        if (bitmap != null) return@LaunchedEffect
-        failed = false
-        val target = currentUrl ?: return@LaunchedEffect
-        runCatching {
-            withContext(Dispatchers.IO) {
-                val bytes = fetchRemoteBytes(target, connectTimeoutMs = 8000, readTimeoutMs = 8000)
-
-                val options = BitmapFactory.Options().apply {
-                    inJustDecodeBounds = true
+        if (bitmap?.takeIfDrawable() != null) return@LaunchedEffect
+        for (candidateUrl in candidates) {
+            val loaded = runCatching {
+                withContext(Dispatchers.IO) {
+                    loadRemoteBitmap(
+                        url = candidateUrl,
+                        maxDecodeDim = maxDecodeDim,
+                    )
                 }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                val maxDim = maxDecodeDim.coerceAtLeast(1)
-                val scale = maxOf(1, (options.outWidth / maxDim).coerceAtMost(options.outHeight / maxDim))
-                options.inJustDecodeBounds = false
-                options.inSampleSize = Integer.highestOneBit(scale)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+            }.getOrNull()
+            if (loaded != null) {
+                bitmap = loaded
+                failed = false
+                FeedBitmapCache.put(candidateUrl, loaded)
+                return@LaunchedEffect
             }
-        }.onSuccess { loaded ->
-            bitmap = loaded
-            FeedBitmapCache.put(target, loaded)
         }
-            .onFailure {
-                if (candidateIndex < candidates.lastIndex) {
-                    candidateIndex += 1
-                } else {
-                    failed = true
-                }
-            }
+        if (bitmap?.takeIfDrawable() == null) {
+            failed = candidates.isNotEmpty()
+        }
     }
+
+    val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
 
     Box(
         modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
         contentAlignment = Alignment.Center,
     ) {
-        val image = bitmap
-        if (image != null) {
+        val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
+        if (imageBitmap != null) {
             Image(
-                bitmap = image.asImageBitmap(),
+                bitmap = imageBitmap,
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = contentScale,
@@ -13126,12 +13314,56 @@ private fun WebView.detachFromParent(): WebView {
     return this
 }
 
-private object AlbumThumbnailBitmapCache {
-    private const val MaxEntries = AlbumBitmapCacheMaxEntries
-    private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
-            size > MaxEntries
+private class BitmapByteCache(private val maxBytes: Int) {
+    private var currentBytes = 0
+    private val entries = object : LinkedHashMap<String, Bitmap>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?): Boolean {
+            if (eldest == null || currentBytes <= maxBytes) return false
+            currentBytes = (currentBytes - eldest.value.allocationByteCount).coerceAtLeast(0)
+            return true
+        }
     }
+
+    @Synchronized
+    fun get(key: String): Bitmap? {
+        val bitmap = entries[key] ?: return null
+        if (bitmap.isRecycled) {
+            entries.remove(key)
+            return null
+        }
+        return bitmap
+    }
+
+    @Synchronized
+    fun get(keys: List<String>): Bitmap? {
+        keys.forEach { key ->
+            get(key)?.let { return it }
+        }
+        return null
+    }
+
+    @Synchronized
+    fun put(key: String, bitmap: Bitmap) {
+        entries.remove(key)?.let { old ->
+            currentBytes = (currentBytes - old.allocationByteCount).coerceAtLeast(0)
+        }
+        entries[key] = bitmap
+        currentBytes += bitmap.allocationByteCount
+    }
+
+    @Synchronized
+    fun trimToFraction(keepFraction: Float) {
+        val target = (maxBytes * keepFraction.coerceIn(0f, 1f)).toInt()
+        while (currentBytes > target && entries.isNotEmpty()) {
+            val eldest = entries.entries.firstOrNull() ?: break
+            entries.remove(eldest.key)
+            currentBytes = (currentBytes - eldest.value.allocationByteCount).coerceAtLeast(0)
+        }
+    }
+}
+
+private object AlbumThumbnailBitmapCache {
+    private val cache = BitmapByteCache(AlbumBitmapCacheMaxBytes)
 
     fun cacheKey(image: FeedImage, maxDecodeDim: Int): String {
         val stableId = when {
@@ -13142,59 +13374,51 @@ private object AlbumThumbnailBitmapCache {
         return "$stableId@$maxDecodeDim"
     }
 
-    @Synchronized
-    fun get(key: String): android.graphics.Bitmap? = entries[key]
+    fun getForImage(image: FeedImage, maxDecodeDim: Int): Bitmap? =
+        cache.get(cacheKey(image, maxDecodeDim))
 
-    @Synchronized
-    fun getForImage(image: FeedImage, maxDecodeDim: Int): android.graphics.Bitmap? =
-        get(cacheKey(image, maxDecodeDim))
+    fun putForImage(image: FeedImage, maxDecodeDim: Int, bitmap: Bitmap) {
+        cache.put(cacheKey(image, maxDecodeDim), bitmap)
+    }
 
-    @Synchronized
-    fun putForImage(image: FeedImage, maxDecodeDim: Int, bitmap: android.graphics.Bitmap) {
-        entries[cacheKey(image, maxDecodeDim)] = bitmap
+    fun trimToFraction(keepFraction: Float) {
+        cache.trimToFraction(keepFraction)
     }
 }
 
 private object FeedBitmapCache {
-    private const val MaxEntries = FeedBitmapCacheMaxEntries
-    private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
-            size > MaxEntries
-    }
+    private val cache = BitmapByteCache(FeedBitmapCacheMaxBytes)
 
-    @Synchronized
-    fun get(url: String): android.graphics.Bitmap? = entries[url]
+    fun get(url: String): Bitmap? = cache.get(url)
 
-    @Synchronized
-    fun get(urls: List<String>): android.graphics.Bitmap? {
-        urls.forEach { url ->
-            get(url)?.let { return it }
-        }
-        return null
-    }
+    fun get(urls: List<String>): Bitmap? = cache.get(urls)
 
-    @Synchronized
-    fun getForImage(image: FeedImage): android.graphics.Bitmap? =
+    fun getForImage(image: FeedImage): Bitmap? =
         get(feedImageUrlCandidates(image))
 
-    @Synchronized
-    fun put(url: String, bitmap: android.graphics.Bitmap) {
-        entries[url] = bitmap
+    fun put(url: String, bitmap: Bitmap) {
+        cache.put(url, bitmap)
     }
 
-    @Synchronized
-    fun putForImage(image: FeedImage, bitmap: android.graphics.Bitmap) {
+    fun putForImage(image: FeedImage, bitmap: Bitmap) {
         feedImageUrlCandidates(image).firstOrNull()?.let { put(it, bitmap) }
-        image.largeUrl.takeIf { it.isNotBlank() }?.let { put(it, bitmap) }
+    }
+
+    fun trimToFraction(keepFraction: Float) {
+        cache.trimToFraction(keepFraction)
     }
 }
 
 private object RemoteBytesCache {
-    private const val MaxEntries = 72
-    private const val MaxBytesPerEntry = 12 * 1024 * 1024
-    private val entries = object : LinkedHashMap<String, ByteArray>(MaxEntries, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
-            size > MaxEntries
+    private const val MaxTotalBytes = RemoteBytesCacheMaxTotal
+    private const val MaxBytesPerEntry = RemoteBytesMaxCachedEntry
+    private var currentBytes = 0
+    private val entries = object : LinkedHashMap<String, ByteArray>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean {
+            if (eldest == null || currentBytes <= MaxTotalBytes) return false
+            currentBytes -= eldest.value.size
+            return true
+        }
     }
 
     @Synchronized
@@ -13202,16 +13426,54 @@ private object RemoteBytesCache {
 
     @Synchronized
     fun put(url: String, bytes: ByteArray) {
-        if (bytes.size <= MaxBytesPerEntry) {
-            entries[url] = bytes
+        if (bytes.size > MaxBytesPerEntry) return
+        entries.remove(url)?.let { removed ->
+            currentBytes -= removed.size
+        }
+        entries[url] = bytes
+        currentBytes += bytes.size
+        while (currentBytes > MaxTotalBytes && entries.isNotEmpty()) {
+            val eldest = entries.entries.firstOrNull() ?: break
+            entries.remove(eldest.key)
+            currentBytes -= eldest.value.size
         }
     }
+
+    @Synchronized
+    fun trimToFraction(keepFraction: Float) {
+        val target = (MaxTotalBytes * keepFraction.coerceIn(0f, 1f)).toInt()
+        while (currentBytes > target && entries.isNotEmpty()) {
+            val eldest = entries.entries.firstOrNull() ?: break
+            entries.remove(eldest.key)
+            currentBytes -= eldest.value.size
+        }
+    }
+}
+
+private fun readRemoteBytesLimited(
+    input: java.io.InputStream,
+    maxBytes: Int,
+): ByteArray {
+    val buffer = java.io.ByteArrayOutputStream()
+    val chunk = ByteArray(8192)
+    var total = 0
+    while (true) {
+        val read = input.read(chunk)
+        if (read <= 0) break
+        total += read
+        if (total > maxBytes) {
+            throw java.io.IOException("Remote response exceeds $maxBytes bytes")
+        }
+        buffer.write(chunk, 0, read)
+    }
+    return buffer.toByteArray()
 }
 
 private fun fetchRemoteBytes(
     url: String,
     connectTimeoutMs: Int,
     readTimeoutMs: Int,
+    maxReadBytes: Int = RemoteBytesMaxCachedEntry,
 ): ByteArray {
     RemoteBytesCache.get(url)?.let { return it }
     val bytes = URL(url).openConnection().apply {
@@ -13219,13 +13481,18 @@ private fun fetchRemoteBytes(
         readTimeout = readTimeoutMs
         setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
         setRequestProperty("Referer", "https://weibo.com/")
-    }.inputStream.use { it.readBytes() }
+    }.inputStream.use { readRemoteBytesLimited(it, maxReadBytes) }
     RemoteBytesCache.put(url, bytes)
     return bytes
 }
 
 private fun loadRemoteAnimatedDrawable(url: String): Drawable {
-    val bytes = fetchRemoteBytes(url, connectTimeoutMs = 10_000, readTimeoutMs = 20_000)
+    val bytes = fetchRemoteBytes(
+        url = url,
+        connectTimeoutMs = 10_000,
+        readTimeoutMs = 20_000,
+        maxReadBytes = RemoteBytesAnimatedMaxRead,
+    )
     val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
     return ImageDecoder.decodeDrawable(source)
 }
@@ -13237,14 +13504,13 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
     }
     candidates.forEach { url ->
         runCatching {
-            val bytes = fetchRemoteBytes(url, connectTimeoutMs = 10_000, readTimeoutMs = 20_000)
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-            val maxDim = 4096
-            val rawSample = maxOf(opts.outWidth / maxDim, opts.outHeight / maxDim).coerceAtLeast(1)
-            opts.inJustDecodeBounds = false
-            opts.inSampleSize = Integer.highestOneBit(rawSample).coerceAtLeast(1)
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+            val bytes = fetchRemoteBytes(
+                url = url,
+                connectTimeoutMs = 10_000,
+                readTimeoutMs = 20_000,
+                maxReadBytes = remoteReadLimitForDecodeDim(4096),
+            )
+            decodeBitmapFromBytes(bytes, 4096)
         }.getOrNull()?.let { bitmap ->
             FeedBitmapCache.putForImage(image, bitmap)
             return bitmap

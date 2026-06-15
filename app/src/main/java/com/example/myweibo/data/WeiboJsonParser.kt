@@ -909,7 +909,12 @@ object WeiboJsonParser {
                 ?: item.optInt("width").takeIf { it > 0 },
             height = largeInfo?.optInt("height")?.takeIf { it > 0 }
                 ?: item.optInt("height").takeIf { it > 0 },
-            type = imgType,
+            type = when (imgType?.lowercase()) {
+                "live", "live_photo", "livephoto" -> "livephoto"
+                "gif" -> "gif"
+                "video", "videos" -> "video"
+                else -> imgType
+            },
         )
     }
 

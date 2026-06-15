@@ -68,9 +68,32 @@ fun FeedImage.toAlbumFeedMedia(): FeedMedia? {
     )
 }
 
+enum class AlbumFetchSource {
+    ImageWall,
+    Waterfall,
+}
+
+data class AlbumFetchTrace(
+    val source: AlbumFetchSource,
+    val imageCount: Int,
+    val isFirstPage: Boolean = true,
+    val fallbackFromEmptyWall: Boolean = false,
+) {
+    fun capsuleMessage(): String {
+        val apiLabel = when (source) {
+            AlbumFetchSource.ImageWall -> "照片墙 getImageWall"
+            AlbumFetchSource.Waterfall -> "瀑布流 getWaterFallContent"
+        }
+        val pageLabel = if (isFirstPage) "首页" else "翻页"
+        val prefix = if (fallbackFromEmptyWall) "照片墙空，降级→" else ""
+        return "相册$pageLabel：$prefix$apiLabel · ${imageCount}张"
+    }
+}
+
 data class AlbumPage(
     val images: List<FeedImage>,
-    val nextCursor: String? = null
+    val nextCursor: String? = null,
+    val fetchTrace: AlbumFetchTrace? = null,
 )
 
 data class MinePostsCache(
