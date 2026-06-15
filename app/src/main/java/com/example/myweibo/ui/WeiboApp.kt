@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.drawable.AnimatedImageDrawable
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
@@ -193,6 +194,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
@@ -227,6 +229,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -523,6 +526,22 @@ private class VideoPlaybackCoordinator {
     private val handoffPlayers = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val inlinePauseHandlers = mutableSetOf<() -> Unit>()
     private val fullscreenPauseHandlers = mutableSetOf<() -> Unit>()
+    private val peekRestartFromBeginningKeys = mutableSetOf<String>()
+
+    fun schedulePeekRestartIfAtEnd(playbackKey: String, durationMs: Long?) {
+        val saved = positions[playbackKey] ?: return
+        val duration = durationMs?.takeIf { it > VideoEndRestartThresholdMs } ?: return
+        if (saved >= duration - VideoEndRestartThresholdMs) {
+            positions[playbackKey] = 0L
+            peekRestartFromBeginningKeys += playbackKey
+        }
+    }
+
+    fun isPeekRestartFromBeginning(playbackKey: String): Boolean =
+        playbackKey in peekRestartFromBeginningKeys
+
+    fun consumePeekRestartFromBeginning(playbackKey: String): Boolean =
+        peekRestartFromBeginningKeys.remove(playbackKey)
 
     fun beginFullscreenHandoff(playbackKey: String) {
         pendingFullscreenHandoffKey = playbackKey
@@ -784,9 +803,11 @@ private data class ImagePeekRequest(
 private class ImagePeekController {
     var activeRequest by mutableStateOf<ImagePeekRequest?>(null)
     var pendingDismiss by mutableStateOf<ImagePeekDismissReason?>(null)
+    var isFloating by mutableStateOf(false)
 
     fun open(request: ImagePeekRequest) {
         pendingDismiss = null
+        isFloating = false
         activeRequest = request
     }
 
@@ -798,7 +819,7 @@ private class ImagePeekController {
 
     fun release() {
         if (activeRequest != null && pendingDismiss == null) {
-            pendingDismiss = ImagePeekDismissReason.Release
+            isFloating = true
         }
     }
 
@@ -813,6 +834,7 @@ private class ImagePeekController {
         val reason = pendingDismiss
         activeRequest = null
         pendingDismiss = null
+        isFloating = false
         when (reason) {
             ImagePeekDismissReason.Cancel -> request?.onCancel?.invoke()
             ImagePeekDismissReason.Release -> request?.onRelease?.invoke()
@@ -825,7 +847,13 @@ private class ImagePeekController {
         val request = activeRequest
         activeRequest = null
         pendingDismiss = null
+        isFloating = false
         request?.onEnterFullscreenHandoffComplete?.invoke()
+    }
+
+    fun finishFullscreenHandoff() {
+        if (pendingDismiss != ImagePeekDismissReason.EnterFullscreen) return
+        completeEnterFullscreenHandoff()
     }
 }
 
@@ -1025,6 +1053,11 @@ private fun videoPlaybackKey(media: FeedMedia): String =
         ?: media.streamUrl.ifBlank { media.replayUrl.orEmpty() }
         .ifBlank { media.downloadUrl.orEmpty() }
         .ifBlank { media.coverUrl.orEmpty() }
+
+private fun videoDurationMs(media: FeedMedia): Long? =
+    media.durationSeconds?.takeIf { it > 0 }?.times(1000L)
+
+private const val VideoEndRestartThresholdMs = 500L
 
 private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     val url = avatarUrl?.takeIf { it.isNotBlank() } ?: return null
@@ -3289,11 +3322,12 @@ fun WeiboApp() {
                     initialImageIndex = request.imageIndex,
                     anchorBounds = request.anchorBounds,
                     pressOffset = request.pressOffset,
+                    isFloating = imagePeekController.isFloating,
                     dismissReason = imagePeekController.pendingDismiss,
                     onRequestCancel = { imagePeekController.cancel() },
                     onDismissComplete = { imagePeekController.completeDismiss() },
                     onOpenFullscreenBehind = { request.onOpenFullscreenBehind(it) },
-                    onEnterFullscreenHandoffComplete = { imagePeekController.completeEnterFullscreenHandoff() },
+                    onEnterFullscreenHandoffComplete = { request.onEnterFullscreenHandoffComplete() },
                 )
             }
             videoPeekController.activeRequest?.let { request ->
@@ -5140,7 +5174,7 @@ private fun FeedImageCell(
     showLiveBadge: Boolean = true,
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
-    onOpenViewer: (Int) -> Unit,
+    onOpenViewer: (Int, (() -> Unit)?) -> Unit,
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
@@ -5173,9 +5207,14 @@ private fun FeedImageCell(
                 anchorBounds = bounds,
                 pressOffset = Offset(bounds.left + bounds.width / 2f, bounds.top + bounds.height / 2f),
                 onCancel = { resetPeekState() },
-                onRelease = { resetPeekState() },
-                onOpenFullscreenBehind = { index -> onOpenViewer(index) },
-                onEnterFullscreenHandoffComplete = { resetPeekState() },
+                onRelease = {},
+                onOpenFullscreenBehind = { index ->
+                    onOpenViewer(index) {
+                        resetPeekState()
+                        imagePeekController.finishFullscreenHandoff()
+                    }
+                },
+                onEnterFullscreenHandoffComplete = { peekActive = false },
             ),
         )
     }
@@ -5193,7 +5232,9 @@ private fun FeedImageCell(
                 clip = false
             }
             .clip(RoundedCornerShape(cornerRadius))
-            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .background(
+                if (actionOpen) Color.Black else MaterialTheme.colorScheme.surfaceContainerHighest,
+            )
             .pointerInput(image.id) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
@@ -5221,7 +5262,7 @@ private fun FeedImageCell(
 
                     if (!longPressed) {
                         if (!cancelledByMoveBeforeLongPress) {
-                            onOpenViewer(imageIndex)
+                            onOpenViewer(imageIndex, null)
                         }
                         return@awaitEachGesture
                     }
@@ -5275,6 +5316,7 @@ private fun FeedImageCell(
 
                     if (!cancelledByDrag && !fullscreenByDrag) {
                         peekActive = false
+                        imagePeekController.release()
                     }
                 }
             },
@@ -5389,6 +5431,7 @@ private fun ImageActionOverlay(
     initialImageIndex: Int,
     anchorBounds: Rect,
     pressOffset: Offset,
+    isFloating: Boolean,
     dismissReason: ImagePeekDismissReason?,
     onRequestCancel: () -> Unit,
     onDismissComplete: () -> Unit,
@@ -5417,6 +5460,12 @@ private fun ImageActionOverlay(
                 stiffness = Spring.StiffnessMediumLow,
             ),
         )
+    }
+
+    LaunchedEffect(isFloating) {
+        if (isFloating && enterProgress.value < 1f) {
+            enterProgress.snapTo(1f)
+        }
     }
 
     LaunchedEffect(dismissReason) {
@@ -5448,10 +5497,71 @@ private fun ImageActionOverlay(
         }
     }
 
-    BackHandler { onRequestCancel() }
+    BackHandler(enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen) {
+        onRequestCancel()
+    }
+    val expandProgressForBackdrop = fullscreenExpandProgress.value.coerceIn(0f, 1f)
+    val expandingToFullscreen = expandProgressForBackdrop > 0f ||
+        fullscreenOpened ||
+        dismissReason == ImagePeekDismissReason.EnterFullscreen
     BoxWithConstraints(
         Modifier
             .fillMaxSize()
+            .then(
+                if (expandingToFullscreen) {
+                    Modifier.background(Color.Black)
+                } else {
+                    Modifier
+                },
+            )
+            .pointerInput(isFloating, dismissReason) {
+                if (!isFloating || dismissReason != null) return@pointerInput
+                val dragGestureThreshold = 82f
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var totalDrag = Offset.Zero
+                    var handled = false
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                            ?: event.changes.firstOrNull()
+                            ?: break
+                        if (!change.pressed) {
+                            if (!handled) {
+                                val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
+                                if (totalDrag.y > dragGestureThreshold && verticalDominant) {
+                                    onRequestCancel()
+                                } else if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
+                                    imagePeekController.enterFullscreen()
+                                }
+                            }
+                            break
+                        }
+                        totalDrag += change.position - change.previousPosition
+                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
+                        if (totalDrag.y > dragGestureThreshold && verticalDominant) {
+                            onRequestCancel()
+                            handled = true
+                            while (true) {
+                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
+                                consumeEvent.changes.forEach { it.consume() }
+                                if (consumeEvent.changes.all { !it.pressed }) break
+                            }
+                            break
+                        }
+                        if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
+                            imagePeekController.enterFullscreen()
+                            handled = true
+                            while (true) {
+                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
+                                consumeEvent.changes.forEach { it.consume() }
+                                if (consumeEvent.changes.all { !it.pressed }) break
+                            }
+                            break
+                        }
+                    }
+                }
+            }
             .zIndex(
                 if (fullscreenExpandProgress.value > 0f || dismissReason == ImagePeekDismissReason.EnterFullscreen) {
                     550f
@@ -5461,17 +5571,18 @@ private fun ImageActionOverlay(
             ),
     ) {
         val peekProgress = enterProgress.value.coerceIn(0f, 1f)
-        val expandProgress = fullscreenExpandProgress.value.coerceIn(0f, 1f)
-        val scrimAlpha = when {
-            fullscreenOpened -> 0f
-            expandProgress > 0f -> 0.18f + 0.82f * expandProgress
-            else -> 0.18f * peekProgress
+        val expandProgress = expandProgressForBackdrop
+        val scrimAlpha = if (expandingToFullscreen) {
+            1f
+        } else {
+            0.18f * peekProgress
         }
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = scrimAlpha))
+                .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
                 .clickable(
+                    enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
                     onClick = { onRequestCancel() },
@@ -5497,10 +5608,10 @@ private fun ImageActionOverlay(
             val previewW = floatWidth + (maxWidth - floatWidth) * expandProgress
             val previewH = floatHeight + (maxHeight - floatHeight) * expandProgress
             val previewCorner = floatCorner * (1f - expandProgress)
-            val previewAlpha = when {
-                fullscreenOpened -> 0f
-                expandProgress > 0f -> 1f
-                else -> peekProgress
+            val previewAlpha = if (expandProgress > 0f) {
+                1f
+            } else {
+                peekProgress
             }
             val previewShape = RoundedCornerShape(previewCorner)
             val previewBounds = Rect(
@@ -5531,7 +5642,7 @@ private fun ImageActionOverlay(
                     modifier = Modifier
                         .size(previewW, previewH)
                         .shadow(
-                            elevation = (18f * peekProgress * (1f - expandProgress)).dp,
+                            elevation = if (expandProgress > 0f) 0.dp else (18f * peekProgress).dp,
                             shape = previewShape,
                             clip = false,
                         )
@@ -5912,6 +6023,7 @@ private fun FeedImagePreviewContent(
                 url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Fit,
+                placeholderBackground = Color.Black,
             )
         } else {
             RemoteImage(
@@ -5919,6 +6031,7 @@ private fun FeedImagePreviewContent(
                 fallbackUrls = image.downloadUrls.drop(1),
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Fit,
+                placeholderBackground = Color.Black,
             )
         }
         if (image.isLivePhoto && livePlaying) {
@@ -5943,6 +6056,13 @@ private fun MediaStrip(
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
+    var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    fun openImageViewer(index: Int, onClosed: (() -> Unit)? = null) {
+        viewerIndex = index
+        viewerDismissHook = onClosed
+        viewerOpen = true
+    }
 
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (images.isNotEmpty()) {
@@ -5972,10 +6092,7 @@ private fun MediaStrip(
                                 .fillMaxWidth(SingleImageMaxWidthFraction)
                                 .aspectRatio(aspect),
                             contentScale = ContentScale.Crop,
-                            onOpenViewer = { index ->
-                                viewerIndex = index
-                                viewerOpen = true
-                            },
+                            onOpenViewer = { index, onClosed -> openImageViewer(index, onClosed) },
                         )
                         if (onDetailClick != null) {
                             Box(
@@ -6007,10 +6124,7 @@ private fun MediaStrip(
                                         .weight(1f)
                                         .aspectRatio(1f),
                                     contentScale = ContentScale.Crop,
-                                    onOpenViewer = { index ->
-                                        viewerIndex = index
-                                        viewerOpen = true
-                                    },
+                                    onOpenViewer = { index, onClosed -> openImageViewer(index, onClosed) },
                                 )
                             }
                             repeat(gridColumns - row.size) {
@@ -6025,7 +6139,11 @@ private fun MediaStrip(
                 FullscreenImageViewer(
                     images = images,
                     initialIndex = viewerIndex,
-                    onDismiss = { viewerOpen = false },
+                    onDismiss = {
+                        viewerOpen = false
+                        viewerDismissHook?.invoke()
+                        viewerDismissHook = null
+                    },
                 )
             }
         }
@@ -6107,6 +6225,11 @@ private fun FullscreenImageViewer(
         onDismissRequest = dismissViewer,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
+        val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+        SideEffect {
+            dialogWindow?.setWindowAnimations(0)
+            dialogWindow?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.BLACK))
+        }
         BackHandler { dismissViewer() }
         Box(
             modifier = Modifier
@@ -6919,6 +7042,7 @@ private fun InlineVideoPlayer(
         actionOpen = true
         peekActive = true
         videoCoordinator.pauseInlineOnly()
+        videoCoordinator.schedulePeekRestartIfAtEnd(playbackKey, videoDurationMs(media))
         videoCoordinator.activeKey = null
         videoPeekController.open(
             VideoPeekRequest(
@@ -7292,13 +7416,33 @@ private fun WeiboVideoSurface(
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
     val player = remember(playbackKey, videoUrl) {
         videoCoordinator.consumeHandoffPlayer(playbackKey)?.apply {
+            if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
+                seekTo(0)
+                videoCoordinator.positions[playbackKey] = 0L
+            } else if (playbackState == androidx.media3.common.Player.STATE_ENDED &&
+                playbackSpeedOverride != null
+            ) {
+                seekTo(0)
+                videoCoordinator.positions[playbackKey] = 0L
+            }
             playWhenReady = true
             if (playbackSpeedOverride != null) {
                 setPlaybackSpeed(playbackSpeedOverride)
             } else {
                 setPlaybackSpeed(1f)
             }
-        } ?: playerCache[videoUrl]?.also { it.playWhenReady = true }
+        } ?: playerCache[videoUrl]?.also { cached ->
+            if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
+                cached.seekTo(0)
+                videoCoordinator.positions[playbackKey] = 0L
+            } else if (cached.playbackState == androidx.media3.common.Player.STATE_ENDED &&
+                playbackSpeedOverride != null
+            ) {
+                cached.seekTo(0)
+                videoCoordinator.positions[playbackKey] = 0L
+            }
+            cached.playWhenReady = true
+        }
             ?: androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
                 playerCache[videoUrl] = this
                 setMediaSource(
@@ -7310,12 +7454,23 @@ private fun WeiboVideoSurface(
                     ),
                 )
                 prepare()
-                if (effectiveResumePosition) {
+                if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
+                    seekTo(0)
+                    videoCoordinator.positions[playbackKey] = 0L
+                } else if (effectiveResumePosition) {
                     videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
                 }
                 playbackSpeedOverride?.let { setPlaybackSpeed(it) }
                 playWhenReady = true
             }
+    }
+
+    LaunchedEffect(player, playbackSpeedOverride) {
+        if (playbackSpeedOverride == null) return@LaunchedEffect
+        if (player.playbackState == androidx.media3.common.Player.STATE_ENDED) {
+            player.seekTo(0)
+            videoCoordinator.positions[playbackKey] = 0L
+        }
     }
 
     LaunchedEffect(player) {
@@ -7386,9 +7541,13 @@ private fun WeiboVideoSurface(
         onDispose {
             videoCoordinator.unregisterPauseHandler(isFullscreen, pauseHandler)
             if (effectiveSavePosition) {
-                val currentPosition = player.currentPosition.coerceAtLeast(0L)
-                if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
-                    videoCoordinator.positions[playbackKey] = currentPosition
+                if (videoCoordinator.isPeekRestartFromBeginning(playbackKey)) {
+                    videoCoordinator.positions[playbackKey] = 0L
+                } else {
+                    val currentPosition = player.currentPosition.coerceAtLeast(0L)
+                    if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
+                        videoCoordinator.positions[playbackKey] = currentPosition
+                    }
                 }
             }
             player.removeListener(listener)
@@ -9063,7 +9222,7 @@ private fun CommentImageStrip(
                 previewUrl = image.thumbnailUrl,
                 contentScale = ContentScale.Crop,
                 showLiveBadge = true,
-                onOpenViewer = { onImageClick(it) },
+                onOpenViewer = { index, _ -> onImageClick(index) },
             )
         }
     }
@@ -12830,7 +12989,7 @@ private fun MineAlbumGridRow(
                         size = cellSize,
                         allImages = monthImages,
                         imageIndex = imageIndex,
-                        onOpenViewer = { onImageClick(monthImages, it) },
+                        onOpenViewer = { index, _ -> onImageClick(monthImages, index) },
                         onVideoClick = onVideoClick,
                     )
                 }
@@ -12845,7 +13004,7 @@ private fun MineAlbumTile(
     size: androidx.compose.ui.unit.Dp,
     allImages: List<FeedImage>,
     imageIndex: Int,
-    onOpenViewer: (Int) -> Unit,
+    onOpenViewer: (Int, (() -> Unit)?) -> Unit,
     onVideoClick: (FeedMedia) -> Unit,
 ) {
     val albumMedia = remember(image.id, image.largeUrl, image.videoStreamUrl) {
@@ -12881,6 +13040,7 @@ private fun AlbumVideoTile(
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
     val haptic = LocalHapticFeedback.current
+    val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl) { videoPlaybackKey(media) }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
@@ -12903,6 +13063,7 @@ private fun AlbumVideoTile(
         actionOpen = true
         peekActive = true
         videoCoordinator.pauseInlineOnly()
+        videoCoordinator.schedulePeekRestartIfAtEnd(playbackKey, videoDurationMs(media))
         videoCoordinator.activeKey = null
         videoPeekController.open(
             VideoPeekRequest(
@@ -13578,12 +13739,14 @@ private fun RemoteImage(
     fallbackUrls: List<String> = emptyList(),
     cacheLookupUrls: List<String> = emptyList(),
     maxDecodeDim: Int = 480,
+    placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
 ) {
     if (animated) {
         AnimatedRemoteImage(
             url = url,
             modifier = modifier,
             contentScale = contentScale,
+            placeholderBackground = placeholderBackground,
         )
         return
     }
@@ -13643,7 +13806,7 @@ private fun RemoteImage(
     val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
 
     Box(
-        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        modifier = modifier.background(placeholderBackground),
         contentAlignment = Alignment.Center,
     ) {
         val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
@@ -13669,6 +13832,7 @@ private fun AnimatedRemoteImage(
     url: String?,
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
+    placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
 ) {
     var drawable by remember(url) { mutableStateOf<Drawable?>(null) }
     var failed by remember(url) { mutableStateOf(false) }
@@ -13686,7 +13850,7 @@ private fun AnimatedRemoteImage(
     }
 
     Box(
-        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        modifier = modifier.background(placeholderBackground),
         contentAlignment = Alignment.Center,
     ) {
         val image = drawable
@@ -13695,6 +13859,7 @@ private fun AnimatedRemoteImage(
                 modifier = Modifier.fillMaxSize(),
                 factory = { context ->
                     ImageView(context).apply {
+                        setBackgroundColor(android.graphics.Color.BLACK)
                         adjustViewBounds = false
                         scaleType = imageViewScaleType(contentScale)
                         setImageDrawable(image)
