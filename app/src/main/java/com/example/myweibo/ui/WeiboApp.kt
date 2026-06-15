@@ -572,8 +572,12 @@ private class VideoPlaybackCoordinator {
     }
 
     fun stashHandoffPlayer(playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer) {
-        player.pause()
+        val currentPosition = player.currentPosition.coerceAtLeast(0L)
+        if (currentPosition > 0L || positions[playbackKey] == null) {
+            positions[playbackKey] = currentPosition
+        }
         player.playWhenReady = false
+        player.pause()
         handoffPlayers[playbackKey] = player
     }
 
@@ -7604,7 +7608,8 @@ private fun InlineVideoPlayer(
         videoPlaybackKey(media, playbackOwnerId)
     }
     val inlinePlaying = videoCoordinator.activeKey == playbackKey &&
-        videoCoordinator.fullscreenKey != playbackKey
+        videoCoordinator.fullscreenKey != playbackKey &&
+        videoCoordinator.peekPlaybackKey != playbackKey
     val displayAspectRatio = remember(
         media.streamUrl,
         media.videoOrientation,
@@ -8061,8 +8066,11 @@ private fun WeiboVideoSurface(
     val awaitingFullscreenHandoff =
         videoCoordinator.pendingFullscreenHandoffKey == playbackKey &&
             (isFullscreen || isPeekPlayback)
-    val awaitingPeekHandoff =
-        !isFullscreen && videoCoordinator.pendingPeekHandoffKey == playbackKey
+    val awaitingPeekHandoffSource =
+        !isFullscreen && !isPeekPlayback &&
+            videoCoordinator.pendingPeekHandoffKey == playbackKey
+    val awaitingPeekHandoffConsume =
+        isPeekPlayback && videoCoordinator.pendingPeekHandoffKey == playbackKey
 
     fun configureExistingPlayer(target: androidx.media3.exoplayer.ExoPlayer) {
         if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
@@ -8116,20 +8124,45 @@ private fun WeiboVideoSurface(
         return createFreshPlayer()
     }
 
-    val immediatePlayer = remember(playbackKey, videoUrl, awaitingFullscreenHandoff, awaitingPeekHandoff) {
-        if (awaitingFullscreenHandoff || awaitingPeekHandoff) null else resolveImmediatePlayer()
+    var handoffPlayerResolved by remember(playbackKey, videoUrl) { mutableStateOf(false) }
+    val immediatePlayer = remember(
+        playbackKey,
+        videoUrl,
+        awaitingFullscreenHandoff,
+        awaitingPeekHandoffSource,
+        handoffPlayerResolved,
+    ) {
+        if (
+            handoffPlayerResolved ||
+            awaitingFullscreenHandoff ||
+            awaitingPeekHandoffSource ||
+            awaitingPeekHandoffConsume
+        ) {
+            null
+        } else {
+            resolveImmediatePlayer()
+        }
     }
     var deferredPlayer by remember(playbackKey, videoUrl) {
         mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null)
     }
 
-    LaunchedEffect(awaitingFullscreenHandoff, awaitingPeekHandoff, playbackKey, videoUrl) {
-        if (!awaitingFullscreenHandoff && !awaitingPeekHandoff) return@LaunchedEffect
+    LaunchedEffect(
+        awaitingFullscreenHandoff,
+        awaitingPeekHandoffSource,
+        awaitingPeekHandoffConsume,
+        playbackKey,
+        videoUrl,
+    ) {
+        if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
+            return@LaunchedEffect
+        }
         val deadline = android.os.SystemClock.uptimeMillis() + 500L
         while (android.os.SystemClock.uptimeMillis() < deadline) {
             videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
                 configureExistingPlayer(handoff)
                 deferredPlayer = handoff
+                handoffPlayerResolved = true
                 return@LaunchedEffect
             }
             if (videoCoordinator.pendingFullscreenHandoffKey != playbackKey &&
@@ -8140,6 +8173,7 @@ private fun WeiboVideoSurface(
             delay(16)
         }
         deferredPlayer = resolveImmediatePlayer()
+        handoffPlayerResolved = true
     }
 
     val player = immediatePlayer ?: deferredPlayer
