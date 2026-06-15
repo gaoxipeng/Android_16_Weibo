@@ -406,7 +406,7 @@ private const val NavTransitionDurationMs = 280
 private fun navStackEnterTransition() =
     slideInHorizontally(
         animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
-        initialOffsetX = { fullWidth -> -fullWidth },
+        initialOffsetX = { fullWidth -> fullWidth },
     ) + fadeIn(tween(NavTransitionDurationMs))
 
 private fun navStackExitTransition() =
@@ -4736,6 +4736,8 @@ private fun FeedImageCell(
     previewUrl: String? = null,
     contentScale: ContentScale = ContentScale.Crop,
     showLiveBadge: Boolean = true,
+    cornerRadius: Dp = 4.dp,
+    maxDecodeDimOverride: Int? = null,
     onOpenViewer: (Int) -> Unit,
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
@@ -4795,7 +4797,7 @@ private fun FeedImageCell(
                 alpha = if (actionOpen) 0f else 1f
                 clip = false
             }
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(cornerRadius))
             .background(MaterialTheme.colorScheme.surfaceContainerHighest)
             .pointerInput(image.id) {
                 detectTapGestures(
@@ -4822,6 +4824,7 @@ private fun FeedImageCell(
             previewUrl = previewUrl,
             modifier = Modifier.fillMaxSize(),
             contentScale = contentScale,
+            maxDecodeDimOverride = maxDecodeDimOverride,
         )
         if (showLiveBadge && (image.isLivePhoto || image.isGif)) {
             Surface(
@@ -12160,10 +12163,13 @@ private fun MineAlbumGridRow(
             val cellSize = (maxWidth - gap * 2) / 3
             Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
                 rowImages.forEachIndexed { columnIndex, image ->
+                    val imageIndex = rowStartIndex + columnIndex
                     MineAlbumTile(
                         image = image,
                         size = cellSize,
-                        onClick = { onImageClick(monthImages, rowStartIndex + columnIndex) },
+                        allImages = monthImages,
+                        imageIndex = imageIndex,
+                        onOpenViewer = { onImageClick(monthImages, it) },
                         onVideoClick = onVideoClick,
                     )
                 }
@@ -12176,16 +12182,166 @@ private fun MineAlbumGridRow(
 private fun MineAlbumTile(
     image: FeedImage,
     size: androidx.compose.ui.unit.Dp,
-    onClick: () -> Unit,
+    allImages: List<FeedImage>,
+    imageIndex: Int,
+    onOpenViewer: (Int) -> Unit,
     onVideoClick: (FeedMedia) -> Unit,
 ) {
+    val albumMedia = remember(image.id, image.largeUrl, image.videoStreamUrl) {
+        image.toAlbumFeedMedia()
+    }
+    if (albumMedia != null && image.isAlbumVideo) {
+        AlbumVideoTile(
+            image = image,
+            media = albumMedia,
+            size = size,
+            onVideoClick = { onVideoClick(albumMedia) },
+        )
+    } else {
+        FeedImageCell(
+            image = image,
+            allImages = allImages,
+            imageIndex = imageIndex,
+            modifier = Modifier.size(size),
+            cornerRadius = 8.dp,
+            maxDecodeDimOverride = AlbumGridMaxDecodeDim,
+            onOpenViewer = onOpenViewer,
+        )
+    }
+}
+
+@Composable
+private fun AlbumVideoTile(
+    image: FeedImage,
+    media: FeedMedia,
+    size: androidx.compose.ui.unit.Dp,
+    onVideoClick: () -> Unit,
+) {
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val videoPeekController = LocalVideoPeekController.current
+    val haptic = LocalHapticFeedback.current
+    var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
+    var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
+    var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
+    val peekScale by animateFloatAsState(
+        targetValue = if (peekActive) 0.96f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium,
+        ),
+        label = "album-video-peek-scale",
+    )
+
+    fun resetPeekState() {
+        actionOpen = false
+        peekActive = false
+    }
+
+    fun openVideoPeek() {
+        val bounds = anchorBounds ?: return
+        actionOpen = true
+        peekActive = true
+        videoCoordinator.pauseInlineOnly()
+        videoCoordinator.activeKey = null
+        videoPeekController.open(
+            VideoPeekRequest(
+                media = media,
+                anchorBounds = bounds,
+                onCancel = { resetPeekState() },
+                onRelease = {
+                    resetPeekState()
+                    videoCoordinator.activeKey = null
+                    onVideoClick()
+                },
+            ),
+        )
+    }
+
     Box(
         modifier = Modifier
             .size(size)
-            .clip(RoundedCornerShape(8.dp))
-            .clickable {
-                image.toAlbumFeedMedia()?.let(onVideoClick) ?: onClick()
+            .onGloballyPositioned { coordinates ->
+                anchorBounds = coordinates.boundsInWindow()
             }
+            .graphicsLayer {
+                scaleX = peekScale
+                scaleY = peekScale
+                alpha = if (actionOpen) 0f else 1f
+            }
+            .clip(RoundedCornerShape(8.dp))
+            .pointerInput(media.streamUrl) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    var cancelledByMoveBeforeLongPress = false
+                    var releasedBeforeLongPress = false
+                    val longPressed = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id }
+                                ?: event.changes.firstOrNull()
+                                ?: return@withTimeoutOrNull false
+                            if (!change.pressed) {
+                                releasedBeforeLongPress = true
+                                return@withTimeoutOrNull false
+                            }
+                            val preLongPressMove = change.position - down.position
+                            if (hypot(preLongPressMove.x, preLongPressMove.y) > viewConfiguration.touchSlop) {
+                                cancelledByMoveBeforeLongPress = true
+                                return@withTimeoutOrNull false
+                            }
+                        }
+                    } == null && !cancelledByMoveBeforeLongPress && !releasedBeforeLongPress
+
+                    if (!longPressed) {
+                        if (!cancelledByMoveBeforeLongPress) {
+                            onVideoClick()
+                        }
+                        return@awaitEachGesture
+                    }
+
+                    if (!media.isStreamPlayable()) {
+                        onVideoClick()
+                        return@awaitEachGesture
+                    }
+
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    down.consume()
+                    openVideoPeek()
+
+                    val dragCancelThreshold = 82f
+                    var cancelledByDrag = false
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                            ?: event.changes.firstOrNull()
+                            ?: break
+                        change.consume()
+                        if (!change.pressed) {
+                            break
+                        }
+                        val totalDrag = change.position - down.position
+                        if (
+                            totalDrag.y > dragCancelThreshold &&
+                            abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
+                        ) {
+                            cancelledByDrag = true
+                            videoPeekController.cancel()
+                            while (true) {
+                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
+                                consumeEvent.changes.forEach { it.consume() }
+                                if (consumeEvent.changes.all { !it.pressed }) break
+                            }
+                            break
+                        }
+                    }
+
+                    if (cancelledByDrag) {
+                        resetPeekState()
+                    } else {
+                        videoPeekController.release()
+                    }
+                }
+            },
     ) {
         FeedImageThumbnailContent(
             image = image,
@@ -12193,36 +12349,18 @@ private fun MineAlbumTile(
             contentScale = ContentScale.Crop,
             maxDecodeDimOverride = AlbumGridMaxDecodeDim,
         )
-        if (image.isAlbumVideo) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.18f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_video_play),
-                    contentDescription = "视频",
-                    modifier = Modifier.size(28.dp),
-                    tint = Color.White.copy(alpha = 0.92f),
-                )
-            }
-        } else if (image.isLivePhoto || image.isGif) {
-            Surface(
-                modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp),
-                shape = CircleShape,
-                color = Color.Black.copy(alpha = 0.42f),
-                contentColor = Color.White,
-            ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_live_photo),
-                    contentDescription = if (image.isGif) "GIF" else "LivePhoto",
-                    modifier = Modifier
-                        .padding(2.dp)
-                        .size(11.dp),
-                    tint = Color.White,
-                )
-            }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.18f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_video_play),
+                contentDescription = "视频",
+                modifier = Modifier.size(28.dp),
+                tint = Color.White.copy(alpha = 0.92f),
+            )
         }
     }
 }
