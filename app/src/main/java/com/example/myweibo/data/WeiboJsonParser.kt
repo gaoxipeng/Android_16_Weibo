@@ -92,6 +92,59 @@ object WeiboJsonParser {
         }
     }
 
+    fun parseMweiboAttitudes(raw: String, page: Int = 1): LikeUsersPage {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 1) <= 0) {
+            throw IllegalStateException(
+                root.optNullableString("msg")
+                    ?: root.optNullableString("message")
+                    ?: "加载点赞列表失败",
+            )
+        }
+        val data = root.optJSONObject("data") ?: JSONObject()
+        val usersArray = data.optJSONArray("data") ?: JSONArray()
+        val users = buildList {
+            for (index in 0 until usersArray.length()) {
+                val entry = usersArray.optJSONObject(index) ?: continue
+                val user = entry.optJSONObject("user") ?: entry
+                val id = user.optNullableString("idstr")
+                    ?: user.optNullableString("id")
+                    ?: continue
+                add(
+                    MentionCandidate(
+                        id = id,
+                        name = user.optNullableString("screen_name")
+                            ?: user.optNullableString("name")
+                            ?: "微博用户",
+                        avatarUrl = user.optNullableString("profile_image_url")
+                            ?: user.optNullableString("avatar_hd"),
+                    ),
+                )
+            }
+        }
+        val totalCount = listOf(
+            data.optInt("total_number", 0),
+            data.optInt("count", 0),
+            data.optInt("total", 0),
+            data.optInt("attitudes_count", 0),
+            root.optInt("total_number", 0),
+        ).firstOrNull { it > 0 }
+        val maxPage = listOf(
+            data.optInt("max", 0),
+            data.optInt("max_page", 0),
+            root.optInt("max", 0),
+        ).firstOrNull { it > 0 }
+        val nextPage = when {
+            users.isEmpty() -> null
+            users.size >= MWEIBO_ATTITUDES_PAGE_SIZE -> page + 1
+            maxPage != null && page < maxPage -> page + 1
+            else -> null
+        }
+        return LikeUsersPage(users = users, nextPage = nextPage, totalCount = totalCount)
+    }
+
+    private const val MWEIBO_ATTITUDES_PAGE_SIZE = 20
+
     fun parsePcReposts(raw: String, page: Int = 1): RepostsPage {
         val root = JSONObject(raw)
         if (root.has("ok") && root.optInt("ok", 1) != 1) {
@@ -593,6 +646,8 @@ object WeiboJsonParser {
         )
     }
 
+    fun formatDisplayCount(count: Number): String = formatCount(count)
+
     fun bumpDisplayCount(value: String, delta: Int): String {
         if (delta == 0) return value
         val trimmed = value.trim()
@@ -1049,7 +1104,7 @@ object WeiboJsonParser {
             repostsCount = formatCount(status.opt("reposts_count")),
             commentsCount = formatCount(status.opt("comments_count")),
             likesCount = formatCount(status.opt("attitudes_count")),
-            liked = status.optBoolean("attitudes_status"),
+            liked = status.parseAttitudesStatus(),
             images = images,
             medias = resolvedMedias,
             inlineImageLinks = inlineImageLinks,
@@ -1643,6 +1698,23 @@ object WeiboJsonParser {
         val editedFlag = optTruthy("edited") || optTruthy("is_edit") || optTruthy("isEdit")
         val isEdited = editCount > 0 || editAt != null || editedFlag
         return isEdited to editCount
+    }
+
+    private fun JSONObject.parseAttitudesStatus(): Boolean {
+        for (key in listOf("attitudes_status", "liked", "is_like", "isLike")) {
+            if (!has(key) || isNull(key)) continue
+            when (val raw = opt(key)) {
+                is Boolean -> return raw
+                is Number -> return raw.toInt() != 0
+                is String -> {
+                    when (raw.trim().lowercase()) {
+                        "true", "1", "yes" -> return true
+                        "false", "0", "no" -> return false
+                    }
+                }
+            }
+        }
+        return false
     }
 
     private fun JSONObject.optIntOrNull(name: String): Int? {

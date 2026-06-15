@@ -233,6 +233,12 @@ data class MentionCandidateBundle(
     val nameIndex: List<MentionCandidate>,
 )
 
+data class LikeUsersPage(
+    val users: List<MentionCandidate>,
+    val nextPage: Int? = null,
+    val totalCount: Int? = null,
+)
+
 sealed class ProfileLookup {
     data class Uid(val uid: String) : ProfileLookup()
     data class ScreenName(val screenName: String) : ProfileLookup()

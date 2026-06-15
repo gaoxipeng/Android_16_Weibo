@@ -88,6 +88,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
@@ -258,6 +259,7 @@ import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.toAlbumFeedMedia
 import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.FeedUrlEntity
+import com.example.myweibo.data.LikeUsersPage
 import com.example.myweibo.data.ProfileLookup
 import com.example.myweibo.data.FeedMedia
 import com.example.myweibo.data.MediaType
@@ -619,6 +621,13 @@ private enum class DetailContentSection {
     Comments,
     Reposts,
 }
+
+private data class LikeUsersOverlayState(
+    val item: FeedItem,
+    val anchorBounds: Rect,
+    val likeId: String,
+    val knownTotal: Int? = null,
+)
 
 private data class CommentComposeTarget(
     val status: FeedItem,
@@ -1152,6 +1161,12 @@ fun WeiboApp() {
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var likeUsersOverlay by remember { mutableStateOf<LikeUsersOverlayState?>(null) }
+    var likeUsers by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
+    var likeUsersLoading by remember { mutableStateOf(false) }
+    var likeUsersLoadingMore by remember { mutableStateOf(false) }
+    var likeUsersNextPage by remember { mutableStateOf<Int?>(null) }
+    var likeUsersError by remember { mutableStateOf<String?>(null) }
     var mineProfile by remember { mutableStateOf<UserProfile?>(null) }
     var mineProfileLoading by remember { mutableStateOf(false) }
     var mineProfileError by remember { mutableStateOf<String?>(null) }
@@ -1902,6 +1917,43 @@ fun WeiboApp() {
         }
     }
 
+    fun reconcileFeedLikeState(freshItems: List<FeedItem>) {
+        if (freshItems.isEmpty()) return
+        val freshLookup = buildMap<String, FeedItem> {
+            fun register(item: FeedItem) {
+                if (item.statusId.isNotBlank()) put(item.statusId, item)
+                if (item.id.isNotBlank()) put(item.id, item)
+            }
+            freshItems.forEach { item ->
+                register(item)
+                item.retweetedStatus?.let(::register)
+            }
+        }
+        expandedFeedItems = expandedFeedItems.mapValues { (_, expanded) ->
+            if (expanded.statusId in likeLoadingIds) return@mapValues expanded
+            val fresh = freshLookup[expanded.statusId] ?: freshLookup[expanded.id] ?: return@mapValues expanded
+            val mergedLikesCount = mergeAuthoritativeLikeCount(expanded.likesCount, fresh.likesCount)
+            var merged = expanded.copy(
+                liked = fresh.liked,
+                likesCount = mergedLikesCount,
+            )
+            val freshRetweet = fresh.retweetedStatus
+            val itemRetweet = expanded.retweetedStatus
+            if (freshRetweet != null && itemRetweet != null) {
+                merged = merged.copy(
+                    retweetedStatus = itemRetweet.copy(
+                        liked = freshRetweet.liked,
+                        likesCount = mergeAuthoritativeLikeCount(
+                            itemRetweet.likesCount,
+                            freshRetweet.likesCount,
+                        ),
+                    ),
+                )
+            }
+            merged
+        }
+    }
+
     fun refreshTimeline() {
         scope.launch {
             val previousItems = items
@@ -1917,6 +1969,7 @@ fun WeiboApp() {
             }
                 .onSuccess { page ->
                     items = sortFeedTimelineItems(page.items)
+                    reconcileFeedLikeState(page.items)
                     nextCursor = page.nextCursor
                     absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     hasLoginCookie = true
@@ -1959,6 +2012,7 @@ fun WeiboApp() {
             }
                 .onSuccess { page ->
                     items = sortFeedTimelineItems(page.items)
+                    reconcileFeedLikeState(page.items)
                     nextCursor = page.nextCursor
                     absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     hasLoginCookie = true
@@ -2004,6 +2058,7 @@ fun WeiboApp() {
                 .onSuccess { page ->
                     val (merged, appended) = mergeFeedTimelinePages(items, page.items)
                     items = merged
+                    reconcileFeedLikeState(page.items)
                     absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                     nextCursor = when {
                         page.items.isEmpty() -> null
@@ -2209,6 +2264,10 @@ fun WeiboApp() {
                 ),
             )
         }
+        likeUsersOverlay = likeUsersOverlay?.let { overlay ->
+            val merged = mergeExpandedIntoItem(overlay.item, expanded)
+            if (merged !== overlay.item) overlay.copy(item = merged) else overlay
+        }
     }
 
     fun toggleStatusLike(item: FeedItem) {
@@ -2236,6 +2295,124 @@ fun WeiboApp() {
             }
             likeLoadingIds = likeLoadingIds - likeId
         }
+    }
+
+    fun syncItemLikeCountFromLikeUsers(item: FeedItem, page: LikeUsersPage, loadedCount: Int) {
+        val resolved = resolveFeedItem(item)
+        val currentCount = parseApproxDisplayCount(resolved.likesCount) ?: 0
+        val authoritativeCount = listOfNotNull(
+            page.totalCount?.takeIf { it > 0 },
+            loadedCount.takeIf { it > 0 },
+        ).maxOrNull() ?: return
+        if (authoritativeCount <= currentCount) return
+        applyExpandedItem(
+            resolved.copy(likesCount = WeiboJsonParser.formatDisplayCount(authoritativeCount)),
+        )
+    }
+
+    fun applyLikeUsersLoadResult(
+        item: FeedItem,
+        page: LikeUsersPage,
+        mergedUsers: List<MentionCandidate>,
+        currentPage: Int,
+        previousKnownTotal: Int? = null,
+    ): Int? {
+        syncItemLikeCountFromLikeUsers(item, page, mergedUsers.size)
+        val resolved = resolveFeedItem(item)
+        val knownTotal = listOfNotNull(
+            previousKnownTotal,
+            page.totalCount?.takeIf { it > 0 },
+            parseApproxDisplayCount(resolved.likesCount),
+        ).maxOrNull()
+        likeUsersOverlay = likeUsersOverlay?.copy(knownTotal = knownTotal)
+        return resolveLikeUsersNextPage(
+            page = page,
+            currentPage = currentPage,
+            loadedCount = mergedUsers.size,
+            knownTotal = knownTotal,
+        )
+    }
+
+    fun openLikeUsers(item: FeedItem, anchorBounds: Rect) {
+        val resolved = resolveFeedItem(item)
+        val likeId = resolved.id.trim().takeIf { it.isNotBlank() && it != "0" && it.all(Char::isDigit) }
+            ?: resolved.statusId.trim().takeIf { it.isNotBlank() && it.all(Char::isDigit) }
+            ?: run {
+                showMessage("无法查看点赞", "微博 ID 无效")
+                return
+            }
+        likeUsersOverlay = LikeUsersOverlayState(
+            item = resolved,
+            anchorBounds = anchorBounds,
+            likeId = likeId,
+        )
+        likeUsers = emptyList()
+        likeUsersError = null
+        likeUsersNextPage = null
+        likeUsersLoadingMore = false
+        if (resolved.hasNoLikes()) {
+            likeUsersLoading = false
+            return
+        }
+        scope.launch {
+            likeUsersLoading = true
+            runCatching { session.loadLikeUsers(likeId) }
+                .onSuccess { page ->
+                    likeUsers = page.users
+                    likeUsersNextPage = applyLikeUsersLoadResult(
+                        item = resolved,
+                        page = page,
+                        mergedUsers = page.users,
+                        currentPage = 1,
+                    )
+                }
+                .onFailure { error ->
+                    likeUsersError = error.message ?: "加载失败"
+                }
+            likeUsersLoading = false
+        }
+    }
+
+    fun loadMoreLikeUsers() {
+        val overlay = likeUsersOverlay ?: return
+        val nextPage = likeUsersNextPage ?: return
+        if (likeUsersLoadingMore || likeUsersLoading) return
+        val item = resolveFeedItem(overlay.item)
+        scope.launch {
+            likeUsersLoadingMore = true
+            runCatching { session.loadLikeUsers(overlay.likeId, nextPage) }
+                .onSuccess { page ->
+                    if (page.users.isEmpty()) {
+                        likeUsersNextPage = null
+                        return@onSuccess
+                    }
+                    val merged = (likeUsers + page.users).distinctBy { mentionCandidateKey(it) }
+                    if (merged.size == likeUsers.size) {
+                        likeUsersNextPage = null
+                        return@onSuccess
+                    }
+                    likeUsers = merged
+                    likeUsersNextPage = applyLikeUsersLoadResult(
+                        item = item,
+                        page = page,
+                        mergedUsers = merged,
+                        currentPage = nextPage,
+                        previousKnownTotal = overlay.knownTotal,
+                    )
+                }
+                .onFailure { error ->
+                    showMessage("加载失败", error.message ?: "无法继续读取点赞列表")
+                }
+            likeUsersLoadingMore = false
+        }
+    }
+
+    fun closeLikeUsers() {
+        likeUsersOverlay = null
+        likeUsers = emptyList()
+        likeUsersError = null
+        likeUsersNextPage = null
+        likeUsersLoadingMore = false
     }
 
     fun loadLongText(item: FeedItem) {
@@ -2769,7 +2946,7 @@ fun WeiboApp() {
             Box(Modifier.fillMaxSize()) {
             Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
             Box(Modifier.fillMaxSize().padding(innerPadding)) {
-            val detailOverlayItem = selectedItem
+            val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
                 detailOverlayItem == null
@@ -2837,6 +3014,7 @@ fun WeiboApp() {
                             isLongTextLoading = { it.statusId in longTextLoadingIds },
                             onLoadLongText = ::loadLongText,
                             onToggleLike = ::toggleStatusLike,
+                            onLikeClick = ::openLikeUsers,
                             onUrlEntityClick = ::openUrlEntity,
                         )
                     }
@@ -2896,6 +3074,7 @@ fun WeiboApp() {
                             isLongTextLoading = { it.statusId in longTextLoadingIds },
                             onLoadLongText = ::loadLongText,
                             onToggleLike = ::toggleStatusLike,
+                            onLikeClick = ::openLikeUsers,
                             onUrlEntityClick = ::openUrlEntity,
                             onOpenLoginSettings = ::openAccountLoginManagement,
                             mineProfileId = mineProfile?.id,
@@ -2990,6 +3169,7 @@ fun WeiboApp() {
                                     isLongTextLoading = { it.statusId in longTextLoadingIds },
                                     onLoadLongText = ::loadLongText,
                                     onToggleLike = ::toggleStatusLike,
+                                    onLikeClick = ::openLikeUsers,
                                     onUrlEntityClick = ::openUrlEntity,
                                     onOpenFollowList = ::openFollowList,
                                     showFollowActions = hasLoginCookie &&
@@ -3052,6 +3232,7 @@ fun WeiboApp() {
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
+                                onLikeClick = ::openLikeUsers,
                                 onUrlEntityClick = ::openUrlEntity,
                                 onOpenFollowList = { uid, screenName, avatarUrl, description, tab ->
                                     openFollowList(uid, screenName, avatarUrl, description, tab)
@@ -3147,6 +3328,7 @@ fun WeiboApp() {
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
+                                onLikeClick = ::openLikeUsers,
                                 onBack = { navigateBack() },
                                 onRefresh = { reloadDetailContent() },
                                 onCommentSortChange = ::changeCommentSort,
@@ -3195,6 +3377,28 @@ fun WeiboApp() {
                         },
                         onSubmit = { text, photoUris, alsoRepost -> submitComment(target, text, photoUris, alsoRepost) },
                     )
+                }
+
+                likeUsersOverlay?.let { overlay ->
+                    val overlayItem = resolveFeedItem(overlay.item)
+                    Box(Modifier.fillMaxSize().zIndex(580f)) {
+                        LikeUsersOverlay(
+                            item = overlayItem,
+                            anchorBounds = overlay.anchorBounds,
+                            loading = likeUsersLoading,
+                            loadingMore = likeUsersLoadingMore,
+                            hasMore = likeUsersNextPage != null,
+                            users = likeUsers,
+                            error = likeUsersError,
+                            onDismiss = ::closeLikeUsers,
+                            onLoadMore = ::loadMoreLikeUsers,
+                            onToggleLike = { toggleStatusLike(overlayItem) },
+                            onUserClick = { uid ->
+                                closeLikeUsers()
+                                openUser(uid)
+                            },
+                        )
+                    }
                 }
             }
 
@@ -4136,6 +4340,7 @@ private fun FollowFeedScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
 ) {
@@ -4211,6 +4416,7 @@ private fun FollowFeedScreen(
                     isLongTextLoading = isLongTextLoading,
                     onLoadLongText = onLoadLongText,
                     onToggleLike = onToggleLike,
+                    onLikeClick = onLikeClick,
                     onUrlEntityClick = onUrlEntityClick,
                     onCommentClick = { onCommentClick(resolved) },
                     onCommentLongClick = { onCommentLongClick(resolved) },
@@ -4636,6 +4842,7 @@ private fun FeedCard(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     onCommentClick: (() -> Unit)? = null,
     onCommentLongClick: (() -> Unit)? = null,
@@ -4732,6 +4939,7 @@ private fun FeedCard(
                 onRepostClick = onRepostClick ?: onClick,
                 onCommentClick = onCommentClick ?: onClick,
                 onCommentLongClick = onCommentLongClick,
+                onLikeClick = onLikeClick?.let { open -> { bounds -> open(item, bounds) } },
                 onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
             )
         }
@@ -7974,6 +8182,7 @@ private fun StatusActions(
     onRepostClick: (() -> Unit)? = null,
     onCommentClick: (() -> Unit)? = null,
     onCommentLongClick: (() -> Unit)? = null,
+    onLikeClick: ((Rect) -> Unit)? = null,
     onToggleLike: (() -> Unit)? = null,
 ) {
     val actionColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.62f)
@@ -8034,12 +8243,20 @@ private fun StatusActions(
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center,
         ) {
+            var likeAnchorBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
             Box(
                 modifier = Modifier
                     .height(24.dp)
+                    .onGloballyPositioned { coordinates ->
+                        likeAnchorBounds = coordinates.boundsInWindow()
+                    }
                     .clip(RoundedCornerShape(12.dp))
                     .combinedClickable(
-                        onClick = {},
+                        onClick = {
+                            likeAnchorBounds?.let { bounds ->
+                                onLikeClick?.invoke(bounds)
+                            }
+                        },
                         onLongClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onToggleLike?.invoke()
@@ -8103,6 +8320,7 @@ private fun DetailScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onComposeComment: ((FeedItem, CommentItem?) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     onExpandNestedComments: ((String) -> Unit)? = null,
@@ -8172,6 +8390,7 @@ private fun DetailScreen(
                             isLongTextLoading = isLongTextLoading,
                             onLoadLongText = onLoadLongText,
                             onToggleLike = onToggleLike,
+                            onLikeClick = onLikeClick,
                             onUrlEntityClick = onUrlEntityClick,
                             onCommentClick = { onSelectContentSection(DetailContentSection.Comments) },
                             onCommentLongClick = { onComposeComment?.invoke(item, null) },
@@ -8765,6 +8984,367 @@ private fun CommentComposerDialog(
     }
 }
 
+private fun FeedItem.hasNoLikes(): Boolean {
+    val value = likesCount.trim()
+    return value == "0" || value == "--" || value.equals("null", ignoreCase = true) || value.isEmpty()
+}
+
+private const val LikeUsersPageSize = 20
+
+private fun parseApproxDisplayCount(value: String): Int? {
+    val trimmed = value.trim()
+    if (trimmed.isEmpty() || trimmed == "--") return null
+    Regex("""^([\d.]+)万$""").find(trimmed)?.let { match ->
+        val num = match.groupValues[1].toDoubleOrNull() ?: return null
+        return (num * 10_000).toInt().coerceAtLeast(0)
+    }
+    return trimmed.toIntOrNull()
+}
+
+private fun mergeAuthoritativeLikeCount(existing: String, incoming: String): String {
+    val existingCount = parseApproxDisplayCount(existing)
+    val incomingCount = parseApproxDisplayCount(incoming)
+    return when {
+        existingCount != null && incomingCount != null && existingCount > incomingCount ->
+            WeiboJsonParser.formatDisplayCount(existingCount)
+        else -> incoming
+    }
+}
+
+private fun resolveLikeUsersNextPage(
+    page: LikeUsersPage,
+    currentPage: Int,
+    loadedCount: Int,
+    knownTotal: Int?,
+): Int? {
+    if (page.users.isEmpty()) return null
+
+    if (page.users.size >= LikeUsersPageSize) {
+        return page.nextPage ?: (currentPage + 1)
+    }
+
+    page.nextPage?.let { return it }
+
+    if (knownTotal != null && loadedCount < knownTotal) {
+        return currentPage + 1
+    }
+
+    return null
+}
+
+private object LikeUsersLayout {
+    val TileWidthDefault = 58.dp
+    val TileMinWidth = 44.dp
+    val TileGap = 8.dp
+    val CardHorizontalPadding = 12.dp
+    val MaxColumns = 5
+    val CardMinWidth = 88.dp
+}
+
+private data class LikeUsersCardLayout(
+    val cardWidth: Dp,
+    val tileWidth: Dp,
+    val columns: Int,
+)
+
+private fun computeLikeUsersCardLayout(
+    userCount: Int,
+    maxScreenWidth: Dp,
+    screenMargin: Dp = 12.dp,
+): LikeUsersCardLayout {
+    val gap = LikeUsersLayout.TileGap
+    val horizontalPadding = LikeUsersLayout.CardHorizontalPadding * 2
+    val maxCardWidth = (maxScreenWidth - screenMargin * 2)
+        .coerceAtLeast(LikeUsersLayout.CardMinWidth)
+    val maxContentWidth = (maxCardWidth - horizontalPadding).coerceAtLeast(1.dp)
+    val preferredColumns = minOf(maxOf(userCount, 1), LikeUsersLayout.MaxColumns)
+
+    var columns = preferredColumns
+    while (columns > 1) {
+        val candidateTileWidth = (maxContentWidth - gap * (columns - 1)) / columns
+        if (candidateTileWidth >= LikeUsersLayout.TileMinWidth) break
+        columns--
+    }
+
+    val tileWidth = ((maxContentWidth - gap * (columns - 1)) / columns)
+        .coerceAtMost(LikeUsersLayout.TileWidthDefault)
+    val contentWidth = tileWidth * columns + gap * (columns - 1)
+    val cardWidth = (contentWidth + horizontalPadding)
+        .coerceIn(LikeUsersLayout.CardMinWidth, maxCardWidth)
+    return LikeUsersCardLayout(
+        cardWidth = cardWidth,
+        tileWidth = tileWidth,
+        columns = columns,
+    )
+}
+
+@Composable
+private fun LikeToggleCapsule(
+    item: FeedItem,
+    onClick: () -> Unit,
+) {
+    val chipColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.62f)
+    val likeLabelColor = if (item.liked) StatusLikeColor else chipColor
+    Box(
+        modifier = Modifier
+            .height(28.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .border(1.dp, HintCapsuleBorderColor, RoundedCornerShape(14.dp))
+            .background(Color.White)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onClick,
+            )
+            .padding(horizontal = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Text("\u8D5E", fontSize = 11.sp, color = likeLabelColor)
+            Text(item.likesCount, fontSize = 11.sp, color = likeLabelColor)
+            AnimatedVisibility(
+                visible = item.liked,
+                enter = fadeIn(tween(120)) + scaleIn(
+                    initialScale = 0.55f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMediumLow,
+                    ),
+                ),
+                exit = fadeOut(tween(90)) + scaleOut(targetScale = 0.75f),
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_status_like),
+                    contentDescription = "\u8D5E",
+                    modifier = Modifier.size(15.dp),
+                    tint = Color.Unspecified,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LikeUsersOverlay(
+    item: FeedItem,
+    anchorBounds: Rect,
+    loading: Boolean,
+    loadingMore: Boolean,
+    hasMore: Boolean,
+    users: List<MentionCandidate>,
+    error: String?,
+    onDismiss: () -> Unit,
+    onLoadMore: () -> Unit,
+    onToggleLike: () -> Unit,
+    onUserClick: (String) -> Unit,
+) {
+    BackHandler { onDismiss() }
+    val showEmptyCapsule = users.isEmpty() && (item.hasNoLikes() || !loading)
+    val emptyMessage = error ?: "暂无点赞"
+
+    if (showEmptyCapsule) {
+        LaunchedEffect(emptyMessage) {
+            delay(1800)
+            onDismiss()
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(580f)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = onDismiss,
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            AnimatedVisibility(
+                visible = true,
+                enter = fadeIn(tween(120)) + scaleIn(
+                    initialScale = 0.92f,
+                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                ),
+                exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.94f),
+            ) {
+                OpaqueHintCapsule {
+                    Text(
+                        text = emptyMessage,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = HintCapsuleText,
+                    )
+                }
+            }
+        }
+        return
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .zIndex(580f)
+            .background(Color.Black.copy(alpha = 0.18f))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onDismiss,
+            ),
+    ) {
+        val density = LocalDensity.current
+        val margin = 12.dp
+        val gap = 8.dp
+        val layoutUserCount = when {
+            users.size >= LikeUsersLayout.MaxColumns -> LikeUsersLayout.MaxColumns
+            users.isNotEmpty() -> users.size
+            loading -> LikeUsersLayout.MaxColumns
+            else -> 1
+        }
+        val cardLayout = computeLikeUsersCardLayout(
+            userCount = layoutUserCount,
+            maxScreenWidth = maxWidth,
+            screenMargin = margin,
+        )
+        val cardWidth = cardLayout.cardWidth
+        val cardMaxHeight = 240.dp
+        val placement = calculateActionMenuOffsetFromAnchorPx(
+            anchorBounds = anchorBounds,
+            screenWidthPx = with(density) { maxWidth.toPx() },
+            screenHeightPx = with(density) { maxHeight.toPx() },
+            menuWidthPx = with(density) { cardWidth.toPx() },
+            menuHeightPx = with(density) { cardMaxHeight.toPx() },
+            marginPx = with(density) { margin.toPx() },
+            gapPx = with(density) { gap.toPx() },
+        )
+        val cardShape = RoundedCornerShape(16.dp)
+        Surface(
+            modifier = Modifier
+                .offset { placement.offset }
+                .width(cardWidth)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {},
+                ),
+            shape = cardShape,
+            color = Color.White,
+            shadowElevation = 6.dp,
+            border = BorderStroke(1.dp, HintCapsuleBorderColor),
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    LikeToggleCapsule(
+                        item = item,
+                        onClick = onToggleLike,
+                    )
+                }
+                if (loading && users.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(88.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                    }
+                } else {
+                    LikeUsersGrid(
+                        users = users,
+                        columns = cardLayout.columns,
+                        tileWidth = cardLayout.tileWidth,
+                        hasMore = hasMore,
+                        loadingMore = loadingMore,
+                        onLoadMore = onLoadMore,
+                        onUserClick = onUserClick,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LikeUsersGrid(
+    users: List<MentionCandidate>,
+    columns: Int,
+    tileWidth: Dp,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    onLoadMore: () -> Unit,
+    onUserClick: (String) -> Unit,
+) {
+    val scrollState = rememberScrollState()
+    val shouldLoadMore by remember {
+        derivedStateOf {
+            hasMore &&
+                !loadingMore &&
+                scrollState.maxValue > 0 &&
+                scrollState.value >= scrollState.maxValue - 48
+        }
+    }
+    LaunchedEffect(shouldLoadMore) {
+        snapshotFlow { shouldLoadMore }
+            .distinctUntilChanged()
+            .filter { it }
+            .collect { onLoadMore() }
+    }
+    LaunchedEffect(users.size, hasMore, loadingMore, scrollState.maxValue) {
+        if (!hasMore || loadingMore || users.isEmpty()) return@LaunchedEffect
+        if (scrollState.maxValue == 0) {
+            onLoadMore()
+            return@LaunchedEffect
+        }
+        if (scrollState.value >= scrollState.maxValue - 48) {
+            onLoadMore()
+        }
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 210.dp)
+            .verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(LikeUsersLayout.TileGap),
+    ) {
+        users.chunked(columns).forEachIndexed { rowIndex, rowUsers ->
+            key(rowIndex) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(LikeUsersLayout.TileGap),
+                ) {
+                    rowUsers.forEach { user ->
+                        key(mentionCandidateKey(user)) {
+                            MentionSuggestionAvatarTile(
+                                user = user,
+                                tileWidth = tileWidth,
+                                onSelect = { onUserClick(user.id) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if (loadingMore) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            }
+        }
+    }
+}
+
 @Composable
 private fun MentionSuggestionPanel(
     users: List<MentionCandidate>,
@@ -8802,10 +9382,11 @@ private fun MentionSuggestionPanel(
 private fun MentionSuggestionAvatarTile(
     user: MentionCandidate,
     onSelect: (MentionCandidate) -> Unit,
+    tileWidth: Dp = 58.dp,
 ) {
     Column(
         modifier = Modifier
-            .width(58.dp)
+            .width(tileWidth)
             .clip(RoundedCornerShape(12.dp))
             .clickable(
                 indication = null,
@@ -9434,6 +10015,7 @@ private fun SearchScreen(
     isLongTextLoading: (FeedItem) -> Boolean,
     onLoadLongText: (FeedItem) -> Unit,
     onToggleLike: (FeedItem) -> Unit,
+    onLikeClick: (FeedItem, Rect) -> Unit,
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
     onOpenLoginSettings: () -> Unit,
     mineProfileId: String?,
@@ -9855,6 +10437,7 @@ private fun SearchScreen(
                                     isLongTextLoading = isLongTextLoading,
                                     onLoadLongText = onLoadLongText,
                                     onToggleLike = onToggleLike,
+                                    onLikeClick = onLikeClick,
                                     onUrlEntityClick = onUrlEntityClick,
                                     menuBackEnabled = resultsBackEnabled,
                                 )
@@ -10147,6 +10730,7 @@ private fun MineScreen(
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
+    onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     enableSettings: Boolean = true,
     storedAccounts: List<StoredWeiboAccount> = emptyList(),
@@ -10548,6 +11132,7 @@ MineContentTab.Posts -> postsListState.animateScrollToTopFixed()
                                             isLongTextLoading = isLongTextLoading,
                                             onLoadLongText = onLoadLongText,
                                             onToggleLike = onToggleLike,
+                                            onLikeClick = onLikeClick,
                                             onUrlEntityClick = onUrlEntityClick,
                                         )
                                     }
@@ -11976,6 +12561,7 @@ private fun VisitedUserProfileContent(
     isLongTextLoading: (FeedItem) -> Boolean,
     onLoadLongText: (FeedItem) -> Unit,
     onToggleLike: (FeedItem) -> Unit,
+    onLikeClick: (FeedItem, Rect) -> Unit,
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
     onOpenFollowList: (String, String, String?, String?, FriendListTab) -> Unit,
     showFollowActions: Boolean,
@@ -12019,6 +12605,7 @@ private fun VisitedUserProfileContent(
         isLongTextLoading = isLongTextLoading,
         onLoadLongText = onLoadLongText,
         onToggleLike = onToggleLike,
+        onLikeClick = onLikeClick,
         onUrlEntityClick = onUrlEntityClick,
         onOpenFollowList = onOpenFollowList,
         enableSettings = false,

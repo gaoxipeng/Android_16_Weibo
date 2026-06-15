@@ -635,6 +635,25 @@ class WeiboWebSession(context: Context) {
         )
     }
 
+    suspend fun loadLikeUsers(statusId: String, page: Int = 1): LikeUsersPage {
+        ensureMweiboSession()
+        val id = statusId.trim()
+        require(id.isNotBlank()) { "无效的微博 ID" }
+        val url = Uri.Builder()
+            .scheme("https")
+            .authority("m.weibo.cn")
+            .appendPath("api")
+            .appendPath("attitudes")
+            .appendPath("show")
+            .appendQueryParameter("id", id)
+            .appendQueryParameter("page", page.toString())
+            .build()
+            .toString()
+        val referer = "https://m.weibo.cn/detail/$id"
+        val raw = nativeFetchMweiboJson(url, referer)
+        return WeiboJsonParser.parseMweiboAttitudes(raw, page)
+    }
+
     suspend fun loadReposts(item: FeedItem, page: Int = 1): RepostsPage {
         if (page <= 1 && item.hasNoReposts()) {
             return RepostsPage(items = emptyList(), nextPage = null)
