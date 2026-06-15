@@ -25,8 +25,10 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideIn
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOut
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -396,6 +398,50 @@ private const val SingleImageMaxWidthFraction = 0.7f
 private const val VideoMaxHeightToWidth = 1f
 private val VideoControlCapsuleShape = RoundedCornerShape(percent = 50)
 private const val VideoMaxWidthFraction = 1f
+private const val AlbumGridMaxDecodeDim = 320
+private const val FeedBitmapCacheMaxEntries = 96
+private const val AlbumBitmapCacheMaxEntries = 256
+private const val NavTransitionDurationMs = 280
+
+private fun navStackEnterTransition() =
+    slideInHorizontally(
+        animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+        initialOffsetX = { fullWidth -> -fullWidth },
+    ) + fadeIn(tween(NavTransitionDurationMs))
+
+private fun navStackExitTransition() =
+    slideOutHorizontally(
+        animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+        targetOffsetX = { fullWidth -> fullWidth },
+    ) + fadeOut(tween(NavTransitionDurationMs))
+
+@Composable
+private fun <T> NavAnimatedOverlay(
+    target: T?,
+    modifier: Modifier = Modifier,
+    content: @Composable (T) -> Unit,
+) {
+    var displayed by remember { mutableStateOf<T?>(null) }
+    if (target != null) {
+        displayed = target
+    }
+    val visible = target != null
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = navStackEnterTransition(),
+        exit = navStackExitTransition(),
+        label = "nav-stack-overlay",
+    ) {
+        displayed?.let { item -> content(item) }
+    }
+    if (!visible && displayed != null) {
+        LaunchedEffect(displayed) {
+            delay(NavTransitionDurationMs.toLong())
+            displayed = null
+        }
+    }
+}
 
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
@@ -991,7 +1037,8 @@ fun WeiboApp() {
             try {
                 val page = session.loadUserAlbumImages(uid = uid)
                 if (loadGeneration == visitedProfileLoadGeneration && uid == visitedProfile?.id) {
-                    visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, visitedPosts)
+                    val lookup = buildAlbumPostLookup(visitedPosts)
+                    visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, lookup)
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
                     visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
@@ -1152,10 +1199,9 @@ fun WeiboApp() {
             val cursor = visitedAlbumNextCursor
             runCatching { session.loadUserAlbumImages(uid, cursor) }
                 .onSuccess { page ->
-                    visitedAlbumImages = enrichAlbumImagesFromPosts(
-                        (visitedAlbumImages + page.images).distinctBy { it.largeUrl },
-                        visitedPosts,
-                    )
+                    val lookup = buildAlbumPostLookup(visitedPosts)
+                    val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
+                    visitedAlbumImages = (visitedAlbumImages + enrichedPage).distinctBy { it.largeUrl }
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
                 }
@@ -1585,8 +1631,9 @@ fun WeiboApp() {
             }
             try {
                 val page = session.loadUserAlbumImages(uid = uid)
+                val lookup = buildAlbumPostLookup(minePosts)
                 mineAlbumImages = filterOutRetweetedOnlyImages(
-                    enrichAlbumImagesFromPosts(page.images, minePosts),
+                    enrichAlbumImagesFromPosts(page.images, lookup),
                     minePosts,
                 )
                 mineAlbumNextCursor = page.nextCursor
@@ -1701,11 +1748,10 @@ fun WeiboApp() {
             val cursor = mineAlbumNextCursor
             runCatching { session.loadUserAlbumImages(uid, cursor) }
                 .onSuccess { page ->
+                    val lookup = buildAlbumPostLookup(minePosts)
+                    val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
                     mineAlbumImages = filterOutRetweetedOnlyImages(
-                        enrichAlbumImagesFromPosts(
-                            (mineAlbumImages + page.images).distinctBy { it.largeUrl },
-                            minePosts,
-                        ),
+                        (mineAlbumImages + enrichedPage).distinctBy { it.largeUrl },
                         minePosts,
                     )
                     mineAlbumNextCursor = page.nextCursor
@@ -2156,8 +2202,9 @@ fun WeiboApp() {
             minePostsError = null
         }
         mineCacheStore.readAlbum()?.let { page ->
+            val lookup = buildAlbumPostLookup(minePosts)
             mineAlbumImages = filterOutRetweetedOnlyImages(
-                enrichAlbumImagesFromPosts(page.images, minePosts),
+                enrichAlbumImagesFromPosts(page.images, lookup),
                 minePosts,
             )
             mineAlbumNextCursor = page.nextCursor
@@ -2360,7 +2407,12 @@ fun WeiboApp() {
                     }
                 }
 
-                followListOverlay?.let { overlay ->
+                NavAnimatedOverlay(
+                    target = followListOverlay,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(550f),
+                ) { overlay ->
                     val followListBelongsToCurrentContext = when {
                         visitedUserId != null -> visitedUserId == overlay.uid
                         else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
@@ -2373,7 +2425,6 @@ fun WeiboApp() {
                     Box(
                         Modifier
                             .fillMaxSize()
-                            .zIndex(550f)
                             .graphicsLayer { alpha = if (followListUiOnTop) 1f else 0f }
                             .blockHiddenTouches(followListUiOnTop),
                     ) {
@@ -2436,7 +2487,8 @@ fun WeiboApp() {
                     }
                 }
 
-                if (visitedUserId != null && selectedItem == null) {
+                val visitedProfileNavTarget = visitedUserId
+                if (visitedProfileNavTarget != null) {
                     LaunchedEffect(visitedProfileLoadGeneration) {
                         if (visitedListScrollResetGeneration == visitedProfileLoadGeneration) return@LaunchedEffect
                         visitedListScrollResetGeneration = visitedProfileLoadGeneration
@@ -2445,10 +2497,15 @@ fun WeiboApp() {
                             visitedAlbumListState.scrollToItem(0)
                         }
                     }
+                }
+                NavAnimatedOverlay(
+                    target = visitedProfileNavTarget,
+                    modifier = Modifier.fillMaxSize().zIndex(540f),
+                ) { uid ->
                     val activeFollowList = followListOverlay
                     val profileOverFollowList = activeFollowList != null &&
-                        visitedUserId != activeFollowList.uid
-                    key(visitedUserId, visitedProfileLoadGeneration) {
+                        uid != activeFollowList.uid
+                    key(uid, visitedProfileLoadGeneration) {
                         Box(
                             Modifier
                                 .fillMaxSize()
@@ -2465,9 +2522,9 @@ fun WeiboApp() {
                             VisitedUserProfileContent(
                                     session = session,
                                     profile = visitedProfile,
-                                    profileHeaderHeight = profileHeaderHeights[visitedUserId.orEmpty()] ?: 0.dp,
+                                    profileHeaderHeight = profileHeaderHeights[uid] ?: 0.dp,
                                     onProfileHeaderHeightChange = { height ->
-                                        visitedUserId?.let { profileHeaderHeights[it] = height }
+                                        profileHeaderHeights[uid] = height
                                     },
                                     isLoading = visitedProfileLoading,
                                     hasLoginCookie = hasLoginCookie,
@@ -2491,8 +2548,8 @@ fun WeiboApp() {
                                         when {
                                             visitedProfile != null ->
                                                 loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
-                                            visitedUserId?.all(Char::isDigit) == true ->
-                                                loadVisitedUserProfile(ProfileLookup.Uid(visitedUserId!!), keepContent = true)
+                                            uid.all(Char::isDigit) ->
+                                                loadVisitedUserProfile(ProfileLookup.Uid(uid), keepContent = true)
                                             visitedUserScreenName.isNotBlank() ->
                                                 loadVisitedUserProfile(
                                                     ProfileLookup.ScreenName(visitedUserScreenName),
@@ -2519,8 +2576,8 @@ fun WeiboApp() {
                                     followLoading = visitedFollowLoading,
                                     onFollowClick = { toggleVisitedFollow() },
                                 )
-                            }
                         }
+                    }
                 }
 
                 if (visitedUserId == null && selectedItem == null) {
@@ -2614,7 +2671,12 @@ fun WeiboApp() {
                     }
                 }
 
-                detailOverlayItem?.let { detailItem ->
+                NavAnimatedOverlay(
+                    target = detailOverlayItem,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(570f),
+                ) { detailItem ->
                     key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
                         LaunchedEffect(detailListState) {
@@ -2647,46 +2709,40 @@ fun WeiboApp() {
                             }
                             detailScrollPending = null
                         }
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .zIndex(570f),
+                        BackHandler(onBack = { navigateBack() })
+                        Surface(
+                            modifier = Modifier.fillMaxSize(),
+                            color = MaterialTheme.colorScheme.background,
                         ) {
-                            BackHandler(onBack = { navigateBack() })
-                            Surface(
-                                modifier = Modifier.fillMaxSize(),
-                                color = MaterialTheme.colorScheme.background,
-                            ) {
-                                DetailScreen(
-                                    item = detailItem,
-                                    contentSection = detailContentSection,
-                                    comments = comments,
-                                    reposts = reposts,
-                                    commentSort = commentSort,
-                                    isLoadingComments = commentsLoading,
-                                    isLoadingReposts = repostsLoading,
-                                    isLongTextLoading = { it.statusId in longTextLoadingIds },
-                                    onLoadLongText = ::loadLongText,
-                                    onToggleLike = ::toggleStatusLike,
-                                    onBack = { navigateBack() },
-                                    onRefresh = { reloadDetailContent() },
-                                    onCommentSortChange = ::changeCommentSort,
-                                    onLoadMoreComments = { loadMoreComments() },
-                                    onLoadMoreReposts = { loadMoreReposts() },
-                                    commentsHasMore = commentsHasMore,
-                                    repostsHasMore = repostsHasMore,
-                                    onSelectContentSection = ::selectDetailContentSection,
-                                    listState = detailListState,
-                                    onMediaClick = ::pushMediaPreview,
-                                    emoticonMap = emoticonMap,
-                                    onRetweetClick = ::openDetail,
-                                    onUserClick = ::openUser,
-                                    onComposeComment = ::openCommentComposer,
-                                    onExpandNestedComments = ::loadNestedCommentsPage,
-                                    nestedCommentsLoadingIds = nestedCommentsLoadingIds,
-                                    onUrlEntityClick = ::openUrlEntity,
-                                )
-                            }
+                            DetailScreen(
+                                item = detailItem,
+                                contentSection = detailContentSection,
+                                comments = comments,
+                                reposts = reposts,
+                                commentSort = commentSort,
+                                isLoadingComments = commentsLoading,
+                                isLoadingReposts = repostsLoading,
+                                isLongTextLoading = { it.statusId in longTextLoadingIds },
+                                onLoadLongText = ::loadLongText,
+                                onToggleLike = ::toggleStatusLike,
+                                onBack = { navigateBack() },
+                                onRefresh = { reloadDetailContent() },
+                                onCommentSortChange = ::changeCommentSort,
+                                onLoadMoreComments = { loadMoreComments() },
+                                onLoadMoreReposts = { loadMoreReposts() },
+                                commentsHasMore = commentsHasMore,
+                                repostsHasMore = repostsHasMore,
+                                onSelectContentSection = ::selectDetailContentSection,
+                                listState = detailListState,
+                                onMediaClick = ::pushMediaPreview,
+                                emoticonMap = emoticonMap,
+                                onRetweetClick = ::openDetail,
+                                onUserClick = ::openUser,
+                                onComposeComment = ::openCommentComposer,
+                                onExpandNestedComments = ::loadNestedCommentsPage,
+                                nestedCommentsLoadingIds = nestedCommentsLoadingIds,
+                                onUrlEntityClick = ::openUrlEntity,
+                            )
                         }
                     }
                 }
@@ -2854,13 +2910,14 @@ fun WeiboApp() {
                 )
             }
             }
-            mediaPreview?.let { media ->
-                Box(Modifier.fillMaxSize().zIndex(500f)) {
-                    FullscreenMediaPreview(
-                        media = media,
-                        onDismiss = { navigateBack() },
-                    )
-                }
+            NavAnimatedOverlay(
+                target = mediaPreview,
+                modifier = Modifier.fillMaxSize().zIndex(500f),
+            ) { media ->
+                FullscreenMediaPreview(
+                    media = media,
+                    onDismiss = { navigateBack() },
+                )
             }
             albumViewerState?.takeIf { selectedItem == null }?.let { viewer ->
                 val relatedPosts = when {
@@ -2893,14 +2950,15 @@ fun WeiboApp() {
                     )
                 }
             }
-            articleOverlay?.let { overlay ->
-                Box(Modifier.fillMaxSize().zIndex(600f)) {
-                    ArticleReaderOverlay(
-                        state = overlay,
-                        onBack = ::closeArticleOverlay,
-                        onRetry = { loadArticleIntoOverlay(overlay.entity) },
-                    )
-                }
+            NavAnimatedOverlay(
+                target = articleOverlay,
+                modifier = Modifier.fillMaxSize().zIndex(600f),
+            ) { overlay ->
+                ArticleReaderOverlay(
+                    state = overlay,
+                    onBack = ::closeArticleOverlay,
+                    onRetry = { loadArticleIntoOverlay(overlay.entity) },
+                )
             }
         }
     }
@@ -4622,15 +4680,19 @@ private fun FeedImageThumbnailContent(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     previewUrl: String? = null,
+    maxDecodeDimOverride: Int? = null,
 ) {
     val thumbnailQuality = LocalFeedThumbnailQuality.current
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     val cachedFullBitmap = remember(image.id, image.largeUrl, upgradeRevision) {
         FeedBitmapCache.getForImage(image)
     }
-    val useCachedFullSize = thumbnailQuality != FeedThumbnailQuality.High && cachedFullBitmap != null
+    val useCachedFullSize = maxDecodeDimOverride == null &&
+        thumbnailQuality != FeedThumbnailQuality.High &&
+        cachedFullBitmap != null
     val displayUrl = remember(image, thumbnailQuality) { thumbnailQuality.displayUrl(image) }
     val fallbackUrl = remember(image, thumbnailQuality) { thumbnailQuality.fallbackUrl(image) }
+    val decodeDim = maxDecodeDimOverride ?: thumbnailQuality.maxDecodeDim
 
     if (useCachedFullSize) {
         Image(
@@ -4638,6 +4700,15 @@ private fun FeedImageThumbnailContent(
             contentDescription = null,
             modifier = modifier,
             contentScale = contentScale,
+        )
+    } else if (maxDecodeDimOverride != null) {
+        AlbumGridRemoteImage(
+            image = image,
+            maxDecodeDim = maxDecodeDimOverride,
+            previewUrl = previewUrl,
+            modifier = modifier,
+            contentScale = contentScale,
+            animated = image.isGif,
         )
     } else {
         RemoteImage(
@@ -4648,7 +4719,7 @@ private fun FeedImageThumbnailContent(
                 listOfNotNull(fallbackUrl)
             },
             cacheLookupUrls = feedImageUrlCandidates(image),
-            maxDecodeDim = thumbnailQuality.maxDecodeDim,
+            maxDecodeDim = decodeDim,
             modifier = modifier,
             contentScale = contentScale,
             animated = image.isGif,
@@ -9702,62 +9773,78 @@ private fun MineScreen(
                         }
 
                         MineContentTab.Album -> {
-                            val albumGrouped = remember(albumImages) {
-                                groupAlbumImagesByMonth(albumImages)
+                            val albumRows = remember(albumImages) {
+                                buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
                             }
-                            LazyColumn(
-                                state = albumListState,
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(bottom = 96.dp),
-                            ) {
-                                if (albumGrouped.isEmpty()) {
-                                    item(key = "album-empty") {
-                                        EmptyState(
-                                            title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
-                                            body = when {
-                                                albumLoading || albumLoadingMore || isLoading ->
-                                                    "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
-                                                !albumError.isNullOrBlank() -> albumError
-                                                else ->
-                                                    "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
-                                            },
-                                        )
+                            val stickyMonthLabel by remember(albumRows) {
+                                derivedStateOf {
+                                    albumListState.layoutInfo.visibleItemsInfo
+                                        .sortedBy { it.index }
+                                        .mapNotNull { info -> albumRows.getOrNull(info.index)?.monthKey }
+                                        .firstOrNull()
+                                }
+                            }
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                LazyColumn(
+                                    state = albumListState,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(bottom = 96.dp),
+                                ) {
+                                    if (albumRows.isEmpty()) {
+                                        item(key = "album-empty") {
+                                            EmptyState(
+                                                title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
+                                                body = when {
+                                                    albumLoading || albumLoadingMore || isLoading ->
+                                                        "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
+                                                    !albumError.isNullOrBlank() -> albumError
+                                                    else ->
+                                                        "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
+                                                },
+                                            )
+                                        }
+                                    } else {
+                                        items(
+                                            items = albumRows,
+                                            key = { it.key },
+                                            contentType = { "album_row" },
+                                        ) { row ->
+                                            MineAlbumGridRow(
+                                                monthImages = row.monthImages,
+                                                rowImages = row.rowImages,
+                                                rowStartIndex = row.rowStartIndex,
+                                                modifier = Modifier
+                                                    .padding(horizontal = 12.dp)
+                                                    .padding(bottom = 6.dp),
+                                                onImageClick = { groupImages, index ->
+                                                    captureAlbumViewerOpen(
+                                                        AlbumViewerState(groupImages, index),
+                                                    )
+                                                },
+                                                onVideoClick = onMediaClick,
+                                            )
+                                        }
                                     }
-                                } else {
-                                    items(
-                                        items = albumGrouped,
-                                        key = { (dateLabel, images) ->
-                                            "album-${dateLabel.first}-${dateLabel.second}-${images.firstOrNull()?.largeUrl.orEmpty()}"
-                                        },
-                                    ) { (dateLabel, images) ->
-                                        MineAlbumMonthSection(
-                                            dateLabel = dateLabel,
-                                            images = images,
-                                            modifier = Modifier
-                                                .padding(horizontal = 12.dp)
-                                                .padding(bottom = 18.dp),
-                                            onImageClick = { groupImages, index ->
-                                                captureAlbumViewerOpen(
-                                                    AlbumViewerState(groupImages, index),
-                                                )
-                                            },
-                                            onVideoClick = onMediaClick,
-                                        )
+                                    if (albumLoadingMore) {
+                                        item(key = "album-loading-more") { MineLoadingMoreIndicator() }
+                                    }
+                                    if (!albumHasMore && albumImages.isNotEmpty()) {
+                                        item(key = "album-end") {
+                                            Text(
+                                                text = "\u5DF2\u7ECF\u5230\u5E95\u4E86",
+                                                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                                textAlign = TextAlign.Center,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
                                     }
                                 }
-                                if (albumLoadingMore) {
-                                    item(key = "album-loading-more") { MineLoadingMoreIndicator() }
-                                }
-                                if (!albumHasMore && albumImages.isNotEmpty()) {
-                                    item(key = "album-end") {
-                                        Text(
-                                            text = "\u5DF2\u7ECF\u5230\u5E95\u4E86",
-                                            modifier = Modifier.fillMaxWidth().padding(16.dp),
-                                            textAlign = TextAlign.Center,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
+                                stickyMonthLabel?.let { monthKey ->
+                                    AlbumMonthStickyHeader(
+                                        dateLabel = monthKey,
+                                        modifier = Modifier.align(Alignment.TopStart),
+                                    )
                                 }
                             }
                         }
@@ -11838,40 +11925,68 @@ private fun MineLoadingMoreIndicator() {
     }
 }
 
-@Composable
-private fun MineAlbumTimeline(
-    albumImages: List<FeedImage>,
-    albumError: String? = null,
-    albumLoading: Boolean = false,
-    onOpenAlbumViewer: (AlbumViewerState) -> Unit,
-    onMediaClick: (FeedMedia) -> Unit,
-) {
-    val albumGrouped = remember(albumImages) { groupAlbumImagesByMonth(albumImages) }
+private data class AlbumGridRow(
+    val key: String,
+    val monthKey: Pair<String, String>,
+    val monthImages: List<FeedImage>,
+    val rowImages: List<FeedImage>,
+    val rowStartIndex: Int,
+)
 
-    if (albumGrouped.isEmpty()) {
-        EmptyState(
-            title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
-            body = when {
-                albumLoading -> "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
-                !albumError.isNullOrBlank() -> albumError
-                else -> "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
-            },
-        )
-        return
+private data class AlbumPostLookup(
+    val postByStatusId: Map<String, FeedItem>,
+    val postByImageKey: Map<String, FeedItem>,
+    val imageByKey: Map<String, FeedImage>,
+)
+
+private fun buildAlbumPostLookup(posts: List<FeedItem>): AlbumPostLookup {
+    if (posts.isEmpty()) {
+        return AlbumPostLookup(emptyMap(), emptyMap(), emptyMap())
     }
+    val postByStatusId = mutableMapOf<String, FeedItem>()
+    val postByImageKey = mutableMapOf<String, FeedItem>()
+    val imageByKey = mutableMapOf<String, FeedImage>()
+    posts.forEach { post ->
+        listOfNotNull(post.id, post.statusId)
+            .filter { it.isNotBlank() }
+            .forEach { id -> postByStatusId.putIfAbsent(id, post) }
+        postImageMatchKeys(post).forEach { key ->
+            postByImageKey.putIfAbsent(key, post)
+        }
+        (post.images + (post.retweetedStatus?.images ?: emptyList())).forEach { image ->
+            albumImageMatchKeys(image).forEach { key ->
+                imageByKey.putIfAbsent(key, image)
+            }
+        }
+    }
+    return AlbumPostLookup(postByStatusId, postByImageKey, imageByKey)
+}
 
-    Column(
-        modifier = Modifier.padding(horizontal = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
-    ) {
-        albumGrouped.forEach { (dateLabel, images) ->
-            MineAlbumMonthSection(
-                dateLabel = dateLabel,
-                images = images,
-                onImageClick = { groupImages, index ->
-                    onOpenAlbumViewer(AlbumViewerState(groupImages, index))
-                },
-                onVideoClick = onMediaClick,
+private fun findPostForAlbumImage(lookup: AlbumPostLookup, image: FeedImage): FeedItem? {
+    val statusId = image.statusId?.takeIf { it.isNotBlank() }
+    if (statusId != null) {
+        lookup.postByStatusId[statusId]?.let { return it }
+    }
+    val imageKeys = albumImageMatchKeys(image)
+    if (imageKeys.isEmpty()) return null
+    return imageKeys.firstNotNullOfOrNull { lookup.postByImageKey[it] }
+}
+
+private fun buildAlbumGridRows(
+    grouped: List<Pair<Pair<String, String>, List<FeedImage>>>,
+): List<AlbumGridRow> = buildList {
+    grouped.forEach { (dateLabel, monthImages) ->
+        monthImages.chunked(3).forEachIndexed { rowIndex, rowImages ->
+            val rowStartIndex = rowIndex * 3
+            val first = rowImages.firstOrNull()
+            add(
+                AlbumGridRow(
+                    key = "album-${dateLabel.first}-${dateLabel.second}-$rowStartIndex-${first?.id.orEmpty()}-${first?.largeUrl.orEmpty()}",
+                    monthKey = dateLabel,
+                    monthImages = monthImages,
+                    rowImages = rowImages,
+                    rowStartIndex = rowStartIndex,
+                ),
             )
         }
     }
@@ -11938,23 +12053,21 @@ private fun albumImageMatchKeys(image: FeedImage): Set<String> {
     return keys
 }
 
-private fun enrichAlbumImagesFromPosts(images: List<FeedImage>, posts: List<FeedItem>): List<FeedImage> {
-    if (images.isEmpty() || posts.isEmpty()) return images
-    val postImages = posts.flatMap { post ->
-        post.images + (post.retweetedStatus?.images ?: emptyList())
-    }
-    if (postImages.isEmpty()) return images
-    val imageByKey = buildMap {
-        postImages.forEach { image ->
-            albumImageMatchKeys(image).forEach { key ->
-                putIfAbsent(key, image)
-            }
-        }
+private fun enrichAlbumImagesFromPosts(
+    images: List<FeedImage>,
+    lookup: AlbumPostLookup,
+): List<FeedImage> {
+    if (images.isEmpty()) return images
+    if (lookup.imageByKey.isEmpty() &&
+        lookup.postByStatusId.isEmpty() &&
+        lookup.postByImageKey.isEmpty()
+    ) {
+        return images
     }
     return images.map { image ->
-        val post = findPostForAlbumImage(posts, image)
+        val post = findPostForAlbumImage(lookup, image)
         val match = albumImageMatchKeys(image)
-            .firstNotNullOfOrNull { key -> imageByKey[key] }
+            .firstNotNullOfOrNull { key -> lookup.imageByKey[key] }
         val mergedLiveVideo = image.livePhotoVideoUrl ?: match?.livePhotoVideoUrl
         val mergedStream = image.videoStreamUrl
             ?: match?.videoStreamUrl
@@ -11986,9 +12099,48 @@ private fun sinaimgPid(url: String): String? =
         ?.getOrNull(1)
 
 @Composable
-private fun MineAlbumMonthSection(
+private fun AlbumMonthStickyHeader(
     dateLabel: Pair<String, String>,
-    images: List<FeedImage>,
+    modifier: Modifier = Modifier,
+) {
+    AlbumMonthLabelColumn(
+        dateLabel = dateLabel,
+        modifier = modifier
+            .padding(start = 12.dp, top = 6.dp)
+            .background(MaterialTheme.colorScheme.background)
+            .padding(bottom = 2.dp),
+    )
+}
+
+@Composable
+private fun AlbumMonthLabelColumn(
+    dateLabel: Pair<String, String>,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.width(42.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = dateLabel.first,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        if (dateLabel.second.isNotBlank()) {
+            Text(
+                text = dateLabel.second,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MineAlbumGridRow(
+    monthImages: List<FeedImage>,
+    rowImages: List<FeedImage>,
+    rowStartIndex: Int,
     onImageClick: (List<FeedImage>, Int) -> Unit,
     onVideoClick: (FeedMedia) -> Unit,
     modifier: Modifier = Modifier,
@@ -11998,23 +12150,7 @@ private fun MineAlbumMonthSection(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Column(
-            modifier = Modifier.width(42.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(
-                text = dateLabel.first,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            if (dateLabel.second.isNotBlank()) {
-                Text(
-                    text = dateLabel.second,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        Spacer(modifier = Modifier.width(42.dp))
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
@@ -12022,20 +12158,14 @@ private fun MineAlbumMonthSection(
         ) {
             val gap = 6.dp
             val cellSize = (maxWidth - gap * 2) / 3
-            Column(verticalArrangement = Arrangement.spacedBy(gap)) {
-                var imageIndex = 0
-                images.chunked(3).forEach { rowImages ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
-                        rowImages.forEach { image ->
-                            val currentIndex = imageIndex++
-                            MineAlbumTile(
-                                image = image,
-                                size = cellSize,
-                                onClick = { onImageClick(images, currentIndex) },
-                                onVideoClick = onVideoClick,
-                            )
-                        }
-                    }
+            Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
+                rowImages.forEachIndexed { columnIndex, image ->
+                    MineAlbumTile(
+                        image = image,
+                        size = cellSize,
+                        onClick = { onImageClick(monthImages, rowStartIndex + columnIndex) },
+                        onVideoClick = onVideoClick,
+                    )
                 }
             }
         }
@@ -12061,6 +12191,7 @@ private fun MineAlbumTile(
             image = image,
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Crop,
+            maxDecodeDimOverride = AlbumGridMaxDecodeDim,
         )
         if (image.isAlbumVideo) {
             Box(
@@ -12557,6 +12688,103 @@ private fun FullscreenMediaPreview(media: FeedMedia, onDismiss: () -> Unit) {
 }
 
 @Composable
+private fun AlbumGridRemoteImage(
+    image: FeedImage,
+    maxDecodeDim: Int,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop,
+    previewUrl: String? = null,
+    animated: Boolean = false,
+) {
+    if (animated) {
+        RemoteImage(
+            url = previewUrl ?: image.thumbnailUrl.ifBlank { image.largeUrl },
+            modifier = modifier,
+            contentScale = contentScale,
+            animated = true,
+            maxDecodeDim = maxDecodeDim,
+        )
+        return
+    }
+
+    val thumbnailQuality = LocalFeedThumbnailQuality.current
+    val cacheKey = remember(image.id, image.largeUrl, maxDecodeDim) {
+        AlbumThumbnailBitmapCache.cacheKey(image, maxDecodeDim)
+    }
+    val candidates = remember(image, previewUrl, thumbnailQuality) {
+        if (previewUrl != null) {
+            listOf(previewUrl)
+        } else {
+            listOfNotNull(
+                thumbnailQuality.displayUrl(image).takeIf { it.isNotBlank() },
+                thumbnailQuality.fallbackUrl(image),
+            ).distinct()
+        }
+    }
+    var candidateIndex by remember(candidates) { mutableStateOf(0) }
+    val currentUrl = candidates.getOrNull(candidateIndex)
+    var bitmap by remember(cacheKey) {
+        mutableStateOf(AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim))
+    }
+    var failed by remember(cacheKey) { mutableStateOf(false) }
+
+    LaunchedEffect(cacheKey, currentUrl, candidateIndex, maxDecodeDim) {
+        AlbumThumbnailBitmapCache.getForImage(image, maxDecodeDim)?.let {
+            bitmap = it
+            failed = false
+            return@LaunchedEffect
+        }
+        if (bitmap != null) return@LaunchedEffect
+        failed = false
+        val target = currentUrl ?: return@LaunchedEffect
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val bytes = fetchRemoteBytes(target, connectTimeoutMs = 8000, readTimeoutMs = 8000)
+                val options = BitmapFactory.Options().apply {
+                    inJustDecodeBounds = true
+                }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                val dim = maxDecodeDim.coerceAtLeast(1)
+                val scale = maxOf(1, (options.outWidth / dim).coerceAtMost(options.outHeight / dim))
+                options.inJustDecodeBounds = false
+                options.inSampleSize = Integer.highestOneBit(scale)
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+            }
+        }.onSuccess { loaded ->
+            bitmap = loaded
+            AlbumThumbnailBitmapCache.putForImage(image, maxDecodeDim, loaded)
+        }.onFailure {
+            if (candidateIndex < candidates.lastIndex) {
+                candidateIndex += 1
+            } else {
+                failed = true
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        contentAlignment = Alignment.Center,
+    ) {
+        val loaded = bitmap
+        if (loaded != null) {
+            Image(
+                bitmap = loaded.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = contentScale,
+            )
+        } else if (failed) {
+            Text(
+                text = "\u56FE\u7247\u4E0D\u53EF\u7528",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
 private fun RemoteImage(
     url: String?,
     modifier: Modifier = Modifier,
@@ -12738,8 +12966,37 @@ private fun WebView.detachFromParent(): WebView {
     return this
 }
 
+private object AlbumThumbnailBitmapCache {
+    private const val MaxEntries = AlbumBitmapCacheMaxEntries
+    private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
+            size > MaxEntries
+    }
+
+    fun cacheKey(image: FeedImage, maxDecodeDim: Int): String {
+        val stableId = when {
+            image.id.isNotBlank() && !image.id.startsWith("http") -> image.id
+            image.largeUrl.isNotBlank() -> image.largeUrl
+            else -> image.thumbnailUrl
+        }
+        return "$stableId@$maxDecodeDim"
+    }
+
+    @Synchronized
+    fun get(key: String): android.graphics.Bitmap? = entries[key]
+
+    @Synchronized
+    fun getForImage(image: FeedImage, maxDecodeDim: Int): android.graphics.Bitmap? =
+        get(cacheKey(image, maxDecodeDim))
+
+    @Synchronized
+    fun putForImage(image: FeedImage, maxDecodeDim: Int, bitmap: android.graphics.Bitmap) {
+        entries[cacheKey(image, maxDecodeDim)] = bitmap
+    }
+}
+
 private object FeedBitmapCache {
-    private const val MaxEntries = 192
+    private const val MaxEntries = FeedBitmapCacheMaxEntries
     private val entries = object : LinkedHashMap<String, android.graphics.Bitmap>(MaxEntries, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, android.graphics.Bitmap>?): Boolean =
             size > MaxEntries
@@ -12773,7 +13030,7 @@ private object FeedBitmapCache {
 }
 
 private object RemoteBytesCache {
-    private const val MaxEntries = 36
+    private const val MaxEntries = 72
     private const val MaxBytesPerEntry = 12 * 1024 * 1024
     private val entries = object : LinkedHashMap<String, ByteArray>(MaxEntries, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>?): Boolean =
