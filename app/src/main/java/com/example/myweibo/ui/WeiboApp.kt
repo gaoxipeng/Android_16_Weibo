@@ -528,6 +528,7 @@ private class VideoPlaybackCoordinator {
     var pendingFullscreenHandoffKey by mutableStateOf<String?>(null)
     var pendingPeekHandoffKey by mutableStateOf<String?>(null)
     var peekPlaybackKey by mutableStateOf<String?>(null)
+    var proactiveStashSignalKey by mutableStateOf<String?>(null)
     private val handoffPlayers = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val inlinePauseHandlers = mutableSetOf<() -> Unit>()
     private val fullscreenPauseHandlers = mutableSetOf<() -> Unit>()
@@ -552,6 +553,13 @@ private class VideoPlaybackCoordinator {
     fun beginFullscreenHandoff(playbackKey: String) {
         pendingFullscreenHandoffKey = playbackKey
     }
+
+    fun requestProactivePeekStash(playbackKey: String) {
+        proactiveStashSignalKey = playbackKey
+    }
+
+    fun hasStashedHandoff(playbackKey: String): Boolean =
+        handoffPlayers.containsKey(playbackKey)
 
     fun cancelFullscreenHandoff(playbackKey: String) {
         if (pendingFullscreenHandoffKey == playbackKey) {
@@ -578,17 +586,19 @@ private class VideoPlaybackCoordinator {
         }
         player.playWhenReady = false
         player.pause()
+        player.clearVideoSurface()
         handoffPlayers[playbackKey] = player
     }
 
     fun consumeHandoffPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
+        val player = handoffPlayers.remove(playbackKey) ?: return null
         if (pendingFullscreenHandoffKey == playbackKey) {
             pendingFullscreenHandoffKey = null
         }
         if (pendingPeekHandoffKey == playbackKey) {
             pendingPeekHandoffKey = null
         }
-        return handoffPlayers.remove(playbackKey)
+        return player
     }
 
     fun registerPauseHandler(isFullscreen: Boolean, handler: () -> Unit) {
@@ -813,16 +823,19 @@ private class VideoPeekController {
     var activeRequest by mutableStateOf<VideoPeekRequest?>(null)
     var pendingDismiss by mutableStateOf<VideoPeekDismissReason?>(null)
     var isFloating by mutableStateOf(false)
+    var isFullscreenMode by mutableStateOf(false)
 
     fun open(request: VideoPeekRequest) {
         pendingDismiss = null
         isFloating = false
+        isFullscreenMode = false
         activeRequest = request
     }
 
     fun openFloating(request: VideoPeekRequest) {
         pendingDismiss = null
         isFloating = true
+        isFullscreenMode = false
         activeRequest = request
     }
 
@@ -845,7 +858,7 @@ private class VideoPeekController {
     }
 
     fun enterFullscreen() {
-        if (activeRequest != null && pendingDismiss == null) {
+        if (activeRequest != null && pendingDismiss == null && !isFullscreenMode) {
             pendingDismiss = VideoPeekDismissReason.EnterFullscreen
         }
     }
@@ -856,6 +869,7 @@ private class VideoPeekController {
         activeRequest = null
         pendingDismiss = null
         isFloating = false
+        isFullscreenMode = false
         when (reason) {
             VideoPeekDismissReason.Cancel -> request?.onCancel?.invoke()
             VideoPeekDismissReason.Release -> request?.onRelease?.invoke()
@@ -865,17 +879,12 @@ private class VideoPeekController {
         }
     }
 
-    fun completeEnterFullscreenHandoff() {
-        val request = activeRequest
-        activeRequest = null
+    fun completeFullscreenExpand() {
+        if (pendingDismiss != VideoPeekDismissReason.EnterFullscreen) return
         pendingDismiss = null
         isFloating = false
-        request?.onEnterFullscreenHandoffComplete?.invoke()
-    }
-
-    fun finishFullscreenHandoff() {
-        if (pendingDismiss != VideoPeekDismissReason.EnterFullscreen) return
-        completeEnterFullscreenHandoff()
+        isFullscreenMode = true
+        activeRequest?.onEnterFullscreenHandoffComplete?.invoke()
     }
 }
 
@@ -1245,6 +1254,7 @@ fun WeiboApp() {
     var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
     var mediaPreview by remember { mutableStateOf<MediaPreviewRequest?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
+    var searchPendingMode by remember { mutableStateOf<SearchMode?>(null) }
     var searchMode by remember { mutableStateOf(storedSearchMode(searchSettingsStore.readMode())) }
     var searchWeiboSort by remember { mutableStateOf(storedSearchWeiboSort(searchSettingsStore.readWeiboSort())) }
     var message by remember { mutableStateOf<NativeUiMessage?>(null) }
@@ -1947,11 +1957,13 @@ fun WeiboApp() {
         if (normalized.isBlank()) return
         if (selectedTab == MainTab.Search && visitedUserId == null && selectedItem == null) {
             searchPendingQuery = normalized
+            searchPendingMode = SearchMode.Weibo
             bottomBarExpanded = true
             return
         }
         pushNavigation {
             searchPendingQuery = normalized
+            searchPendingMode = SearchMode.Weibo
             selectedTab = MainTab.Search
             bottomBarExpanded = true
         }
@@ -3194,9 +3206,12 @@ fun WeiboApp() {
                             hasLoginCookie = hasLoginCookie,
                             pendingQuery = searchPendingQuery,
                             onPendingQueryConsumed = { searchPendingQuery = null },
+                            pendingSearchMode = searchPendingMode,
+                            onPendingSearchModeConsumed = { searchPendingMode = null },
                             emoticonMap = emoticonMap,
                             listState = searchListState,
                             resultsBackEnabled = searchUiOnTop,
+                            onResultsNavigateBack = if (navStack.isNotEmpty()) ::navigateBack else null,
                             onItemClick = { item, _ -> openDetailFromSource(item, null) },
                             onMediaClick = ::pushMediaPreview,
                             onUserClick = ::openUser,
@@ -3694,7 +3709,7 @@ fun WeiboApp() {
             }
             videoPeekController.activeRequest?.let { request ->
                 VideoPeekOverlay(
-                    modifier = Modifier.zIndex(565f),
+                    modifier = Modifier.zIndex(if (videoPeekController.isFullscreenMode) 600f else 565f),
                     media = request.media,
                     playbackOwnerId = request.playbackOwnerId,
                     anchorBounds = request.anchorBounds,
@@ -3702,11 +3717,11 @@ fun WeiboApp() {
                     fromFullscreen = request.fromFullscreen,
                     dockImmediately = request.dockImmediately,
                     isFloating = videoPeekController.isFloating,
+                    isFullscreenMode = videoPeekController.isFullscreenMode,
                     dismissReason = videoPeekController.pendingDismiss,
                     onRequestCancel = { videoPeekController.cancel() },
                     onDismissComplete = { videoPeekController.completeDismiss() },
                     onPlaybackEnded = { videoPeekController.dismissForPlaybackEnded() },
-                    onOpenFullscreenBehind = { request.onOpenFullscreenBehind() },
                     onEnterFullscreenHandoffComplete = { request.onEnterFullscreenHandoffComplete() },
                 )
             }
@@ -6148,16 +6163,19 @@ private fun VideoPeekOverlay(
     fromFullscreen: Boolean = false,
     dockImmediately: Boolean = false,
     isFloating: Boolean,
+    isFullscreenMode: Boolean,
     dismissReason: VideoPeekDismissReason?,
     onRequestCancel: () -> Unit,
     onDismissComplete: () -> Unit,
     onPlaybackEnded: () -> Unit,
-    onOpenFullscreenBehind: () -> Unit,
     onEnterFullscreenHandoffComplete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
     val videoPeekController = LocalVideoPeekController.current
+    val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl, playbackOwnerId) {
+        videoPlaybackKey(media, playbackOwnerId)
+    }
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
@@ -6173,9 +6191,10 @@ private fun VideoPeekOverlay(
     val dockProgress = remember(dockImmediately) {
         Animatable(if (dockImmediately) 1f else 0f)
     }
-    val fullscreenExpandProgress = remember { Animatable(0f) }
-    var fullscreenOpened by remember { mutableStateOf(false) }
-    val isDocked = isFloating || dockProgress.value > 0f
+    val fullscreenExpandProgress = remember { Animatable(if (isFullscreenMode) 1f else 0f) }
+    val isDocked = isFloating || dockProgress.value > 0f || isFullscreenMode
+
+    ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
 
     LaunchedEffect(expandFromAnchor, fromFullscreen, dockImmediately) {
         when {
@@ -6191,7 +6210,13 @@ private fun VideoPeekOverlay(
         }
     }
 
-    LaunchedEffect(isFloating, dockImmediately, fromFullscreen) {
+    LaunchedEffect(isFloating, dockImmediately, fromFullscreen, isFullscreenMode) {
+        if (isFullscreenMode) {
+            enterProgress.snapTo(1f)
+            dockProgress.snapTo(1f)
+            fullscreenExpandProgress.snapTo(1f)
+            return@LaunchedEffect
+        }
         if (isFloating) {
             if (!fromFullscreen && enterProgress.value < 1f) {
                 enterProgress.snapTo(1f)
@@ -6219,9 +6244,8 @@ private fun VideoPeekOverlay(
                 if (!expandFromAnchor && enterProgress.value < 1f) {
                     enterProgress.snapTo(1f)
                 }
-                if (!fullscreenOpened) {
-                    fullscreenOpened = true
-                    onOpenFullscreenBehind()
+                if (isFloating && dockProgress.value < 1f) {
+                    dockProgress.snapTo(1f)
                 }
                 fullscreenExpandProgress.snapTo(0f)
                 fullscreenExpandProgress.animateTo(
@@ -6231,9 +6255,7 @@ private fun VideoPeekOverlay(
                         easing = FastOutSlowInEasing,
                     ),
                 )
-                delay(32)
-                videoPeekController.finishFullscreenHandoff()
-                onEnterFullscreenHandoffComplete()
+                videoPeekController.completeFullscreenExpand()
             }
             else -> {
                 fullscreenExpandProgress.snapTo(0f)
@@ -6246,13 +6268,13 @@ private fun VideoPeekOverlay(
         }
     }
 
-    BackHandler(enabled = dismissReason != VideoPeekDismissReason.EnterFullscreen && isDocked) {
+    BackHandler(enabled = isFullscreenMode || (dismissReason != VideoPeekDismissReason.EnterFullscreen && isDocked)) {
         onRequestCancel()
     }
 
     val expandProgressForBackdrop = fullscreenExpandProgress.value.coerceIn(0f, 1f)
-    val expandingToFullscreen = expandProgressForBackdrop > 0f ||
-        fullscreenOpened ||
+    val expandingToFullscreen = isFullscreenMode ||
+        expandProgressForBackdrop > 0f ||
         dismissReason == VideoPeekDismissReason.EnterFullscreen
 
     BoxWithConstraints(
@@ -6269,7 +6291,7 @@ private fun VideoPeekOverlay(
         val dockedProgress = dockProgress.value.coerceIn(0f, 1f)
         val effectiveMaxHeight = if (maxHeight == Dp.Infinity) screenHeight else maxHeight
 
-        val previewWidth = minOf(maxWidth * 0.92f, 360.dp)
+        val previewWidth = minOf(maxWidth - 32.dp, maxWidth * 0.94f)
         val previewHeight = previewWidth / aspectRatio.coerceIn(0.56f, 1.78f)
         val holdLeft = (maxWidth - previewWidth) / 2
         val holdTop = effectiveMaxHeight * 0.18f
@@ -6459,14 +6481,16 @@ private fun VideoPeekOverlay(
                 WeiboVideoSurface(
                     media = media,
                     playbackOwnerId = playbackOwnerId,
-                    isFullscreen = false,
-                    controlsEnabled = isDocked,
+                    isFullscreen = isFullscreenMode,
+                    controlsEnabled = isDocked || isFullscreenMode,
                     initialControlsVisible = false,
                     trackViewportPauseOverride = false,
-                    isPeekPlayback = true,
+                    isPeekPlayback = !isFullscreenMode,
+                    seamlessOverlayPlayback = true,
                     resumePosition = true,
                     savePositionOnDispose = true,
                     playbackSpeedOverride = when {
+                        isFullscreenMode -> null
                         expandFromAnchor -> null
                         isDocked -> null
                         else -> VideoPeekFloatingPlaybackSpeed
@@ -6477,7 +6501,7 @@ private fun VideoPeekOverlay(
                     enableDoubleTapFullscreen = false,
                     showFullscreenButton = false,
                     showPictureInPictureButton = false,
-                    enableLongPressSpeedBoost = isDocked,
+                    enableLongPressSpeedBoost = isDocked && !isFullscreenMode,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -7658,11 +7682,7 @@ private fun InlineVideoPlayer(
                 },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
-                onOpenFullscreenBehind = {
-                    videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.claimFullscreenPlayback(playbackKey)
-                    onFullscreenRequest()
-                },
+                onOpenFullscreenBehind = {},
                 onEnterFullscreenHandoffComplete = {
                     resetPeekState()
                 },
@@ -7687,11 +7707,7 @@ private fun InlineVideoPlayer(
                 },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
-                onOpenFullscreenBehind = {
-                    videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.claimFullscreenPlayback(playbackKey)
-                    onFullscreenRequest()
-                },
+                onOpenFullscreenBehind = {},
                 onEnterFullscreenHandoffComplete = {
                     resetPeekState()
                 },
@@ -7706,9 +7722,10 @@ private fun InlineVideoPlayer(
             onFullscreenRequest()
             return
         }
-        videoCoordinator.beginFullscreenHandoff(playbackKey)
         actionOpen = true
-        videoCoordinator.claimFullscreenPlayback(playbackKey)
+        peekActive = true
+        videoCoordinator.schedulePeekRestartIfAtEnd(playbackKey, videoDurationMs(media))
+        videoCoordinator.claimPeekPlayback(playbackKey)
         videoPeekController.open(
             VideoPeekRequest(
                 media = media,
@@ -7722,11 +7739,7 @@ private fun InlineVideoPlayer(
                 },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
-                onOpenFullscreenBehind = {
-                    videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.claimFullscreenPlayback(playbackKey)
-                    onFullscreenRequest()
-                },
+                onOpenFullscreenBehind = {},
                 onEnterFullscreenHandoffComplete = {
                     resetPeekState()
                 },
@@ -7943,6 +7956,7 @@ private fun WeiboVideoSurface(
     showPictureInPictureButton: Boolean = true,
     enableLongPressSpeedBoost: Boolean = false,
     isPeekPlayback: Boolean = false,
+    seamlessOverlayPlayback: Boolean = false,
 ) {
     val context = LocalContext.current
     val onMessage = LocalUiMessenger.current
@@ -8063,13 +8077,13 @@ private fun WeiboVideoSurface(
     }
 
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
-    val awaitingFullscreenHandoff =
+    val awaitingFullscreenHandoff = !seamlessOverlayPlayback &&
         videoCoordinator.pendingFullscreenHandoffKey == playbackKey &&
-            (isFullscreen || isPeekPlayback)
-    val awaitingPeekHandoffSource =
+        (isFullscreen || isPeekPlayback)
+    val awaitingPeekHandoffSource = !seamlessOverlayPlayback &&
         !isFullscreen && !isPeekPlayback &&
-            videoCoordinator.pendingPeekHandoffKey == playbackKey
-    val awaitingPeekHandoffConsume =
+        videoCoordinator.pendingPeekHandoffKey == playbackKey
+    val awaitingPeekHandoffConsume = !seamlessOverlayPlayback &&
         isPeekPlayback && videoCoordinator.pendingPeekHandoffKey == playbackKey
 
     fun configureExistingPlayer(target: androidx.media3.exoplayer.ExoPlayer) {
@@ -8088,6 +8102,7 @@ private fun WeiboVideoSurface(
         } else {
             target.setPlaybackSpeed(1f)
         }
+        target.play()
     }
 
     fun createFreshPlayer(): androidx.media3.exoplayer.ExoPlayer =
@@ -8157,7 +8172,7 @@ private fun WeiboVideoSurface(
         if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
             return@LaunchedEffect
         }
-        val deadline = android.os.SystemClock.uptimeMillis() + 500L
+        val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
         while (android.os.SystemClock.uptimeMillis() < deadline) {
             videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
                 configureExistingPlayer(handoff)
@@ -8172,11 +8187,14 @@ private fun WeiboVideoSurface(
             }
             delay(16)
         }
+        videoCoordinator.cancelFullscreenHandoff(playbackKey)
+        videoCoordinator.cancelPeekHandoff(playbackKey)
         deferredPlayer = resolveImmediatePlayer()
         handoffPlayerResolved = true
     }
 
     val player = immediatePlayer ?: deferredPlayer
+    val playerViewHolder = remember { object { var view: androidx.media3.ui.PlayerView? = null } }
     if (player == null) {
         Box(
             modifier = modifier.background(Color.Black),
@@ -8288,12 +8306,15 @@ private fun WeiboVideoSurface(
                 }
             }
             player.removeListener(listener)
-            val handoffToFullscreen = !isFullscreen &&
+            val handoffToFullscreen = !seamlessOverlayPlayback && !isFullscreen &&
                 videoCoordinator.pendingFullscreenHandoffKey == playbackKey
-            val handoffToPeek = !isPeekPlayback &&
+            val handoffToPeek = !seamlessOverlayPlayback && !isPeekPlayback &&
                 videoCoordinator.pendingPeekHandoffKey == playbackKey
             if (handoffToFullscreen || handoffToPeek) {
-                videoCoordinator.stashHandoffPlayer(playbackKey, player)
+                if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
+                    playerViewHolder.view?.player = null
+                    videoCoordinator.stashHandoffPlayer(playbackKey, player)
+                }
             } else {
                 player.pause()
                 if (trackViewportPause && videoCoordinator.activeKey == playbackKey) {
@@ -8383,6 +8404,7 @@ private fun WeiboVideoSurface(
             factory = { ctx ->
                 (android.view.LayoutInflater.from(ctx)
                     .inflate(R.layout.view_video_player, null, false) as androidx.media3.ui.PlayerView).apply {
+                    playerViewHolder.view = this
                     this.player = player
                     useController = false
                     resizeMode = videoResizeMode
@@ -8390,10 +8412,20 @@ private fun WeiboVideoSurface(
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
                 }
             },
-            update = {
-                it.resizeMode = videoResizeMode
-                it.player = player
-                it.requestLayout()
+            update = { view ->
+                playerViewHolder.view = view
+                if (view.player !== player) {
+                    view.player = null
+                    view.player = player
+                }
+                view.resizeMode = videoResizeMode
+                view.requestLayout()
+            },
+            onRelease = { view ->
+                view.player = null
+                if (playerViewHolder.view === view) {
+                    playerViewHolder.view = null
+                }
             },
         )
 
@@ -10555,9 +10587,12 @@ private fun SearchScreen(
     hasLoginCookie: Boolean,
     pendingQuery: String?,
     onPendingQueryConsumed: () -> Unit,
+    pendingSearchMode: SearchMode?,
+    onPendingSearchModeConsumed: () -> Unit,
     emoticonMap: Map<String, String>,
     listState: LazyListState,
     resultsBackEnabled: Boolean,
+    onResultsNavigateBack: (() -> Unit)?,
     onItemClick: (FeedItem, Rect?) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
     onUserClick: (String) -> Unit,
@@ -10581,6 +10616,7 @@ private fun SearchScreen(
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var queryInput by remember { mutableStateOf("") }
     var activeQuery by remember { mutableStateOf<String?>(null) }
+    var activeSearchMode by remember { mutableStateOf(searchMode) }
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
     var hotSearchLoading by remember { mutableStateOf(false) }
     var hotSearchError by remember { mutableStateOf<String?>(null) }
@@ -10597,6 +10633,7 @@ private fun SearchScreen(
     fun clearSearchResults() {
         queryInput = ""
         activeQuery = null
+        activeSearchMode = searchMode
         resultItems = emptyList()
         userResultItems = emptyList()
         resultError = null
@@ -10608,15 +10645,19 @@ private fun SearchScreen(
     }
 
     BackHandler(enabled = activeQuery != null && resultsBackEnabled) {
-        clearSearchResults()
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
+        if (onResultsNavigateBack != null) {
+            onResultsNavigateBack()
+        } else {
+            clearSearchResults()
+        }
     }
 
     fun normalizeTopic(raw: String): String =
         raw.trim()
 
-    fun submitQuery(raw: String) {
+    fun submitQuery(raw: String, modeOverride: SearchMode? = null) {
         val normalized = normalizeTopic(raw)
         if (normalized.isBlank()) return
         queryInput = normalized
@@ -10628,13 +10669,14 @@ private fun SearchScreen(
         resultLoadingMore = false
         initialResultsReady = false
         searchGeneration++
+        activeSearchMode = modeOverride ?: searchMode
         activeQuery = normalized
     }
 
     fun changeWeiboSort(sort: SearchWeiboSort) {
         if (sort == weiboSort) return
         onWeiboSortChange(sort)
-        if (searchMode == SearchMode.Weibo && activeQuery != null) {
+        if (activeSearchMode == SearchMode.Weibo && activeQuery != null) {
             resultItems = emptyList()
             resultError = null
             resultNextPage = null
@@ -10674,7 +10716,7 @@ private fun SearchScreen(
         }
         try {
             val page = if (reset) 1 else resultNextPage?.toIntOrNull() ?: return
-            if (searchMode == SearchMode.User) {
+            if (activeSearchMode == SearchMode.User) {
                 val pageResult = session.loadWeiboUserSearch(query, page)
                 if (generation != searchGeneration) return
                 if (reset) {
@@ -10740,13 +10782,14 @@ private fun SearchScreen(
         if (hasLoginCookie) reloadHotSearch()
     }
 
-    LaunchedEffect(pendingQuery) {
+    LaunchedEffect(pendingQuery, pendingSearchMode) {
         val pending = pendingQuery?.let(::normalizeTopic)?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        submitQuery(pending)
+        submitQuery(pending, modeOverride = pendingSearchMode)
         onPendingQueryConsumed()
+        onPendingSearchModeConsumed()
     }
 
-    LaunchedEffect(activeQuery, searchGeneration, hasLoginCookie, searchMode, weiboSort) {
+    LaunchedEffect(activeQuery, searchGeneration, hasLoginCookie, activeSearchMode, weiboSort) {
         val query = activeQuery ?: return@LaunchedEffect
         if (!hasLoginCookie) return@LaunchedEffect
         loadTopicResults(reset = true, generation = searchGeneration)
@@ -10762,7 +10805,7 @@ private fun SearchScreen(
     val searchGenerationState by rememberUpdatedState(searchGeneration)
     val initialResultsReadyState by rememberUpdatedState(initialResultsReady)
 
-    LaunchedEffect(listState, activeQuery, searchGeneration, searchMode, weiboSort) {
+    LaunchedEffect(listState, activeQuery, searchGeneration, activeSearchMode, weiboSort) {
         if (activeQuery == null) return@LaunchedEffect
         snapshotFlow {
             if (!initialResultsReadyState) return@snapshotFlow null
@@ -10813,7 +10856,10 @@ private fun SearchScreen(
                     resultError = null
                     resultNextPage = null
                     initialResultsReady = false
-                    activeQuery?.let { searchGeneration++ }
+                    activeQuery?.let {
+                        activeSearchMode = mode
+                        searchGeneration++
+                    }
                 }
             },
             onSearch = { submitQuery(queryInput) },
@@ -10928,7 +10974,7 @@ private fun SearchScreen(
                 } else {
                     when {
                         resultError != null &&
-                            (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
+                            (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
                             item {
                                 Column(
                                     modifier = Modifier
@@ -10949,7 +10995,7 @@ private fun SearchScreen(
                                 }
                             }
                         }
-                        (if (searchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
+                        (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
                             !resultLoading -> {
                             item {
                                 Text(
@@ -10959,7 +11005,7 @@ private fun SearchScreen(
                                 )
                             }
                         }
-                        searchMode == SearchMode.User -> {
+                        activeSearchMode == SearchMode.User -> {
                             items(userResultItems, key = { it.id.ifBlank { it.screenName } }) { user ->
                                 RelationUserRow(
                                     user = user,
@@ -11027,12 +11073,12 @@ private fun SearchScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = "${searchMode.label}搜索结果",
+                            text = "${activeSearchMode.label}搜索结果",
                             modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        if (searchMode == SearchMode.Weibo) {
+                        if (activeSearchMode == SearchMode.Weibo) {
                             SearchWeiboSortToggle(
                                 selected = weiboSort,
                                 onSelected = ::changeWeiboSort,
@@ -14214,12 +14260,7 @@ private fun AlbumVideoTile(
                 onCancel = { resetPeekState() },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
-                onOpenFullscreenBehind = {
-                    resetPeekState()
-                    videoCoordinator.beginFullscreenHandoff(playbackKey)
-                    videoCoordinator.claimFullscreenPlayback(playbackKey)
-                    onVideoClick()
-                },
+                onOpenFullscreenBehind = {},
                 onEnterFullscreenHandoffComplete = {},
             ),
         )
