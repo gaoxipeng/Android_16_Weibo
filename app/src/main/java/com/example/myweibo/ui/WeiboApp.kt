@@ -1,9 +1,10 @@
 package com.example.myweibo.ui
 
 import android.content.ActivityNotFoundException
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.content.ComponentCallbacks2
 import android.content.Intent
-import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
@@ -39,6 +40,8 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
 import androidx.compose.animation.core.DecayAnimationSpec
@@ -150,6 +153,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -1169,6 +1173,12 @@ private fun videoDurationMs(media: FeedMedia): Long? =
 private const val VideoEndRestartThresholdMs = 500L
 private const val VideoPeekFloatingPlaybackSpeed = 2f
 private const val VideoPeekMaxDockHeightFraction = 1f / 3f
+private const val VideoPeekDockAspectRatio = 16f / 9f
+private enum class ForcedVideoOrientation {
+    None,
+    Landscape,
+    Portrait,
+}
 
 private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     val url = avatarUrl?.takeIf { it.isNotBlank() } ?: return null
@@ -1962,6 +1972,13 @@ fun WeiboApp() {
             return
         }
         pushNavigation {
+            selectedItem = null
+            comments = emptyList()
+            commentsCursor = null
+            commentsHasMore = true
+            if (visitedUserId != null) {
+                clearVisitedProfileState()
+            }
             searchPendingQuery = normalized
             searchPendingMode = SearchMode.Weibo
             selectedTab = MainTab.Search
@@ -3031,7 +3048,19 @@ fun WeiboApp() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(selectedTab, visitedUserId, selectedItem, mediaPreview, articleOverlay, followListOverlay, albumViewerState) {
+    LaunchedEffect(
+        selectedTab,
+        visitedUserId,
+        selectedItem,
+        mediaPreview,
+        articleOverlay,
+        followListOverlay,
+        albumViewerState,
+        videoPeekController.activeRequest,
+        videoPeekController.isFloating,
+        videoPeekController.isFullscreenMode,
+        videoPeekController.pendingDismiss,
+    ) {
         val homeFeedOnTop = selectedTab == MainTab.Feed &&
             visitedUserId == null &&
             selectedItem == null &&
@@ -3039,8 +3068,12 @@ fun WeiboApp() {
             articleOverlay == null &&
             followListOverlay == null &&
             albumViewerState == null
+        val keepFloatingPeekPlayback = videoPeekController.activeRequest != null &&
+            videoPeekController.isFloating &&
+            !videoPeekController.isFullscreenMode &&
+            videoPeekController.pendingDismiss == null
         if (!homeFeedOnTop) {
-            if (mediaPreview != null) {
+            if (mediaPreview != null || keepFloatingPeekPlayback) {
                 videoPlaybackCoordinator.pauseInlineOnly()
             } else {
                 videoPlaybackCoordinator.pauseAll()
@@ -3709,7 +3742,13 @@ fun WeiboApp() {
             }
             videoPeekController.activeRequest?.let { request ->
                 VideoPeekOverlay(
-                    modifier = Modifier.zIndex(if (videoPeekController.isFullscreenMode) 600f else 565f),
+                    modifier = Modifier.zIndex(
+                        when {
+                            videoPeekController.isFullscreenMode -> 600f
+                            videoPeekController.isFloating -> 575f
+                            else -> 565f
+                        },
+                    ),
                     media = request.media,
                     playbackOwnerId = request.playbackOwnerId,
                     anchorBounds = request.anchorBounds,
@@ -5489,6 +5528,13 @@ private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float {
     )
 }
 
+private fun isPortraitFeedVideo(aspectRatio: Float, media: FeedMedia): Boolean {
+    if (aspectRatio > 0f && abs(aspectRatio - 16f / 9f) > 0.02f) {
+        return aspectRatio < 1f
+    }
+    return feedVideoDisplayAspectRatio(media) < 1f
+}
+
 @Composable
 private fun FeedImageThumbnailContent(
     image: FeedImage,
@@ -6296,7 +6342,7 @@ private fun VideoPeekOverlay(
         val holdLeft = (maxWidth - previewWidth) / 2
         val holdTop = effectiveMaxHeight * 0.18f
         val dockHorizontalMargin = 12.dp
-        val dockAspect = aspectRatio.coerceIn(0.56f, 1.78f)
+        val dockAspect = VideoPeekDockAspectRatio
         val maxDockHeight = effectiveMaxHeight * VideoPeekMaxDockHeightFraction
         val dockWidthCap = maxWidth - dockHorizontalMargin * 2
         var dockWidth = dockWidthCap
@@ -6504,6 +6550,18 @@ private fun VideoPeekOverlay(
                     enableLongPressSpeedBoost = isDocked && !isFullscreenMode,
                     modifier = Modifier.fillMaxSize(),
                 )
+                if (isFloating && !isFullscreenMode && dismissReason == null) {
+                    GlassTextButton(
+                        text = "全屏",
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 8.dp, end = 8.dp)
+                            .width(54.dp)
+                            .height(28.dp)
+                            .zIndex(5f),
+                        onClick = { videoPeekController.enterFullscreen() },
+                    )
+                }
             }
         }
 
@@ -7800,8 +7858,11 @@ private fun InlineVideoPlayer(
                             tapUptime - lastTapUptimeMs <= viewConfiguration.doubleTapTimeoutMillis
                         if (isDoubleTap) {
                             lastTapUptimeMs = 0L
-                            videoCoordinator.activeKey = null
-                            onFullscreenRequest()
+                            if (media.isStreamPlayable()) {
+                                openInlineFloatingPlayback()
+                            } else {
+                                onClick()
+                            }
                             return@awaitEachGesture
                         }
                         lastTapUptimeMs = tapUptime
@@ -8057,6 +8118,36 @@ private fun WeiboVideoSurface(
     var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
     var downloading by remember(videoUrl) { mutableStateOf(false) }
     var aspectRatio by remember(videoUrl) { mutableFloatStateOf(16f / 9f) }
+    var forcedOrientation by remember(videoUrl) { mutableStateOf(ForcedVideoOrientation.None) }
+    LaunchedEffect(isFullscreen) {
+        if (!isFullscreen) {
+            forcedOrientation = ForcedVideoOrientation.None
+        }
+    }
+    val isPortraitVideo = isPortraitFeedVideo(aspectRatio, media)
+    val isDevicePortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
+    LaunchedEffect(forcedOrientation, isDevicePortrait) {
+        if (forcedOrientation == ForcedVideoOrientation.Portrait && isDevicePortrait) {
+            forcedOrientation = ForcedVideoOrientation.None
+        }
+    }
+    val showLandscapeToggle = isFullscreen &&
+        isPortraitVideo &&
+        forcedOrientation == ForcedVideoOrientation.None &&
+        isDevicePortrait
+    val showPortraitToggle = isFullscreen &&
+        isPortraitVideo &&
+        forcedOrientation == ForcedVideoOrientation.Landscape
+    val showOrientationToggle = showLandscapeToggle || showPortraitToggle
+    val fullscreenFloatingButtonTop = if (showOrientationToggle) {
+        fullscreenTopInset + 58.dp
+    } else {
+        fullscreenTopInset + 22.dp
+    }
+    FullscreenForcedOrientationEffect(
+        orientation = forcedOrientation,
+        enabled = isFullscreen,
+    )
     val trackViewportPause = trackViewportPauseOverride ?: (!isFullscreen && controlsEnabled)
     val screenHeightPx = remember(context) {
         context.resources.displayMetrics.heightPixels.toFloat()
@@ -8351,7 +8442,11 @@ private fun WeiboVideoSurface(
             videoCoordinator.positions[playbackKey] = positionMs
             durationMs = player.duration.takeIf { it > 0 } ?: durationMs
             isPlaying = player.isPlaying
-            delay(80)
+            if (player.isPlaying) {
+                withFrameMillis { }
+            } else {
+                delay(200)
+            }
         }
     }
 
@@ -8458,6 +8553,54 @@ private fun WeiboVideoSurface(
         }
 
         AnimatedVisibility(
+            visible = controlsEnabled && controlsVisible && isFullscreen && showLandscapeToggle,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .zIndex(21f),
+        ) {
+            GlassTextButton(
+                text = "横屏",
+                modifier = Modifier
+                    .padding(
+                        end = 10.dp,
+                        top = fullscreenTopInset + 22.dp,
+                    )
+                    .width(54.dp)
+                    .height(28.dp),
+                onClick = {
+                    showControls()
+                    forcedOrientation = ForcedVideoOrientation.Landscape
+                },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = controlsEnabled && controlsVisible && isFullscreen && showPortraitToggle,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .zIndex(21f),
+        ) {
+            GlassTextButton(
+                text = "竖屏",
+                modifier = Modifier
+                    .padding(
+                        end = 10.dp,
+                        top = fullscreenTopInset + 22.dp,
+                    )
+                    .width(54.dp)
+                    .height(28.dp),
+                onClick = {
+                    showControls()
+                    forcedOrientation = ForcedVideoOrientation.Portrait
+                },
+            )
+        }
+
+        AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isPeekPlayback && (
                 onEnterFloatingPlayback != null ||
                 (showPictureInPictureButton && onEnterPictureInPicture != null)
@@ -8473,7 +8616,7 @@ private fun WeiboVideoSurface(
                 modifier = Modifier
                     .padding(
                         end = 10.dp,
-                        top = if (isFullscreen) fullscreenTopInset + 22.dp else 10.dp,
+                        top = if (isFullscreen) fullscreenFloatingButtonTop else 10.dp,
                     )
                     .width(if (onEnterFloatingPlayback != null) 54.dp else 66.dp)
                     .height(28.dp),
@@ -8643,6 +8786,7 @@ private fun VideoControls(
     } else {
         0f
     }
+    var isScrubbing by remember { mutableStateOf(false) }
     val positionState by rememberUpdatedState(positionMs)
     val durationState by rememberUpdatedState(durationMs)
     val onSeekState by rememberUpdatedState(onSeek)
@@ -8652,31 +8796,37 @@ private fun VideoControls(
             .clip(VideoControlCapsuleShape)
             .pointerInput(durationState) {
                 awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    val duration = durationState
-                    val width = size.width.toFloat()
-                    if (duration <= 0L || width <= 0f) return@awaitEachGesture
-                    val anchorPosition = positionState
-                    val anchorX = down.position.x
-                    var lastSeekPosition = anchorPosition
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull() ?: break
-                        if (change.pressed) {
-                            val deltaMs = ((change.position.x - anchorX) / width * duration).toLong()
-                            val newPosition = (anchorPosition + deltaMs).coerceIn(0L, duration)
-                            if (newPosition != lastSeekPosition) {
-                                lastSeekPosition = newPosition
-                                onSeekState(newPosition)
+                    isScrubbing = true
+                    try {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val duration = durationState
+                        val width = size.width.toFloat()
+                        if (duration <= 0L || width <= 0f) return@awaitEachGesture
+                        val anchorPosition = positionState
+                        val anchorX = down.position.x
+                        var lastSeekPosition = anchorPosition
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull() ?: break
+                            if (change.pressed) {
+                                val deltaMs = ((change.position.x - anchorX) / width * duration).toLong()
+                                val newPosition = (anchorPosition + deltaMs).coerceIn(0L, duration)
+                                if (newPosition != lastSeekPosition) {
+                                    lastSeekPosition = newPosition
+                                    onSeekState(newPosition)
+                                }
                             }
+                            if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
                         }
-                        if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
+                    } finally {
+                        isScrubbing = false
                     }
                 }
             },
     ) {
         VideoControlCapsuleProgressBackground(
             progress = progress,
+            animate = isPlaying && !isScrubbing,
             modifier = Modifier.matchParentSize(),
         )
         Row(
@@ -8688,14 +8838,18 @@ private fun VideoControls(
         ) {
             Text(
                 text = formatVideoTime(positionMs),
-                modifier = Modifier.widthIn(min = 36.dp),
+                modifier = Modifier
+                    .widthIn(min = 36.dp)
+                    .align(Alignment.CenterVertically),
                 color = Color.White,
-                fontSize = 12.sp,
+                style = videoControlTextStyle(12),
                 maxLines = 1,
             )
             IconButton(
                 onClick = onPlayPause,
-                modifier = Modifier.size(24.dp),
+                modifier = Modifier
+                    .size(24.dp)
+                    .align(Alignment.CenterVertically),
             ) {
                 Icon(
                     painter = painterResource(if (isPlaying) R.drawable.ic_video_pause else R.drawable.ic_video_play),
@@ -8705,22 +8859,32 @@ private fun VideoControls(
                 )
             }
             Spacer(Modifier.weight(1f))
-            IconButton(
-                onClick = onSpeedClick,
-                modifier = Modifier.size(width = 30.dp, height = 24.dp),
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .widthIn(min = 30.dp)
+                    .align(Alignment.CenterVertically)
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = onSpeedClick,
+                    ),
+                contentAlignment = Alignment.Center,
             ) {
                 Text(
                     text = speedLabel(speed),
                     color = Color.White,
-                    fontSize = 13.sp,
+                    style = videoControlTextStyle(13),
                     maxLines = 1,
                 )
             }
             Text(
                 text = formatVideoTime((durationMs - positionMs).coerceAtLeast(0L)),
-                modifier = Modifier.widthIn(min = 36.dp),
+                modifier = Modifier
+                    .widthIn(min = 36.dp)
+                    .align(Alignment.CenterVertically),
                 color = Color.White.copy(alpha = 0.82f),
-                fontSize = 12.sp,
+                style = videoControlTextStyle(12),
                 maxLines = 1,
                 textAlign = TextAlign.End,
             )
@@ -8731,20 +8895,30 @@ private fun VideoControls(
 @Composable
 private fun VideoControlCapsuleProgressBackground(
     progress: Float,
+    animate: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    val playedProgress = progress.coerceIn(0f, 1f)
+    val targetProgress = progress.coerceIn(0f, 1f)
+    val displayedProgress by animateFloatAsState(
+        targetValue = targetProgress,
+        animationSpec = if (animate) {
+            tween(durationMillis = 120, easing = LinearEasing)
+        } else {
+            snap()
+        },
+        label = "video-control-progress",
+    )
     val unplayedColor = Color(0xFF3A3A3C).copy(alpha = 0.55f)
     val playedColor = Color(0xFF5E5E62).copy(alpha = 0.9f)
     Box(
         modifier = modifier.clip(VideoControlCapsuleShape),
     ) {
         Box(Modifier.matchParentSize().background(unplayedColor))
-        if (playedProgress > 0f) {
+        if (displayedProgress > 0f) {
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .fillMaxWidth(playedProgress)
+                    .fillMaxWidth(displayedProgress)
                     .align(Alignment.CenterStart)
                     .background(playedColor),
             )
@@ -12165,8 +12339,8 @@ private fun SettingsAboutCard(versionName: String) {
                 painter = painterResource(R.drawable.ic_launcher_app),
                 contentDescription = null,
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp)),
+                    .size(52.dp)
+                    .clip(RoundedCornerShape(14.dp)),
                 contentScale = ContentScale.Crop,
             )
             Column(
@@ -14815,6 +14989,28 @@ private fun ArticleReaderOverlay(
 }
 
 @Composable
+private fun FullscreenForcedOrientationEffect(
+    orientation: ForcedVideoOrientation,
+    enabled: Boolean,
+) {
+    val context = LocalContext.current
+    val activity = context as? android.app.Activity
+    DisposableEffect(enabled, orientation, activity) {
+        if (!enabled || activity == null || orientation == ForcedVideoOrientation.None) {
+            return@DisposableEffect onDispose {}
+        }
+        activity.requestedOrientation = when (orientation) {
+            ForcedVideoOrientation.Landscape -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            ForcedVideoOrientation.Portrait -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            ForcedVideoOrientation.None -> ActivityInfo.SCREEN_ORIENTATION_USER
+        }
+        onDispose {
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
+        }
+    }
+}
+
+@Composable
 private fun ImmersiveVideoChromeEffect(enabled: Boolean) {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
@@ -15432,6 +15628,19 @@ private fun formatVideoTime(ms: Long): String {
 
 private fun speedLabel(speed: Float): String =
     if (speed == speed.toInt().toFloat()) "${speed.toInt()}x" else "${speed}x"
+
+@Composable
+private fun videoControlFixedSp(size: Int): TextUnit {
+    val fontScale = LocalDensity.current.fontScale
+    return (size / fontScale).sp
+}
+
+@Composable
+private fun videoControlTextStyle(sizeSp: Int): TextStyle = TextStyle(
+    fontSize = videoControlFixedSp(sizeSp),
+    lineHeight = videoControlFixedSp(sizeSp),
+    platformStyle = PlatformTextStyle(includeFontPadding = false),
+)
 
 private const val DESKTOP_CHROME_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
