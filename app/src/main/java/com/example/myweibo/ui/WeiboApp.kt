@@ -7805,13 +7805,6 @@ private fun InlineVideoPlayer(
                             return@awaitEachGesture
                         }
                         lastTapUptimeMs = tapUptime
-                        if (videoCoordinator.activeKey != playbackKey) {
-                            if (media.isStreamPlayable()) {
-                                videoCoordinator.requestInlinePlayback(playbackKey)
-                            } else {
-                                onClick()
-                            }
-                        }
                         return@awaitEachGesture
                     }
 
@@ -7895,12 +7888,28 @@ private fun InlineVideoPlayer(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    painter = painterResource(R.drawable.ic_video_play),
-                    contentDescription = "播放",
-                    modifier = Modifier.size(60.dp),
-                    tint = Color.White,
-                )
+                Box(
+                    modifier = Modifier
+                        .size(72.dp)
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                        ) {
+                            if (media.isStreamPlayable()) {
+                                videoCoordinator.requestInlinePlayback(playbackKey)
+                            } else {
+                                onClick()
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_video_play),
+                        contentDescription = "播放",
+                        modifier = Modifier.size(60.dp),
+                        tint = Color.White,
+                    )
+                }
             }
             if (media.liveBadgeLabel() != null) {
                 Text(
@@ -8629,15 +8638,61 @@ private fun VideoControls(
     onSpeedClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Box(modifier = modifier) {
-        VideoControlGlassBackground(Modifier.matchParentSize())
+    val progress = if (durationMs > 0L) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val positionState by rememberUpdatedState(positionMs)
+    val durationState by rememberUpdatedState(durationMs)
+    val onSeekState by rememberUpdatedState(onSeek)
+
+    Box(
+        modifier = modifier
+            .clip(VideoControlCapsuleShape)
+            .pointerInput(durationState) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val duration = durationState
+                    val width = size.width.toFloat()
+                    if (duration <= 0L || width <= 0f) return@awaitEachGesture
+                    val anchorPosition = positionState
+                    val anchorX = down.position.x
+                    var lastSeekPosition = anchorPosition
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull() ?: break
+                        if (change.pressed) {
+                            val deltaMs = ((change.position.x - anchorX) / width * duration).toLong()
+                            val newPosition = (anchorPosition + deltaMs).coerceIn(0L, duration)
+                            if (newPosition != lastSeekPosition) {
+                                lastSeekPosition = newPosition
+                                onSeekState(newPosition)
+                            }
+                        }
+                        if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
+                    }
+                }
+            },
+    ) {
+        VideoControlCapsuleProgressBackground(
+            progress = progress,
+            modifier = Modifier.matchParentSize(),
+        )
         Row(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(horizontal = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            Text(
+                text = formatVideoTime(positionMs),
+                modifier = Modifier.widthIn(min = 36.dp),
+                color = Color.White,
+                fontSize = 12.sp,
+                maxLines = 1,
+            )
             IconButton(
                 onClick = onPlayPause,
                 modifier = Modifier.size(24.dp),
@@ -8649,26 +8704,7 @@ private fun VideoControls(
                     tint = Color.White,
                 )
             }
-            Text(
-                text = formatVideoTime(positionMs),
-                modifier = Modifier.width(38.dp),
-                color = Color.White,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-            )
-            CompactVideoScrubber(
-                positionMs = positionMs,
-                durationMs = durationMs,
-                onSeek = onSeek,
-                modifier = Modifier.weight(1f).height(18.dp),
-            )
-            Text(
-                text = formatVideoTime((durationMs - positionMs).coerceAtLeast(0L)),
-                modifier = Modifier.width(42.dp),
-                color = Color.White,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-            )
+            Spacer(Modifier.weight(1f))
             IconButton(
                 onClick = onSpeedClick,
                 modifier = Modifier.size(width = 30.dp, height = 24.dp),
@@ -8680,60 +8716,39 @@ private fun VideoControls(
                     maxLines = 1,
                 )
             }
+            Text(
+                text = formatVideoTime((durationMs - positionMs).coerceAtLeast(0L)),
+                modifier = Modifier.widthIn(min = 36.dp),
+                color = Color.White.copy(alpha = 0.82f),
+                fontSize = 12.sp,
+                maxLines = 1,
+                textAlign = TextAlign.End,
+            )
         }
     }
 }
 
 @Composable
-private fun CompactVideoScrubber(
-    positionMs: Long,
-    durationMs: Long,
-    onSeek: (Long) -> Unit,
+private fun VideoControlCapsuleProgressBackground(
+    progress: Float,
     modifier: Modifier = Modifier,
 ) {
-    val progress = if (durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
-    Canvas(
-        modifier = modifier.pointerInput(durationMs) {
-            awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
-                fun seekTo(x: Float) {
-                    if (durationMs <= 0L || size.width <= 0) return
-                    val ratio = (x / size.width.toFloat()).coerceIn(0f, 1f)
-                    onSeek((durationMs * ratio).toLong())
-                }
-                seekTo(down.position.x)
-                while (true) {
-                    val event = awaitPointerEvent()
-                    val change = event.changes.firstOrNull() ?: break
-                    if (change.pressed) seekTo(change.position.x)
-                    if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
-                }
-            }
-        },
+    val playedProgress = progress.coerceIn(0f, 1f)
+    val unplayedColor = Color(0xFF3A3A3C).copy(alpha = 0.55f)
+    val playedColor = Color(0xFF5E5E62).copy(alpha = 0.9f)
+    Box(
+        modifier = modifier.clip(VideoControlCapsuleShape),
     ) {
-        val y = size.height / 2f
-        val trackHeight = (size.height * 0.34f).coerceIn(3.dp.toPx(), 6.dp.toPx())
-        val trackTop = y - trackHeight / 2f
-        val radius = trackHeight / 2f
-        drawRoundRect(
-            color = Color.White.copy(alpha = 0.26f),
-            topLeft = Offset(0f, trackTop),
-            size = Size(size.width, trackHeight),
-            cornerRadius = CornerRadius(radius, radius),
-        )
-        if (progress > 0f) {
-            drawRoundRect(
-                color = Color(0xFFFF4F9A),
-                topLeft = Offset(0f, trackTop),
-                size = Size(size.width * progress, trackHeight),
-                cornerRadius = CornerRadius(radius, radius),
+        Box(Modifier.matchParentSize().background(unplayedColor))
+        if (playedProgress > 0f) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(playedProgress)
+                    .align(Alignment.CenterStart)
+                    .background(playedColor),
             )
         }
-        drawCircle(
-            color = Color.White,
-            radius = 5.5.dp.toPx(),
-            center = Offset(size.width * progress, y),
-        )
     }
 }
 
