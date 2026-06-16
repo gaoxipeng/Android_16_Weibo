@@ -7445,6 +7445,21 @@ private fun ZoomableFullscreenImage(
             val dismissOffsetY = dismissTranslationY + dismissSnapAnim.value
             val dismissAlpha = (1f - abs(dismissOffsetY) / containerHeightPx * 0.75f).coerceIn(0.35f, 1f)
             val currentScale = scale
+            val imageLayout = layoutFor(currentScale)
+            val displayedWidth = imageLayout.fitWidthPx * currentScale
+            val displayedHeight = imageLayout.fitHeightPx * currentScale
+            val imageCenterX = containerWidthPx / 2f + panOffsetX
+            val imageCenterY = containerHeightPx / 2f + panOffsetY + dismissOffsetY
+            val iconSizePx = with(density) { 16.dp.toPx() }
+            val iconMarginPx = with(density) { 8.dp.toPx() }
+            val imageLeft = imageCenterX - displayedWidth / 2f
+            val imageTop = imageCenterY - displayedHeight / 2f
+            val iconOffsetX = (imageLeft + displayedWidth - iconSizePx - iconMarginPx)
+                .coerceIn(iconMarginPx, containerWidthPx - iconSizePx - iconMarginPx)
+                .roundToInt()
+            val iconOffsetY = (imageTop + displayedHeight - iconSizePx - iconMarginPx)
+                .coerceIn(iconMarginPx, containerHeightPx - iconSizePx - iconMarginPx)
+                .roundToInt()
             val imageModifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
@@ -7473,6 +7488,20 @@ private fun ZoomableFullscreenImage(
                     image = image,
                     modifier = imageModifier,
                     onEnded = { livePlaying = false },
+                )
+            }
+            if (image.isLivePhoto && !livePlaying) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_live_photo),
+                    contentDescription = "Live Photo",
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .offset {
+                            IntOffset(iconOffsetX, iconOffsetY)
+                        }
+                        .zIndex(8f)
+                        .size(16.dp),
+                    tint = Color.White.copy(alpha = 0.92f),
                 )
             }
 
@@ -8125,6 +8154,7 @@ private fun WeiboVideoSurface(
         }
     }
     val isPortraitVideo = isPortraitFeedVideo(aspectRatio, media)
+    val isLandscapeVideo = !isPortraitVideo
     val isDevicePortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
     LaunchedEffect(forcedOrientation, isDevicePortrait) {
         if (forcedOrientation == ForcedVideoOrientation.Portrait && isDevicePortrait) {
@@ -8132,11 +8162,11 @@ private fun WeiboVideoSurface(
         }
     }
     val showLandscapeToggle = isFullscreen &&
-        isPortraitVideo &&
+        isLandscapeVideo &&
         forcedOrientation == ForcedVideoOrientation.None &&
         isDevicePortrait
     val showPortraitToggle = isFullscreen &&
-        isPortraitVideo &&
+        isLandscapeVideo &&
         forcedOrientation == ForcedVideoOrientation.Landscape
     val showOrientationToggle = showLandscapeToggle || showPortraitToggle
     val fullscreenFloatingButtonTop = if (showOrientationToggle) {
