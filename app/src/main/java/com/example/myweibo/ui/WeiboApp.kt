@@ -13,6 +13,7 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
@@ -93,6 +94,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -166,10 +168,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
-import dev.chrisbanes.haze.materials.ExperimentalHazeMaterialsApi
-import dev.chrisbanes.haze.materials.HazeMaterials
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
@@ -190,6 +189,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.zIndex
@@ -292,6 +292,12 @@ import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
+import com.example.myweibo.ui.liquidglass.LocalHazeState
+import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
+import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
+import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
@@ -320,14 +326,6 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-
-private enum class MainTab(val label: String) {
-    Feed("\u9996\u9875"),
-    Messages("\u6D88\u606F"),
-    Search("\u641C\u7D22"),
-    Compose("\u5199\u5FAE\u535A"),
-    Mine("\u6211\u7684"),
-}
 
 private enum class SearchMode(val label: String) {
     Weibo("微博"),
@@ -799,7 +797,6 @@ private fun FeedImage.albumStatusCacheKey(): String =
 
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
-private val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
 
 private enum class VideoPeekDismissReason {
@@ -891,6 +888,26 @@ private class VideoPeekController {
         activeRequest?.onEnterFullscreenHandoffComplete?.invoke()
     }
 }
+
+private data class FeedCardActionMenuRequest(
+    val item: FeedItem,
+    val anchorBoundsInRoot: Rect,
+    val backHandlerEnabled: Boolean,
+)
+
+private class FeedCardActionMenuController {
+    var activeRequest by mutableStateOf<FeedCardActionMenuRequest?>(null)
+
+    fun open(item: FeedItem, anchorBoundsInRoot: Rect, backHandlerEnabled: Boolean) {
+        activeRequest = FeedCardActionMenuRequest(item, anchorBoundsInRoot, backHandlerEnabled)
+    }
+
+    fun dismiss() {
+        activeRequest = null
+    }
+}
+
+private val LocalFeedCardActionMenuController = staticCompositionLocalOf { FeedCardActionMenuController() }
 
 private enum class ImagePeekDismissReason {
     Cancel,
@@ -1189,14 +1206,6 @@ private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
         downloadUrls = listOf(url),
     )
 }
-
-/*
-private enum class LegacyMainTab(val label: String) {
-    Feed("Feed"),
-    Account("Account"),
-}
-
-*/
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -3083,7 +3092,9 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(selectedTab, visitedUserId) {
-        bottomBarExpanded = true
+        if (selectedTab != MainTab.Messages && selectedTab != MainTab.Compose) {
+            bottomBarExpanded = true
+        }
         bottomBarAwaitingOutsideDismiss = false
     }
 
@@ -3154,31 +3165,18 @@ fun WeiboApp() {
         LocalTopicClickHandler provides ::openSearchTopic,
     ) {
     MyWeiboScaffold(
-        selectedTab = selectedTab,
-        selectedItem = selectedItem,
-        isLoading = isLoading,
         snackbarHostState = snackbarHostState,
-        onTabChange = { tab ->
-            if (tab != selectedTab) {
-                dismissFollowListForTabSwitch()
-            }
-            if (tab == MainTab.Feed && selectedTab == MainTab.Feed && selectedItem == null) {
-                refreshTimelineFromTop()
-            } else {
-                if (tab == MainTab.Feed) {
-                    hasLoginCookie = session.hasLoginCookie()
-                }
-                selectedTab = tab
-            }
-        },
-        onBack = { navigateBack() },
-        onRefresh = { refreshTimeline() },
     ) { innerPadding ->
         val hazeState = rememberHazeState()
+        val bottomBarBackdrop = rememberLayerBackdrop()
+        val feedCardActionMenuController = remember { FeedCardActionMenuController() }
+        var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
+            LocalLiquidMenuBackdrop provides bottomBarBackdrop,
+            LocalFeedCardActionMenuController provides feedCardActionMenuController,
             LocalImagePeekController provides imagePeekController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
@@ -3187,6 +3185,63 @@ fun WeiboApp() {
             Box(Modifier.fillMaxSize()) {
             Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
             Box(Modifier.fillMaxSize().padding(innerPadding)) {
+            val mainContentClear = visitedUserId == null && selectedItem == null
+            val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
+            val composeWebVisible = selectedTab == MainTab.Compose && mainContentClear
+            val webTabBackdropExcluded = messagesWebVisible || composeWebVisible
+            var messagesWebMounted by remember { mutableStateOf(false) }
+            var composeWebMounted by remember { mutableStateOf(false) }
+            if (messagesWebVisible) messagesWebMounted = true
+            if (composeWebVisible) composeWebMounted = true
+
+            if (messagesWebMounted) {
+                Box(
+                    Modifier
+                        .then(if (messagesWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                        .graphicsLayer {
+                            alpha = if (messagesWebVisible) 1f else 0f
+                            clip = true
+                        }
+                        .zIndex(if (messagesWebVisible) 2f else -10f)
+                        .blockHiddenTouches(messagesWebVisible),
+                ) {
+                    MessagesScreen(
+                        onRootBack = ::handleRootBackPress,
+                        active = messagesWebVisible,
+                    )
+                }
+            }
+            if (composeWebMounted) {
+                Box(
+                    Modifier
+                        .then(if (composeWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                        .graphicsLayer {
+                            alpha = if (composeWebVisible) 1f else 0f
+                            clip = true
+                        }
+                        .zIndex(if (composeWebVisible) 2f else -10f)
+                        .blockHiddenTouches(composeWebVisible),
+                ) {
+                    MobileWeiboWebScreen(
+                        pageUrl = "https://m.weibo.cn/compose/",
+                        onRootBack = ::handleRootBackPress,
+                        active = composeWebVisible,
+                    )
+                }
+            }
+
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .zIndex(1f)
+                    .then(
+                        if (!webTabBackdropExcluded) {
+                            Modifier.layerBackdrop(bottomBarBackdrop)
+                        } else {
+                            Modifier
+                        },
+                    ),
+            ) {
             val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
@@ -3230,6 +3285,7 @@ fun WeiboApp() {
                     Box(
                         Modifier
                             .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.background)
                             .graphicsLayer { alpha = feedVisibleAlpha }
                             .blockHiddenTouches(feedUiOnTop),
                     ) {
@@ -3429,7 +3485,7 @@ fun WeiboApp() {
                 if (visitedUserId == null && selectedItem == null) {
                     when (selectedTab) {
                         MainTab.Search -> Unit
-                        MainTab.Messages -> MessagesScreen(onRootBack = ::handleRootBackPress)
+                        MainTab.Messages, MainTab.Compose -> Unit
 
                         MainTab.Mine -> {
                             LaunchedEffect(mineProfile) {
@@ -3508,11 +3564,6 @@ fun WeiboApp() {
                                 },
                             )
                         }
-
-                        MainTab.Compose -> MobileWeiboWebScreen(
-                            pageUrl = "https://m.weibo.cn/compose/",
-                            onRootBack = ::handleRootBackPress,
-                        )
 
                         MainTab.Feed -> Unit
                     }
@@ -3646,7 +3697,12 @@ fun WeiboApp() {
                 }
             }
 
-            if (selectedTab != MainTab.Mine && selectedItem == null) {
+            if (
+                selectedTab != MainTab.Mine &&
+                selectedTab != MainTab.Messages &&
+                selectedTab != MainTab.Compose &&
+                selectedItem == null
+            ) {
                 HiddenSessionWebView(session)
             }
 
@@ -3686,8 +3742,21 @@ fun WeiboApp() {
                     )
                 }
             }
+            }
 
             if (selectedItem == null && visitedUserId == null) {
+                if (timelineMenuExpanded) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(40f)
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() },
+                                onClick = { timelineMenuExpanded = false },
+                            ),
+                    )
+                }
                 if (bottomBarExpanded && bottomBarAwaitingOutsideDismiss) {
                     Box(
                         modifier = Modifier
@@ -3703,10 +3772,12 @@ fun WeiboApp() {
                             ),
                     )
                 }
-                FloatingBottomBar(
+                WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
-                    hazeState = hazeState,
+                    backdrop = bottomBarBackdrop,
+                    timelineMenuExpanded = timelineMenuExpanded,
+                    onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
                     onExpandRequest = {
                         if (!bottomBarExpanded) {
                             bottomBarAwaitingOutsideDismiss = true
@@ -3739,6 +3810,9 @@ fun WeiboApp() {
                     onTabChange = { tab ->
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
+                            if (tab == MainTab.Feed && visitedUserId != null) {
+                                clearVisitedProfileState()
+                            }
                         }
                         if (tab == MainTab.Feed && selectedTab == MainTab.Feed) {
                             refreshTimelineFromTop()
@@ -3749,8 +3823,28 @@ fun WeiboApp() {
                             selectedTab = tab
                         }
                     },
+                    timelineMenuContent = { dismiss ->
+                        ImageActionFrostedCard(modifier = Modifier.width(136.dp)) {
+                            listOf(TimelineKind.Following, TimelineKind.FriendsCircle).forEachIndexed { index, kind ->
+                                if (index > 0) {
+                                    ImageActionMenuDivider()
+                                }
+                                ImageActionRow(
+                                    label = kind.label,
+                                    enabled = true,
+                                    selected = kind == timelineKind,
+                                    onClick = {
+                                        dismiss()
+                                        dismissFollowListForTabSwitch()
+                                        selectedTab = MainTab.Feed
+                                        switchTimelineKind(kind)
+                                    },
+                                )
+                            }
+                        }
+                    },
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
+                        .align(Alignment.BottomStart)
                         .zIndex(41f),
                 )
             }
@@ -3760,6 +3854,10 @@ fun WeiboApp() {
                 token = exitHintToken,
                 onDismiss = { exitHintVisible = false },
                 modifier = Modifier.align(Alignment.Center),
+            )
+            FeedCardActionMenuOverlay(
+                controller = feedCardActionMenuController,
+                backdrop = bottomBarBackdrop,
             )
             }
             }
@@ -3879,441 +3977,14 @@ fun WeiboApp() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MyWeiboScaffold(
-    selectedTab: MainTab,
-    selectedItem: FeedItem?,
-    isLoading: Boolean,
     snackbarHostState: SnackbarHostState,
-    onTabChange: (MainTab) -> Unit,
-    onBack: () -> Unit,
-    onRefresh: () -> Unit,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         snackbarHost = { SnackbarHost(snackbarHostState) },
-        topBar = {
-            if (false) {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    titleContentColor = MaterialTheme.colorScheme.onSurface,
-                ),
-                title = {
-                    Text(
-                        text = selectedItem?.authorName ?: "MyWeibo",
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                navigationIcon = {
-                    if (selectedItem != null) {
-                        TextButton(onClick = onBack) { Text("返回") }
-                    }
-                },
-                actions = {
-                    if (false) {
-                        TextButton(onClick = onRefresh, enabled = !isLoading) {
-                            Text(if (isLoading) "\u540C\u6B65\u4E2D" else "\u540C\u6B65")
-                        }
-                    }
-                }
-            )
-            }
-        },
-        bottomBar = {
-            if (false && selectedItem == null) {
-                FloatingBottomBar(
-                    selectedTab = selectedTab,
-                    expanded = true,
-                    hazeState = rememberHazeState(),
-                    onExpandRequest = {},
-                    onCollapsedTap = {},
-                    onTabChange = onTabChange,
-                )
-            }
-        },
         content = content,
     )
-}
-
-@Composable
-private fun FloatingBottomBar(
-    selectedTab: MainTab,
-    onTabChange: (MainTab) -> Unit,
-    expanded: Boolean,
-    hazeState: HazeState,
-    onExpandRequest: () -> Unit,
-    onCollapsedTap: () -> Unit,
-    feedTabLabel: String = MainTab.Feed.label,
-    selectedTimelineKind: TimelineKind = TimelineKind.Following,
-    onTimelineKindChange: (TimelineKind) -> Unit = {},
-    modifier: Modifier = Modifier,
-) {
-    val glassShape = RoundedCornerShape(36.dp)
-    val density = LocalDensity.current
-    val scope = rememberCoroutineScope()
-    val collapsedWidth = 72.dp
-    val collapsedWidthPx = with(density) { collapsedWidth.toPx() }
-    val tabs = MainTab.entries
-    var liquidActive by remember { mutableStateOf(false) }
-    var gestureActive by remember { mutableStateOf(false) }
-    var highlightedIndex by remember { mutableIntStateOf(-1) }
-    var collapsedLongPressDragging by remember { mutableStateOf(false) }
-    var timelineMenuExpanded by remember { mutableStateOf(false) }
-    val pillOffsetAnim = remember { Animatable(0f) }
-    val navPillSpring = spring<Float>(
-        dampingRatio = Spring.DampingRatioNoBouncy,
-        stiffness = Spring.StiffnessMedium,
-    )
-    val navChromeSpring = spring<Dp>(
-        dampingRatio = Spring.DampingRatioNoBouncy,
-        stiffness = Spring.StiffnessMedium,
-    )
-
-    LaunchedEffect(selectedTab, gestureActive) {
-        if (!gestureActive) {
-            liquidActive = true
-            delay(220)
-            liquidActive = false
-        }
-    }
-
-    BoxWithConstraints(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(start = 18.dp, top = 4.dp, end = 18.dp, bottom = 24.dp),
-        contentAlignment = Alignment.BottomStart,
-    ) {
-        val fullBarWidth = maxWidth
-        val selectedIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)
-        val showExpandedChrome = expanded || gestureActive
-        val animatedBarWidth by animateDpAsState(
-            targetValue = if (expanded || gestureActive) fullBarWidth else collapsedWidth,
-            animationSpec = navChromeSpring,
-            label = "bottom-bar-width",
-        )
-
-        BoxWithConstraints(Modifier.width(fullBarWidth).height(72.dp)) {
-            val barContentPadding = 8.dp
-            val contentWidth = fullBarWidth - barContentPadding * 2
-            val itemWidth = contentWidth / tabs.size
-            val restingPillWidth = itemWidth
-            val gesturePillWidth = itemWidth + 12.dp
-            val maxWidthPx = with(density) { contentWidth.toPx() }.coerceAtLeast(1f)
-            val horizontalPaddingPx = with(density) { barContentPadding.toPx() }
-            val restingPillWidthPx = with(density) { restingPillWidth.toPx() }
-            val gesturePillWidthPx = with(density) { gesturePillWidth.toPx() }
-            val expandedState by rememberUpdatedState(expanded)
-            val gestureActiveState by rememberUpdatedState(gestureActive)
-            val onExpandRequestState by rememberUpdatedState(onExpandRequest)
-            val onTabChangeState by rememberUpdatedState(onTabChange)
-            val onCollapsedTapState by rememberUpdatedState(onCollapsedTap)
-            val onTimelineKindChangeState by rememberUpdatedState(onTimelineKindChange)
-            val feedTabLabelState by rememberUpdatedState(feedTabLabel)
-            val selectedTimelineKindState by rememberUpdatedState(selectedTimelineKind)
-            val feedIndex = tabs.indexOf(MainTab.Feed).coerceAtLeast(0)
-
-            fun contentX(rawX: Float) = (rawX - horizontalPaddingPx).coerceIn(0f, maxWidthPx)
-
-            fun indexForX(rawX: Float): Int {
-                val x = contentX(rawX)
-                return ((x / maxWidthPx) * tabs.size).toInt().coerceIn(0, tabs.lastIndex)
-            }
-
-            fun pillOffsetPxForX(rawX: Float, activePillWidthPx: Float = gesturePillWidthPx): Float {
-                val x = contentX(rawX)
-                val maxOffset = (maxWidthPx - activePillWidthPx).coerceAtLeast(0f)
-                return (x - activePillWidthPx / 2f).coerceIn(0f, maxOffset)
-            }
-
-            fun pillOffsetPxForIndex(index: Int, activePillWidthPx: Float = restingPillWidthPx): Float {
-                val slotStart = with(density) { (itemWidth * index).toPx() }
-                val slotCenter = slotStart + with(density) { itemWidth.toPx() } / 2f
-                val maxOffset = (maxWidthPx - activePillWidthPx).coerceAtLeast(0f)
-                return (slotCenter - activePillWidthPx / 2f).coerceIn(0f, maxOffset)
-            }
-
-            fun updateGesturePill(rawX: Float) {
-                highlightedIndex = indexForX(rawX)
-                val offset = pillOffsetPxForX(rawX)
-                scope.launch {
-                    pillOffsetAnim.snapTo(offset)
-                }
-            }
-
-            fun resetGesture() {
-                gestureActive = false
-                collapsedLongPressDragging = false
-                highlightedIndex = -1
-            }
-
-            fun finishGesture(targetIndex: Int, requestExpand: Boolean = false) {
-                highlightedIndex = -1
-                collapsedLongPressDragging = false
-                if (requestExpand) {
-                    onExpandRequestState()
-                }
-                gestureActive = false
-                onTabChangeState(tabs[targetIndex])
-            }
-
-            fun commitExpandedTabTap(rawX: Float) {
-                val targetIndex = indexForX(rawX)
-                val targetTab = tabs[targetIndex]
-                if (targetTab == selectedTab && targetTab != MainTab.Feed) return
-                onTabChangeState(targetTab)
-            }
-
-            LaunchedEffect(selectedIndex, restingPillWidthPx, gestureActive) {
-                if (!gestureActive) {
-                    pillOffsetAnim.animateTo(
-                        pillOffsetPxForIndex(selectedIndex, restingPillWidthPx),
-                        navPillSpring,
-                    )
-                }
-            }
-
-            val animatedPillWidth by animateDpAsState(
-                targetValue = if (gestureActive) gesturePillWidth else restingPillWidth,
-                animationSpec = navChromeSpring,
-                label = "nav-pill-width",
-            )
-            val animatedPillHeight by animateDpAsState(
-                targetValue = if (gestureActive) 62.dp else 58.dp,
-                animationSpec = navChromeSpring,
-                label = "nav-pill-height",
-            )
-            val pillOffset = with(density) { pillOffsetAnim.value.toDp() }
-            val highlightedTab = highlightedIndex.takeIf { it >= 0 }?.let { tabs[it] }
-
-            Surface(
-                modifier = Modifier.width(animatedBarWidth).fillMaxHeight(),
-                color = HintCapsuleWhite,
-                shadowElevation = 0.dp,
-                shape = glassShape,
-                border = BorderStroke(1.dp, HintCapsuleBorderColor),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .width(fullBarWidth)
-                        .fillMaxHeight()
-                        .clip(glassShape)
-                        .padding(horizontal = barContentPadding),
-                ) {
-                    if (showExpandedChrome) {
-                        LiquidSelectedPill(
-                            active = liquidActive || gestureActive,
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .offset(x = pillOffset)
-                                .width(animatedPillWidth)
-                                .height(animatedPillHeight),
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalArrangement = Arrangement.SpaceEvenly,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            tabs.forEach { tab ->
-                                val isTouchingSelectedTab = gestureActive && highlightedTab == selectedTab
-                                FloatingNavItem(
-                                    tab = tab,
-                                    label = if (tab == MainTab.Feed) feedTabLabelState else tab.label,
-                                    selected = selectedTab == tab &&
-                                        (!gestureActive || highlightedTab == null || isTouchingSelectedTab),
-                                    highlighted = gestureActive &&
-                                        highlightedTab != selectedTab &&
-                                        highlightedTab == tab,
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.CenterStart)
-                                .width(collapsedWidth)
-                                .fillMaxHeight(),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            LiquidSelectedPill(
-                                active = false,
-                                modifier = Modifier.size(width = 58.dp, height = 58.dp),
-                            )
-                            FloatingNavItem(
-                                tab = selectedTab,
-                                label = if (selectedTab == MainTab.Feed) feedTabLabelState else selectedTab.label,
-                                selected = true,
-                                highlighted = false,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
-                    }
-                }
-            }
-
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .pointerInput(maxWidthPx, collapsedWidthPx) {
-                        detectTapGestures(
-                            onTap = { offset ->
-                                if (!expandedState && !gestureActiveState && offset.x <= collapsedWidthPx) {
-                                    onExpandRequestState()
-                                }
-                            },
-                            onDoubleTap = { offset ->
-                                if (!expandedState && !gestureActiveState && offset.x <= collapsedWidthPx) {
-                                    onCollapsedTapState()
-                                }
-                            },
-                        )
-                    }
-                    .pointerInput(maxWidthPx, gesturePillWidthPx, collapsedWidthPx) {
-                        detectDragGesturesAfterLongPress(
-                            onDragStart = { offset ->
-                                if (expandedState) return@detectDragGesturesAfterLongPress
-                                if (offset.x > collapsedWidthPx) return@detectDragGesturesAfterLongPress
-                                collapsedLongPressDragging = true
-                                gestureActive = true
-                                onExpandRequestState()
-                                scope.launch {
-                                    pillOffsetAnim.snapTo(
-                                        pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
-                                    )
-                                }
-                                updateGesturePill(offset.x)
-                            },
-                            onDrag = { change, _ ->
-                                if (!collapsedLongPressDragging) return@detectDragGesturesAfterLongPress
-                                updateGesturePill(change.position.x)
-                            },
-                            onDragEnd = {
-                                if (!collapsedLongPressDragging) return@detectDragGesturesAfterLongPress
-                                val targetIndex = highlightedIndex
-                                    .takeIf { it >= 0 }
-                                    ?: selectedIndex
-                                finishGesture(targetIndex, requestExpand = true)
-                            },
-                            onDragCancel = {
-                                if (collapsedLongPressDragging) {
-                                    resetGesture()
-                                }
-                            },
-                        )
-                    },
-            )
-
-            if (expanded && !collapsedLongPressDragging) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .pointerInput(maxWidthPx, gesturePillWidthPx, selectedIndex) {
-                            awaitEachGesture {
-                                val down = awaitFirstDown(requireUnconsumed = false)
-                                val startX = down.position.x
-                                var targetIndex = indexForX(startX)
-                                var dragStarted = false
-                                val touchSlop = viewConfiguration.touchSlop
-
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    val change = event.changes.firstOrNull { it.id == down.id }
-                                        ?: event.changes.firstOrNull()
-                                        ?: break
-
-                                    if (!change.pressed) {
-                                        if (dragStarted) {
-                                            finishGesture(targetIndex)
-                                        } else {
-                                            commitExpandedTabTap(startX)
-                                        }
-                                        break
-                                    }
-
-                                    val deltaX = change.position.x - startX
-                                    if (!dragStarted) {
-                                        if (abs(deltaX) > touchSlop) {
-                                            dragStarted = true
-                                            gestureActive = true
-                                            scope.launch {
-                                                pillOffsetAnim.snapTo(
-                                                    pillOffsetPxForIndex(selectedIndex, gesturePillWidthPx),
-                                                )
-                                            }
-                                            targetIndex = indexForX(change.position.x)
-                                            updateGesturePill(change.position.x)
-                                        }
-                                    } else {
-                                        targetIndex = indexForX(change.position.x)
-                                        updateGesturePill(change.position.x)
-                                    }
-                                    change.consume()
-                                }
-                            }
-                        },
-                )
-
-                Box(
-                    modifier = Modifier
-                        .offset(x = barContentPadding + itemWidth * feedIndex)
-                        .width(itemWidth)
-                        .fillMaxHeight()
-                        .zIndex(4f)
-                        .combinedClickable(
-                            indication = null,
-                            interactionSource = remember { MutableInteractionSource() },
-                            onClick = {
-                                if (selectedTab == MainTab.Feed) {
-                                    onTabChangeState(MainTab.Feed)
-                                } else {
-                                    onTabChangeState(MainTab.Feed)
-                                }
-                            },
-                            onLongClick = {
-                                timelineMenuExpanded = true
-                            },
-                        ),
-                )
-            }
-
-            if (timelineMenuExpanded) {
-                val timelineMenuWidth = 136.dp
-                val timelineMenuOffsetX = with(density) {
-                    val fullWidthPx = fullBarWidth.toPx()
-                    val menuWidthPx = timelineMenuWidth.toPx()
-                    val feedCenterPx = (barContentPadding + itemWidth * feedIndex + itemWidth / 2).toPx()
-                    (feedCenterPx - menuWidthPx / 2f)
-                        .coerceIn(0f, (fullWidthPx - menuWidthPx).coerceAtLeast(0f))
-                        .roundToInt()
-                }
-                Popup(
-                    alignment = Alignment.BottomStart,
-                    offset = IntOffset(timelineMenuOffsetX, -with(density) { 80.dp.roundToPx() }),
-                    onDismissRequest = { timelineMenuExpanded = false },
-                    properties = PopupProperties(focusable = false),
-                ) {
-                    ImageActionFrostedCard(modifier = Modifier.width(timelineMenuWidth)) {
-                        listOf(TimelineKind.Following, TimelineKind.FriendsCircle).forEachIndexed { index, kind ->
-                            if (index > 0) {
-                                ImageActionMenuDivider()
-                            }
-                            ImageActionRow(
-                                label = kind.label,
-                                enabled = true,
-                                selected = kind == selectedTimelineKindState,
-                                onClick = {
-                                    timelineMenuExpanded = false
-                                    onTimelineKindChangeState(kind)
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 @Composable
@@ -4405,83 +4076,6 @@ private fun ExitConfirmCapsule(
 }
 
 @Composable
-private fun LiquidSelectedPill(
-    active: Boolean,
-    modifier: Modifier = Modifier,
-) {
-    val surface = MaterialTheme.colorScheme.surface
-    val neutralGlow = MaterialTheme.colorScheme.outlineVariant
-    val shape = RoundedCornerShape(26.dp)
-
-    Surface(
-        modifier = modifier,
-        color = Color.Transparent,
-        shape = shape,
-        shadowElevation = 0.dp,
-        border = BorderStroke(
-            1.dp,
-            Brush.linearGradient(
-                colors = if (active) {
-                    listOf(
-                        Color.White.copy(alpha = 0.30f),
-                        neutralGlow.copy(alpha = 0.18f),
-                        Color(0xFFB8B8B8).copy(alpha = 0.16f),
-                    )
-                } else {
-                    listOf(
-                        Color.White.copy(alpha = 0.10f),
-                        Color(0xFFBDBDBD).copy(alpha = 0.18f),
-                        Color(0xFF9E9E9E).copy(alpha = 0.10f),
-                    )
-                }
-            )
-        ),
-    ) {
-        Box(
-            Modifier
-                .clip(shape)
-                .blur(8.dp)
-                .background(
-                    Brush.linearGradient(
-                        colors = if (active) {
-                            listOf(
-                                Color(0xFFE8E8E8).copy(alpha = 0.34f),
-                                Color.White.copy(alpha = 0.16f),
-                                Color(0xFFBDBDBD).copy(alpha = 0.16f),
-                            )
-                        } else {
-                            listOf(
-                                Color(0xFFCFCFCF).copy(alpha = 0.16f),
-                                Color(0xFFE4E4E4).copy(alpha = 0.24f),
-                                Color(0xFFB8B8B8).copy(alpha = 0.12f),
-                            )
-                        },
-                        start = Offset(0f, 0f),
-                        end = Offset(260f, 90f),
-                    )
-                )
-        ) {
-            Canvas(Modifier.fillMaxSize()) {
-                if (active) {
-                    drawRoundRect(
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = 0.30f),
-                                Color.White.copy(alpha = 0.08f),
-                                Color.Transparent,
-                            ),
-                            center = Offset(size.width * 0.5f, size.height * 0.18f),
-                            radius = size.width * 0.88f,
-                        ),
-                        cornerRadius = CornerRadius(26.dp.toPx(), 26.dp.toPx()),
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun Modifier.consumeTouchEvents(): Modifier = clickable(
     indication = null,
     interactionSource = remember { MutableInteractionSource() },
@@ -4527,65 +4121,6 @@ private fun AppPullToRefreshBox(
             )
         },
         content = content,
-    )
-}
-
-@Composable
-private fun FloatingNavItem(
-    tab: MainTab,
-    label: String = tab.label,
-    selected: Boolean,
-    highlighted: Boolean,
-    modifier: Modifier = Modifier,
-) {
-    val primary = MaterialTheme.colorScheme.primary
-    val hotPink = Color(0xFFFF4F9A)
-    val iconColor = when {
-        highlighted -> hotPink
-        selected -> primary
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    Column(
-        modifier = modifier
-            .fillMaxHeight()
-            .clip(RoundedCornerShape(28.dp))
-            .padding(top = 8.dp, bottom = 6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Box(
-            modifier = Modifier.size(32.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            TabIcon(tab = tab, color = iconColor)
-        }
-        Text(
-            text = label,
-            fontSize = 10.sp,
-            color = iconColor,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
-
-@Composable
-private fun TabIcon(tab: MainTab, color: Color) {
-    Icon(
-        painter = painterResource(
-            when (tab) {
-                MainTab.Feed -> R.drawable.ic_tab_home
-                MainTab.Search -> R.drawable.ic_tab_search
-                MainTab.Messages -> R.drawable.ic_tab_messages
-                MainTab.Mine -> R.drawable.ic_tab_mine
-                MainTab.Compose -> R.drawable.ic_tab_compose
-            }
-        ),
-        contentDescription = tab.label,
-        modifier = Modifier.size(20.dp),
-        tint = color,
     )
 }
 
@@ -5410,78 +4945,125 @@ private fun CommentSortToggle(
     }
 }
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun FeedCardActionMenu(
     item: FeedItem,
     backHandlerEnabled: Boolean = true,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    val controller = LocalFeedCardActionMenuController.current
+    var anchorBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
+    val isExpanded = controller.activeRequest?.item?.id == item.id
+
+    LaunchedEffect(backHandlerEnabled, isExpanded) {
+        if (!backHandlerEnabled && isExpanded) {
+            controller.dismiss()
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .size(32.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .onGloballyPositioned { coordinates ->
+                anchorBounds = coordinates.boundsInRoot()
+            }
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = {
+                    if (isExpanded) {
+                        controller.dismiss()
+                    } else {
+                        val bounds = anchorBounds ?: return@clickable
+                        controller.open(item, bounds, backHandlerEnabled)
+                    }
+                },
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        SettingsExpandIndicator(
+            modifier = Modifier.size(18.dp),
+            tint = weiboMetaTextColor(),
+        )
+    }
+}
+
+@Composable
+private fun FeedCardActionMenuOverlay(
+    controller: FeedCardActionMenuController,
+    backdrop: Backdrop,
+) {
+    val request = controller.activeRequest ?: return
     val context = LocalContext.current
     val density = LocalDensity.current
-    val shareUrl = remember(item.id, item.statusId, item.authorId) {
-        WeiboStatusActions.weiboUrl(item)
+    val shareUrl = remember(request.item.id) {
+        WeiboStatusActions.weiboUrl(request.item)
     }
 
-    fun dismissMenu() {
-        expanded = false
+    LaunchedEffect(request.backHandlerEnabled) {
+        if (!request.backHandlerEnabled) {
+            controller.dismiss()
+        }
     }
 
-    LaunchedEffect(backHandlerEnabled) {
-        if (!backHandlerEnabled) dismissMenu()
+    BackHandler(enabled = request.backHandlerEnabled) {
+        controller.dismiss()
     }
 
-    if (expanded) {
-        BackHandler(enabled = backHandlerEnabled) { dismissMenu() }
-    }
+    val menuWidth = 140.dp
+    val gapFromButton = 6.dp
+    val screenMargin = 14.dp
+    val anchor = request.anchorBoundsInRoot
 
-    Box {
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .zIndex(45f),
+    ) {
+        val screenWidthPx = with(density) { maxWidth.toPx() }
+        val screenHeightPx = with(density) { maxHeight.toPx() }
+        val menuPlacement = calculateFeedCardActionMenuOffsetPx(
+            anchorBounds = anchor,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx,
+            menuWidthPx = with(density) { menuWidth.toPx() },
+            menuHeightPx = with(density) { ActionMenuTwoRowHeight.toPx() },
+            marginPx = with(density) { screenMargin.toPx() },
+            gapPx = with(density) { gapFromButton.toPx() },
+        )
+
         Box(
             modifier = Modifier
-                .size(32.dp)
-                .clip(RoundedCornerShape(8.dp))
+                .fillMaxSize()
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
-                    onClick = {
-                        expanded = !expanded
-                    },
+                    onClick = { controller.dismiss() },
                 ),
-            contentAlignment = Alignment.Center,
+        )
+        ImageActionFrostedCard(
+            modifier = Modifier
+                .offset { menuPlacement.offset }
+                .width(menuWidth),
+            backdrop = backdrop,
         ) {
-            SettingsExpandIndicator(
-                modifier = Modifier.size(18.dp),
-                tint = weiboMetaTextColor(),
+            ImageActionRow(
+                label = "跳转到微博",
+                enabled = shareUrl != null,
+                onClick = {
+                    controller.dismiss()
+                    WeiboStatusActions.openInWeiboApp(context, request.item)
+                },
             )
-        }
-
-        if (expanded) {
-            Popup(
-                alignment = Alignment.TopEnd,
-                offset = IntOffset(0, with(density) { 34.dp.roundToPx() }),
-                onDismissRequest = { dismissMenu() },
-                properties = PopupProperties(focusable = true),
-            ) {
-                ImageActionFrostedCard(modifier = Modifier.width(140.dp)) {
-                    ImageActionRow(
-                        label = "跳转到微博",
-                        enabled = shareUrl != null,
-                        onClick = {
-                            dismissMenu()
-                            WeiboStatusActions.openInWeiboApp(context, item)
-                        },
-                    )
-                    ImageActionMenuDivider()
-                    ImageActionRow(
-                        label = "分享",
-                        enabled = shareUrl != null,
-                        onClick = {
-                            dismissMenu()
-                            WeiboStatusActions.shareLink(context, item)
-                        },
-                    )
-                }
-            }
+            ImageActionMenuDivider()
+            ImageActionRow(
+                label = "分享",
+                enabled = shareUrl != null,
+                onClick = {
+                    controller.dismiss()
+                    WeiboStatusActions.shareLink(context, request.item)
+                },
+            )
         }
     }
 }
@@ -5858,59 +5440,19 @@ private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
         platformStyle = PlatformTextStyle(includeFontPadding = false),
     )
 
-@OptIn(ExperimentalHazeMaterialsApi::class)
 @Composable
 private fun ImageActionFrostedCard(
     modifier: Modifier = Modifier,
+    backdrop: Backdrop? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    val hazeState = LocalHazeState.current
-    val shape = RoundedCornerShape(ActionMenuCornerRadius)
-    Surface(
+    SurfaceLiquidMenuCard(
         modifier = modifier,
-        shape = shape,
-        color = Color.Transparent,
-        shadowElevation = 0.dp,
-        tonalElevation = 0.dp,
-    ) {
-        Box(
-            Modifier
-                .clip(shape)
-                .border(0.6.dp, Color.Black.copy(alpha = 0.10f), shape),
-        ) {
-            if (hazeState != null) {
-                Box(
-                    Modifier
-                        .matchParentSize()
-                        .hazeEffect(state = hazeState, style = HazeMaterials.ultraThin()) {
-                            blurRadius = 86.dp
-                            noiseFactor = 0.04f
-                            alpha = 1f
-                        },
-                )
-            }
-            Box(
-                Modifier
-                    .matchParentSize()
-                    .background(Color(0xFFF2F2F3).copy(alpha = 0.74f))
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = 0.42f),
-                                Color(0xFFF1F1F2).copy(alpha = 0.28f),
-                                Color(0xFFD9D9DC).copy(alpha = 0.16f),
-                            ),
-                        ),
-                    ),
-            )
-            Column(
-                Modifier.padding(vertical = ActionMenuPaddingVertical),
-                horizontalAlignment = Alignment.Start,
-                verticalArrangement = Arrangement.spacedBy(0.dp),
-                content = content,
-            )
-        }
-    }
+        backdrop = backdrop ?: LocalLiquidMenuBackdrop.current,
+        cornerRadius = ActionMenuCornerRadius,
+        contentPadding = PaddingValues(vertical = ActionMenuPaddingVertical),
+        content = content,
+    )
 }
 
 @Composable
@@ -6695,6 +6237,28 @@ private fun calculateActionMenuOffsetFromAnchorPx(
     return ActionMenuPlacement(IntOffset(x.roundToInt(), y.roundToInt()), hasSpaceBelow)
 }
 
+private fun calculateFeedCardActionMenuOffsetPx(
+    anchorBounds: Rect,
+    screenWidthPx: Float,
+    screenHeightPx: Float,
+    menuWidthPx: Float,
+    menuHeightPx: Float,
+    marginPx: Float,
+    gapPx: Float,
+): ActionMenuPlacement {
+    val maxX = (screenWidthPx - menuWidthPx - marginPx).coerceAtLeast(marginPx)
+    val x = (anchorBounds.right - menuWidthPx).coerceIn(marginPx, maxX)
+    val hasSpaceBelow = anchorBounds.bottom + gapPx + menuHeightPx <= screenHeightPx - marginPx
+    val targetY = if (hasSpaceBelow) {
+        anchorBounds.bottom + gapPx
+    } else {
+        anchorBounds.top - gapPx - menuHeightPx
+    }
+    val maxY = (screenHeightPx - menuHeightPx - marginPx).coerceAtLeast(marginPx)
+    val y = targetY.coerceIn(marginPx, maxY)
+    return ActionMenuPlacement(IntOffset(x.roundToInt(), y.roundToInt()), hasSpaceBelow)
+}
+
 @Composable
 private fun ImageActionMenuDivider() {
     HorizontalDivider(
@@ -7265,6 +6829,12 @@ private fun ZoomableFullscreenImage(
                 point.y in (centerY - displayedHeight / 2f)..(centerY + displayedHeight / 2f)
         }
 
+        val pageMenuBackdrop = rememberLayerBackdrop()
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .layerBackdrop(pageMenuBackdrop),
+        ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -7586,18 +7156,20 @@ private fun ZoomableFullscreenImage(
                     strokeWidth = 2.dp,
                 )
             }
+        }
+        }
 
-            actionMenuOffset?.let { offset ->
-                FullscreenImageActionMenu(
-                    image = image,
-                    allImages = allImages,
-                    pressOffset = offset,
-                    visible = actionMenuVisible,
-                    screenWidthPx = containerWidthPx,
-                    screenHeightPx = containerHeightPx,
-                    onDismiss = { actionMenuVisible = false },
-                )
-            }
+        actionMenuOffset?.let { offset ->
+            FullscreenImageActionMenu(
+                image = image,
+                allImages = allImages,
+                pressOffset = offset,
+                visible = actionMenuVisible,
+                screenWidthPx = containerWidthPx,
+                screenHeightPx = containerHeightPx,
+                backdrop = pageMenuBackdrop,
+                onDismiss = { actionMenuVisible = false },
+            )
         }
     }
 }
@@ -7610,6 +7182,7 @@ private fun BoxScope.FullscreenImageActionMenu(
     visible: Boolean,
     screenWidthPx: Float,
     screenHeightPx: Float,
+    backdrop: Backdrop? = null,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -7646,7 +7219,7 @@ private fun BoxScope.FullscreenImageActionMenu(
             .width(menuWidth)
             .zIndex(20f),
     ) {
-        ImageActionFrostedCard {
+        ImageActionFrostedCard(backdrop = backdrop) {
             ImageActionRow(
                 label = "保存",
                 enabled = !saving,
@@ -11419,6 +10992,7 @@ private fun MobileWeiboWebScreen(
     onRootBack: () -> Unit,
     scrollToTopOnPageFinished: (String?) -> Boolean = { true },
     userAgent: String? = null,
+    active: Boolean = true,
 ) {
     val context = LocalContext.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
@@ -11430,6 +11004,7 @@ private fun MobileWeiboWebScreen(
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
             "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
     val fileUploadBridge = remember { MobileWebFileUploadBridge() }
+    val viewportCoordinator = remember(pageUrl) { MobileWebViewportCoordinator() }
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -11447,6 +11022,7 @@ private fun MobileWeiboWebScreen(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.apply {
@@ -11461,10 +11037,20 @@ private fun MobileWeiboWebScreen(
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
+                    if (!viewportCoordinator.shouldFitOnPageFinished(url)) return
                     view?.fitMobileWebViewport(scrollToTop = scrollToTopOnPageFinished(url))
                 }
             }
             loadUrl(pageUrl)
+        }
+    }
+
+    DisposableEffect(pageUrl) {
+        onDispose {
+            fileUploadBridge.cancelPendingUpload()
+            webView.webChromeClient = null
+            webView.stopLoading()
+            webView.destroy()
         }
     }
 
@@ -11481,20 +11067,33 @@ private fun MobileWeiboWebScreen(
             )
         }
         onDispose {
-            fileUploadBridge.cancelPendingUpload()
             webView.webChromeClient = null
-            webView.stopLoading()
-            webView.destroy()
+        }
+    }
+
+    LaunchedEffect(active) {
+        if (active) {
+            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            webView.visibility = View.VISIBLE
+            webView.onResume()
+        } else {
+            webView.onPause()
+            webView.visibility = View.GONE
+            webView.setLayerType(View.LAYER_TYPE_NONE, null)
         }
     }
 
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    LaunchedEffect(imeVisible, bottomInset) {
+    LaunchedEffect(imeVisible, active) {
+        if (!active) return@LaunchedEffect
+        if (!viewportCoordinator.shouldFitOnImeChange(imeVisible)) return@LaunchedEffect
         delay(120)
-        webView.fitMobileWebViewport(scrollToTop = false)
+        if (viewportCoordinator.debounceAllowed()) {
+            webView.fitMobileWebViewport(scrollToTop = false)
+        }
     }
 
-    BackHandler {
+    BackHandler(enabled = active) {
         if (webView.canGoBack()) {
             webView.goBack()
         } else {
@@ -11510,6 +11109,9 @@ private fun MobileWeiboWebScreen(
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { webView },
+            update = { view ->
+                view.visibility = if (active) View.VISIBLE else View.GONE
+            },
         )
     }
 }
@@ -11517,11 +11119,13 @@ private fun MobileWeiboWebScreen(
 @Composable
 private fun MessagesScreen(
     onRootBack: () -> Unit,
+    active: Boolean = true,
 ) {
     MobileWeiboWebScreen(
         pageUrl = "https://m.weibo.cn/message",
         onRootBack = onRootBack,
         scrollToTopOnPageFinished = { url -> url?.contains("/message", ignoreCase = true) != true },
+        active = active,
     )
 }
 
@@ -11554,6 +11158,32 @@ private class MobileWebFileUploadBridge {
     }
 }
 
+private class MobileWebViewportCoordinator {
+    private var lastFittedUrl: String? = null
+    private var lastImeVisible: Boolean? = null
+    private var lastFitAtMs: Long = 0L
+
+    fun shouldFitOnPageFinished(url: String?): Boolean {
+        val normalized = url.orEmpty()
+        if (normalized == lastFittedUrl) return false
+        lastFittedUrl = normalized
+        return true
+    }
+
+    fun shouldFitOnImeChange(imeVisible: Boolean): Boolean {
+        if (imeVisible == lastImeVisible) return false
+        lastImeVisible = imeVisible
+        return true
+    }
+
+    fun debounceAllowed(minIntervalMs: Long = 400L): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastFitAtMs < minIntervalMs) return false
+        lastFitAtMs = now
+        return true
+    }
+}
+
 private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
     evaluateJavascript(
         """
@@ -11564,10 +11194,17 @@ private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
                 meta.name = 'viewport';
                 document.head.appendChild(meta);
             }
-            meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
-            var height = window.innerHeight;
-            document.documentElement.style.height = height + 'px';
-            document.body.style.minHeight = height + 'px';
+            var viewport = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
+            if (meta.content !== viewport) {
+                meta.content = viewport;
+            }
+            var height = window.innerHeight + 'px';
+            if (document.documentElement.style.height !== height) {
+                document.documentElement.style.height = height;
+            }
+            if (document.body.style.minHeight !== height) {
+                document.body.style.minHeight = height;
+            }
             ${if (scrollToTop) "window.scrollTo(0, 0);" else ""}
         })();
         """.trimIndent(),
