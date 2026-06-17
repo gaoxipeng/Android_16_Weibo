@@ -7143,13 +7143,17 @@ private fun ZoomableFullscreenImage(
     var panInertiaJob by remember(image.largeUrl) { mutableStateOf<Job?>(null) }
     val dismissSnapAnim = remember(image.largeUrl) { Animatable(0f) }
     val scope = rememberCoroutineScope()
-    var bitmap by remember(image.largeUrl) {
+    var fullscreenBitmap by remember(image.largeUrl) {
         mutableStateOf(
             FeedBitmapCache.get(fullscreenImageUrlCandidates(image))
                 ?.takeIfDrawable()
                 ?.takeIf { it.isFullscreenQuality(image) },
         )
     }
+    var previewBitmap by remember(image.largeUrl) {
+        mutableStateOf(resolveFullscreenPreviewBitmap(image))
+    }
+    var fullscreenLoading by remember(image.largeUrl) { mutableStateOf(false) }
     var livePlaying by remember(image.largeUrl) { mutableStateOf(image.isLivePhoto) }
     var actionMenuOffset by remember(image.largeUrl) { mutableStateOf<Offset?>(null) }
     var actionMenuVisible by remember(image.largeUrl) { mutableStateOf(false) }
@@ -7167,17 +7171,33 @@ private fun ZoomableFullscreenImage(
         val fullscreenCandidates = fullscreenImageUrlCandidates(image)
         FeedBitmapCache.get(fullscreenCandidates)?.takeIfDrawable()?.let { cached ->
             if (cached.isFullscreenQuality(image)) {
-                bitmap = cached
+                fullscreenBitmap = cached
                 return@LaunchedEffect
             }
         }
-        bitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
-        bitmap?.let { loaded ->
+        if (previewBitmap == null) {
+            previewBitmap = withContext(Dispatchers.IO) { loadFullscreenPreviewBitmap(image) }
+        }
+        if (fullscreenBitmap?.isFullscreenQuality(image) == true) {
+            return@LaunchedEffect
+        }
+        fullscreenLoading = true
+        val loaded = withContext(Dispatchers.IO) { loadFullscreenBitmap(image) }
+        fullscreenLoading = false
+        loaded?.let { bitmap ->
+            fullscreenBitmap = bitmap
             fullscreenCandidates.firstOrNull()?.let { url ->
-                FeedBitmapCache.put(url, loaded)
-            } ?: FeedBitmapCache.putForImage(image, loaded)
+                FeedBitmapCache.put(url, bitmap)
+            } ?: FeedBitmapCache.putForImage(image, bitmap)
         }
     }
+
+    val displayBitmap = fullscreenBitmap?.takeIf { it.isFullscreenQuality(image) }
+        ?: previewBitmap
+        ?: fullscreenBitmap
+    val showFullscreenLoading = fullscreenLoading &&
+        displayBitmap != null &&
+        fullscreenBitmap?.isFullscreenQuality(image) != true
 
     LaunchedEffect(actionMenuVisible, actionMenuOffset) {
         if (!actionMenuVisible && actionMenuOffset != null) {
@@ -7186,7 +7206,7 @@ private fun ZoomableFullscreenImage(
         }
     }
 
-    val loadedBitmap = bitmap
+    val loadedBitmap = displayBitmap
     if (loadedBitmap == null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(color = Color.White)
@@ -7554,6 +7574,16 @@ private fun ZoomableFullscreenImage(
                         .zIndex(8f)
                         .size(16.dp),
                     tint = Color.White.copy(alpha = 0.92f),
+                )
+            }
+            if (showFullscreenLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 56.dp)
+                        .size(22.dp),
+                    color = Color.White.copy(alpha = 0.85f),
+                    strokeWidth = 2.dp,
                 )
             }
 
@@ -15634,6 +15664,37 @@ private fun loadRemoteAnimatedDrawable(url: String): Drawable {
     )
     val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
     return ImageDecoder.decodeDrawable(source)
+}
+
+private fun resolveFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
+    feedImageUrlCandidates(image).forEach { url ->
+        FeedBitmapCache.get(url)?.takeIfDrawable()?.let { return it }
+    }
+    AlbumThumbnailBitmapCache.getForImage(image, AlbumGridMaxDecodeDim)?.takeIfDrawable()?.let { return it }
+    return null
+}
+
+private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
+    resolveFullscreenPreviewBitmap(image)?.let { return it }
+    loadAlbumGridBitmap(image)?.let { return it }
+    val previewUrls = listOfNotNull(
+        image.thumbnailUrl.takeIf { it.isNotBlank() },
+        image.largeUrl.takeIf { it.isNotBlank() },
+    ).distinct()
+    for (url in previewUrls) {
+        runCatching {
+            loadRemoteBitmap(
+                url = url,
+                maxDecodeDim = 960,
+                connectTimeoutMs = 5_000,
+                readTimeoutMs = 8_000,
+            )
+        }.getOrNull()?.let { bitmap ->
+            FeedBitmapCache.put(url, bitmap)
+            return bitmap
+        }
+    }
+    return null
 }
 
 private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
