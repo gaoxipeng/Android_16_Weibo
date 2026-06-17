@@ -294,7 +294,11 @@ import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
 import com.example.myweibo.ui.liquidglass.LocalHazeState
 import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
+import com.example.myweibo.ui.liquidglass.SurfaceLiquidCapsule
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
+import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
+import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
+import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
@@ -908,6 +912,16 @@ private class FeedCardActionMenuController {
 }
 
 private val LocalFeedCardActionMenuController = staticCompositionLocalOf { FeedCardActionMenuController() }
+
+private class SearchBarOverlayController {
+    var active by mutableStateOf(false)
+    var queryInput by mutableStateOf("")
+    var mode by mutableStateOf(SearchMode.Weibo)
+    var onModeChange: (SearchMode) -> Unit = {}
+    var onSearch: () -> Unit = {}
+    var onClear: () -> Unit = {}
+    var bottomPadding by mutableStateOf(96.dp)
+}
 
 private enum class ImagePeekDismissReason {
     Cancel,
@@ -3170,6 +3184,7 @@ fun WeiboApp() {
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
         val feedCardActionMenuController = remember { FeedCardActionMenuController() }
+        val searchBarOverlay = remember { SearchBarOverlayController() }
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
@@ -3358,6 +3373,8 @@ fun WeiboApp() {
                     ) {
                         SearchScreen(
                             session = session,
+                            searchBarOverlay = searchBarOverlay,
+                            searchBarVisible = searchUiOnTop,
                             hasLoginCookie = hasLoginCookie,
                             pendingQuery = searchPendingQuery,
                             onPendingQueryConsumed = { searchPendingQuery = null },
@@ -3705,6 +3722,23 @@ fun WeiboApp() {
             ) {
                 HiddenSessionWebView(session)
             }
+            }
+
+            if (searchBarOverlay.active) {
+                SearchCapsuleField(
+                    value = searchBarOverlay.queryInput,
+                    onValueChange = { searchBarOverlay.queryInput = it },
+                    mode = searchBarOverlay.mode,
+                    onModeChange = searchBarOverlay.onModeChange,
+                    onSearch = searchBarOverlay.onSearch,
+                    onClear = searchBarOverlay.onClear,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(start = 18.dp, end = 18.dp, bottom = searchBarOverlay.bottomPadding)
+                        .zIndex(85f),
+                )
+            }
 
             val capsuleHint = operationCapsuleHint
                 ?: albumFetchCapsuleHint
@@ -3741,7 +3775,6 @@ fun WeiboApp() {
                         },
                     )
                 }
-            }
             }
 
             if (selectedItem == null && visitedUserId == null) {
@@ -3992,14 +4025,7 @@ private fun OpaqueHintCapsule(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
-    val shape = RoundedCornerShape(22.dp)
-    Surface(
-        modifier = modifier,
-        shape = shape,
-        color = HintCapsuleWhite,
-        shadowElevation = 0.dp,
-        border = BorderStroke(1.dp, HintCapsuleBorderColor),
-    ) {
+    SurfaceLiquidCapsule(modifier = modifier, cornerRadius = 22.dp) {
         content()
     }
 }
@@ -7624,29 +7650,32 @@ private fun InlineVideoPlayer(
                 showPictureInPictureButton = false,
             )
         } else {
-            RemoteImage(
-                url = media.coverUrl,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-            )
+            val coverPlayBackdrop = rememberLayerBackdrop()
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .layerBackdrop(coverPlayBackdrop),
+            ) {
+                RemoteImage(
+                    url = media.coverUrl,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            }
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center,
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(72.dp)
-                        .clickable(
-                            indication = null,
-                            interactionSource = remember { MutableInteractionSource() },
-                        ) {
-                            if (media.isStreamPlayable()) {
-                                videoCoordinator.requestInlinePlayback(playbackKey)
-                            } else {
-                                onClick()
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
+                TransparentLiquidIconButton(
+                    onClick = {
+                        if (media.isStreamPlayable()) {
+                            videoCoordinator.requestInlinePlayback(playbackKey)
+                        } else {
+                            onClick()
+                        }
+                    },
+                    backdrop = coverPlayBackdrop,
+                    modifier = Modifier.size(65.dp),
                 ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_video_play),
@@ -7751,30 +7780,38 @@ private fun WeiboVideoSurface(
     }
 
     if (isPlaybackUnavailable || playbackUrl.isBlank()) {
+        val videoControlBackdrop = rememberLayerBackdrop()
         Box(
             modifier = modifier.background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
-            RemoteImage(
-                url = media.coverUrl,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop,
-            )
             Box(
-                modifier = Modifier
+                Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.35f)),
-                contentAlignment = Alignment.Center,
+                    .layerBackdrop(videoControlBackdrop),
             ) {
-                Text(
-                    text = media.liveBadgeLabel() ?: "直播暂不可播放",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyMedium,
+                RemoteImage(
+                    url = media.coverUrl,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
                 )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.35f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = media.liveBadgeLabel() ?: "直播暂不可播放",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
             if (controlsEnabled && !isFullscreen) {
                 GlassTextButton(
                     text = "全屏",
+                    backdrop = videoControlBackdrop,
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(10.dp)
@@ -8153,6 +8190,12 @@ private fun WeiboVideoSurface(
                 },
             ),
     ) {
+        val videoControlBackdrop = rememberLayerBackdrop()
+        Box(
+            Modifier
+                .fillMaxSize()
+                .layerBackdrop(videoControlBackdrop),
+        ) {
         AndroidView(
             modifier = Modifier
                 .fillMaxSize()
@@ -8217,6 +8260,7 @@ private fun WeiboVideoSurface(
                 }
             },
         )
+        }
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isFullscreen && !isPeekPlayback && showFullscreenButton,
@@ -8226,6 +8270,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = "全屏",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(10.dp)
                     .width(54.dp)
@@ -8247,6 +8292,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = "横屏",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(
                         end = 10.dp,
@@ -8271,6 +8317,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = "竖屏",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(
                         end = 10.dp,
@@ -8298,6 +8345,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = if (onEnterFloatingPlayback != null) "浮窗" else "画中画",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(
                         end = 10.dp,
@@ -8326,6 +8374,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = if (downloading) "下载中" else "下载",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(start = 10.dp, top = fullscreenTopInset + 22.dp)
                     .width(if (downloading) 66.dp else 54.dp)
@@ -8387,6 +8436,7 @@ private fun WeiboVideoSurface(
         ) {
             GlassTextButton(
                 text = "全屏",
+                backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(top = 8.dp, end = 8.dp)
                     .width(54.dp)
@@ -8412,6 +8462,7 @@ private fun WeiboVideoSurface(
                 positionMs = positionMs,
                 durationMs = durationMs,
                 speed = displayedSpeed,
+                backdrop = videoControlBackdrop,
                 onPlayPause = {
                     showControls()
                     if (player.isPlaying) {
@@ -8458,22 +8509,19 @@ private fun WeiboVideoSurface(
 @Composable
 private fun GlassTextButton(
     text: String,
+    backdrop: Backdrop,
     modifier: Modifier,
     enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
-    Box(
-        modifier = modifier.clickable(enabled = enabled, onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        VideoControlGlassBackground(Modifier.matchParentSize())
-        Text(
-            text = text,
-            color = Color.White,
-            style = MaterialTheme.typography.labelMedium,
-            textAlign = TextAlign.Center,
-        )
-    }
+    TransparentLiquidTextButton(
+        text = text,
+        onClick = onClick,
+        backdrop = backdrop,
+        modifier = modifier,
+        enabled = enabled,
+        textColor = Color.White,
+    )
 }
 
 @Composable
@@ -8485,6 +8533,7 @@ private fun VideoControls(
     onPlayPause: () -> Unit,
     onSeek: (Long) -> Unit,
     onSpeedClick: () -> Unit,
+    backdrop: Backdrop,
     modifier: Modifier = Modifier,
 ) {
     val progress = if (durationMs > 0L) {
@@ -8497,9 +8546,8 @@ private fun VideoControls(
     val durationState by rememberUpdatedState(durationMs)
     val onSeekState by rememberUpdatedState(onSeek)
 
-    Box(
+    TransparentLiquidCapsule(
         modifier = modifier
-            .clip(VideoControlCapsuleShape)
             .pointerInput(durationState) {
                 awaitEachGesture {
                     isScrubbing = true
@@ -8529,6 +8577,8 @@ private fun VideoControls(
                     }
                 }
             },
+        backdrop = backdrop,
+        pill = true,
     ) {
         VideoControlCapsuleProgressBackground(
             progress = progress,
@@ -8554,13 +8604,13 @@ private fun VideoControls(
             IconButton(
                 onClick = onPlayPause,
                 modifier = Modifier
-                    .size(24.dp)
+                    .size(25.dp)
                     .align(Alignment.CenterVertically),
             ) {
                 Icon(
                     painter = painterResource(if (isPlaying) R.drawable.ic_video_pause else R.drawable.ic_video_play),
                     contentDescription = if (isPlaying) "暂停" else "播放",
-                    modifier = Modifier.size(17.dp),
+                    modifier = Modifier.size(20.dp),
                     tint = Color.White,
                 )
             }
@@ -8614,40 +8664,21 @@ private fun VideoControlCapsuleProgressBackground(
         },
         label = "video-control-progress",
     )
-    val unplayedColor = Color(0xFF3A3A3C).copy(alpha = 0.55f)
-    val playedColor = Color(0xFF5E5E62).copy(alpha = 0.9f)
+    val unplayedColor = Color(0xFF2C2C2E).copy(alpha = 0.90f)
     Box(
         modifier = modifier.clip(VideoControlCapsuleShape),
     ) {
-        Box(Modifier.matchParentSize().background(unplayedColor))
-        if (displayedProgress > 0f) {
+        val unplayedFraction = (1f - displayedProgress).coerceIn(0f, 1f)
+        if (unplayedFraction > 0f) {
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .fillMaxWidth(displayedProgress)
-                    .align(Alignment.CenterStart)
-                    .background(playedColor),
+                    .fillMaxWidth(unplayedFraction)
+                    .align(Alignment.CenterEnd)
+                    .background(unplayedColor),
             )
         }
     }
-}
-
-@Composable
-private fun VideoControlGlassBackground(modifier: Modifier = Modifier) {
-    Box(
-        modifier = modifier
-            .clip(VideoControlCapsuleShape)
-            .blur(24.dp)
-            .background(Color(0xFF3A3A3C).copy(alpha = 0.45f))
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        Color.White.copy(alpha = 0.06f),
-                        Color.White.copy(alpha = 0.02f),
-                    )
-                )
-            ),
-    )
 }
 
 private val StatusLikeColor = Color(0xFFE94326)
@@ -10358,22 +10389,19 @@ private fun SearchCapsuleField(
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
 ) {
-    val shape = RoundedCornerShape(22.dp)
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
         color = HintCapsuleText,
         fontSize = 15.sp,
         lineHeight = 20.sp,
     )
     val placeholderStyle = fieldTextStyle.copy(color = HintCapsulePlaceholder)
-    Surface(
+    SurfaceLiquidCapsule(
         modifier = modifier,
-        shape = shape,
-        color = HintCapsuleWhite,
-        shadowElevation = 0.dp,
-        border = BorderStroke(1.dp, HintCapsuleBorderColor),
+        pill = true,
     ) {
         Row(
             modifier = Modifier
+                .fillMaxWidth()
                 .height(44.dp)
                 .padding(start = 16.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -10478,6 +10506,8 @@ private fun HotSearchRow(
 @Composable
 private fun SearchScreen(
     session: WeiboWebSession,
+    searchBarOverlay: SearchBarOverlayController,
+    searchBarVisible: Boolean,
     hasLoginCookie: Boolean,
     pendingQuery: String?,
     onPendingQueryConsumed: () -> Unit,
@@ -10508,7 +10538,6 @@ private fun SearchScreen(
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    var queryInput by remember { mutableStateOf("") }
     var activeQuery by remember { mutableStateOf<String?>(null) }
     var activeSearchMode by remember { mutableStateOf(searchMode) }
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
@@ -10525,7 +10554,7 @@ private fun SearchScreen(
     var searchPullRefreshing by remember { mutableStateOf(false) }
 
     fun clearSearchResults() {
-        queryInput = ""
+        searchBarOverlay.queryInput = ""
         activeQuery = null
         activeSearchMode = searchMode
         resultItems = emptyList()
@@ -10554,7 +10583,7 @@ private fun SearchScreen(
     fun submitQuery(raw: String, modeOverride: SearchMode? = null) {
         val normalized = normalizeTopic(raw)
         if (normalized.isBlank()) return
-        queryInput = normalized
+        searchBarOverlay.queryInput = normalized
         resultItems = emptyList()
         userResultItems = emptyList()
         resultError = null
@@ -10733,38 +10762,38 @@ private fun SearchScreen(
     val searchFieldBottom = maxOf(searchBarBottom, imeBottom + searchBarGap)
     val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap
 
+    SideEffect {
+        searchBarOverlay.active = searchBarVisible
+        searchBarOverlay.mode = searchMode
+        searchBarOverlay.onModeChange = { mode ->
+            if (mode != searchMode) {
+                onSearchModeChange(mode)
+                resultItems = emptyList()
+                userResultItems = emptyList()
+                resultError = null
+                resultNextPage = null
+                initialResultsReady = false
+                activeQuery?.let {
+                    activeSearchMode = mode
+                    searchGeneration++
+                }
+            }
+        }
+        searchBarOverlay.onSearch = { submitQuery(searchBarOverlay.queryInput) }
+        searchBarOverlay.onClear = ::clearSearchResults
+        searchBarOverlay.bottomPadding = searchFieldBottom
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            searchBarOverlay.active = false
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
-        SearchCapsuleField(
-            value = queryInput,
-            onValueChange = { queryInput = it },
-            mode = searchMode,
-            onModeChange = { mode ->
-                if (mode != searchMode) {
-                    onSearchModeChange(mode)
-                    resultItems = emptyList()
-                    userResultItems = emptyList()
-                    resultError = null
-                    resultNextPage = null
-                    initialResultsReady = false
-                    activeQuery?.let {
-                        activeSearchMode = mode
-                        searchGeneration++
-                    }
-                }
-            },
-            onSearch = { submitQuery(queryInput) },
-            onClear = ::clearSearchResults,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .padding(start = 18.dp, end = 18.dp, bottom = searchFieldBottom)
-                .zIndex(2f),
-        )
-
         if (!hasLoginCookie) {
             Box(
                 modifier = Modifier
@@ -14794,8 +14823,6 @@ private fun ImmersiveVideoChromeEffect(enabled: Boolean) {
         if (!enabled || activity == null) return@DisposableEffect onDispose {}
         val window = activity.window
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-        window.statusBarColor = android.graphics.Color.BLACK
-        window.navigationBarColor = android.graphics.Color.BLACK
         WindowCompat.setDecorFitsSystemWindows(window, false)
         insetsController.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE

@@ -6,6 +6,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,6 +15,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.remember
@@ -26,6 +30,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceAtMost
@@ -141,6 +147,147 @@ fun LiquidButton(
 
 fun liquidSurfaceColor(isLightTheme: Boolean): Color =
     if (isLightTheme) Color.White.copy(0.48f) else Color.White.copy(0.22f)
+
+@Composable
+fun SurfaceLiquidCapsule(
+    modifier: Modifier = Modifier,
+    backdrop: Backdrop? = null,
+    pill: Boolean = false,
+    cornerRadius: Dp = 22.dp,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val resolvedBackdrop = backdrop ?: LocalLiquidMenuBackdrop.current
+    val isLightTheme = !isSystemInDarkTheme()
+    val surfaceColor = liquidSurfaceColor(isLightTheme)
+    val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
+
+    if (resolvedBackdrop != null) {
+        Box(
+            modifier
+                .graphicsLayer { clip = false }
+                .drawBackdrop(
+                    backdrop = resolvedBackdrop,
+                    shape = { shape },
+                    effects = {
+                        vibrancy()
+                        blur(2f.dp.toPx())
+                        lens(12f.dp.toPx(), 24f.dp.toPx())
+                    },
+                    onDrawSurface = { drawRect(surfaceColor) },
+                ),
+            content = content,
+        )
+    } else {
+        Box(
+            modifier
+                .clip(shape)
+                .background(surfaceColor, shape),
+            content = content,
+        )
+    }
+}
+
+@Composable
+fun SurfaceLiquidTextButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    backdrop: Backdrop? = null,
+    textColor: Color = Color.Unspecified,
+    style: TextStyle? = null,
+) {
+    val resolvedBackdrop = backdrop ?: LocalLiquidMenuBackdrop.current
+    val isLightTheme = !isSystemInDarkTheme()
+    val resolvedTextColor = when {
+        textColor.isSpecified -> textColor
+        isLightTheme -> Color(0xFF1F1F1F)
+        else -> Color.White
+    }
+    val textStyle = style ?: MaterialTheme.typography.labelMedium
+
+    if (resolvedBackdrop != null) {
+        LiquidButton(
+            onClick = onClick,
+            backdrop = resolvedBackdrop,
+            modifier = modifier,
+            isInteractive = enabled,
+            surfaceColor = liquidSurfaceColor(isLightTheme),
+        ) {
+            Text(
+                text = text,
+                color = resolvedTextColor,
+                style = textStyle,
+                textAlign = TextAlign.Center,
+            )
+        }
+    } else {
+        SurfaceLiquidCapsule(
+            modifier = modifier.clickable(enabled = enabled, onClick = onClick),
+            pill = true,
+        ) {
+            Text(
+                text = text,
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = 12.dp),
+                color = resolvedTextColor,
+                style = textStyle,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+@Composable
+fun TransparentLiquidCapsule(
+    modifier: Modifier = Modifier,
+    backdrop: Backdrop,
+    pill: Boolean = false,
+    cornerRadius: Dp = 22.dp,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
+    Box(
+        modifier
+            .graphicsLayer { clip = false }
+            .drawBackdrop(
+                backdrop = backdrop,
+                shape = { shape },
+                effects = {
+                    vibrancy()
+                    blur(2f.dp.toPx())
+                    lens(12f.dp.toPx(), 24f.dp.toPx())
+                },
+            ),
+        content = content,
+    )
+}
+
+@Composable
+fun TransparentLiquidTextButton(
+    text: String,
+    onClick: () -> Unit,
+    backdrop: Backdrop,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    textColor: Color = Color.White,
+    style: TextStyle? = null,
+) {
+    LiquidButton(
+        onClick = onClick,
+        backdrop = backdrop,
+        modifier = modifier,
+        isInteractive = enabled,
+    ) {
+        Text(
+            text = text,
+            color = textColor,
+            style = style ?: MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
 
 @Composable
 fun SurfaceLiquidMenuCard(
