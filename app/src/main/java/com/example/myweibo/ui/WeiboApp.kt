@@ -2093,9 +2093,13 @@ fun WeiboApp() {
             if (expanded.statusId in likeLoadingIds) return@mapValues expanded
             val fresh = freshLookup[expanded.statusId] ?: freshLookup[expanded.id] ?: return@mapValues expanded
             val mergedLikesCount = mergeAuthoritativeLikeCount(expanded.likesCount, fresh.likesCount)
+            val mergedCommentsCount = mergeAuthoritativeLikeCount(expanded.commentsCount, fresh.commentsCount)
+            val mergedRepostsCount = mergeAuthoritativeLikeCount(expanded.repostsCount, fresh.repostsCount)
             var merged = expanded.copy(
                 liked = fresh.liked,
                 likesCount = mergedLikesCount,
+                commentsCount = mergedCommentsCount,
+                repostsCount = mergedRepostsCount,
             )
             val freshRetweet = fresh.retweetedStatus
             val itemRetweet = expanded.retweetedStatus
@@ -2106,6 +2110,14 @@ fun WeiboApp() {
                         likesCount = mergeAuthoritativeLikeCount(
                             itemRetweet.likesCount,
                             freshRetweet.likesCount,
+                        ),
+                        commentsCount = mergeAuthoritativeLikeCount(
+                            itemRetweet.commentsCount,
+                            freshRetweet.commentsCount,
+                        ),
+                        repostsCount = mergeAuthoritativeLikeCount(
+                            itemRetweet.repostsCount,
+                            freshRetweet.repostsCount,
                         ),
                     ),
                 )
@@ -2457,16 +2469,58 @@ fun WeiboApp() {
         }
     }
 
-    fun syncItemLikeCountFromLikeUsers(item: FeedItem, page: LikeUsersPage, loadedCount: Int) {
+    fun syncItemDisplayCount(
+        item: FeedItem,
+        totalCount: Int?,
+        loadedCount: Int,
+        currentCount: (FeedItem) -> String,
+        updateCount: (FeedItem, String) -> FeedItem,
+    ) {
         val resolved = resolveFeedItem(item)
-        val currentCount = parseApproxDisplayCount(resolved.likesCount) ?: 0
+        val current = parseApproxDisplayCount(currentCount(resolved)) ?: 0
         val authoritativeCount = listOfNotNull(
-            page.totalCount?.takeIf { it > 0 },
+            totalCount?.takeIf { it > 0 },
             loadedCount.takeIf { it > 0 },
         ).maxOrNull() ?: return
-        if (authoritativeCount <= currentCount) return
+        if (authoritativeCount <= current) return
         applyExpandedItem(
-            resolved.copy(likesCount = WeiboJsonParser.formatDisplayCount(authoritativeCount)),
+            updateCount(resolved, WeiboJsonParser.formatDisplayCount(authoritativeCount)),
+        )
+    }
+
+    fun syncItemLikeCountFromLikeUsers(item: FeedItem, page: LikeUsersPage, loadedCount: Int) {
+        syncItemDisplayCount(
+            item = item,
+            totalCount = page.totalCount,
+            loadedCount = loadedCount,
+            currentCount = { resolveFeedItem(item).likesCount },
+            updateCount = { resolved, formatted ->
+                resolved.copy(likesCount = formatted)
+            },
+        )
+    }
+
+    fun syncItemCommentsCount(item: FeedItem, totalCount: Int?, loadedCount: Int) {
+        syncItemDisplayCount(
+            item = item,
+            totalCount = totalCount,
+            loadedCount = loadedCount,
+            currentCount = { resolveFeedItem(item).commentsCount },
+            updateCount = { resolved, formatted ->
+                resolved.copy(commentsCount = formatted)
+            },
+        )
+    }
+
+    fun syncItemRepostsCount(item: FeedItem, totalCount: Int?, loadedCount: Int) {
+        syncItemDisplayCount(
+            item = item,
+            totalCount = totalCount,
+            loadedCount = loadedCount,
+            currentCount = { resolveFeedItem(item).repostsCount },
+            updateCount = { resolved, formatted ->
+                resolved.copy(repostsCount = formatted)
+            },
         )
     }
 
@@ -2606,6 +2660,7 @@ fun WeiboApp() {
                     absorbDiscoveredEmoticons(page.items.collectAllCommentEmoticons())
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
+                    syncItemCommentsCount(item, page.totalCount, page.items.size)
                 }
                 .onFailure { error ->
                     showMessage("\u8BC4\u8BBA\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
@@ -2646,7 +2701,15 @@ fun WeiboApp() {
                     }
                     val updated = target.status.copy(
                         commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
-                    )
+                    ).let { status ->
+                        if (alsoRepost) {
+                            status.copy(
+                                repostsCount = WeiboJsonParser.bumpDisplayCount(status.repostsCount, 1),
+                            )
+                        } else {
+                            status
+                        }
+                    }
                     applyExpandedItem(updated)
                     selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
                     reloadComments()
@@ -2673,6 +2736,7 @@ fun WeiboApp() {
                     reposts = page.items
                     repostsNextPage = page.nextPage
                     repostsHasMore = page.nextPage != null
+                    syncItemRepostsCount(item, page.totalCount, page.items.size)
                 }
                 .onFailure { error ->
                     showMessage("\u8F6C\u53D1\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
@@ -2822,6 +2886,7 @@ fun WeiboApp() {
                     absorbDiscoveredEmoticons(page.items.collectAllCommentEmoticons())
                     commentsCursor = page.nextCursor
                     commentsHasMore = page.nextCursor != null
+                    syncItemCommentsCount(item, page.totalCount, comments.size)
                 }
                 .onFailure { error ->
                     showMessage("评论加载失败", error.message ?: "微博接口无响应")
@@ -2841,6 +2906,7 @@ fun WeiboApp() {
                     reposts = mergeCommentItems(reposts, result.items)
                     repostsNextPage = result.nextPage
                     repostsHasMore = result.nextPage != null
+                    syncItemRepostsCount(item, result.totalCount, reposts.size)
                 }
                 .onFailure { error ->
                     showMessage("转发加载失败", error.message ?: "微博接口无响应")
@@ -5353,7 +5419,6 @@ private fun FeedCardActionMenu(
     var expanded by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val density = LocalDensity.current
-    val haptic = LocalHapticFeedback.current
     val shareUrl = remember(item.id, item.statusId, item.authorId) {
         WeiboStatusActions.weiboUrl(item)
     }
@@ -5379,7 +5444,6 @@ private fun FeedCardActionMenu(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
                     onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.ContextClick)
                         expanded = !expanded
                     },
                 ),
@@ -6550,18 +6614,6 @@ private fun VideoPeekOverlay(
                     enableLongPressSpeedBoost = isDocked && !isFullscreenMode,
                     modifier = Modifier.fillMaxSize(),
                 )
-                if (isFloating && !isFullscreenMode && dismissReason == null) {
-                    GlassTextButton(
-                        text = "全屏",
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 8.dp, end = 8.dp)
-                            .width(54.dp)
-                            .height(28.dp)
-                            .zIndex(5f),
-                        onClick = { videoPeekController.enterFullscreen() },
-                    )
-                }
             }
         }
 
@@ -8723,6 +8775,27 @@ private fun WeiboVideoSurface(
         }
 
         AnimatedVisibility(
+            visible = controlsEnabled && controlsVisible && !isFullscreen && isPeekPlayback,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
+            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .zIndex(10f),
+        ) {
+            GlassTextButton(
+                text = "全屏",
+                modifier = Modifier
+                    .padding(top = 8.dp, end = 8.dp)
+                    .width(54.dp)
+                    .height(28.dp),
+                onClick = {
+                    showControls()
+                    onFullscreen()
+                },
+            )
+        }
+
+        AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !hideProgressControls,
             enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it },
             exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { it },
@@ -10466,7 +10539,6 @@ private fun CommentRow(
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
                     .then(
                         if (onReplyClick != null) {
                             Modifier.combinedClickable(

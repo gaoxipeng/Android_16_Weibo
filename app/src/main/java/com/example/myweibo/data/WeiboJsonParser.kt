@@ -92,6 +92,19 @@ object WeiboJsonParser {
         }
     }
 
+    fun parseCommentsTotalCount(raw: String): Int? {
+        val root = JSONObject(raw)
+        val data = root.optJSONObject("data")
+        return listOf(
+            data?.optInt("total_number", 0) ?: 0,
+            data?.optInt("count", 0) ?: 0,
+            data?.optInt("total", 0) ?: 0,
+            data?.optJSONObject("status")?.optInt("comments_count", 0) ?: 0,
+            root.optInt("total_number", 0),
+            root.optInt("comments_count", 0),
+        ).firstOrNull { it > 0 }
+    }
+
     fun parseMweiboAttitudes(raw: String, page: Int = 1): LikeUsersPage {
         val root = JSONObject(raw)
         if (root.optInt("ok", 1) <= 0) {
@@ -186,7 +199,11 @@ object WeiboJsonParser {
             items.size >= PC_REPOST_PAGE_SIZE -> page + 1
             else -> null
         }
-        return RepostsPage(items = items, nextPage = nextPage)
+        return RepostsPage(
+            items = items,
+            nextPage = nextPage,
+            totalCount = totalNumber.takeIf { it > 0L }?.toInt(),
+        )
     }
 
     private const val PC_REPOST_PAGE_SIZE = 20

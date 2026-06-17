@@ -189,6 +189,7 @@ data class CommentItem(
 data class RepostsPage(
     val items: List<CommentItem>,
     val nextPage: Int?,
+    val totalCount: Int? = null,
 )
 
 data class UserProfile(

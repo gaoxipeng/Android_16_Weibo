@@ -398,7 +398,11 @@ class WeiboWebSession(context: Context) {
         return fetchJson(WeiboEndpoints.timelinePath(kind), params, referer)
     }
 
-    data class CommentsPage(val items: List<CommentItem>, val nextCursor: String?)
+    data class CommentsPage(
+        val items: List<CommentItem>,
+        val nextCursor: String?,
+        val totalCount: Int? = null,
+    )
 
     private fun commentRequestParams(item: FeedItem, sort: CommentSort): LinkedHashMap<String, String> =
         linkedMapOf(
@@ -494,7 +498,11 @@ class WeiboWebSession(context: Context) {
         val json = org.json.JSONObject(raw)
         val cursor = json.optJSONObject("data")?.nullableString("max_id")
             ?: json.nullableString("max_id")
-        return CommentsPage(items, cursor.takeUnless { it.isNullOrBlank() || it == "0" })
+        return CommentsPage(
+            items = items,
+            nextCursor = cursor.takeUnless { it.isNullOrBlank() || it == "0" },
+            totalCount = WeiboJsonParser.parseCommentsTotalCount(raw),
+        )
     }
 
     suspend fun loadMoreComments(
@@ -510,7 +518,11 @@ class WeiboWebSession(context: Context) {
         val json = org.json.JSONObject(raw)
         val nextCursor = json.optJSONObject("data")?.nullableString("max_id")
             ?: json.nullableString("max_id")
-        return CommentsPage(items, nextCursor.takeUnless { it.isNullOrBlank() || it == "0" })
+        return CommentsPage(
+            items = items,
+            nextCursor = nextCursor.takeUnless { it.isNullOrBlank() || it == "0" },
+            totalCount = WeiboJsonParser.parseCommentsTotalCount(raw),
+        )
     }
 
     suspend fun loadNestedComments(
