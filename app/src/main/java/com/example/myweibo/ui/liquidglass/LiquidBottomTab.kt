@@ -22,6 +22,9 @@ internal val LocalLiquidBottomTabScale =
 internal val LocalLiquidBottomTabBackdropRow =
     staticCompositionLocalOf { false }
 
+internal val LocalLiquidBottomTabIndicatorIndex =
+    staticCompositionLocalOf { -1 }
+
 @Composable
 fun RowScope.LiquidBottomTab(
     onClick: () -> Unit,

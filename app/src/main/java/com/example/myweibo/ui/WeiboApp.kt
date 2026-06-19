@@ -4687,6 +4687,7 @@ private fun FeedCard(
 ) {
     val resolvedEmoticonMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
     var inlineImagePreview by remember(item.statusId) { mutableStateOf<List<FeedImage>?>(null) }
+    val cardContainerColor = MaterialTheme.colorScheme.surface
     val contentVerticalPadding = when {
         insetRounded -> 14.dp
         showAuthorRow -> 10.dp
@@ -4793,7 +4794,7 @@ private fun FeedCard(
                     .padding(horizontal = FeedCardContentHorizontalPadding),
                 shape = RoundedCornerShape(8.dp),
                 colors = CardDefaults.elevatedCardColors(
-                    containerColor = Color.White,
+                    containerColor = cardContainerColor,
                 ),
                 elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
             ) {
@@ -4804,7 +4805,7 @@ private fun FeedCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = FeedCardItemSpacing)
-                    .background(Color.White),
+                    .background(cardContainerColor),
             ) {
                 cardBody()
             }
@@ -4874,13 +4875,14 @@ private fun QuotedStatus(
 ) {
     val resolvedMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
+    val quotedShape = RoundedCornerShape(8.dp)
     ElevatedCard(
         modifier = modifier
             .fillMaxWidth()
-            .border(0.5.dp, Color(0xFFE8E8E8), RoundedCornerShape(8.dp)),
-        shape = RoundedCornerShape(8.dp),
+            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, quotedShape),
+        shape = quotedShape,
         colors = CardDefaults.elevatedCardColors(
-            containerColor = StatusQuotedBackground,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         ),
         elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
     ) {
@@ -9000,7 +9002,7 @@ private fun DetailStickyAuthorHeader(
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
-        color = Color.White,
+        color = MaterialTheme.colorScheme.surface,
     ) {
         Column {
             Row(
@@ -12947,8 +12949,8 @@ private fun MineProfileHeader(
                             Brush.linearGradient(
                                 colors = listOf(
                                     MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
-                                    Color.White.copy(alpha = 0.42f),
-                                    StatusQuotedBackground,
+                                    MaterialTheme.colorScheme.surface.copy(alpha = 0.42f),
+                                    MaterialTheme.colorScheme.surfaceContainerLow,
                                 ),
                             ),
                         ),
@@ -12966,7 +12968,7 @@ private fun MineProfileHeader(
                         .offset(y = -ProfileHeaderCardCoverOverlap)
                         .zIndex(1f),
                     shape = RoundedCornerShape(ProfileHeaderCardRadius),
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.surface,
                     shadowElevation = 0.dp,
                     tonalElevation = 0.dp,
                 ) {

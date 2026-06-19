@@ -43,6 +43,7 @@ import com.example.myweibo.ui.theme.TabAccentLight
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabBackdropRow
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorIndex
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidIconButton
 import com.kyant.backdrop.Backdrop
 import kotlin.math.abs
@@ -156,13 +157,21 @@ internal fun WeiboLiquidBottomBar(
                         ) {
                             tabs.forEachIndexed { index, tab ->
                                 val isBackdropRow = LocalLiquidBottomTabBackdropRow.current
+                                val indicatorIndex = LocalLiquidBottomTabIndicatorIndex.current
                                 val isSelected = index == selectedIndex
                                 val tabColor = when {
                                     isBackdropRow -> accentColor
                                     isSelected -> accentColor
                                     else -> unselectedColor
                                 }
-                                val tabAlpha = if (!isBackdropRow && isSelected) 0f else 1f
+                                val tabAlpha = if (
+                                    !isBackdropRow &&
+                                    (index == indicatorIndex || isSelected && indicatorIndex < 0)
+                                ) {
+                                    0f
+                                } else {
+                                    1f
+                                }
                                 LiquidBottomTab(
                                     onClick = { onTabChange(tab) },
                                 ) {
