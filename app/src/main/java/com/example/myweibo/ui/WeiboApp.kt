@@ -19,6 +19,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -177,12 +178,17 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -288,6 +294,7 @@ import com.example.myweibo.data.PlaybackSettingsStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
 import com.example.myweibo.data.StoredWeiboAccount
+import com.example.myweibo.data.ThemeSettingsStore
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.data.UserProfile
@@ -781,7 +788,6 @@ private const val SingleImageMaxWidthFraction = 0.7f
 private const val VideoMaxHeightToWidth = 1f
 private val VideoControlCapsuleShape = RoundedCornerShape(percent = 50)
 private val VideoProgressLineWidth = 2.5.dp
-private val VideoProgressLineColor = Color(0xFFFB7299)
 private val VideoControlBarHeight = 32.dp
 private val VideoControlBarBottomFullscreen = 26.dp
 private val VideoControlBarBottomInline = 8.dp
@@ -796,6 +802,30 @@ private const val AlbumGridPrefetchConcurrency = 8
 private const val AlbumGridPrefetchBatchSize = 48
 private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
 private const val FullscreenBitmapCacheMaxBytes = 64 * 1024 * 1024
+
+private data class MorandiThemeColor(
+    val storageValue: String,
+    val label: String,
+    val primary: Color,
+    val primaryContainer: Color,
+    val secondary: Color,
+)
+
+private val MorandiThemeColors = listOf(
+    MorandiThemeColor("dusty_rose", "灰粉", Color(0xFFC78395), Color(0xFFF1D9DF), Color(0xFFB58C98)),
+    MorandiThemeColor("mist_blue", "雾蓝", Color(0xFF7F9CAF), Color(0xFFD8E4EA), Color(0xFF879BA7)),
+    MorandiThemeColor("sage", "鼠尾草", Color(0xFF86A08A), Color(0xFFDCE8DD), Color(0xFF8A9B82)),
+    MorandiThemeColor("clay", "陶土", Color(0xFFC08A72), Color(0xFFEEDDD5), Color(0xFFA98B7C)),
+    MorandiThemeColor("lavender_gray", "薰衣草灰", Color(0xFF9A8EAD), Color(0xFFE3DDEB), Color(0xFF958CA3)),
+    MorandiThemeColor("warm_sand", "暖沙", Color(0xFFA99778), Color(0xFFE8DFCF), Color(0xFF9F927F)),
+    MorandiThemeColor("smoky_teal", "烟青", Color(0xFF789E9B), Color(0xFFD7E5E3), Color(0xFF7F9996)),
+    MorandiThemeColor("mauve", "豆沙紫", Color(0xFFA77F94), Color(0xFFE8D9E1), Color(0xFF9B8792)),
+    MorandiThemeColor("olive_gray", "橄榄灰", Color(0xFF969873), Color(0xFFE4E5D3), Color(0xFF8F9278)),
+    MorandiThemeColor("slate", "石板灰", Color(0xFF7F8C98), Color(0xFFD9E0E5), Color(0xFF858D96)),
+)
+
+private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
+    MorandiThemeColors.firstOrNull { it.storageValue == value } ?: MorandiThemeColors.first()
 private const val RemoteBytesCacheMaxTotal = 32 * 1024 * 1024
 private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
 private const val RemoteBytesAnimatedMaxRead = 12 * 1024 * 1024
@@ -1607,6 +1637,7 @@ fun WeiboApp() {
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val imageSettingsStore = remember { ImageSettingsStore(context) }
+    val themeSettingsStore = remember { ThemeSettingsStore(context) }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -1663,6 +1694,9 @@ fun WeiboApp() {
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
+    var selectedThemeColor by remember {
+        mutableStateOf(morandiThemeColorFromStorage(themeSettingsStore.readThemeColor()))
+    }
     var mediaPreview by remember { mutableStateOf<MediaPreviewRequest?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
     var searchPendingMode by remember { mutableStateOf<SearchMode?>(null) }
@@ -3707,6 +3741,18 @@ fun WeiboApp() {
         }
     }
 
+    val themedColorScheme = MaterialTheme.colorScheme.copy(
+        primary = selectedThemeColor.primary,
+        primaryContainer = selectedThemeColor.primaryContainer,
+        secondary = selectedThemeColor.secondary,
+        tertiary = selectedThemeColor.primary,
+        inversePrimary = selectedThemeColor.primary,
+    )
+
+    MaterialTheme(
+        colorScheme = themedColorScheme,
+        typography = MaterialTheme.typography,
+    ) {
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
@@ -4112,6 +4158,11 @@ fun WeiboApp() {
                                 onFeedThumbnailQualityChange = { quality ->
                                     feedThumbnailQuality = quality
                                     imageSettingsStore.writeThumbnailQuality(quality)
+                                },
+                                selectedThemeColor = selectedThemeColor,
+                                onThemeColorChange = { color ->
+                                    selectedThemeColor = color
+                                    themeSettingsStore.writeThemeColor(color.storageValue)
                                 },
                             )
                         }
@@ -4538,6 +4589,7 @@ fun WeiboApp() {
                 )
             }
         }
+    }
     }
     }
 }
@@ -5834,6 +5886,7 @@ private fun FeedImageCell(
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
     onOpenViewer: (Int, Rect?, (() -> Unit)?) -> Unit,
+    onAnchorBoundsChanged: (Rect) -> Unit = {},
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
@@ -5879,7 +5932,9 @@ private fun FeedImageCell(
         modifier = modifier
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
-                anchorBounds = coordinates.boundsInWindow()
+                val bounds = coordinates.boundsInWindow()
+                anchorBounds = bounds
+                onAnchorBoundsChanged(bounds)
             }
             .graphicsLayer {
                 scaleX = holdScale
@@ -7070,12 +7125,14 @@ private fun MediaStrip(
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
-    var viewerSourceBounds by remember { mutableStateOf<Rect?>(null) }
+    var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun openImageViewer(index: Int, sourceBounds: Rect?, onClosed: (() -> Unit)? = null) {
         viewerIndex = index
-        viewerSourceBounds = sourceBounds
+        if (sourceBounds != null) {
+            thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
+        }
         viewerDismissHook = onClosed
         viewerOpen = true
     }
@@ -7111,6 +7168,9 @@ private fun MediaStrip(
                             onOpenViewer = { index, bounds, onClosed ->
                                 openImageViewer(index, bounds, onClosed)
                             },
+                            onAnchorBoundsChanged = { bounds ->
+                                thumbnailBoundsByIndex = thumbnailBoundsByIndex + (0 to bounds)
+                            },
                         )
                         if (onDetailClick != null) {
                             Box(
@@ -7134,16 +7194,20 @@ private fun MediaStrip(
                     rows.forEach { row ->
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             row.forEach { image ->
+                                val cellIndex = images.indexOf(image)
                                 FeedImageCell(
                                     image = image,
                                     allImages = images,
-                                    imageIndex = images.indexOf(image),
+                                    imageIndex = cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
                                     contentScale = ContentScale.Crop,
                                     onOpenViewer = { index, bounds, onClosed ->
                                         openImageViewer(index, bounds, onClosed)
+                                    },
+                                    onAnchorBoundsChanged = { bounds ->
+                                        thumbnailBoundsByIndex = thumbnailBoundsByIndex + (cellIndex to bounds)
                                     },
                                 )
                             }
@@ -7159,10 +7223,9 @@ private fun MediaStrip(
                 FullscreenImageViewer(
                     images = images,
                     initialIndex = viewerIndex,
-                    sourceBounds = viewerSourceBounds,
+                    sourceBoundsByIndex = thumbnailBoundsByIndex,
                     onDismiss = {
                         viewerOpen = false
-                        viewerSourceBounds = null
                         viewerDismissHook?.invoke()
                         viewerDismissHook = null
                     },
@@ -7181,12 +7244,66 @@ private fun MediaStrip(
     }
 }
 
+private val ThumbnailMorphCornerRadius = 4.dp
+
+@Composable
+private fun MorphRevealScrim(
+    morphLeft: Float,
+    morphTop: Float,
+    morphRight: Float,
+    morphBottom: Float,
+    cornerRadiusPx: Float,
+    scrimColor: Color = Color.Black,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier.fillMaxSize()) {
+        val path = Path().apply {
+            fillType = PathFillType.EvenOdd
+            addRect(Rect(0f, 0f, size.width, size.height))
+            addRoundRect(
+                RoundRect(
+                    left = morphLeft,
+                    top = morphTop,
+                    right = morphRight,
+                    bottom = morphBottom,
+                    cornerRadius = CornerRadius(cornerRadiusPx, cornerRadiusPx),
+                ),
+            )
+        }
+        drawPath(path, scrimColor)
+    }
+}
+
+private fun Modifier.morphRevealClip(
+    morphLeft: Float,
+    morphTop: Float,
+    morphRight: Float,
+    morphBottom: Float,
+    cornerRadiusPx: Float,
+): Modifier = drawWithContent {
+    val path = Path().apply {
+        addRoundRect(
+            RoundRect(
+                left = morphLeft,
+                top = morphTop,
+                right = morphRight,
+                bottom = morphBottom,
+                cornerRadius = CornerRadius(cornerRadiusPx, cornerRadiusPx),
+            ),
+        )
+    }
+    drawContext.canvas.save()
+    drawContext.canvas.clipPath(path)
+    drawContent()
+    drawContext.canvas.restore()
+}
+
 @Composable
 private fun FullscreenImageViewer(
     images: List<FeedImage>,
     initialIndex: Int,
     onDismiss: () -> Unit,
-    sourceBounds: Rect? = null,
+    sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
     session: WeiboWebSession? = null,
     relatedPosts: List<FeedItem> = emptyList(),
     emoticonMap: Map<String, String> = emptyMap(),
@@ -7195,18 +7312,19 @@ private fun FullscreenImageViewer(
 ) {
     val scope = rememberCoroutineScope()
     val pagerState = rememberPagerState(pageCount = { images.size }, initialPage = initialIndex)
-    val transitionProgress = remember(sourceBounds) {
-        Animatable(if (sourceBounds == null) 1f else 0f)
+    val transitionProgress = remember(initialIndex) {
+        Animatable(if (sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
     }
-    var transitionClosing by remember(sourceBounds) { mutableStateOf(false) }
+    var transitionClosing by remember { mutableStateOf(false) }
     val dismissViewer = {
         if (!transitionClosing) {
-            if (sourceBounds != null && pagerState.currentPage == initialIndex) {
+            val closeBounds = sourceBoundsByIndex[pagerState.currentPage]
+            if (closeBounds != null) {
                 transitionClosing = true
                 scope.launch {
                     transitionProgress.animateTo(
                         targetValue = 0f,
-                        animationSpec = tween(190, easing = FastOutSlowInEasing),
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
                     )
                     onDismiss()
                 }
@@ -7236,8 +7354,8 @@ private fun FullscreenImageViewer(
         )
     }
 
-    LaunchedEffect(sourceBounds) {
-        if (sourceBounds != null) {
+    LaunchedEffect(initialIndex) {
+        if (sourceBoundsByIndex[initialIndex] != null) {
             transitionProgress.snapTo(0f)
             transitionProgress.animateTo(
                 targetValue = 1f,
@@ -7276,58 +7394,121 @@ private fun FullscreenImageViewer(
     ) {
         val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
         SideEffect {
-            dialogWindow?.setWindowAnimations(0)
-            dialogWindow?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+            dialogWindow?.apply {
+                setWindowAnimations(0)
+                setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+                setDimAmount(0f)
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            }
         }
         BackHandler { dismissViewer() }
         BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black.copy(alpha = transitionProgress.value.coerceIn(0f, 1f))),
+            modifier = Modifier.fillMaxSize(),
         ) {
             val density = LocalDensity.current
             val containerWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
             val containerHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-            val initialImageForTransition = images.getOrNull(initialIndex)
-            val imageAspect = initialImageForTransition?.let {
+            val morphPageIndex = if (transitionClosing) pagerState.currentPage else initialIndex
+            val morphSourceBounds = when {
+                transitionClosing -> sourceBoundsByIndex[pagerState.currentPage]
+                pagerState.currentPage == initialIndex -> sourceBoundsByIndex[initialIndex]
+                else -> null
+            }
+            val morphImage = images.getOrNull(morphPageIndex)
+            val imageAspect = morphImage?.let {
                 val width = (it.width ?: 1).coerceAtLeast(1)
                 val height = (it.height ?: 1).coerceAtLeast(1)
                 width.toFloat() / height.toFloat()
             } ?: 1f
-            val targetFitWidthPx: Float
-            val targetFitHeightPx: Float
-            if (imageAspect > containerWidthPx / containerHeightPx) {
-                targetFitWidthPx = containerWidthPx
-                targetFitHeightPx = containerWidthPx / imageAspect
-            } else {
-                targetFitHeightPx = containerHeightPx
-                targetFitWidthPx = containerHeightPx * imageAspect
-            }
-            val sourceScale = sourceBounds?.let { bounds ->
-                minOf(
-                    bounds.width / targetFitWidthPx.coerceAtLeast(1f),
-                    bounds.height / targetFitHeightPx.coerceAtLeast(1f),
-                ).coerceIn(0.05f, 1f)
-            } ?: 1f
+            val fitLayout = computeFitImageLayout(
+                containerWidthPx = containerWidthPx,
+                containerHeightPx = containerHeightPx,
+                imageAspect = imageAspect,
+                scale = 1f,
+            )
             val transition = transitionProgress.value.coerceIn(0f, 1f)
-            val sourceTranslationX = sourceBounds?.center?.x?.minus(containerWidthPx / 2f) ?: 0f
-            val sourceTranslationY = sourceBounds?.center?.y?.minus(containerHeightPx / 2f) ?: 0f
+            val morphWidth: Float
+            val morphHeight: Float
+            val morphCenterX: Float
+            val morphCenterY: Float
+            val uniformScale: Float
+            if (morphSourceBounds != null) {
+                morphWidth = lerp(morphSourceBounds.width, fitLayout.fitWidthPx, transition)
+                morphHeight = lerp(morphSourceBounds.height, fitLayout.fitHeightPx, transition)
+                morphCenterX = lerp(morphSourceBounds.center.x, containerWidthPx / 2f, transition)
+                morphCenterY = lerp(morphSourceBounds.center.y, containerHeightPx / 2f, transition)
+                uniformScale = maxOf(
+                    morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
+                    morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
+                ).coerceIn(0.05f, 4f)
+            } else {
+                morphWidth = fitLayout.fitWidthPx
+                morphHeight = fitLayout.fitHeightPx
+                morphCenterX = containerWidthPx / 2f
+                morphCenterY = containerHeightPx / 2f
+                uniformScale = 1f
+            }
+            val activeMorph = morphSourceBounds != null && (transitionClosing || transition < 0.999f)
+            val morphLeft = morphCenterX - morphWidth / 2f
+            val morphTop = morphCenterY - morphHeight / 2f
+            val morphRight = morphCenterX + morphWidth / 2f
+            val morphBottom = morphCenterY + morphHeight / 2f
+            val morphCornerRadiusPx = with(density) {
+                ThumbnailMorphCornerRadius.toPx() * (1f - transition).coerceIn(0f, 1f)
+            }
+            when {
+                activeMorph && transitionClosing -> {
+                    MorphRevealScrim(
+                        morphLeft = morphLeft,
+                        morphTop = morphTop,
+                        morphRight = morphRight,
+                        morphBottom = morphBottom,
+                        cornerRadiusPx = morphCornerRadiusPx,
+                        scrimColor = Color.Black.copy(alpha = transition),
+                    )
+                }
+                activeMorph -> {
+                    MorphRevealScrim(
+                        morphLeft = morphLeft,
+                        morphTop = morphTop,
+                        morphRight = morphRight,
+                        morphBottom = morphBottom,
+                        cornerRadiusPx = morphCornerRadiusPx,
+                    )
+                }
+                else -> {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = if (sourceBoundsByIndex.isEmpty()) transition else 1f)),
+                    )
+                }
+            }
             HorizontalPager(
                 state = pagerState,
                 flingBehavior = pagerFling,
                 userScrollEnabled = !blockPagerScroll,
                 modifier = Modifier
                     .fillMaxSize()
+                    .then(
+                        if (activeMorph) {
+                            Modifier.morphRevealClip(
+                                morphLeft = morphLeft,
+                                morphTop = morphTop,
+                                morphRight = morphRight,
+                                morphBottom = morphBottom,
+                                cornerRadiusPx = morphCornerRadiusPx,
+                            )
+                        } else {
+                            Modifier
+                        },
+                    )
                     .graphicsLayer {
-                        val activeTransition = sourceBounds != null &&
-                            pagerState.currentPage == initialIndex
-                        if (activeTransition) {
-                            translationX = lerp(sourceTranslationX, 0f, transition)
-                            translationY = lerp(sourceTranslationY, 0f, transition)
-                            scaleX = lerp(sourceScale, 1f, transition)
-                            scaleY = lerp(sourceScale, 1f, transition)
-                            // Keep the returning image opaque until the dialog is removed.
-                            // Fading it to zero exposes the white feed for one frame.
+                        if (activeMorph) {
+                            translationX = morphCenterX - containerWidthPx / 2f
+                            translationY = morphCenterY - containerHeightPx / 2f
+                            scaleX = uniformScale
+                            scaleY = uniformScale
                             alpha = if (transitionClosing) 1f else transition
                             transformOrigin = TransformOrigin.Center
                         }
@@ -7353,7 +7534,10 @@ private fun FullscreenImageViewer(
                 text = "${pagerState.currentPage + 1} / ${images.size}",
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 48.dp),
+                    .padding(top = 48.dp)
+                    .graphicsLayer {
+                        alpha = if (transitionClosing) 0f else transition.coerceIn(0f, 1f)
+                    },
                 color = Color.White,
                 style = MaterialTheme.typography.labelLarge,
             )
@@ -7367,7 +7551,11 @@ private fun FullscreenImageViewer(
                             onOpenStatus?.invoke(item, currentPage, resolvedStatusCache)
                         }
                     },
-                    modifier = Modifier.align(Alignment.BottomCenter),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .graphicsLayer {
+                            alpha = if (transitionClosing) 0f else transition.coerceIn(0f, 1f)
+                        },
                 )
             }
         }
@@ -7501,6 +7689,7 @@ private fun ZoomableFullscreenImage(
     var panOffsetY by remember(image.largeUrl) { mutableFloatStateOf(0f) }
     var dismissTranslationY by remember(image.largeUrl) { mutableStateOf(0f) }
     var panInertiaJob by remember(image.largeUrl) { mutableStateOf<Job?>(null) }
+    var zoomAnimationJob by remember(image.largeUrl) { mutableStateOf<Job?>(null) }
     val dismissSnapAnim = remember(image.largeUrl) { Animatable(0f) }
     val scope = rememberCoroutineScope()
     var fullscreenBitmap by remember(image.largeUrl) {
@@ -7521,6 +7710,8 @@ private fun ZoomableFullscreenImage(
     LaunchedEffect(image.largeUrl) {
         dismissTranslationY = 0f
         dismissSnapAnim.snapTo(0f)
+        zoomAnimationJob?.cancel()
+        zoomAnimationJob = null
         panOffsetX = 0f
         panOffsetY = 0f
         scale = 1f
@@ -7599,6 +7790,10 @@ private fun ZoomableFullscreenImage(
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
                 .coerceIn(1.35f, 5f)
         }
+        val latestScaleState = rememberUpdatedState(scale)
+        val latestPanOffsetXState = rememberUpdatedState(panOffsetX)
+        val latestPanOffsetYState = rememberUpdatedState(panOffsetY)
+        val latestActionMenuVisibleState = rememberUpdatedState(actionMenuVisible)
 
         fun layoutFor(currentScale: Float) =
             computeFitImageLayout(containerWidthPx, containerHeightPx, imageAspect, currentScale)
@@ -7636,17 +7831,21 @@ private fun ZoomableFullscreenImage(
                 .fillMaxSize()
                 .pointerInput(image.largeUrl, containerWidthPx, containerHeightPx, imageAspect) {
                     awaitEachGesture {
-                        panInertiaJob?.cancel()
                         val velocityTracker = VelocityTracker()
                         val touchSlop = viewConfiguration.touchSlop
                         var panningZoomed = false
                         var dismissing = false
                         var lockedAxis: FullscreenDragAxis? = null
                         var horizontalPageDragAccum = 0f
-                        var gestureScale = scale
                         val boxCenterX = containerWidthPx / 2f
                         val boxCenterY = containerHeightPx / 2f
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        panInertiaJob?.cancel()
+                        zoomAnimationJob?.cancel()
+                        zoomAnimationJob = null
+                        var gestureScale = latestScaleState.value
+                        var gesturePanOffsetX = latestPanOffsetXState.value
+                        var gesturePanOffsetY = latestPanOffsetYState.value
                         var lastDistance = 0f
                         while (true) {
                             val event = awaitPointerEvent()
@@ -7663,17 +7862,19 @@ private fun ZoomableFullscreenImage(
                                 if (lastDistance > 0f) {
                                     val oldScale = gestureScale.coerceAtLeast(0.01f)
                                     val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, 5f)
-                                    panOffsetX = centroid.x - boxCenterX -
-                                        (centroid.x - boxCenterX - panOffsetX) * (newScale / oldScale)
-                                    panOffsetY = centroid.y - boxCenterY -
-                                        (centroid.y - boxCenterY - panOffsetY) * (newScale / oldScale)
+                                    gesturePanOffsetX = centroid.x - boxCenterX -
+                                        (centroid.x - boxCenterX - gesturePanOffsetX) * (newScale / oldScale)
+                                    gesturePanOffsetY = centroid.y - boxCenterY -
+                                        (centroid.y - boxCenterY - gesturePanOffsetY) * (newScale / oldScale)
                                     val layout = layoutFor(newScale)
-                                    val (cx, cy) = clampPan(panOffsetX, panOffsetY, layout)
-                                    panOffsetX = cx
-                                    panOffsetY = cy
+                                    val (cx, cy) = clampPan(gesturePanOffsetX, gesturePanOffsetY, layout)
+                                    gesturePanOffsetX = cx
+                                    gesturePanOffsetY = cy
+                                    panOffsetX = gesturePanOffsetX
+                                    panOffsetY = gesturePanOffsetY
                                     scale = newScale
                                     gestureScale = newScale
-                                    updatePagerScrollBlock(newScale, panOffsetX)
+                                    updatePagerScrollBlock(newScale, gesturePanOffsetX)
                                     velocityTracker.addPosition(
                                         pressed.first().uptimeMillis,
                                         centroid,
@@ -7686,7 +7887,9 @@ private fun ZoomableFullscreenImage(
                                 val change = pressed.first()
                                 val totalDrag = change.position - down.position
                                 val delta = change.position - change.previousPosition
-                                gestureScale = scale
+                                gestureScale = latestScaleState.value
+                                gesturePanOffsetX = latestPanOffsetXState.value
+                                gesturePanOffsetY = latestPanOffsetYState.value
                                 if (lockedAxis == null) {
                                     val absX = abs(totalDrag.x)
                                     val absY = abs(totalDrag.y)
@@ -7700,7 +7903,7 @@ private fun ZoomableFullscreenImage(
                                 }
                                 val layout = layoutFor(gestureScale)
                                 val (blackTop, blackBottom) = computeVisibleBlackBars(
-                                    panOffsetY,
+                                    gesturePanOffsetY,
                                     layout,
                                     gestureScale,
                                     containerHeightPx,
@@ -7715,7 +7918,7 @@ private fun ZoomableFullscreenImage(
                                             abs(totalDrag.y) > abs(totalDrag.x) * 1.35f
                                         ))
 
-                                updatePagerScrollBlock(gestureScale, panOffsetX)
+                                updatePagerScrollBlock(gestureScale, gesturePanOffsetX)
 
                                 if (gestureScale <= 1.01f && lockedAxis == FullscreenDragAxis.Horizontal) {
                                     dismissTranslationY = 0f
@@ -7728,8 +7931,8 @@ private fun ZoomableFullscreenImage(
                                     hasMultipleImages &&
                                     abs(delta.x) > abs(delta.y) * 0.55f
                                 ) {
-                                    val atLeftEdge = layout.maxPanX <= 1f || panOffsetX <= -layout.maxPanX + 4f
-                                    val atRightEdge = layout.maxPanX <= 1f || panOffsetX >= layout.maxPanX - 4f
+                                    val atLeftEdge = layout.maxPanX <= 1f || gesturePanOffsetX <= -layout.maxPanX + 4f
+                                    val atRightEdge = layout.maxPanX <= 1f || gesturePanOffsetX >= layout.maxPanX - 4f
                                     val swipeToNext = atLeftEdge && delta.x < 0
                                     val swipeToPrev = atRightEdge && delta.x > 0
                                     if (swipeToNext || swipeToPrev) {
@@ -7762,13 +7965,15 @@ private fun ZoomableFullscreenImage(
                                     panningZoomed = true
                                     velocityTracker.addPosition(change.uptimeMillis, change.position)
                                     val (cx, cy) = clampPan(
-                                        panOffsetX + delta.x,
-                                        panOffsetY + delta.y,
+                                        gesturePanOffsetX + delta.x,
+                                        gesturePanOffsetY + delta.y,
                                         layout,
                                     )
-                                    panOffsetX = cx
-                                    panOffsetY = cy
-                                    updatePagerScrollBlock(gestureScale, panOffsetX)
+                                    gesturePanOffsetX = cx
+                                    gesturePanOffsetY = cy
+                                    panOffsetX = gesturePanOffsetX
+                                    panOffsetY = gesturePanOffsetY
+                                    updatePagerScrollBlock(gestureScale, gesturePanOffsetX)
                                     change.consume()
                                 } else {
                                     onBlockPagerScroll(false)
@@ -7776,7 +7981,7 @@ private fun ZoomableFullscreenImage(
                             }
                         }
 
-                        gestureScale = scale
+                        gestureScale = latestScaleState.value
                         val dismissDistance = dismissTranslationY + dismissSnapAnim.value
                         if (dismissing || dismissDistance != 0f) {
                             val velocity = velocityTracker.calculateVelocity()
@@ -7795,7 +8000,10 @@ private fun ZoomableFullscreenImage(
                             return@awaitEachGesture
                         }
 
-                        updatePagerScrollBlock(gestureScale, panOffsetX)
+                        gestureScale = latestScaleState.value
+                        gesturePanOffsetX = latestPanOffsetXState.value
+                        gesturePanOffsetY = latestPanOffsetYState.value
+                        updatePagerScrollBlock(gestureScale, gesturePanOffsetX)
                         if (panningZoomed && gestureScale > 1.01f) {
                             val velocity = velocityTracker.calculateVelocity()
                             val layout = layoutFor(gestureScale)
@@ -7803,8 +8011,8 @@ private fun ZoomableFullscreenImage(
                                 frictionMultiplier = 0.42f,
                                 absVelocityThreshold = 0.5f,
                             )
-                            val startX = panOffsetX
-                            val startY = panOffsetY
+                            val startX = gesturePanOffsetX
+                            val startY = gesturePanOffsetY
                             panInertiaJob = scope.launch {
                                 coroutineScope {
                                     launch {
@@ -7826,7 +8034,7 @@ private fun ZoomableFullscreenImage(
                                         ) { panOffsetY = it }
                                     }
                                 }
-                                updatePagerScrollBlock(gestureScale, panOffsetX)
+                                updatePagerScrollBlock(gestureScale, latestPanOffsetXState.value)
                             }
                         }
                     }
@@ -7834,7 +8042,7 @@ private fun ZoomableFullscreenImage(
                 .pointerInput(image.largeUrl, fillScreenScale) {
                     detectTapGestures(
                         onTap = {
-                            if (actionMenuVisible) {
+                            if (latestActionMenuVisibleState.value) {
                                 actionMenuVisible = false
                             } else {
                                 onDismiss()
@@ -7843,26 +8051,30 @@ private fun ZoomableFullscreenImage(
                         onDoubleTap = {
                             actionMenuVisible = false
                             panInertiaJob?.cancel()
+                            zoomAnimationJob?.cancel()
                             dismissTranslationY = 0f
                             scope.launch { dismissSnapAnim.snapTo(0f) }
                             onBlockPagerScroll(false)
-                            if (scale > 1f) {
-                                scope.launch {
+                            val currentScale = latestScaleState.value
+                            if (currentScale > 1f) {
+                                zoomAnimationJob = scope.launch {
                                     animate(
-                                        initialValue = scale,
+                                        initialValue = currentScale,
                                         targetValue = 1f,
                                         animationSpec = tween(180),
                                     ) { value, _ -> scale = value }
+                                    zoomAnimationJob = null
                                 }
                                 panOffsetX = 0f
                                 panOffsetY = 0f
                             } else {
-                                scope.launch {
+                                zoomAnimationJob = scope.launch {
                                     animate(
-                                        initialValue = scale,
+                                        initialValue = currentScale,
                                         targetValue = fillScreenScale,
                                         animationSpec = tween(180),
                                     ) { value, _ -> scale = value }
+                                    zoomAnimationJob = null
                                 }
                             }
                         },
@@ -9443,6 +9655,7 @@ private fun VideoControls(
             },
         backdrop = backdrop,
         pill = true,
+        surfaceColor = Color.White.copy(alpha = 0.14f),
     ) {
         VideoControlCapsuleProgressBackground(
             progress = progress,
@@ -9540,7 +9753,7 @@ private fun VideoControlCapsuleProgressBackground(
                     .width(VideoProgressLineWidth)
                     .fillMaxHeight()
                     .clip(RoundedCornerShape(percent = 50))
-                    .background(VideoProgressLineColor),
+                    .background(MaterialTheme.colorScheme.primary),
             )
         }
     }
@@ -12193,6 +12406,8 @@ private fun MineScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
     feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
+    selectedThemeColor: MorandiThemeColor = MorandiThemeColors.first(),
+    onThemeColorChange: (MorandiThemeColor) -> Unit = {},
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
@@ -12297,6 +12512,8 @@ private fun MineScreen(
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                 feedThumbnailQuality = feedThumbnailQuality,
                 onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
+                selectedThemeColor = selectedThemeColor,
+                onThemeColorChange = onThemeColorChange,
                 onBack = {
                     showAccountManagement = false
                     showSettings = false
@@ -12744,6 +12961,8 @@ private fun SettingsScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit,
     feedThumbnailQuality: FeedThumbnailQuality,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
+    selectedThemeColor: MorandiThemeColor,
+    onThemeColorChange: (MorandiThemeColor) -> Unit,
     onBack: () -> Unit,
     onSwitchAccount: (String) -> Unit,
     onAddAccount: () -> Unit,
@@ -12752,6 +12971,7 @@ private fun SettingsScreen(
     var accountExpanded by remember { mutableStateOf(false) }
     var emoticonExpanded by remember { mutableStateOf(false) }
     var imageExpanded by remember { mutableStateOf(false) }
+    var themeExpanded by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val versionName = remember {
@@ -12808,6 +13028,14 @@ private fun SettingsScreen(
                         onExpandedChange = { imageExpanded = it },
                         quality = feedThumbnailQuality,
                         onQualityChange = onFeedThumbnailQualityChange,
+                    )
+                }
+                item {
+                    SettingsThemeColorCard(
+                        expanded = themeExpanded,
+                        onExpandedChange = { themeExpanded = it },
+                        selected = selectedThemeColor,
+                        onSelected = onThemeColorChange,
                     )
                 }
                 item {
@@ -13187,6 +13415,128 @@ private fun SettingsImageCard(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsThemeColorCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    selected: MorandiThemeColor,
+    onSelected: (MorandiThemeColor) -> Unit,
+) {
+    SettingsPlainCard {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "主题颜色",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = selected.primaryContainer.copy(alpha = 0.55f),
+                            contentColor = selected.primary,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(selected.primary),
+                                )
+                                Text(
+                                    text = selected.label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        text = "选择低饱和莫兰迪色，替换当前粉色强调区域。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                FlowRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    MorandiThemeColors.forEach { option ->
+                        val isSelected = selected.storageValue == option.storageValue
+                        Row(
+                            modifier = Modifier
+                                .width(94.dp)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isSelected) option.primary else Color(0xFFE1E1E1),
+                                    shape = RoundedCornerShape(8.dp),
+                                )
+                                .background(
+                                    color = if (isSelected) {
+                                        option.primaryContainer.copy(alpha = 0.48f)
+                                    } else {
+                                        Color.White
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                )
+                                .clickable { onSelected(option) }
+                                .padding(horizontal = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(7.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .background(option.primary),
+                            )
+                            Text(
+                                text = option.label,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isSelected) option.primary else MaterialTheme.colorScheme.onSurface,
+                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                         }
                     }
                 }
@@ -14396,7 +14746,7 @@ private fun FollowListContentTabs(
     onTabSelected: (FriendListTab) -> Unit,
 ) {
     val tabs = FriendListTab.entries
-    val accent = Color(0xFFFF4F9A)
+    val accent = MaterialTheme.colorScheme.primary
     val density = LocalDensity.current
     val indicatorWidth = 22.dp
     val tabCentersPx = remember { FloatArray(tabs.size) { Float.NaN } }
@@ -14685,7 +15035,7 @@ private fun MineContentTabs(
     onTabSelected: (MineContentTab) -> Unit,
 ) {
     val tabs = MineContentTab.entries
-    val accent = Color(0xFFFF4F9A)
+    val accent = MaterialTheme.colorScheme.primary
     val density = LocalDensity.current
     val indicatorWidth = 22.dp
     val tabCentersPx = remember { FloatArray(tabs.size) { Float.NaN } }

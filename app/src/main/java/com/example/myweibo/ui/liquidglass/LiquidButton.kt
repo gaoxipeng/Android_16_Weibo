@@ -57,6 +57,7 @@ fun LiquidButton(
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
     isInteractive: Boolean = true,
+    inputEnabled: Boolean = true,
     tint: Color = Color.Unspecified,
     surfaceColor: Color = Color.Unspecified,
     onDoubleClick: (() -> Unit)? = null,
@@ -67,7 +68,9 @@ fun LiquidButton(
         InteractiveHighlight(animationScope = animationScope)
     }
     val interactionModifier =
-        if (onDoubleClick != null) {
+        if (!inputEnabled) {
+            Modifier
+        } else if (onDoubleClick != null) {
             Modifier.pointerInput(onClick, onDoubleClick) {
                 detectTapGestures(
                     onTap = { onClick() },
@@ -131,7 +134,7 @@ fun LiquidButton(
             )
             .then(interactionModifier)
             .then(
-                if (isInteractive) {
+                if (isInteractive && inputEnabled) {
                     Modifier
                         .then(interactiveHighlight.modifier)
                         .then(interactiveHighlight.gestureModifier)
@@ -245,6 +248,7 @@ fun TransparentLiquidCapsule(
     backdrop: Backdrop,
     pill: Boolean = false,
     cornerRadius: Dp = 22.dp,
+    surfaceColor: Color = Color.Unspecified,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
@@ -258,6 +262,11 @@ fun TransparentLiquidCapsule(
                     vibrancy()
                     blur(2f.dp.toPx())
                     lens(12f.dp.toPx(), 24f.dp.toPx())
+                },
+                onDrawSurface = {
+                    if (surfaceColor.isSpecified) {
+                        drawRect(surfaceColor)
+                    }
                 },
             ),
         content = content,
@@ -338,6 +347,7 @@ fun SurfaceLiquidIconButton(
     modifier: Modifier = Modifier,
     onDoubleClick: (() -> Unit)? = null,
     isInteractive: Boolean = true,
+    inputEnabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
     LiquidButton(
@@ -346,6 +356,7 @@ fun SurfaceLiquidIconButton(
         modifier = modifier,
         onDoubleClick = onDoubleClick,
         isInteractive = isInteractive,
+        inputEnabled = inputEnabled,
         surfaceColor = liquidSurfaceColor(!isSystemInDarkTheme()),
         content = content,
     )
@@ -358,6 +369,7 @@ fun TransparentLiquidIconButton(
     modifier: Modifier = Modifier,
     onDoubleClick: (() -> Unit)? = null,
     isInteractive: Boolean = true,
+    inputEnabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
     LiquidButton(
@@ -366,6 +378,7 @@ fun TransparentLiquidIconButton(
         modifier = modifier,
         onDoubleClick = onDoubleClick,
         isInteractive = isInteractive,
+        inputEnabled = inputEnabled,
         content = content,
     )
 }

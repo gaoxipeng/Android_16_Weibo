@@ -5,7 +5,8 @@ import androidx.compose.animation.core.animateDp
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.updateTransition
-import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,17 +18,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -38,14 +44,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
-import com.example.myweibo.ui.theme.TabAccentDark
-import com.example.myweibo.ui.theme.TabAccentLight
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
+import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
 import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabBackdropRow
 import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorIndex
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidIconButton
 import com.kyant.backdrop.Backdrop
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -65,8 +74,7 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuContent: @Composable (dismiss: () -> Unit) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val isLightTheme = !isSystemInDarkTheme()
-    val accentColor = if (isLightTheme) TabAccentLight else TabAccentDark
+    val accentColor = MaterialTheme.colorScheme.primary
     val unselectedColor = Color.Black
     val density = LocalDensity.current
     val collapsedSize = 64.dp
@@ -75,6 +83,9 @@ internal fun WeiboLiquidBottomBar(
     val tabs = MainTab.entries
     val selectedIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)
     val feedIndex = tabs.indexOf(MainTab.Feed).coerceAtLeast(0)
+    val tabsGestureController = rememberLiquidBottomTabsGestureController()
+    val collapsedGestureScope = rememberCoroutineScope()
+    var collapsedGestureActive by remember { mutableStateOf(false) }
     var tabsMounted by remember { mutableStateOf(expanded) }
     if (expanded) {
         tabsMounted = true
@@ -121,8 +132,12 @@ internal fun WeiboLiquidBottomBar(
         val morphScaleX = 1f + morphT * 0.06f + bounceOvershoot * 0.1f
         val morphScaleY = 1f - morphT * 0.02f + bounceOvershoot * 0.06f
         val collapsedOnTop = revealAlpha < 0.5f
+        val expandedState = rememberUpdatedState(expanded)
+        val collapsedInteractiveState = rememberUpdatedState(
+            collapsedOnTop && collapsedAlpha > 0.5f,
+        )
 
-        BoxWithConstraints(Modifier.width(fullBarWidth).height(barHeight + animationOverflow)) {
+        Box(Modifier.width(fullBarWidth).height(barHeight + animationOverflow)) {
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
@@ -148,9 +163,15 @@ internal fun WeiboLiquidBottomBar(
                     ) {
                         LiquidBottomTabs(
                             selectedTabIndex = { selectedIndex },
-                            onTabSelected = { index -> onTabChange(tabs[index]) },
+                            onTabSelected = { index ->
+                                if (index != feedIndex) {
+                                    onTimelineMenuExpandedChange(false)
+                                }
+                                onTabChange(tabs[index])
+                            },
                             backdrop = backdrop,
                             tabsCount = tabs.size,
+                            gestureController = tabsGestureController,
                             feedTabIndex = feedIndex,
                             onTabLongPress = { onTimelineMenuExpandedChange(true) },
                             modifier = Modifier.fillMaxWidth(),
@@ -213,6 +234,7 @@ internal fun WeiboLiquidBottomBar(
                             onDoubleClick = onCollapsedTap,
                             backdrop = backdrop,
                             isInteractive = collapsedOnTop && collapsedAlpha > 0.5f,
+                            inputEnabled = false,
                             modifier = Modifier.fillMaxSize(),
                         ) {
                             WeiboTabIcon(
@@ -249,6 +271,129 @@ internal fun WeiboLiquidBottomBar(
                 ) {
                     timelineMenuContent { onTimelineMenuExpandedChange(false) }
                 }
+            }
+
+            if (!expanded || collapsedGestureActive) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(3f)
+                        .pointerInput(tabsGestureController, collapsedSize) {
+                        val collapsedSizePx = collapsedSize.toPx()
+                        var pendingSingleTap: Job? = null
+                        var lastTapUptime = 0L
+                        awaitEachGesture {
+                            val down = awaitFirstDown(
+                                requireUnconsumed = false,
+                                pass = PointerEventPass.Initial,
+                            )
+                            if (
+                                expandedState.value ||
+                                !collapsedInteractiveState.value ||
+                                down.position.x > collapsedSizePx ||
+                                down.position.y < size.height - collapsedSizePx
+                            ) {
+                                return@awaitEachGesture
+                            }
+
+                            down.consume()
+                            var latestPosition = down.position
+                            var releasedBeforeLongPress = false
+                            var cancelledBeforeLongPress = false
+                            var releaseUptime = down.uptimeMillis
+                            val completedBeforeTimeout = withTimeoutOrNull(
+                                viewConfiguration.longPressTimeoutMillis,
+                            ) {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                        ?: event.changes.firstOrNull()
+                                        ?: run {
+                                            cancelledBeforeLongPress = true
+                                            return@withTimeoutOrNull true
+                                        }
+                                    latestPosition = change.position
+                                    if (!change.pressed) {
+                                        releasedBeforeLongPress = true
+                                        releaseUptime = change.uptimeMillis
+                                        change.consume()
+                                        return@withTimeoutOrNull true
+                                    }
+                                    if ((change.position - down.position).getDistance() >
+                                        viewConfiguration.touchSlop
+                                    ) {
+                                        cancelledBeforeLongPress = true
+                                        return@withTimeoutOrNull true
+                                    }
+                                    change.consume()
+                                }
+                            } != null
+
+                            if (completedBeforeTimeout) {
+                                if (releasedBeforeLongPress && !cancelledBeforeLongPress) {
+                                    val isDoubleTap = lastTapUptime > 0L &&
+                                        releaseUptime - lastTapUptime <=
+                                        viewConfiguration.doubleTapTimeoutMillis
+                                    if (isDoubleTap) {
+                                        pendingSingleTap?.cancel()
+                                        pendingSingleTap = null
+                                        lastTapUptime = 0L
+                                        onCollapsedTap()
+                                    } else {
+                                        lastTapUptime = releaseUptime
+                                        pendingSingleTap?.cancel()
+                                        pendingSingleTap = collapsedGestureScope.launch {
+                                            delay(viewConfiguration.doubleTapTimeoutMillis)
+                                            if (lastTapUptime == releaseUptime) {
+                                                lastTapUptime = 0L
+                                                onExpandRequest()
+                                            }
+                                        }
+                                    }
+                                }
+                                return@awaitEachGesture
+                            }
+
+                            pendingSingleTap?.cancel()
+                            pendingSingleTap = null
+                            lastTapUptime = 0L
+                            collapsedGestureActive = true
+                            onExpandRequest()
+                            val fullWidthPx = size.width.toFloat().coerceAtLeast(1f)
+                            val fullHeightPx = size.height.toFloat().coerceAtLeast(1f)
+                            fun normalized(position: androidx.compose.ui.geometry.Offset) =
+                                androidx.compose.ui.geometry.Offset(
+                                    x = position.x / fullWidthPx,
+                                    y = position.y / fullHeightPx,
+                                )
+                            tabsGestureController.beginAt(normalized(latestPosition))
+                            var previousPosition = latestPosition
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val change = event.changes.firstOrNull { it.id == down.id }
+                                    ?: event.changes.firstOrNull()
+                                    ?: run {
+                                        tabsGestureController.cancel()
+                                        collapsedGestureActive = false
+                                        break
+                                    }
+                                latestPosition = change.position
+                                change.consume()
+                                if (!change.pressed) {
+                                    tabsGestureController.end()
+                                    collapsedGestureActive = false
+                                    break
+                                }
+                                val dragAmount = latestPosition - previousPosition
+                                previousPosition = latestPosition
+                                tabsGestureController.dragTo(
+                                    normalized(latestPosition),
+                                    dragAmount,
+                                )
+                            }
+                        }
+                        },
+                )
             }
         }
     }

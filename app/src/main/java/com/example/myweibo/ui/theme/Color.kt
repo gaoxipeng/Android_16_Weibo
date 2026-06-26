@@ -12,12 +12,10 @@ val WeiboCoral40 = Color(0xFFE9836F)
 
 val WeiboTopicBlue = Color(0xFF6CB4EE)
 
-val TabAccentLight = Color(0xFFFF4F9A)
-val TabAccentDark = Color(0xFFFF6BAA)
-
 val TabMutedLight = Color(0xFF8E8E93)
 val TabMutedDark = Color(0xFF98989D)
 
-val AppBackgroundLight = Color(0xFFFAFAFA)
+val AppBackgroundLight = Color(0xFFF6F6F7)
+val AppSurfaceLight = Color.White
 
-val StatusQuotedBackground = AppBackgroundLight
+val StatusQuotedBackground = AppSurfaceLight

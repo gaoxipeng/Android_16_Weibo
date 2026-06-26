@@ -9,6 +9,7 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 
 private val DarkColorScheme = darkColorScheme(
@@ -22,6 +23,13 @@ private val LightColorScheme = lightColorScheme(
     secondary = WeiboTeal40,
     tertiary = WeiboCoral40,
     background = AppBackgroundLight,
+    surface = AppSurfaceLight,
+    surfaceContainerLowest = AppBackgroundLight,
+    surfaceContainerLow = Color(0xFFF5F5F5),
+    surfaceContainer = Color(0xFFF0F0F0),
+    surfaceContainerHigh = Color(0xFFEBEBEB),
+    surfaceContainerHighest = Color(0xFFE6E6E6),
+    surfaceTint = Color.Transparent,
 )
 
 @Composable
