@@ -203,6 +203,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
@@ -5892,6 +5893,7 @@ private fun FeedImageCell(
     var peekActive by remember(image.id) { mutableStateOf(false) }
     var pressHoldProgress by remember(image.id) { mutableFloatStateOf(0f) }
     var anchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
+    var anchorCoordinates by remember(image.id) { mutableStateOf<LayoutCoordinates?>(null) }
     val imagePeekController = LocalImagePeekController.current
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
@@ -5904,7 +5906,9 @@ private fun FeedImageCell(
     }
 
     fun openImagePeek(pressWindowOffset: Offset) {
-        val bounds = anchorBounds ?: return
+        val bounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
+            ?: anchorBounds
+            ?: return
         actionOpen = true
         peekActive = true
         pressHoldProgress = 1f
@@ -5932,6 +5936,7 @@ private fun FeedImageCell(
         modifier = modifier
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
+                anchorCoordinates = coordinates
                 val bounds = coordinates.boundsInWindow()
                 anchorBounds = bounds
                 onAnchorBoundsChanged(bounds)
@@ -5947,7 +5952,9 @@ private fun FeedImageCell(
             )
             .pointerInput(image.id) {
                 awaitEachGesture {
-                    val bounds = anchorBounds ?: return@awaitEachGesture
+                    val bounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
+                        ?: anchorBounds
+                        ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var lastPosition = down.position
                     var pressResult = MediaLongPressResult.Tap
@@ -5959,7 +5966,12 @@ private fun FeedImageCell(
                     )
 
                     when (pressResult) {
-                        MediaLongPressResult.Tap -> onOpenViewer(imageIndex, bounds, null)
+                        MediaLongPressResult.Tap -> {
+                            val currentBounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
+                                ?: bounds
+                            onAnchorBoundsChanged(currentBounds)
+                            onOpenViewer(imageIndex, currentBounds, null)
+                        }
                         MediaLongPressResult.Cancelled -> Unit
                         MediaLongPressResult.LongPress -> Unit
                     }
@@ -7126,12 +7138,17 @@ private fun MediaStrip(
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
+    var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun openImageViewer(index: Int, sourceBounds: Rect?, onClosed: (() -> Unit)? = null) {
         viewerIndex = index
-        if (sourceBounds != null) {
-            thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
+        viewerSourceBoundsByIndex = if (sourceBounds != null) {
+            (thumbnailBoundsByIndex + (index to sourceBounds)).also {
+                thumbnailBoundsByIndex = it
+            }
+        } else {
+            emptyMap()
         }
         viewerDismissHook = onClosed
         viewerOpen = true
@@ -7223,9 +7240,10 @@ private fun MediaStrip(
                 FullscreenImageViewer(
                     images = images,
                     initialIndex = viewerIndex,
-                    sourceBoundsByIndex = thumbnailBoundsByIndex,
+                    sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     onDismiss = {
                         viewerOpen = false
+                        viewerSourceBoundsByIndex = emptyMap()
                         viewerDismissHook?.invoke()
                         viewerDismissHook = null
                     },
@@ -7316,10 +7334,13 @@ private fun FullscreenImageViewer(
         Animatable(if (sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
     }
     var transitionClosing by remember { mutableStateOf(false) }
-    val dismissViewer = {
+    var dragDismissProgress by remember { mutableFloatStateOf(0f) }
+    var closeStartBounds by remember { mutableStateOf<Rect?>(null) }
+    fun dismissViewer(startBounds: Rect? = null) {
         if (!transitionClosing) {
             val closeBounds = sourceBoundsByIndex[pagerState.currentPage]
             if (closeBounds != null) {
+                closeStartBounds = startBounds
                 transitionClosing = true
                 scope.launch {
                     transitionProgress.animateTo(
@@ -7389,7 +7410,7 @@ private fun FullscreenImageViewer(
     }
 
     Dialog(
-        onDismissRequest = dismissViewer,
+        onDismissRequest = { dismissViewer() },
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
         val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
@@ -7410,9 +7431,14 @@ private fun FullscreenImageViewer(
             val containerHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
             val morphPageIndex = if (transitionClosing) pagerState.currentPage else initialIndex
             val morphSourceBounds = when {
-                transitionClosing -> sourceBoundsByIndex[pagerState.currentPage]
+                transitionClosing -> closeStartBounds ?: sourceBoundsByIndex[pagerState.currentPage]
                 pagerState.currentPage == initialIndex -> sourceBoundsByIndex[initialIndex]
                 else -> null
+            }
+            val morphTargetBounds = if (transitionClosing && closeStartBounds != null) {
+                sourceBoundsByIndex[pagerState.currentPage]
+            } else {
+                null
             }
             val morphImage = images.getOrNull(morphPageIndex)
             val imageAspect = morphImage?.let {
@@ -7427,16 +7453,25 @@ private fun FullscreenImageViewer(
                 scale = 1f,
             )
             val transition = transitionProgress.value.coerceIn(0f, 1f)
+            val backdropAlpha = (1f - dragDismissProgress * 0.92f).coerceIn(0f, 1f)
             val morphWidth: Float
             val morphHeight: Float
             val morphCenterX: Float
             val morphCenterY: Float
             val uniformScale: Float
             if (morphSourceBounds != null) {
-                morphWidth = lerp(morphSourceBounds.width, fitLayout.fitWidthPx, transition)
-                morphHeight = lerp(morphSourceBounds.height, fitLayout.fitHeightPx, transition)
-                morphCenterX = lerp(morphSourceBounds.center.x, containerWidthPx / 2f, transition)
-                morphCenterY = lerp(morphSourceBounds.center.y, containerHeightPx / 2f, transition)
+                val targetBounds = morphTargetBounds
+                if (targetBounds != null) {
+                    morphWidth = lerp(targetBounds.width, morphSourceBounds.width, transition)
+                    morphHeight = lerp(targetBounds.height, morphSourceBounds.height, transition)
+                    morphCenterX = lerp(targetBounds.center.x, morphSourceBounds.center.x, transition)
+                    morphCenterY = lerp(targetBounds.center.y, morphSourceBounds.center.y, transition)
+                } else {
+                    morphWidth = lerp(morphSourceBounds.width, fitLayout.fitWidthPx, transition)
+                    morphHeight = lerp(morphSourceBounds.height, fitLayout.fitHeightPx, transition)
+                    morphCenterX = lerp(morphSourceBounds.center.x, containerWidthPx / 2f, transition)
+                    morphCenterY = lerp(morphSourceBounds.center.y, containerHeightPx / 2f, transition)
+                }
                 uniformScale = maxOf(
                     morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
                     morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
@@ -7464,7 +7499,7 @@ private fun FullscreenImageViewer(
                         morphRight = morphRight,
                         morphBottom = morphBottom,
                         cornerRadiusPx = morphCornerRadiusPx,
-                        scrimColor = Color.Black.copy(alpha = transition),
+                        scrimColor = Color.Black.copy(alpha = transition * backdropAlpha),
                     )
                 }
                 activeMorph -> {
@@ -7474,13 +7509,22 @@ private fun FullscreenImageViewer(
                         morphRight = morphRight,
                         morphBottom = morphBottom,
                         cornerRadiusPx = morphCornerRadiusPx,
+                        scrimColor = Color.Black.copy(alpha = backdropAlpha),
                     )
                 }
                 else -> {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color.Black.copy(alpha = if (sourceBoundsByIndex.isEmpty()) transition else 1f)),
+                            .background(
+                                Color.Black.copy(
+                                    alpha = if (sourceBoundsByIndex.isEmpty()) {
+                                        transition * backdropAlpha
+                                    } else {
+                                        backdropAlpha
+                                    },
+                                ),
+                            ),
                     )
                 }
             }
@@ -7509,7 +7553,7 @@ private fun FullscreenImageViewer(
                             translationY = morphCenterY - containerHeightPx / 2f
                             scaleX = uniformScale
                             scaleY = uniformScale
-                            alpha = if (transitionClosing) 1f else transition
+                            alpha = 1f
                             transformOrigin = TransformOrigin.Center
                         }
                     },
@@ -7517,9 +7561,11 @@ private fun FullscreenImageViewer(
                 ZoomableFullscreenImage(
                     image = images[page],
                     allImages = images,
-                    onDismiss = dismissViewer,
+                    onDismiss = { dismissViewer() },
+                    onDismissFromBounds = { bounds -> dismissViewer(bounds) },
                     hasMultipleImages = images.size > 1,
                     onBlockPagerScroll = { blockPagerScroll = it },
+                    onDragDismissProgress = { dragDismissProgress = it },
                     onRequestPageChange = { delta ->
                         scope.launch {
                             val next = (pagerState.currentPage + delta).coerceIn(0, images.lastIndex)
@@ -7680,8 +7726,10 @@ private fun ZoomableFullscreenImage(
     image: FeedImage,
     allImages: List<FeedImage>,
     onDismiss: () -> Unit,
+    onDismissFromBounds: (Rect) -> Unit = { onDismiss() },
     hasMultipleImages: Boolean = false,
     onBlockPagerScroll: (Boolean) -> Unit = {},
+    onDragDismissProgress: (Float) -> Unit = {},
     onRequestPageChange: (Int) -> Unit = {},
 ) {
     var scale by remember(image.largeUrl) { mutableFloatStateOf(1f) }
@@ -7716,6 +7764,7 @@ private fun ZoomableFullscreenImage(
         panOffsetY = 0f
         scale = 1f
         onBlockPagerScroll(false)
+        onDragDismissProgress(0f)
         actionMenuOffset = null
         actionMenuVisible = false
         val fullscreenCandidates = fullscreenImageUrlCandidates(image)
@@ -7956,6 +8005,9 @@ private fun ZoomableFullscreenImage(
                                 if (canDismissVertically) {
                                     dismissing = true
                                     dismissTranslationY += delta.y
+                                    val dragProgress = (abs(dismissTranslationY) / (containerHeightPx * 0.48f))
+                                        .coerceIn(0f, 1f)
+                                    onDragDismissProgress(dragProgress)
                                     velocityTracker.addPosition(change.uptimeMillis, change.position)
                                     change.consume()
                                     continue
@@ -7989,12 +8041,34 @@ private fun ZoomableFullscreenImage(
                                 abs(dismissDistance) > dismissReleaseThresholdPx ||
                                 abs(velocity.y) > 850f
                             ) {
-                                onDismiss()
+                                val handoffScale = latestScaleState.value
+                                val handoffLayout = layoutFor(handoffScale)
+                                val handoffProgress = (abs(dismissDistance) / (containerHeightPx * 0.48f))
+                                    .coerceIn(0f, 1f)
+                                val handoffDragScale =
+                                    1f - 0.16f * FastOutSlowInEasing.transform(handoffProgress)
+                                val handoffWidth = handoffLayout.fitWidthPx * handoffScale * handoffDragScale
+                                val handoffHeight = handoffLayout.fitHeightPx * handoffScale * handoffDragScale
+                                val handoffCenterX = containerWidthPx / 2f + latestPanOffsetXState.value
+                                val handoffCenterY = containerHeightPx / 2f + latestPanOffsetYState.value +
+                                    dismissDistance
+                                val handoffBounds = Rect(
+                                    left = handoffCenterX - handoffWidth / 2f,
+                                    top = handoffCenterY - handoffHeight / 2f,
+                                    right = handoffCenterX + handoffWidth / 2f,
+                                    bottom = handoffCenterY + handoffHeight / 2f,
+                                )
+                                dismissTranslationY = 0f
+                                panOffsetX = 0f
+                                panOffsetY = 0f
+                                scale = 1f
+                                onDismissFromBounds(handoffBounds)
                             } else {
                                 scope.launch {
                                     dismissSnapAnim.snapTo(dismissTranslationY)
                                     dismissTranslationY = 0f
                                     dismissSnapAnim.animateTo(0f, tween(220))
+                                    onDragDismissProgress(0f)
                                 }
                             }
                             return@awaitEachGesture
@@ -8091,7 +8165,9 @@ private fun ZoomableFullscreenImage(
             contentAlignment = Alignment.Center,
         ) {
             val dismissOffsetY = dismissTranslationY + dismissSnapAnim.value
-            val dismissAlpha = (1f - abs(dismissOffsetY) / containerHeightPx * 0.75f).coerceIn(0.35f, 1f)
+            val dismissProgress = (abs(dismissOffsetY) / (containerHeightPx * 0.48f)).coerceIn(0f, 1f)
+            val dragScale = 1f - 0.16f * FastOutSlowInEasing.transform(dismissProgress)
+            val dismissAlpha = (1f - dismissProgress * 0.18f).coerceIn(0.82f, 1f)
             val currentScale = scale
             val imageLayout = layoutFor(currentScale)
             val displayedWidth = imageLayout.fitWidthPx * currentScale
@@ -8111,8 +8187,8 @@ private fun ZoomableFullscreenImage(
             val imageModifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    scaleX = currentScale
-                    scaleY = currentScale
+                    scaleX = currentScale * dragScale
+                    scaleY = currentScale * dragScale
                     translationX = panOffsetX
                     translationY = panOffsetY + dismissOffsetY
                     alpha = dismissAlpha
@@ -15877,7 +15953,6 @@ private fun AccountLoginWebView(
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                databaseEnabled = true
                 loadsImagesAutomatically = true
                 useWideViewPort = true
                 loadWithOverviewMode = true

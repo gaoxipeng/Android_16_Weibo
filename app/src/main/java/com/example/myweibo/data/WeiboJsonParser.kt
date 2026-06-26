@@ -776,7 +776,7 @@ object WeiboJsonParser {
                 val cursor = value.toLong()
                 if (cursor < 0L) null else cursor.toString()
             }
-            else -> value.toString().trim().takeIf { it.isNotBlank() && it != "-1" && it != "0" }
+            else -> value?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "-1" && it != "0" }
         }
     }
 
@@ -1026,7 +1026,7 @@ object WeiboJsonParser {
         if (!has("since_id") || isNull("since_id")) return null
         return when (val value = opt("since_id")) {
             is Number -> if (value.toLong() == 0L) null else value.toString()
-            else -> value.toString().trim().takeIf { it.isNotBlank() && it != "0" }
+            else -> value?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "0" }
         }
     }
 
@@ -1703,7 +1703,7 @@ object WeiboJsonParser {
         return when (val value = opt(name)) {
             is Boolean -> value
             is Number -> value.toInt() != 0
-            else -> value.toString().trim() in setOf("1", "true", "TRUE")
+            else -> value?.toString()?.trim() in setOf("1", "true", "TRUE")
         }
     }
 
@@ -1738,7 +1738,7 @@ object WeiboJsonParser {
         if (!has(name) || isNull(name)) return null
         return when (val value = opt(name)) {
             is Number -> value.toInt()
-            else -> value.toString().trim().toIntOrNull()
+            else -> value?.toString()?.trim()?.toIntOrNull()
         }
     }
 
