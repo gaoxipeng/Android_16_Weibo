@@ -1082,8 +1082,9 @@ object WeiboJsonParser {
         val rawText = status.optNullableString("text_raw")
             ?: status.optNullableString("raw_text")
             ?: htmlText
-        val isLongText = status.isLongTextPreview()
-        val displayText = if (isLongText) stripLongTextPreviewLabel(rawText) else rawText
+        val isLongTextPreview = status.isLongTextPreview()
+        val displayText = if (isLongTextPreview) stripLongTextPreviewLabel(rawText) else rawText
+        val isLongText = status.shouldShowLongTextExpand(rawText, displayText)
         val inlineImageLinks = parseInlineImageLinks(status, displayText)
         val urlEntities = parseUrlEntities(status, displayText, inlineImageLinks.keys)
 
@@ -1782,6 +1783,45 @@ object WeiboJsonParser {
 
     private fun JSONObject.isLongTextPreview(): Boolean =
         optBoolean("isLongText") && !(has("longText") && !isNull("longText"))
+
+    private fun JSONObject.shouldShowLongTextExpand(rawText: String, displayText: String): Boolean {
+        if (!isLongTextPreview()) return false
+        // 接口对「超过 9 张图」也会设 isLongText，但短配文已完整；仅在这种场景隐藏按钮。
+        return !isLongTextExpandForExtraImagesOnly(rawText, displayText)
+    }
+
+    private fun JSONObject.isLongTextExpandForExtraImagesOnly(
+        rawText: String,
+        displayText: String,
+    ): Boolean {
+        if (resolvePicCount() <= 9) return false
+        if (hasTextTruncationSignals(rawText, displayText)) return false
+        // 长文预览通常接近 140 字；明显更短的配文视为已完整。
+        return plainText(displayText).length < 100
+    }
+
+    private fun JSONObject.resolvePicCount(): Int {
+        val fromPicIds = optJSONArray("pic_ids")?.length() ?: 0
+        val fromPicNum = optInt("pic_num").takeIf { it > 0 } ?: 0
+        return maxOf(fromPicIds, fromPicNum)
+    }
+
+    private fun hasTextTruncationSignals(rawText: String, displayText: String): Boolean {
+        if (containsLongTextExpandMarker(rawText)) return true
+        if (plainText(rawText) != plainText(displayText)) return true
+        val plain = plainText(displayText).trimEnd()
+        return plain.endsWith("...") || plain.endsWith("…") || plain.endsWith("⋯")
+    }
+
+    private fun containsLongTextExpandMarker(text: String): Boolean =
+        LONG_TEXT_EXPAND_MARKER.containsMatchIn(text)
+
+    private val LONG_TEXT_EXPAND_MARKER = Regex(
+        """<span\b[^>]*\bclass=(["'])[^"']*\bexpand\b[^"']*\1|""" +
+            """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?全文|""" +
+            """(?<=\S)(?:\.{3}|…|⋯)?\s*全文\s*</""",
+        RegexOption.IGNORE_CASE,
+    )
 
     private fun stripLongTextPreviewLabel(text: String): String =
         text

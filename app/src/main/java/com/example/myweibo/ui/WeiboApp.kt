@@ -66,6 +66,13 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.gestures.AnchoredDraggableState
+import androidx.compose.foundation.gestures.DraggableAnchors
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.animateTo
+import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -94,6 +101,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imeAnimationTarget
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.safeDrawing
@@ -203,7 +211,6 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
@@ -271,7 +278,10 @@ import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.MentionSuggestionCacheStore
+import com.example.myweibo.data.SearchHistoryStore
 import com.example.myweibo.data.SearchSettingsStore
+import com.example.myweibo.data.SearchSuggestResult
+import com.example.myweibo.data.SearchUserItem
 import com.example.myweibo.data.MentionCandidate
 import com.example.myweibo.data.extractActiveMentionQuery
 import com.example.myweibo.data.filterMentionCandidatesByQuery
@@ -782,11 +792,12 @@ private val HintCapsuleText = Color(0xFF1F1F1F)
 private val HintCapsulePlaceholder = Color(0xFFAAAAAA)
 private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
 private val SettingsBottomBarInset = 96.dp
+private val SearchBarBottomGap = 20.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
-private const val SingleImageMaxHeightToWidth = 0.7f
+private const val SingleImageMaxHeightToWidth = 1.2f
 private const val SingleImageMaxWidthFraction = 0.7f
 private const val VideoMaxHeightToWidth = 1f
 private val VideoControlCapsuleShape = RoundedCornerShape(percent = 50)
@@ -1313,11 +1324,17 @@ private val LocalFeedCardActionMenuController = staticCompositionLocalOf { FeedC
 
 private class SearchBarOverlayController {
     var active by mutableStateOf(false)
-    var queryInput by mutableStateOf("")
+    var queryInput by mutableStateOf(TextFieldValue(""))
     var mode by mutableStateOf(SearchMode.Weibo)
     var onModeChange: (SearchMode) -> Unit = {}
+    var onQueryInputChange: (TextFieldValue) -> Unit = { queryInput = it }
     var onSearch: () -> Unit = {}
     var onClear: () -> Unit = {}
+    var suggestions by mutableStateOf(SearchSuggestResult())
+    var suggestionsVisible by mutableStateOf(false)
+    var suggestionsLoading by mutableStateOf(false)
+    var onSuggestionClick: (String, SearchMode) -> Unit = { _, _ -> }
+    var onSuggestionUserClick: (SearchUserItem) -> Unit = {}
     var bottomPadding by mutableStateOf(96.dp)
 }
 
@@ -1677,6 +1694,7 @@ fun WeiboApp() {
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
+    val searchHistoryStore = remember { SearchHistoryStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val imageSettingsStore = remember { ImageSettingsStore(context) }
     val themeSettingsStore = remember { ThemeSettingsStore(context) }
@@ -4043,6 +4061,7 @@ fun WeiboApp() {
                         SearchScreen(
                             session = session,
                             searchBarOverlay = searchBarOverlay,
+                            searchHistoryStore = searchHistoryStore,
                             searchBarVisible = searchUiOnTop,
                             hasLoginCookie = hasLoginCookie,
                             pendingQuery = searchPendingQuery,
@@ -4402,19 +4421,45 @@ fun WeiboApp() {
             }
 
             if (searchBarOverlay.active) {
-                SearchCapsuleField(
-                    value = searchBarOverlay.queryInput,
-                    onValueChange = { searchBarOverlay.queryInput = it },
-                    mode = searchBarOverlay.mode,
-                    onModeChange = searchBarOverlay.onModeChange,
-                    onSearch = searchBarOverlay.onSearch,
-                    onClear = searchBarOverlay.onClear,
+                val suggestionReserve = if (searchBarOverlay.suggestionsVisible) 176.dp else 0.dp
+                Box(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .padding(start = 18.dp, end = 18.dp, bottom = searchBarOverlay.bottomPadding)
-                        .zIndex(85f),
+                        .height(searchBarOverlay.bottomPadding + 52.dp + suggestionReserve)
+                        .zIndex(84f),
                 )
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .zIndex(85f)
+                        .padding(
+                            start = 18.dp,
+                            end = 18.dp,
+                            bottom = searchBarOverlay.bottomPadding,
+                        ),
+                ) {
+                    SearchSuggestionPanel(
+                        suggestions = searchBarOverlay.suggestions,
+                        visible = searchBarOverlay.suggestionsVisible,
+                        loading = searchBarOverlay.suggestionsLoading,
+                        onSuggestionClick = searchBarOverlay.onSuggestionClick,
+                        onUserClick = searchBarOverlay.onSuggestionUserClick,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                    )
+                    SearchCapsuleField(
+                        value = searchBarOverlay.queryInput,
+                        onValueChange = searchBarOverlay.onQueryInputChange,
+                        mode = searchBarOverlay.mode,
+                        onModeChange = searchBarOverlay.onModeChange,
+                        onSearch = searchBarOverlay.onSearch,
+                        onClear = searchBarOverlay.onClear,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
 
             val capsuleHint = operationCapsuleHint
@@ -4583,7 +4628,7 @@ fun WeiboApp() {
                     onRequestCancel = { imagePeekController.cancel() },
                     onDismissComplete = { imagePeekController.completeDismiss() },
                     onOpenFullscreenBehind = { request.onOpenFullscreenBehind(it) },
-                    onEnterFullscreenHandoffComplete = { request.onEnterFullscreenHandoffComplete() },
+                    onEnterFullscreenHandoffComplete = { imagePeekController.completeEnterFullscreenHandoff() },
                 )
             }
             }
@@ -5858,6 +5903,36 @@ private fun AuthorRow(
     }
 }
 
+private data class SingleImageFeedLayout(
+    val aspectRatio: Float,
+    val widthFraction: Float,
+)
+
+private fun singleImageFeedLayout(
+    width: Int,
+    height: Int,
+    maxWidthFraction: Float = SingleImageMaxWidthFraction,
+    maxHeightToWidth: Float = SingleImageMaxHeightToWidth,
+): SingleImageFeedLayout {
+    val naturalAspect = if (width > 0 && height > 0) {
+        width.toFloat() / height
+    } else {
+        1f
+    }
+    val aspectRatio = naturalAspect.coerceIn(0.05f, 3f)
+    val maxHeightFraction = maxWidthFraction * maxHeightToWidth
+    val heightAtMaxWidth = maxWidthFraction / aspectRatio
+    val widthFraction = if (heightAtMaxWidth <= maxHeightFraction) {
+        maxWidthFraction
+    } else {
+        maxHeightFraction * aspectRatio
+    }
+    return SingleImageFeedLayout(
+        aspectRatio = aspectRatio,
+        widthFraction = widthFraction,
+    )
+}
+
 private fun singleImageDisplayAspectRatio(
     width: Int,
     height: Int,
@@ -5865,20 +5940,8 @@ private fun singleImageDisplayAspectRatio(
 ): Float {
     if (width <= 0 || height <= 0) return 1f
     val naturalAspect = width.toFloat() / height
-    val heightToWidth = height.toFloat() / width
     val minAspectFromHeightCap = 1f / maxHeightToWidth
-    val aspect = if (heightToWidth <= 1.35f) {
-        naturalAspect.coerceIn(0.75f, 3f)
-    } else {
-        val minAspect = when {
-            heightToWidth <= 2f -> 0.72f
-            heightToWidth <= 3f -> 0.80f
-            heightToWidth <= 5f -> 0.86f
-            else -> 0.90f
-        }
-        naturalAspect.coerceAtLeast(minAspect)
-    }
-    return aspect.coerceAtLeast(minAspectFromHeightCap).coerceAtMost(3f)
+    return naturalAspect.coerceIn(minAspectFromHeightCap, 3f)
 }
 
 private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float {
@@ -5978,7 +6041,7 @@ private fun FeedImageCell(
     showLiveBadge: Boolean = true,
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
-    onOpenViewer: (Int, Rect?, (() -> Unit)?) -> Unit,
+    onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
@@ -6014,10 +6077,10 @@ private fun FeedImageCell(
                 onCancel = { resetPeekState() },
                 onRelease = {},
                 onOpenFullscreenBehind = { index ->
-                    onOpenViewer(index, null) {
+                    onOpenViewer(index, null, {
                         resetPeekState()
                         imagePeekController.finishFullscreenHandoff()
-                    }
+                    }, null)
                 },
                 onEnterFullscreenHandoffComplete = { peekActive = false },
             ),
@@ -6062,7 +6125,7 @@ private fun FeedImageCell(
                             val currentBounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
                                 ?: bounds
                             onAnchorBoundsChanged(currentBounds)
-                            onOpenViewer(imageIndex, currentBounds, null)
+                            onOpenViewer(imageIndex, currentBounds, null, null)
                         }
                         MediaLongPressResult.Cancelled -> Unit
                         MediaLongPressResult.LongPress -> Unit
@@ -6292,6 +6355,7 @@ private fun ImageActionOverlay(
                     fullscreenOpened = true
                     onOpenFullscreenBehind(pagerState.currentPage)
                 }
+                withFrameMillis { }
                 onEnterFullscreenHandoffComplete()
             }
             else -> {
@@ -7255,19 +7319,22 @@ private fun MediaStrip(
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
     var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var viewerCloseHandoff by remember { mutableStateOf<(() -> Unit)?>(null) }
 
-    fun openImageViewer(index: Int, sourceBounds: Rect?, onClosed: (() -> Unit)? = null) {
+    fun openImageViewer(
+        index: Int,
+        sourceBounds: Rect?,
+        onClosed: (() -> Unit)? = null,
+        onCloseStart: (() -> Unit)? = null,
+    ) {
         viewerIndex = index
-        val boundsForIndex = sourceBounds ?: thumbnailBoundsByIndex[index]
-        viewerSourceBoundsByIndex = if (boundsForIndex != null) {
-            (thumbnailBoundsByIndex + (index to boundsForIndex)).also {
-                thumbnailBoundsByIndex = it
-            }
-        } else {
-            emptyMap()
+        if (sourceBounds != null) {
+            thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
         }
+        viewerSourceBoundsByIndex = thumbnailBoundsByIndex
         viewerAnimateOpenFromSource = sourceBounds != null
         viewerDismissHook = onClosed
+        viewerCloseHandoff = onCloseStart
         viewerOpen = true
     }
 
@@ -7285,7 +7352,7 @@ private fun MediaStrip(
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (images.size == 1) {
                     val image = images.first()
-                    val aspect = singleImageDisplayAspectRatio(
+                    val layout = singleImageFeedLayout(
                         width = image.width ?: 0,
                         height = image.height ?: 0,
                     )
@@ -7296,10 +7363,10 @@ private fun MediaStrip(
                             imageIndex = 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
-                                .fillMaxWidth(SingleImageMaxWidthFraction)
-                                .aspectRatio(aspect),
-                            contentScale = ContentScale.Crop,
-                            onOpenViewer = { index, bounds, onClosed ->
+                                .fillMaxWidth(layout.widthFraction)
+                                .aspectRatio(layout.aspectRatio),
+                            contentScale = ContentScale.Fit,
+                            onOpenViewer = { index, bounds, onClosed, _ ->
                                 openImageViewer(index, bounds, onClosed)
                             },
                             onAnchorBoundsChanged = { bounds ->
@@ -7313,7 +7380,7 @@ private fun MediaStrip(
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .fillMaxWidth(1f - SingleImageMaxWidthFraction)
+                                        .fillMaxWidth(1f - layout.widthFraction)
                                         .fillMaxHeight()
                                         .clickable(
                                             indication = null,
@@ -7337,7 +7404,7 @@ private fun MediaStrip(
                                         .weight(1f)
                                         .aspectRatio(1f),
                                     contentScale = ContentScale.Crop,
-                                    onOpenViewer = { index, bounds, onClosed ->
+                                    onOpenViewer = { index, bounds, onClosed, _ ->
                                         openImageViewer(index, bounds, onClosed)
                                     },
                                     onAnchorBoundsChanged = { bounds ->
@@ -7359,10 +7426,12 @@ private fun MediaStrip(
                     initialIndex = viewerIndex,
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     animateOpenFromSource = viewerAnimateOpenFromSource,
+                    onCloseStart = viewerCloseHandoff,
                     onDismiss = {
                         viewerOpen = false
                         viewerSourceBoundsByIndex = emptyMap()
                         viewerAnimateOpenFromSource = true
+                        viewerCloseHandoff = null
                         viewerDismissHook?.invoke()
                         viewerDismissHook = null
                     },
@@ -7442,6 +7511,7 @@ private fun FullscreenImageViewer(
     onDismiss: () -> Unit,
     sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
     animateOpenFromSource: Boolean = true,
+    onCloseStart: (() -> Unit)? = null,
     session: WeiboWebSession? = null,
     relatedPosts: List<FeedItem> = emptyList(),
     emoticonMap: Map<String, String> = emptyMap(),
@@ -7462,6 +7532,7 @@ private fun FullscreenImageViewer(
             if (closeBounds != null) {
                 closeStartBounds = startBounds
                 transitionClosing = true
+                onCloseStart?.invoke()
                 scope.launch {
                     transitionProgress.animateTo(
                         targetValue = 0f,
@@ -7470,6 +7541,7 @@ private fun FullscreenImageViewer(
                     onDismiss()
                 }
             } else {
+                onCloseStart?.invoke()
                 onDismiss()
             }
         }
@@ -7495,8 +7567,8 @@ private fun FullscreenImageViewer(
         )
     }
 
-    LaunchedEffect(initialIndex) {
-        if (sourceBoundsByIndex[initialIndex] != null) {
+    LaunchedEffect(initialIndex, animateOpenFromSource) {
+        if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) {
             transitionProgress.snapTo(0f)
             transitionProgress.animateTo(
                 targetValue = 1f,
@@ -11588,7 +11660,7 @@ private fun CommentImageStrip(
                 previewUrl = image.thumbnailUrl,
                 contentScale = ContentScale.Crop,
                 showLiveBadge = true,
-                onOpenViewer = { index, _, _ -> onImageClick(index) },
+                onOpenViewer = { index, _, _, _ -> onImageClick(index) },
             )
         }
     }
@@ -11658,8 +11730,8 @@ private fun SearchWeiboSortToggle(
 
 @Composable
 private fun SearchCapsuleField(
-    value: String,
-    onValueChange: (String) -> Unit,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
     mode: SearchMode,
     onModeChange: (SearchMode) -> Unit,
     onSearch: () -> Unit,
@@ -11667,6 +11739,7 @@ private fun SearchCapsuleField(
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
 ) {
+    val focusRequester = remember { FocusRequester() }
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
         color = HintCapsuleText,
         fontSize = 15.sp,
@@ -11689,31 +11762,42 @@ private fun SearchCapsuleField(
                 onSelected = onModeChange,
             )
             Spacer(Modifier.width(8.dp))
-            BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier.weight(1f),
-                textStyle = fieldTextStyle,
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(onSearch = { onSearch() }),
-                decorationBox = { innerTextField ->
-                    Box(
-                        modifier = Modifier.fillMaxWidth(),
-                        contentAlignment = Alignment.CenterStart,
-                    ) {
-                        if (value.isEmpty()) {
-                            Text(
-                                text = placeholder,
-                                style = placeholderStyle,
-                                maxLines = 1,
-                            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight(),
+            ) {
+                BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight()
+                        .focusRequester(focusRequester),
+                    textStyle = fieldTextStyle,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { onSearch() }),
+                    decorationBox = { innerTextField ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .fillMaxHeight(),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            if (value.text.isEmpty()) {
+                                Text(
+                                    text = placeholder,
+                                    style = placeholderStyle,
+                                    maxLines = 1,
+                                )
+                            }
+                            innerTextField()
                         }
-                        innerTextField()
-                    }
-                },
-            )
-            if (value.isNotEmpty()) {
+                    },
+                )
+            }
+            if (value.text.isNotEmpty()) {
                 TextButton(
                     onClick = onClear,
                     contentPadding = PaddingValues(horizontal = 8.dp),
@@ -11725,6 +11809,162 @@ private fun SearchCapsuleField(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SearchSuggestionPanel(
+    suggestions: SearchSuggestResult,
+    visible: Boolean,
+    loading: Boolean,
+    onSuggestionClick: (String, SearchMode) -> Unit,
+    onUserClick: (SearchUserItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val querySuggestions = suggestions.hotQueries.distinct().take(5)
+    val userSuggestions = suggestions.users.take(3)
+    AnimatedVisibility(
+        visible = visible && (loading || querySuggestions.isNotEmpty() || userSuggestions.isNotEmpty()),
+        enter = fadeIn(tween(120)) + slideInVertically(tween(140)) { it / 4 },
+        exit = fadeOut(tween(100)),
+        modifier = modifier,
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            color = Color.White.copy(alpha = 0.96f),
+            tonalElevation = 0.dp,
+            shadowElevation = 8.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(vertical = 6.dp),
+            ) {
+                if (loading && querySuggestions.isEmpty() && userSuggestions.isEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(42.dp)
+                            .padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Text(
+                            text = "正在获取联想词",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                querySuggestions.forEach { query ->
+                    SearchSuggestionTextRow(
+                        text = query,
+                        onClick = { onSuggestionClick(query, SearchMode.Weibo) },
+                    )
+                }
+                userSuggestions.forEach { user ->
+                    SearchSuggestionUserRow(
+                        user = user,
+                        onClick = { onUserClick(user) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchSuggestionTextRow(
+    text: String,
+    onClick: () -> Unit,
+) {
+    Text(
+        text = text,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(38.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp)
+            .wrapContentHeight(Alignment.CenterVertically),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurface,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+@Composable
+private fun SearchSuggestionUserRow(
+    user: SearchUserItem,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(46.dp)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        RemoteImage(
+            url = user.avatarUrl,
+            modifier = Modifier
+                .size(30.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop,
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = user.screenName.ifBlank { user.name },
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = user.description.ifBlank { user.followersCount },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Text(
+            text = "用户",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun SearchHistoryRow(
+    query: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            text = "↺",
+            modifier = Modifier.width(22.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 14.sp,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            text = query,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
@@ -11781,10 +12021,14 @@ private fun HotSearchRow(
     }
 }
 
+private const val SearchImeFollowDurationMillis = 120
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SearchScreen(
     session: WeiboWebSession,
     searchBarOverlay: SearchBarOverlayController,
+    searchHistoryStore: SearchHistoryStore,
     searchBarVisible: Boolean,
     hasLoginCookie: Boolean,
     pendingQuery: String?,
@@ -11830,11 +12074,17 @@ private fun SearchScreen(
     var searchGeneration by remember { mutableIntStateOf(0) }
     var initialResultsReady by remember { mutableStateOf(false) }
     var searchPullRefreshing by remember { mutableStateOf(false) }
+    var searchHistory by remember { mutableStateOf(searchHistoryStore.read()) }
+    var searchHistoryExpanded by remember { mutableStateOf(false) }
+    var suggestResult by remember { mutableStateOf(SearchSuggestResult()) }
+    var suggestLoading by remember { mutableStateOf(false) }
+    var searchDraft by remember { mutableStateOf(searchBarOverlay.queryInput) }
 
-    fun clearSearchResults() {
-        searchBarOverlay.queryInput = ""
-        activeQuery = null
-        activeSearchMode = searchMode
+    fun resetSearchResults(clearActiveQuery: Boolean) {
+        if (clearActiveQuery) {
+            activeQuery = null
+        }
+        searchGeneration++
         resultItems = emptyList()
         userResultItems = emptyList()
         resultError = null
@@ -11842,6 +12092,22 @@ private fun SearchScreen(
         resultLoading = false
         resultLoadingMore = false
         initialResultsReady = false
+    }
+
+    fun updateSearchDraft(value: TextFieldValue) {
+        searchDraft = value
+        searchBarOverlay.queryInput = value
+        if (activeQuery != null && value.text.trim() != activeQuery) {
+            resetSearchResults(clearActiveQuery = true)
+        }
+    }
+
+    fun clearSearchResults() {
+        searchDraft = TextFieldValue("")
+        searchBarOverlay.queryInput = TextFieldValue("")
+        activeQuery = null
+        activeSearchMode = searchMode
+        resetSearchResults(clearActiveQuery = true)
         scope.launch { runCatching { listState.scrollToItem(0) } }
     }
 
@@ -11861,15 +12127,10 @@ private fun SearchScreen(
     fun submitQuery(raw: String, modeOverride: SearchMode? = null) {
         val normalized = normalizeTopic(raw)
         if (normalized.isBlank()) return
-        searchBarOverlay.queryInput = normalized
-        resultItems = emptyList()
-        userResultItems = emptyList()
-        resultError = null
-        resultNextPage = null
-        resultLoading = false
-        resultLoadingMore = false
-        initialResultsReady = false
-        searchGeneration++
+        searchHistory = searchHistoryStore.touch(normalized)
+        searchDraft = TextFieldValue(normalized, TextRange(normalized.length))
+        searchBarOverlay.queryInput = searchDraft
+        resetSearchResults(clearActiveQuery = false)
         activeSearchMode = modeOverride ?: searchMode
         activeQuery = normalized
     }
@@ -11996,6 +12257,24 @@ private fun SearchScreen(
         loadTopicResults(reset = true, generation = searchGeneration)
     }
 
+    LaunchedEffect(searchBarVisible, hasLoginCookie, searchDraft.text) {
+        val query = searchDraft.text.trim()
+        if (!searchBarVisible || !hasLoginCookie || query.isBlank()) {
+            suggestLoading = false
+            suggestResult = SearchSuggestResult()
+            return@LaunchedEffect
+        }
+        suggestResult = SearchSuggestResult()
+        suggestLoading = true
+        delay(120)
+        if (query != searchDraft.text.trim()) return@LaunchedEffect
+        val result = runCatching { session.loadSearchSuggest(query) }
+            .getOrElse { SearchSuggestResult() }
+        if (query != searchDraft.text.trim()) return@LaunchedEffect
+        suggestResult = result
+        suggestLoading = false
+    }
+
     LaunchedEffect(initialResultsReady, activeQuery, searchGeneration) {
         if (activeQuery != null && initialResultsReady) {
             focusManager.clearFocus(force = true)
@@ -12005,6 +12284,7 @@ private fun SearchScreen(
 
     val searchGenerationState by rememberUpdatedState(searchGeneration)
     val initialResultsReadyState by rememberUpdatedState(initialResultsReady)
+    val latestSearchDraft by rememberUpdatedState(searchDraft)
 
     LaunchedEffect(listState, activeQuery, searchGeneration, activeSearchMode, weiboSort) {
         if (activeQuery == null) return@LaunchedEffect
@@ -12033,12 +12313,35 @@ private fun SearchScreen(
     var searchHeaderHeight by remember { mutableStateOf(0.dp) }
     val density = LocalDensity.current
     val bottomNavSpace = 96.dp
-    val searchBarGap = 8.dp
+    val searchBarGap = SearchBarBottomGap
     val searchBarBottom = bottomNavSpace + searchBarGap
     val searchFieldHeight = 44.dp
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    val searchFieldBottom = maxOf(searchBarBottom, imeBottom + searchBarGap)
-    val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap
+    val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
+    val imeInsetForLayout = if (imeTargetBottom < imeBottom) {
+        imeTargetBottom
+    } else {
+        maxOf(imeBottom, imeTargetBottom)
+    }
+    val searchFieldBottomTarget = maxOf(searchBarBottom, imeInsetForLayout + searchBarGap)
+    val searchFieldBottom by animateDpAsState(
+        targetValue = searchFieldBottomTarget,
+        animationSpec = tween(
+            durationMillis = SearchImeFollowDurationMillis,
+            easing = FastOutSlowInEasing,
+        ),
+        label = "search-field-bottom",
+    )
+    val suggestionPanelInset = if (
+        searchBarVisible &&
+        searchDraft.text.trim().isNotBlank() &&
+        activeQuery != searchDraft.text.trim()
+    ) {
+        176.dp
+    } else {
+        0.dp
+    }
+    val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap + suggestionPanelInset
 
     SideEffect {
         searchBarOverlay.active = searchBarVisible
@@ -12057,13 +12360,34 @@ private fun SearchScreen(
                 }
             }
         }
-        searchBarOverlay.onSearch = { submitQuery(searchBarOverlay.queryInput) }
+        searchBarOverlay.onQueryInputChange = { value -> updateSearchDraft(value) }
+        searchBarOverlay.onSearch = { submitQuery(latestSearchDraft.text) }
         searchBarOverlay.onClear = ::clearSearchResults
+        searchBarOverlay.suggestions = suggestResult
+        searchBarOverlay.suggestionsLoading = suggestLoading
+        searchBarOverlay.suggestionsVisible = searchBarVisible &&
+            searchDraft.text.trim().isNotBlank() &&
+            activeQuery != searchDraft.text.trim()
+        searchBarOverlay.onSuggestionClick = { query, mode ->
+            onSearchModeChange(mode)
+            activeSearchMode = mode
+            submitQuery(query, modeOverride = mode)
+        }
+        searchBarOverlay.onSuggestionUserClick = { user ->
+            focusManager.clearFocus(force = true)
+            keyboardController?.hide()
+            onUserClick(user.id)
+        }
         searchBarOverlay.bottomPadding = searchFieldBottom
     }
     DisposableEffect(Unit) {
         onDispose {
             searchBarOverlay.active = false
+            searchBarOverlay.onQueryInputChange = { searchBarOverlay.queryInput = it }
+            searchBarOverlay.onSuggestionUserClick = {}
+            searchBarOverlay.suggestionsVisible = false
+            searchBarOverlay.suggestions = SearchSuggestResult()
+            searchBarOverlay.suggestionsLoading = false
         }
     }
 
@@ -12122,6 +12446,51 @@ private fun SearchScreen(
                         ),
                     ) {
                 if (activeQuery == null) {
+                    if (searchHistory.isNotEmpty()) {
+                        item {
+                            Text(
+                                text = "搜索历史",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(bottom = 8.dp),
+                            )
+                        }
+                        val visibleHistory = if (searchHistoryExpanded) {
+                            searchHistory
+                        } else {
+                            searchHistory.take(SearchHistoryStore.DISPLAY_COLLAPSED)
+                        }
+                        itemsIndexed(visibleHistory, key = { _, query -> "history-$query" }) { index, query ->
+                            SearchHistoryRow(
+                                query = query,
+                                onClick = { submitQuery(query) },
+                            )
+                            if (index < visibleHistory.lastIndex) {
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+                            }
+                        }
+                        if (searchHistory.size > SearchHistoryStore.DISPLAY_COLLAPSED) {
+                            item {
+                                TextButton(
+                                    onClick = { searchHistoryExpanded = !searchHistoryExpanded },
+                                    contentPadding = PaddingValues(vertical = 4.dp),
+                                ) {
+                                    Text(
+                                        text = if (searchHistoryExpanded) {
+                                            "收起"
+                                        } else {
+                                            "展开更多（${searchHistory.size - SearchHistoryStore.DISPLAY_COLLAPSED}）"
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.primary,
+                                    )
+                                }
+                            }
+                        }
+                        item {
+                            Spacer(Modifier.height(16.dp))
+                        }
+                    }
                     item {
                         Text(
                             text = "热搜",
@@ -13526,13 +13895,9 @@ private fun SettingsHelpSectionCard(section: HelpSection) {
     }
 }
 
-private fun Modifier.swipeRevealOffset(offsetPx: Float): Modifier = layout { measurable, constraints ->
-    val placeable = measurable.measure(constraints)
-    layout(placeable.width, placeable.height) {
-        placeable.placeRelative(offsetPx.roundToInt(), 0)
-    }
-}
+private enum class SettingsAccountSwipeAnchor { Closed, Open }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SettingsAccountRow(
     account: StoredWeiboAccount,
@@ -13543,17 +13908,32 @@ private fun SettingsAccountRow(
     val density = LocalDensity.current
     val deleteActionWidth = 72.dp
     val deleteActionWidthPx = remember(density) { with(density) { deleteActionWidth.toPx() } }
-    val openThresholdPx = remember(deleteActionWidthPx) { deleteActionWidthPx * 0.35f }
-    val offsetAnim = remember(account.id) { Animatable(0f) }
-    var dragOffset by remember(account.id) { mutableFloatStateOf(0f) }
-    var isDragging by remember(account.id) { mutableStateOf(false) }
-    val currentOffsetPx = if (isDragging) dragOffset else offsetAnim.value
     val rowShape = RoundedCornerShape(8.dp)
     val rowBackground = if (isActive) {
         lerp(Color.White, MaterialTheme.colorScheme.primaryContainer, 0.35f)
     } else {
         Color.White
     }
+    val dragState = remember(account.id, deleteActionWidthPx, density) {
+        AnchoredDraggableState(
+            initialValue = SettingsAccountSwipeAnchor.Closed,
+            anchors = DraggableAnchors {
+                SettingsAccountSwipeAnchor.Closed at 0f
+                SettingsAccountSwipeAnchor.Open at -deleteActionWidthPx
+            },
+            positionalThreshold = { distance -> distance * 0.35f },
+            velocityThreshold = { with(density) { 120.dp.toPx() } },
+            snapAnimationSpec = spring(
+                dampingRatio = 0.82f,
+                stiffness = Spring.StiffnessMedium,
+            ),
+            decayAnimationSpec = exponentialDecay(),
+        )
+    }
+    val scope = rememberCoroutineScope()
+    val swipeOffsetPx = dragState.requireOffset()
+    val isRevealed = dragState.currentValue == SettingsAccountSwipeAnchor.Open
+    val canSwitchAccount = !isActive && !isRevealed && swipeOffsetPx == 0f
 
     Box(
         modifier = Modifier
@@ -13570,9 +13950,11 @@ private fun SettingsAccountRow(
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                ) {
-                    onDeleteAccount(account.id)
-                },
+                    onClick = {
+                        onDeleteAccount(account.id)
+                        scope.launch { dragState.animateTo(SettingsAccountSwipeAnchor.Closed) }
+                    },
+                ),
             contentAlignment = Alignment.Center,
         ) {
             Text(
@@ -13582,107 +13964,49 @@ private fun SettingsAccountRow(
                 fontWeight = FontWeight.SemiBold,
             )
         }
-        Box(
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .swipeRevealOffset(currentOffsetPx)
-                .background(rowBackground, rowShape)
-                .pointerInput(account.id, deleteActionWidthPx, openThresholdPx) {
-                    coroutineScope {
-                        awaitEachGesture {
-                            var dragging = false
-                            val down = awaitFirstDown(requireUnconsumed = false)
-                            val dragStartOffset = offsetAnim.value
-                            var totalDragX = 0f
-                            var totalDragY = 0f
-                            val touchSlop = viewConfiguration.touchSlop
-                            while (true) {
-                                val event = awaitPointerEvent(PointerEventPass.Initial)
-                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                if (!change.pressed) break
-                                val deltaX = change.position.x - change.previousPosition.x
-                                val deltaY = change.position.y - change.previousPosition.y
-                                totalDragX += deltaX
-                                totalDragY += deltaY
-                                if (!dragging) {
-                                    if (abs(totalDragX) > touchSlop && abs(totalDragX) > abs(totalDragY)) {
-                                        dragging = true
-                                        isDragging = true
-                                    } else if (abs(totalDragY) > touchSlop) {
-                                        break
-                                    }
-                                }
-                                if (dragging) {
-                                    change.consume()
-                                    dragOffset = (dragStartOffset + change.position.x - down.position.x)
-                                        .coerceIn(-deleteActionWidthPx, 0f)
-                                }
-                            }
-                            if (dragging) {
-                                val target = if (dragOffset <= -openThresholdPx) {
-                                    -deleteActionWidthPx
-                                } else {
-                                    0f
-                                }
-                                isDragging = false
-                                launch {
-                                    offsetAnim.snapTo(dragOffset)
-                                    offsetAnim.animateTo(
-                                        targetValue = target,
-                                        animationSpec = spring(
-                                            dampingRatio = 0.82f,
-                                            stiffness = Spring.StiffnessMedium,
-                                        ),
-                                    )
-                                }
-                            }
-                        }
-                    }
+                .graphicsLayer {
+                    translationX = swipeOffsetPx
+                    clip = true
+                    shape = rowShape
                 }
-                .clickable(
-                    enabled = !isActive && !isDragging && offsetAnim.value == 0f,
-                ) { onSwitchAccount(account.id) }
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                RemoteImage(
-                    url = account.avatarUrl,
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape),
-                    contentScale = ContentScale.Crop,
+                .anchoredDraggable(
+                    state = dragState,
+                    orientation = Orientation.Horizontal,
                 )
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text(
-                        text = account.screenName.ifBlank { "微博用户" },
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.Medium,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = "UID ${account.id}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                if (isActive) {
-                    Text(
-                        text = "当前",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
+                .background(rowBackground, rowShape)
+                .clickable(
+                    enabled = canSwitchAccount,
+                    onClick = { onSwitchAccount(account.id) },
+                )
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            RemoteImage(
+                url = account.avatarUrl,
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Text(
+                text = account.screenName.ifBlank { "微博用户" },
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (isActive) {
+                Text(
+                    text = "当前",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
             }
         }
     }
@@ -13859,9 +14183,9 @@ private fun SettingsThemeColorCard(
                 BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                        .padding(start = 8.dp, end = 8.dp, bottom = 12.dp),
                 ) {
-                    val gap = 6.dp
+                    val gap = 4.dp
                     val columns = 4
                     val cellWidth = (maxWidth - gap * (columns - 1)) / columns
                     Column(verticalArrangement = Arrangement.spacedBy(gap)) {
@@ -13876,7 +14200,7 @@ private fun SettingsThemeColorCard(
                                     Box(
                                         modifier = Modifier
                                             .width(cellWidth)
-                                            .height(34.dp)
+                                            .height(30.dp)
                                             .clip(RoundedCornerShape(999.dp))
                                             .border(
                                                 width = if (isSelected) 1.5.dp else 1.dp,
@@ -13904,6 +14228,9 @@ private fun SettingsThemeColorCard(
                                             textAlign = TextAlign.Center,
                                         )
                                     }
+                                }
+                                repeat(columns - rowOptions.size) {
+                                    Spacer(Modifier.width(cellWidth))
                                 }
                             }
                         }
@@ -15710,7 +16037,7 @@ private fun MineAlbumGridRow(
                         size = cellSize,
                         allImages = monthImages,
                         imageIndex = imageIndex,
-                        onOpenViewer = { index, _, _ -> onImageClick(monthImages, index) },
+                        onOpenViewer = { index, _, _, _ -> onImageClick(monthImages, index) },
                         onVideoClick = onVideoClick,
                     )
                 }
@@ -15725,7 +16052,7 @@ private fun MineAlbumTile(
     size: androidx.compose.ui.unit.Dp,
     allImages: List<FeedImage>,
     imageIndex: Int,
-    onOpenViewer: (Int, Rect?, (() -> Unit)?) -> Unit,
+    onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onVideoClick: (FeedMedia, String) -> Unit,
 ) {
     val albumMedia = remember(image.id, image.largeUrl, image.videoStreamUrl) {
