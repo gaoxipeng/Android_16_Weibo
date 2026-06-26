@@ -85,6 +85,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -202,6 +203,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
@@ -13524,6 +13526,13 @@ private fun SettingsHelpSectionCard(section: HelpSection) {
     }
 }
 
+private fun Modifier.swipeRevealOffset(offsetPx: Float): Modifier = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    layout(placeable.width, placeable.height) {
+        placeable.placeRelative(offsetPx.roundToInt(), 0)
+    }
+}
+
 @Composable
 private fun SettingsAccountRow(
     account: StoredWeiboAccount,
@@ -13531,98 +13540,149 @@ private fun SettingsAccountRow(
     onSwitchAccount: (String) -> Unit,
     onDeleteAccount: (String) -> Unit,
 ) {
-    var offsetX by remember(account.id) { mutableFloatStateOf(0f) }
     val density = LocalDensity.current
-    val deleteThresholdPx = remember(density) { with(density) { 68.dp.toPx() } }
-    val revealLimitPx = remember(density) { with(density) { 88.dp.toPx() } }
+    val deleteActionWidth = 72.dp
+    val deleteActionWidthPx = remember(density) { with(density) { deleteActionWidth.toPx() } }
+    val openThresholdPx = remember(deleteActionWidthPx) { deleteActionWidthPx * 0.35f }
+    val offsetAnim = remember(account.id) { Animatable(0f) }
+    var dragOffset by remember(account.id) { mutableFloatStateOf(0f) }
+    var isDragging by remember(account.id) { mutableStateOf(false) }
+    val currentOffsetPx = if (isDragging) dragOffset else offsetAnim.value
+    val rowShape = RoundedCornerShape(8.dp)
+    val rowBackground = if (isActive) {
+        lerp(Color.White, MaterialTheme.colorScheme.primaryContainer, 0.35f)
+    } else {
+        Color.White
+    }
 
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp)),
+            .height(IntrinsicSize.Max)
+            .clip(rowShape),
     ) {
         Box(
             modifier = Modifier
-                .matchParentSize()
-                .background(Color(0xFFE35D5B)),
-            contentAlignment = Alignment.CenterEnd,
+                .align(Alignment.CenterEnd)
+                .width(deleteActionWidth)
+                .fillMaxHeight()
+                .background(Color(0xFFE35D5B))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {
+                    onDeleteAccount(account.id)
+                },
+            contentAlignment = Alignment.Center,
         ) {
             Text(
                 text = "删除",
-                modifier = Modifier.padding(end = 18.dp),
                 style = MaterialTheme.typography.labelLarge,
                 color = Color.White,
                 fontWeight = FontWeight.SemiBold,
             )
         }
-        Row(
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .graphicsLayer { translationX = offsetX }
-                .background(
-                    if (isActive) {
-                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
-                    } else {
-                        StatusQuotedBackground
-                    },
-                )
-                .pointerInput(account.id) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        var dragX = offsetX
-                        while (true) {
-                            val event = awaitPointerEvent(PointerEventPass.Initial)
-                            val change = event.changes.firstOrNull() ?: break
-                            if (!change.pressed) break
-                            val deltaX = change.position.x - change.previousPosition.x
-                            dragX = (dragX + deltaX).coerceIn(-revealLimitPx, 0f)
-                            offsetX = dragX
-                            if (abs(deltaX) > 0.5f) change.consume()
+                .swipeRevealOffset(currentOffsetPx)
+                .background(rowBackground, rowShape)
+                .pointerInput(account.id, deleteActionWidthPx, openThresholdPx) {
+                    coroutineScope {
+                        awaitEachGesture {
+                            var dragging = false
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val dragStartOffset = offsetAnim.value
+                            var totalDragX = 0f
+                            var totalDragY = 0f
+                            val touchSlop = viewConfiguration.touchSlop
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) break
+                                val deltaX = change.position.x - change.previousPosition.x
+                                val deltaY = change.position.y - change.previousPosition.y
+                                totalDragX += deltaX
+                                totalDragY += deltaY
+                                if (!dragging) {
+                                    if (abs(totalDragX) > touchSlop && abs(totalDragX) > abs(totalDragY)) {
+                                        dragging = true
+                                        isDragging = true
+                                    } else if (abs(totalDragY) > touchSlop) {
+                                        break
+                                    }
+                                }
+                                if (dragging) {
+                                    change.consume()
+                                    dragOffset = (dragStartOffset + change.position.x - down.position.x)
+                                        .coerceIn(-deleteActionWidthPx, 0f)
+                                }
+                            }
+                            if (dragging) {
+                                val target = if (dragOffset <= -openThresholdPx) {
+                                    -deleteActionWidthPx
+                                } else {
+                                    0f
+                                }
+                                isDragging = false
+                                launch {
+                                    offsetAnim.snapTo(dragOffset)
+                                    offsetAnim.animateTo(
+                                        targetValue = target,
+                                        animationSpec = spring(
+                                            dampingRatio = 0.82f,
+                                            stiffness = Spring.StiffnessMedium,
+                                        ),
+                                    )
+                                }
+                            }
                         }
-                        if (offsetX <= -deleteThresholdPx) {
-                            onDeleteAccount(account.id)
-                        }
-                        offsetX = 0f
                     }
                 }
-                .clickable(enabled = !isActive && offsetX == 0f) { onSwitchAccount(account.id) }
+                .clickable(
+                    enabled = !isActive && !isDragging && offsetAnim.value == 0f,
+                ) { onSwitchAccount(account.id) }
                 .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            RemoteImage(
-                url = account.avatarUrl,
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape),
-                contentScale = ContentScale.Crop,
-            )
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text(
-                    text = account.screenName.ifBlank { "微博用户" },
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                RemoteImage(
+                    url = account.avatarUrl,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape),
+                    contentScale = ContentScale.Crop,
                 )
-                Text(
-                    text = "UID ${account.id}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (isActive) {
-                Text(
-                    text = "当前",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        text = account.screenName.ifBlank { "微博用户" },
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = "UID ${account.id}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (isActive) {
+                    Text(
+                        text = "当前",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
             }
         }
     }
@@ -13787,7 +13847,7 @@ private fun SettingsThemeColorCard(
                         }
                     }
                     Text(
-                        text = "选择低饱和莫兰迪色，替换当前粉色强调区域。",
+                        text = "更换应用强调色",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -13799,45 +13859,52 @@ private fun SettingsThemeColorCard(
                 BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
                 ) {
                     val gap = 6.dp
-                    val buttonWidth = (maxWidth - gap * 3) / 4
-                    FlowRow(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(gap),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        maxItemsInEachRow = 4,
-                    ) {
-                        MorandiThemeColors.forEach { option ->
-                            val isSelected = selected.storageValue == option.storageValue
-                            val textColor = readableTextColor(option.primary)
-                            Box(
-                                modifier = Modifier
-                                    .width(buttonWidth)
-                                    .height(34.dp)
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .border(
-                                        width = if (isSelected) 1.5.dp else 1.dp,
-                                        color = if (isSelected) textColor.copy(alpha = 0.92f) else Color.White.copy(alpha = 0.55f),
-                                        shape = RoundedCornerShape(999.dp),
-                                    )
-                                    .background(option.primary)
-                                    .clickable { onSelected(option) },
-                                contentAlignment = Alignment.Center,
+                    val columns = 4
+                    val cellWidth = (maxWidth - gap * (columns - 1)) / columns
+                    Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+                        MorandiThemeColors.chunked(columns).forEach { rowOptions ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(gap),
                             ) {
-                                Text(
-                                    text = option.label,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 3.dp),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = textColor,
-                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    textAlign = TextAlign.Center,
-                                )
+                                rowOptions.forEach { option ->
+                                    val isSelected = selected.storageValue == option.storageValue
+                                    val textColor = readableTextColor(option.primary)
+                                    Box(
+                                        modifier = Modifier
+                                            .width(cellWidth)
+                                            .height(34.dp)
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .border(
+                                                width = if (isSelected) 1.5.dp else 1.dp,
+                                                color = if (isSelected) {
+                                                    textColor.copy(alpha = 0.92f)
+                                                } else {
+                                                    Color.White.copy(alpha = 0.55f)
+                                                },
+                                                shape = RoundedCornerShape(999.dp),
+                                            )
+                                            .background(option.primary)
+                                            .clickable { onSelected(option) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            text = option.label,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 2.dp),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = textColor,
+                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            textAlign = TextAlign.Center,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
