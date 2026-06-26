@@ -5,27 +5,64 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.geometry.Offset
 
 class LiquidBottomTabsGestureController internal constructor() {
-    internal var impl: GestureImpl? = null
+    private var pendingPositionFraction = Offset.Zero
+    private var pendingDragAmount = Offset.Zero
+    private var pendingGesture = false
+    private var pendingEnd = false
 
-    fun beginAt(position: Offset) {
-        impl?.begin(position)
+    internal var impl: GestureImpl? = null
+        set(value) {
+            field = value
+            if (value != null && pendingGesture) {
+                value.begin(pendingPositionFraction)
+                if (pendingDragAmount != Offset.Zero) {
+                    value.drag(pendingPositionFraction, pendingDragAmount)
+                }
+                if (pendingEnd) {
+                    value.end()
+                    clearPending()
+                }
+            }
+        }
+
+    fun beginAt(positionFraction: Offset) {
+        pendingPositionFraction = positionFraction
+        pendingDragAmount = Offset.Zero
+        pendingGesture = true
+        pendingEnd = false
+        impl?.begin(positionFraction)
     }
 
-    fun dragTo(position: Offset, dragAmount: Offset) {
-        impl?.drag(position, dragAmount)
+    fun dragTo(positionFraction: Offset, dragAmount: Offset) {
+        pendingPositionFraction = positionFraction
+        pendingDragAmount = dragAmount
+        impl?.drag(positionFraction, dragAmount)
     }
 
     fun end() {
-        impl?.end()
+        val target = impl
+        if (target != null) {
+            target.end()
+            clearPending()
+        } else if (pendingGesture) {
+            pendingEnd = true
+        }
     }
 
     fun cancel() {
         impl?.cancel()
+        clearPending()
+    }
+
+    private fun clearPending() {
+        pendingGesture = false
+        pendingEnd = false
+        pendingDragAmount = Offset.Zero
     }
 
     internal interface GestureImpl {
-        fun begin(position: Offset)
-        fun drag(position: Offset, dragAmount: Offset)
+        fun begin(positionFraction: Offset)
+        fun drag(positionFraction: Offset, dragAmount: Offset)
         fun end()
         fun cancel()
     }

@@ -8,10 +8,11 @@ enum class FeedThumbnailQuality(
     val description: String,
     val maxDecodeDim: Int,
     private val preferLargeUrl: Boolean,
+    private val feedSinaimgVariant: String? = null,
 ) {
-    Low("low", "省流", "bmiddle，约 440px", 480, preferLargeUrl = false),
-    Medium("medium", "标准", "large，约 690px", 960, preferLargeUrl = true),
-    High("high", "高清", "最高可用规格", 2048, preferLargeUrl = true),
+    Low("low", "省流", "中等缩略图 bmiddle，约 440px", 640, preferLargeUrl = false, feedSinaimgVariant = "bmiddle"),
+    Medium("medium", "标准", "中图 mw690，约 690px", 960, preferLargeUrl = true, feedSinaimgVariant = "mw690"),
+    High("high", "高清", "大图预览 mw1024", 1280, preferLargeUrl = true, feedSinaimgVariant = "mw1024"),
     ;
 
     companion object {
@@ -19,18 +20,31 @@ enum class FeedThumbnailQuality(
             entries.firstOrNull { it.storageValue == value } ?: Medium
     }
 
-    fun displayUrl(image: FeedImage): String =
-        if (preferLargeUrl) {
+    fun displayUrl(image: FeedImage): String {
+        val preferred = if (preferLargeUrl) {
             image.largeUrl.ifBlank { image.thumbnailUrl }
         } else {
             image.thumbnailUrl.ifBlank { image.largeUrl }
         }
+        return preferred.withSinaimgVariant(feedSinaimgVariant)
+    }
 
     fun fallbackUrl(image: FeedImage): String? {
         val primary = displayUrl(image)
         val fallback = if (preferLargeUrl) image.thumbnailUrl else image.largeUrl
-        return fallback.takeIf { it.isNotBlank() && it != primary }
+        return fallback
+            .withSinaimgVariant(feedSinaimgVariant)
+            .takeIf { it.isNotBlank() && it != primary }
     }
+}
+
+private fun String.withSinaimgVariant(variant: String?): String {
+    if (variant.isNullOrBlank()) return this
+    if (!contains("sinaimg.cn", ignoreCase = true)) return this
+    return replace(
+        Regex("""/(?:large|mw2000|woriginal|original|bmiddle|orj360|orj480|mw690|mw1024|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE),
+        "/$variant/",
+    )
 }
 
 class ImageSettingsStore(context: Context) {

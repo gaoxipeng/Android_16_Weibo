@@ -36,10 +36,16 @@ class WeiboAccountStore(context: Context) {
         readAccounts().firstOrNull { it.id == id }
 
     @Synchronized
-    fun upsertAccount(account: StoredWeiboAccount) {
+    fun upsertAccount(account: StoredWeiboAccount, makeActive: Boolean = false) {
         val accounts = readAccounts()
             .filterNot { it.id == account.id } + account
-        write(accounts, account.id)
+        val currentActiveId = readActiveAccountId()
+        val activeId = when {
+            makeActive -> account.id
+            currentActiveId.isNullOrBlank() -> account.id
+            else -> currentActiveId
+        }
+        write(accounts, activeId)
     }
 
     @Synchronized

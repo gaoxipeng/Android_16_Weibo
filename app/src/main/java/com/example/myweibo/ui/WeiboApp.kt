@@ -801,6 +801,7 @@ private const val AlbumBitmapCacheMaxBytes = 96 * 1024 * 1024
 private const val AlbumGridMaxReadBytes = 768 * 1024
 private const val AlbumGridPrefetchConcurrency = 8
 private const val AlbumGridPrefetchBatchSize = 48
+private const val FeedImageLoadConcurrency = 4
 private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
 private const val FullscreenBitmapCacheMaxBytes = 64 * 1024 * 1024
 
@@ -823,13 +824,25 @@ private val MorandiThemeColors = listOf(
     MorandiThemeColor("mauve", "豆沙紫", Color(0xFFA77F94), Color(0xFFE8D9E1), Color(0xFF9B8792)),
     MorandiThemeColor("olive_gray", "橄榄灰", Color(0xFF969873), Color(0xFFE4E5D3), Color(0xFF8F9278)),
     MorandiThemeColor("slate", "石板灰", Color(0xFF7F8C98), Color(0xFFD9E0E5), Color(0xFF858D96)),
+    MorandiThemeColor("classic_black", "黑色", Color(0xFF202124), Color(0xFFE6E6E6), Color(0xFF4A4A4A)),
+    MorandiThemeColor("graphite", "石墨", Color(0xFF4E5965), Color(0xFFDDE2E7), Color(0xFF66717C)),
+    MorandiThemeColor("ocean_blue", "海蓝", Color(0xFF4E7FA8), Color(0xFFD6E5F1), Color(0xFF668AA8)),
+    MorandiThemeColor("clear_green", "青绿", Color(0xFF4F9278), Color(0xFFD8EADF), Color(0xFF6E9B82)),
+    MorandiThemeColor("wine_red", "酒红", Color(0xFF9A4E5B), Color(0xFFEBD7DB), Color(0xFFA56B73)),
+    MorandiThemeColor("iris", "鸢尾", Color(0xFF7367B2), Color(0xFFE0DDF2), Color(0xFF8279AF)),
+    MorandiThemeColor("amber", "琥珀", Color(0xFFB07A39), Color(0xFFEADDCB), Color(0xFFA4865A)),
+    MorandiThemeColor("coral", "珊瑚", Color(0xFFC8665D), Color(0xFFF0D8D5), Color(0xFFB27771)),
 )
 
 private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
     MorandiThemeColors.firstOrNull { it.storageValue == value } ?: MorandiThemeColors.first()
+
+private val FeedImageLoadSemaphore = Semaphore(FeedImageLoadConcurrency)
+
 private const val RemoteBytesCacheMaxTotal = 32 * 1024 * 1024
 private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
 private const val RemoteBytesAnimatedMaxRead = 12 * 1024 * 1024
+private const val RemoteDiskBytesCacheMaxTotal = 192 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
 // ComponentCallbacks2.TRIM_MEMORY_* 在较新 SDK 中已标记 deprecated，数值仍稳定可用。
 private const val TrimMemoryRunningLow = 10
@@ -1231,6 +1244,13 @@ private class VideoPeekController {
         }
     }
 
+    fun exitFullscreenToFloating() {
+        if (activeRequest != null && pendingDismiss == null && isFullscreenMode) {
+            isFullscreenMode = false
+            isFloating = true
+        }
+    }
+
     fun dismissForPlaybackEnded() {
         if (activeRequest != null && pendingDismiss == null) {
             pendingDismiss = VideoPeekDismissReason.PlaybackEnded
@@ -1416,9 +1436,28 @@ private class FeedImageUpgradeNotifier {
 }
 
 private fun feedImageUrlCandidates(image: FeedImage): List<String> =
-    (image.downloadUrls + image.largeUrl + image.thumbnailUrl)
+    (listOf(image.thumbnailUrl, downgradeSinaimgForFeed(image.largeUrl, "mw690")) +
+        image.downloadUrls.map { downgradeSinaimgForFeed(it, "mw690") })
         .filter { it.isNotBlank() }
         .distinct()
+
+private fun feedImageCacheCandidates(
+    image: FeedImage,
+    quality: FeedThumbnailQuality,
+): List<String> =
+    listOfNotNull(
+        quality.displayUrl(image).takeIf { it.isNotBlank() },
+        quality.fallbackUrl(image),
+    ).distinct()
+
+private fun downgradeSinaimgForFeed(url: String, variant: String): String {
+    if (url.isBlank()) return url
+    if (!url.contains("sinaimg.cn", ignoreCase = true)) return url
+    return url.replace(
+        Regex("""/(?:large|mw2000|woriginal|original|bmiddle|orj360|orj480|mw690|mw1024|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE),
+        "/$variant/",
+    )
+}
 
 private val LowQualityImageUrlPattern =
     Regex("""/(?:orj360|orj480|bmiddle|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE)
@@ -1520,7 +1559,7 @@ private suspend fun prefetchAlbumGridThumbnails(images: List<FeedImage>) {
 
 private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
     maxDecodeDim <= AlbumGridMaxDecodeDim -> 4 * 1024 * 1024
-    maxDecodeDim <= 960 -> 8 * 1024 * 1024
+    maxDecodeDim <= 960 -> 4 * 1024 * 1024
     else -> 12 * 1024 * 1024
 }
 
@@ -1639,6 +1678,11 @@ fun WeiboApp() {
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val imageSettingsStore = remember { ImageSettingsStore(context) }
     val themeSettingsStore = remember { ThemeSettingsStore(context) }
+    LaunchedEffect(context) {
+        withContext(Dispatchers.IO) {
+            RemoteDiskBytesCache.configure(java.io.File(context.cacheDir, "remote-image-bytes"))
+        }
+    }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     val feedListState = rememberLazyListState()
@@ -1678,6 +1722,7 @@ fun WeiboApp() {
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
+    var commentsLoadingMore by remember { mutableStateOf(false) }
     var commentsRequestJob by remember { mutableStateOf<Job?>(null) }
     var commentsCursor by remember { mutableStateOf<String?>(null) }
     var commentsHasMore by remember { mutableStateOf(true) }
@@ -1688,6 +1733,7 @@ fun WeiboApp() {
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
     var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var repostsLoading by remember { mutableStateOf(false) }
+    var repostsLoadingMore by remember { mutableStateOf(false) }
     var repostsRequestJob by remember { mutableStateOf<Job?>(null) }
     var repostsNextPage by remember { mutableStateOf<Int?>(null) }
     var repostsHasMore by remember { mutableStateOf(true) }
@@ -1813,9 +1859,7 @@ fun WeiboApp() {
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
     }
 
-    fun showAlbumFetchTrace(page: AlbumPage) {
-        page.fetchTrace?.capsuleMessage()?.let { albumFetchCapsuleHint = it }
-    }
+    fun showAlbumFetchTrace(@Suppress("UNUSED_PARAMETER") page: AlbumPage) = Unit
 
     fun absorbDiscoveredEmoticons(discovered: Map<String, String>) {
         if (discovered.isEmpty()) return
@@ -1863,8 +1907,8 @@ fun WeiboApp() {
         activeAccountId = accountStore.readActiveAccountId()
     }
 
-    suspend fun persistLoginSession() {
-        runCatching { session.persistCurrentAccount(accountStore) }
+    suspend fun persistLoginSession(makeActive: Boolean = false) {
+        runCatching { session.persistCurrentAccount(accountStore, makeActive = makeActive) }
             .onSuccess {
                 reloadStoredAccounts()
                 hasLoginCookie = session.hasLoginCookie()
@@ -2123,7 +2167,9 @@ fun WeiboApp() {
         repostsRequestJob?.cancel()
         detailRequestGeneration += 1
         commentsLoading = false
+        commentsLoadingMore = false
         repostsLoading = false
+        repostsLoadingMore = false
         nestedCommentsLoadingIds = emptySet()
         selectedItem = snapshot.item
         comments = snapshot.comments
@@ -2815,6 +2861,38 @@ fun WeiboApp() {
         }
     }
 
+    fun deleteStoredAccount(accountId: String) {
+        scope.launch {
+            val deletingActive = activeAccountId == accountId
+            accountStore.removeAccount(accountId)
+            reloadStoredAccounts()
+            val nextActiveId = activeAccountId
+            if (deletingActive) {
+                if (nextActiveId != null && accountStore.getAccount(nextActiveId) != null) {
+                    runCatching { session.activateAccount(accountStore, nextActiveId) }
+                        .onSuccess {
+                            hasLoginCookie = session.hasLoginCookie()
+                            mineHasLoginCookie = hasLoginCookie
+                            refreshTimeline()
+                            refreshMineProfile()
+                        }
+                        .onFailure { error ->
+                            showMessage("账号删除成功", "但切换到下一个账号失败：${error.message ?: "登录态不可用"}")
+                        }
+                } else {
+                    session.clearAllCookies()
+                    hasLoginCookie = false
+                    mineHasLoginCookie = false
+                    items = emptyList()
+                    nextCursor = null
+                    mineProfile = null
+                    minePosts = emptyList()
+                    mineAlbumImages = emptyList()
+                }
+            }
+        }
+    }
+
     fun loadMoreMinePosts() {
         val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
         if (minePostsLoadingMore || mineProfileLoading || !minePostsHasMore) return
@@ -3131,6 +3209,7 @@ fun WeiboApp() {
         val requestedSort = commentSort
         commentsRequestJob = scope.launch {
             commentsLoading = true
+            commentsLoadingMore = false
             commentsCursor = null
             commentsHasMore = true
             runCatchingPreservingCancellation { session.loadComments(item, requestedSort) }
@@ -3232,6 +3311,7 @@ fun WeiboApp() {
         val requestedItemId = item.id
         repostsRequestJob = scope.launch {
             repostsLoading = true
+            repostsLoadingMore = false
             repostsNextPage = null
             repostsHasMore = true
             runCatchingPreservingCancellation { session.loadReposts(item, page = 1) }
@@ -3286,7 +3366,9 @@ fun WeiboApp() {
         repostsRequestJob?.cancel()
         detailRequestGeneration += 1
         commentsLoading = false
+        commentsLoadingMore = false
         repostsLoading = false
+        repostsLoadingMore = false
         nestedCommentsLoadingIds = emptySet()
         comments = emptyList()
         commentsCursor = null
@@ -3410,6 +3492,7 @@ fun WeiboApp() {
         val requestedSort = commentSort
         commentsRequestJob = scope.launch {
             commentsLoading = true
+            commentsLoadingMore = true
             runCatchingPreservingCancellation { session.loadMoreComments(item, cursor, requestedSort) }
                 .onSuccess { page ->
                     if (
@@ -3441,6 +3524,7 @@ fun WeiboApp() {
                 commentSort == requestedSort
             ) {
                 commentsLoading = false
+                commentsLoadingMore = false
                 commentsRequestJob = null
             }
         }
@@ -3454,6 +3538,7 @@ fun WeiboApp() {
         val requestedItemId = item.id
         repostsRequestJob = scope.launch {
             repostsLoading = true
+            repostsLoadingMore = true
             runCatchingPreservingCancellation { session.loadReposts(item, page) }
                 .onSuccess { result ->
                     if (
@@ -3481,6 +3566,7 @@ fun WeiboApp() {
                 selectedItem?.id == requestedItemId
             ) {
                 repostsLoading = false
+                repostsLoadingMore = false
                 repostsRequestJob = null
             }
         }
@@ -3577,7 +3663,7 @@ fun WeiboApp() {
         if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
             runCatching { session.activateAccount(accountStore, savedActiveId) }
         } else if (session.hasLoginCookie()) {
-            persistLoginSession()
+            persistLoginSession(makeActive = true)
         }
         reloadStoredAccounts()
 
@@ -4138,8 +4224,9 @@ fun WeiboApp() {
                                 storedAccounts = storedAccounts,
                                 activeAccountId = activeAccountId,
                                 onSwitchAccount = ::switchStoredAccount,
+                                onDeleteAccount = ::deleteStoredAccount,
                                 onPrepareAddAccount = { session.prepareAddAccount() },
-                                onPersistLoginSession = { persistLoginSession() },
+                                onPersistLoginSession = { persistLoginSession(makeActive = true) },
                                 onReturnToFeed = {
                                     scope.launch {
                                         persistLoginSession()
@@ -4223,6 +4310,8 @@ fun WeiboApp() {
                                 commentSort = commentSort,
                                 isLoadingComments = commentsLoading,
                                 isLoadingReposts = repostsLoading,
+                                isLoadingMoreComments = commentsLoadingMore,
+                                isLoadingMoreReposts = repostsLoadingMore,
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
@@ -5832,18 +5921,18 @@ private fun FeedImageThumbnailContent(
 ) {
     val thumbnailQuality = LocalFeedThumbnailQuality.current
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
-    val cachedFullBitmap = remember(image.id, image.largeUrl, upgradeRevision) {
-        FeedBitmapCache.getForImage(image)?.takeIfDrawable()
+    val feedCacheCandidates = remember(image, thumbnailQuality) {
+        feedImageCacheCandidates(image, thumbnailQuality)
     }
-    val useCachedFullSize = maxDecodeDimOverride == null &&
-        thumbnailQuality != FeedThumbnailQuality.High &&
-        cachedFullBitmap != null
+    val cachedFeedBitmap = remember(image.id, image.largeUrl, thumbnailQuality, upgradeRevision) {
+        FeedBitmapCache.get(feedCacheCandidates)?.takeIfDrawable()
+    }
     val displayUrl = remember(image, thumbnailQuality) { thumbnailQuality.displayUrl(image) }
     val fallbackUrl = remember(image, thumbnailQuality) { thumbnailQuality.fallbackUrl(image) }
     val decodeDim = maxDecodeDimOverride ?: thumbnailQuality.maxDecodeDim
 
-    if (useCachedFullSize) {
-        val imageBitmap = remember(cachedFullBitmap) { cachedFullBitmap!!.asImageBitmap() }
+    if (maxDecodeDimOverride == null && cachedFeedBitmap != null) {
+        val imageBitmap = remember(cachedFeedBitmap) { cachedFeedBitmap.asImageBitmap() }
         Image(
             bitmap = imageBitmap,
             contentDescription = null,
@@ -5866,11 +5955,12 @@ private fun FeedImageThumbnailContent(
             } else {
                 listOfNotNull(fallbackUrl)
             },
-            cacheLookupUrls = feedImageUrlCandidates(image),
+            cacheLookupUrls = feedCacheCandidates,
             maxDecodeDim = decodeDim,
             modifier = modifier,
             contentScale = contentScale,
             animated = image.isGif,
+            limitConcurrency = true,
         )
     }
 }
@@ -6601,8 +6691,17 @@ private fun VideoPeekOverlay(
             return@LaunchedEffect
         }
         if (isFloating) {
-            if (!fromFullscreen && enterProgress.value < 1f) {
+            if (enterProgress.value < 1f) {
                 enterProgress.animateTo(1f, MediaPeekEnterAnimationSpec)
+            }
+            if (fullscreenExpandProgress.value > 0f) {
+                fullscreenExpandProgress.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(
+                        durationMillis = NavTransitionDurationMs,
+                        easing = FastOutSlowInEasing,
+                    ),
+                )
             }
             if (dockImmediately) {
                 dockProgress.snapTo(1f)
@@ -6734,6 +6833,7 @@ private fun VideoPeekOverlay(
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var totalDrag = Offset.Zero
+                    var requestedDismiss = false
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Initial)
                         val change = event.changes.firstOrNull { it.id == down.id }
@@ -6741,9 +6841,11 @@ private fun VideoPeekOverlay(
                             ?: break
                         if (!change.pressed) break
                         totalDrag += change.position - change.previousPosition
+                        videoPeekController.updateFingerDragOffset(totalDrag)
                         val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
                         if (abs(totalDrag.y) > dragGestureThreshold && verticalDominant) {
                             change.consume()
+                            requestedDismiss = true
                             onRequestCancel()
                             while (true) {
                                 val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
@@ -6752,6 +6854,9 @@ private fun VideoPeekOverlay(
                             }
                             break
                         }
+                    }
+                    if (!requestedDismiss) {
+                        videoPeekController.resetFingerDragOffset()
                     }
                 }
             }
@@ -6784,9 +6889,11 @@ private fun VideoPeekOverlay(
                                     ?: event.changes.firstOrNull()
                                     ?: break
                                 if (!change.pressed) {
+                                    videoPeekController.resetFingerDragOffset()
                                     break
                                 }
                                 totalDrag += change.position - change.previousPosition
+                                videoPeekController.updateFingerDragOffset(totalDrag)
                                 val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
                                 if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
                                     change.consume()
@@ -6845,6 +6952,11 @@ private fun VideoPeekOverlay(
                     onPlaybackEnded = onPlaybackEnded,
                     onAspectRatio = { aspectRatio = it },
                     onFullscreen = { videoPeekController.enterFullscreen() },
+                    onEnterFloatingPlayback = if (isFullscreenMode) {
+                        { videoPeekController.exitFullscreenToFloating() }
+                    } else {
+                        null
+                    },
                     enableDoubleTapFullscreen = false,
                     showFullscreenButton = false,
                     showPictureInPictureButton = false,
@@ -7139,17 +7251,20 @@ private fun MediaStrip(
     var viewerIndex by remember { mutableStateOf(0) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
+    var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
     var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun openImageViewer(index: Int, sourceBounds: Rect?, onClosed: (() -> Unit)? = null) {
         viewerIndex = index
-        viewerSourceBoundsByIndex = if (sourceBounds != null) {
-            (thumbnailBoundsByIndex + (index to sourceBounds)).also {
+        val boundsForIndex = sourceBounds ?: thumbnailBoundsByIndex[index]
+        viewerSourceBoundsByIndex = if (boundsForIndex != null) {
+            (thumbnailBoundsByIndex + (index to boundsForIndex)).also {
                 thumbnailBoundsByIndex = it
             }
         } else {
             emptyMap()
         }
+        viewerAnimateOpenFromSource = sourceBounds != null
         viewerDismissHook = onClosed
         viewerOpen = true
     }
@@ -7241,9 +7356,11 @@ private fun MediaStrip(
                     images = images,
                     initialIndex = viewerIndex,
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
+                    animateOpenFromSource = viewerAnimateOpenFromSource,
                     onDismiss = {
                         viewerOpen = false
                         viewerSourceBoundsByIndex = emptyMap()
+                        viewerAnimateOpenFromSource = true
                         viewerDismissHook?.invoke()
                         viewerDismissHook = null
                     },
@@ -7322,6 +7439,7 @@ private fun FullscreenImageViewer(
     initialIndex: Int,
     onDismiss: () -> Unit,
     sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
+    animateOpenFromSource: Boolean = true,
     session: WeiboWebSession? = null,
     relatedPosts: List<FeedItem> = emptyList(),
     emoticonMap: Map<String, String> = emptyMap(),
@@ -7331,7 +7449,7 @@ private fun FullscreenImageViewer(
     val scope = rememberCoroutineScope()
     val pagerState = rememberPagerState(pageCount = { images.size }, initialPage = initialIndex)
     val transitionProgress = remember(initialIndex) {
-        Animatable(if (sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
+        Animatable(if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
     }
     var transitionClosing by remember { mutableStateOf(false) }
     var dragDismissProgress by remember { mutableFloatStateOf(0f) }
@@ -8933,6 +9051,11 @@ private fun WeiboVideoSurface(
         fullscreenTopInset + VideoFullscreenTopControlInset
     }
     val fullscreenFloatingButtonTop = fullscreenPrimaryControlTop
+    val fullscreenSecondaryButtonEnd = if (isFullscreen && onEnterFloatingPlayback != null) {
+        VideoFullscreenHorizontalControlInset + 62.dp
+    } else {
+        VideoFullscreenHorizontalControlInset
+    }
     FullscreenForcedOrientationEffect(
         orientation = forcedOrientation,
         enabled = isFullscreen,
@@ -9346,6 +9469,7 @@ private fun WeiboVideoSurface(
                     this.player = player
                     useController = false
                     resizeMode = effectiveResizeMode
+                    keepScreenOn = isPlaying
                     setKeepContentOnPlayerReset(true)
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
                 }
@@ -9357,9 +9481,11 @@ private fun WeiboVideoSurface(
                     view.player = player
                 }
                 view.resizeMode = effectiveResizeMode
+                view.keepScreenOn = isPlaying
                 view.requestLayout()
             },
             onRelease = { view ->
+                view.keepScreenOn = false
                 view.player = null
                 if (playerViewHolder.view === view) {
                     playerViewHolder.view = null
@@ -9432,7 +9558,7 @@ private fun WeiboVideoSurface(
                 backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(
-                        end = VideoFullscreenHorizontalControlInset,
+                        end = fullscreenSecondaryButtonEnd,
                         top = fullscreenPrimaryControlTop,
                     )
                     .width(54.dp)
@@ -9457,7 +9583,7 @@ private fun WeiboVideoSurface(
                 backdrop = videoControlBackdrop,
                 modifier = Modifier
                     .padding(
-                        end = VideoFullscreenHorizontalControlInset,
+                        end = fullscreenSecondaryButtonEnd,
                         top = fullscreenPrimaryControlTop,
                     )
                     .width(54.dp)
@@ -9966,6 +10092,8 @@ private fun DetailScreen(
     commentSort: CommentSort,
     isLoadingComments: Boolean,
     isLoadingReposts: Boolean,
+    isLoadingMoreComments: Boolean = false,
+    isLoadingMoreReposts: Boolean = false,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onCommentSortChange: (CommentSort) -> Unit,
@@ -9998,6 +10126,8 @@ private fun DetailScreen(
     val showingReposts = contentSection == DetailContentSection.Reposts
     val sectionItems = if (showingReposts) reposts else comments
     val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
+    val isLoadingMoreSection = if (showingReposts) isLoadingMoreReposts else isLoadingMoreComments
+    val isRefreshingSection = isLoadingSection && !isLoadingMoreSection
     val sectionHasMore = if (showingReposts) repostsHasMore else commentsHasMore
     val onLoadMoreSection = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
 
@@ -10023,7 +10153,7 @@ private fun DetailScreen(
 
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
-        isRefreshing = isLoadingSection,
+        isRefreshing = isRefreshingSection,
         onRefresh = onRefresh,
         modifier = Modifier.fillMaxSize(),
     ) {
@@ -10084,14 +10214,6 @@ private fun DetailScreen(
                                 selected = commentSort,
                                 onSelected = onCommentSortChange,
                             )
-                        }
-                    }
-                }
-
-                if (isLoadingSection && sectionItems.isEmpty()) {
-                    item {
-                        Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                            AppLoadingIndicator()
                         }
                     }
                 }
@@ -12473,6 +12595,7 @@ private fun MineScreen(
     storedAccounts: List<StoredWeiboAccount> = emptyList(),
     activeAccountId: String? = null,
     onSwitchAccount: (String) -> Unit = {},
+    onDeleteAccount: (String) -> Unit = {},
     onPrepareAddAccount: suspend () -> Unit = {},
     onPersistLoginSession: suspend () -> Unit = {},
     onReturnToFeed: () -> Unit = {},
@@ -12595,6 +12718,7 @@ private fun MineScreen(
                     showSettings = false
                 },
                 onSwitchAccount = onSwitchAccount,
+                onDeleteAccount = onDeleteAccount,
                 onAddAccount = {
                     coroutineScope.launch {
                         onPrepareAddAccount()
@@ -13041,6 +13165,7 @@ private fun SettingsScreen(
     onThemeColorChange: (MorandiThemeColor) -> Unit,
     onBack: () -> Unit,
     onSwitchAccount: (String) -> Unit,
+    onDeleteAccount: (String) -> Unit,
     onAddAccount: () -> Unit,
     onSyncEmoticons: () -> Unit,
 ) {
@@ -13086,6 +13211,7 @@ private fun SettingsScreen(
                         activeAccountId = activeAccountId,
                         hasLoginCookie = hasLoginCookie,
                         onSwitchAccount = onSwitchAccount,
+                        onDeleteAccount = onDeleteAccount,
                         onAddAccount = onAddAccount,
                     )
                 }
@@ -13399,6 +13525,110 @@ private fun SettingsHelpSectionCard(section: HelpSection) {
 }
 
 @Composable
+private fun SettingsAccountRow(
+    account: StoredWeiboAccount,
+    isActive: Boolean,
+    onSwitchAccount: (String) -> Unit,
+    onDeleteAccount: (String) -> Unit,
+) {
+    var offsetX by remember(account.id) { mutableFloatStateOf(0f) }
+    val density = LocalDensity.current
+    val deleteThresholdPx = remember(density) { with(density) { 68.dp.toPx() } }
+    val revealLimitPx = remember(density) { with(density) { 88.dp.toPx() } }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp)),
+    ) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color(0xFFE35D5B)),
+            contentAlignment = Alignment.CenterEnd,
+        ) {
+            Text(
+                text = "删除",
+                modifier = Modifier.padding(end = 18.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .graphicsLayer { translationX = offsetX }
+                .background(
+                    if (isActive) {
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                    } else {
+                        StatusQuotedBackground
+                    },
+                )
+                .pointerInput(account.id) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        var dragX = offsetX
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull() ?: break
+                            if (!change.pressed) break
+                            val deltaX = change.position.x - change.previousPosition.x
+                            dragX = (dragX + deltaX).coerceIn(-revealLimitPx, 0f)
+                            offsetX = dragX
+                            if (abs(deltaX) > 0.5f) change.consume()
+                        }
+                        if (offsetX <= -deleteThresholdPx) {
+                            onDeleteAccount(account.id)
+                        }
+                        offsetX = 0f
+                    }
+                }
+                .clickable(enabled = !isActive && offsetX == 0f) { onSwitchAccount(account.id) }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            RemoteImage(
+                url = account.avatarUrl,
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(
+                    text = account.screenName.ifBlank { "微博用户" },
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "UID ${account.id}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (isActive) {
+                Text(
+                    text = "当前",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingsImageCard(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
@@ -13407,8 +13637,8 @@ private fun SettingsImageCard(
 ) {
     val subtitle = when (quality) {
         FeedThumbnailQuality.Low -> "当前为省流模式，优先加载 bmiddle 缩略图"
-        FeedThumbnailQuality.Medium -> "当前为标准模式，优先加载 large 大图"
-        FeedThumbnailQuality.High -> "当前为高清模式，优先加载最高可用规格"
+        FeedThumbnailQuality.Medium -> "当前为标准模式，优先加载 mw690 中图"
+        FeedThumbnailQuality.High -> "当前为高清模式，优先加载 mw1024 预览图"
     }
 
     SettingsPlainCard {
@@ -13566,53 +13796,49 @@ private fun SettingsThemeColorCard(
             }
 
             AnimatedVisibility(visible = expanded) {
-                FlowRow(
+                BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
                 ) {
-                    MorandiThemeColors.forEach { option ->
-                        val isSelected = selected.storageValue == option.storageValue
-                        Row(
-                            modifier = Modifier
-                                .width(94.dp)
-                                .height(46.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .border(
-                                    width = 1.dp,
-                                    color = if (isSelected) option.primary else Color(0xFFE1E1E1),
-                                    shape = RoundedCornerShape(8.dp),
-                                )
-                                .background(
-                                    color = if (isSelected) {
-                                        option.primaryContainer.copy(alpha = 0.48f)
-                                    } else {
-                                        Color.White
-                                    },
-                                    shape = RoundedCornerShape(8.dp),
-                                )
-                                .clickable { onSelected(option) }
-                                .padding(horizontal = 9.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(7.dp),
-                        ) {
+                    val gap = 6.dp
+                    val buttonWidth = (maxWidth - gap * 3) / 4
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(gap),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        maxItemsInEachRow = 4,
+                    ) {
+                        MorandiThemeColors.forEach { option ->
+                            val isSelected = selected.storageValue == option.storageValue
+                            val textColor = readableTextColor(option.primary)
                             Box(
                                 modifier = Modifier
-                                    .size(18.dp)
-                                    .clip(CircleShape)
-                                    .background(option.primary),
-                            )
-                            Text(
-                                text = option.label,
-                                modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (isSelected) option.primary else MaterialTheme.colorScheme.onSurface,
-                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                                    .width(buttonWidth)
+                                    .height(34.dp)
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .border(
+                                        width = if (isSelected) 1.5.dp else 1.dp,
+                                        color = if (isSelected) textColor.copy(alpha = 0.92f) else Color.White.copy(alpha = 0.55f),
+                                        shape = RoundedCornerShape(999.dp),
+                                    )
+                                    .background(option.primary)
+                                    .clickable { onSelected(option) },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = option.label,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 3.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = textColor,
+                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    textAlign = TextAlign.Center,
+                                )
+                            }
                         }
                     }
                 }
@@ -13695,6 +13921,7 @@ private fun SettingsAccountCard(
     activeAccountId: String?,
     hasLoginCookie: Boolean,
     onSwitchAccount: (String) -> Unit,
+    onDeleteAccount: (String) -> Unit,
     onAddAccount: () -> Unit,
 ) {
     val activeAccount = accounts.firstOrNull { it.id == activeAccountId }
@@ -13774,57 +14001,12 @@ private fun SettingsAccountCard(
                     } else {
                         accounts.forEach { account ->
                             val isActive = account.id == activeAccountId
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (isActive) {
-                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
-                                        } else {
-                                            StatusQuotedBackground
-                                        }
-                                    )
-                                    .clickable(enabled = !isActive) { onSwitchAccount(account.id) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                            ) {
-                                RemoteImage(
-                                    url = account.avatarUrl,
-                                    modifier = Modifier
-                                        .size(40.dp)
-                                        .clip(CircleShape),
-                                    contentScale = ContentScale.Crop,
-                                )
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                                ) {
-                                    Text(
-                                        text = account.screenName.ifBlank { "微博用户" },
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = FontWeight.Medium,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    Text(
-                                        text = "UID ${account.id}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                if (isActive) {
-                                    Text(
-                                        text = "当前",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.SemiBold,
-                                    )
-                                }
-                            }
+                            SettingsAccountRow(
+                                account = account,
+                                isActive = isActive,
+                                onSwitchAccount = onSwitchAccount,
+                                onDeleteAccount = onDeleteAccount,
+                            )
                         }
                     }
                     TextButton(
@@ -13837,6 +14019,11 @@ private fun SettingsAccountCard(
             }
         }
     }
+}
+
+private fun readableTextColor(background: Color): Color {
+    val luminance = 0.299f * background.red + 0.587f * background.green + 0.114f * background.blue
+    return if (luminance < 0.58f) Color.White else Color(0xFF202124)
 }
 
 @Composable
@@ -16322,6 +16509,7 @@ private fun RemoteImage(
     cacheLookupUrls: List<String> = emptyList(),
     maxDecodeDim: Int = 480,
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
+    limitConcurrency: Boolean = false,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -16329,6 +16517,7 @@ private fun RemoteImage(
             modifier = modifier,
             contentScale = contentScale,
             placeholderBackground = placeholderBackground,
+            limitConcurrency = limitConcurrency,
         )
         return
     }
@@ -16367,10 +16556,19 @@ private fun RemoteImage(
         for (candidateUrl in candidates) {
             val loaded = runCatching {
                 withContext(Dispatchers.IO) {
-                    loadRemoteBitmap(
-                        url = candidateUrl,
-                        maxDecodeDim = maxDecodeDim,
-                    )
+                    if (limitConcurrency) {
+                        FeedImageLoadSemaphore.withPermit {
+                            loadRemoteBitmap(
+                                url = candidateUrl,
+                                maxDecodeDim = maxDecodeDim,
+                            )
+                        }
+                    } else {
+                        loadRemoteBitmap(
+                            url = candidateUrl,
+                            maxDecodeDim = maxDecodeDim,
+                        )
+                    }
                 }
             }.getOrNull()
             if (loaded != null) {
@@ -16415,6 +16613,7 @@ private fun AnimatedRemoteImage(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
+    limitConcurrency: Boolean = false,
 ) {
     var drawable by remember(url) { mutableStateOf<Drawable?>(null) }
     var failed by remember(url) { mutableStateOf(false) }
@@ -16425,7 +16624,13 @@ private fun AnimatedRemoteImage(
         val target = url?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         runCatching {
             withContext(Dispatchers.IO) {
-                loadRemoteAnimatedDrawable(target)
+                if (limitConcurrency) {
+                    FeedImageLoadSemaphore.withPermit {
+                        loadRemoteAnimatedDrawable(target)
+                    }
+                } else {
+                    loadRemoteAnimatedDrawable(target)
+                }
             }
         }.onSuccess { drawable = it }
             .onFailure { failed = true }
@@ -16658,6 +16863,69 @@ private object RemoteBytesCache {
     }
 }
 
+private object RemoteDiskBytesCache {
+    private var directory: java.io.File? = null
+
+    @Synchronized
+    fun configure(cacheDir: java.io.File) {
+        directory = cacheDir.also { it.mkdirs() }
+        trimLocked()
+    }
+
+    @Synchronized
+    fun get(url: String, maxBytes: Int): ByteArray? {
+        val dir = directory ?: return null
+        val file = java.io.File(dir, cacheFileName(url))
+        if (!file.isFile || file.length() <= 0L || file.length() > maxBytes) return null
+        return runCatching {
+            file.setLastModified(System.currentTimeMillis())
+            file.readBytes()
+        }.getOrNull()
+    }
+
+    @Synchronized
+    fun put(url: String, bytes: ByteArray) {
+        if (bytes.isEmpty() || bytes.size > RemoteBytesAnimatedMaxRead) return
+        val dir = directory ?: return
+        dir.mkdirs()
+        val file = java.io.File(dir, cacheFileName(url))
+        val tempFile = java.io.File(dir, "${file.name}.tmp")
+        runCatching {
+            tempFile.writeBytes(bytes)
+            if (file.exists()) file.delete()
+            if (!tempFile.renameTo(file)) {
+                tempFile.delete()
+                return
+            }
+            file.setLastModified(System.currentTimeMillis())
+            trimLocked()
+        }
+    }
+
+    @Synchronized
+    fun trim() {
+        trimLocked()
+    }
+
+    private fun trimLocked() {
+        val dir = directory ?: return
+        val files = dir.listFiles()?.filter { it.isFile } ?: return
+        var totalBytes = files.sumOf { it.length() }
+        if (totalBytes <= RemoteDiskBytesCacheMaxTotal) return
+        files.sortedBy { it.lastModified() }.forEach { file ->
+            if (totalBytes <= RemoteDiskBytesCacheMaxTotal) return
+            val size = file.length()
+            if (file.delete()) totalBytes -= size
+        }
+    }
+
+    private fun cacheFileName(url: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(url.toByteArray(Charsets.UTF_8))
+        return digest.joinToString(separator = "") { byte -> "%02x".format(byte) }
+    }
+}
+
 private fun readRemoteBytesLimited(
     input: java.io.InputStream,
     maxBytes: Int,
@@ -16683,7 +16951,11 @@ private fun fetchRemoteBytes(
     readTimeoutMs: Int,
     maxReadBytes: Int = RemoteBytesMaxCachedEntry,
 ): ByteArray {
-    RemoteBytesCache.get(url)?.let { return it }
+    RemoteBytesCache.get(url)?.takeIf { it.size <= maxReadBytes }?.let { return it }
+    RemoteDiskBytesCache.get(url, maxReadBytes)?.let { bytes ->
+        RemoteBytesCache.put(url, bytes)
+        return bytes
+    }
     val bytes = URL(url).openConnection().apply {
         (this as HttpURLConnection).connectTimeout = connectTimeoutMs
         readTimeout = readTimeoutMs
@@ -16691,6 +16963,7 @@ private fun fetchRemoteBytes(
         setRequestProperty("Referer", "https://weibo.com/")
     }.inputStream.use { readRemoteBytesLimited(it, maxReadBytes) }
     RemoteBytesCache.put(url, bytes)
+    RemoteDiskBytesCache.put(url, bytes)
     return bytes
 }
 

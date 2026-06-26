@@ -1,3 +1,5 @@
+@file:Suppress("UnsafeOptInUsageError")
+
 package com.example.myweibo
 
 import android.app.PictureInPictureParams
@@ -49,6 +51,7 @@ class VideoPipActivity : ComponentActivity() {
         playerView = PlayerView(this).apply {
             useController = false
             resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+            keepScreenOn = true
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -117,6 +120,7 @@ class VideoPipActivity : ComponentActivity() {
     }
 
     private fun stopAndReleasePlayer() {
+        playerView?.keepScreenOn = false
         playerView?.player = null
         player?.let { exoPlayer ->
             exoPlayer.playWhenReady = false

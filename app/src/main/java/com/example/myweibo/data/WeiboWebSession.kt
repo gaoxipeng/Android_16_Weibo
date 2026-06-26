@@ -38,6 +38,7 @@ class WeiboWebSession(context: Context) {
     private val albumLoadMutex = Mutex()
     private val mweiboSessionMutex = Mutex()
     private var mweiboSessionReady = false
+    private val viewportCoordinator = SessionWebViewportCoordinator()
 
     var currentUrl: String = ""
         private set
@@ -50,7 +51,9 @@ class WeiboWebSession(context: Context) {
         webView.loadUrl(WEIBO_HOME)
     }
 
-    fun openLogin() {
+    fun openLogin(forceReload: Boolean = false) {
+        val activeUrl = webView.url.orEmpty().ifBlank { currentUrl }
+        if (!forceReload && activeUrl.startsWith(WEIBO_PASSPORT_ORIGIN)) return
         webView.loadUrl(WEIBO_PASSPORT_LOGIN)
     }
 
@@ -1489,11 +1492,10 @@ class WeiboWebSession(context: Context) {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             loadsImagesAutomatically = true
             useWideViewPort = true
-            loadWithOverviewMode = true
+            loadWithOverviewMode = false
             cacheMode = WebSettings.LOAD_DEFAULT
             userAgentString = DESKTOP_CHROME_USER_AGENT
         }
@@ -1509,6 +1511,13 @@ class WeiboWebSession(context: Context) {
                 isWeiboPageReady =
                     currentUrl.startsWith("https://weibo.com") ||
                         currentUrl.startsWith("https://www.weibo.com")
+                if (currentUrl.contains("passport.weibo")) {
+                    if (viewportCoordinator.shouldFitOnPageFinished(url) &&
+                        viewportCoordinator.debounceAllowed()
+                    ) {
+                        view?.fitSessionWebViewport(scrollToTop = false)
+                    }
+                }
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -1526,7 +1535,10 @@ class WeiboWebSession(context: Context) {
         return WeiboJsonParser.parseEmotions(raw)
     }
 
-    suspend fun persistCurrentAccount(store: WeiboAccountStore): StoredWeiboAccount? {
+    suspend fun persistCurrentAccount(
+        store: WeiboAccountStore,
+        makeActive: Boolean = false,
+    ): StoredWeiboAccount? {
         if (!hasLoginCookie()) return null
         val profile = loadCurrentUserProfile()
         val account = StoredWeiboAccount(
@@ -1535,7 +1547,7 @@ class WeiboWebSession(context: Context) {
             avatarUrl = profile.avatarUrl,
             cookies = captureCookieSnapshot(),
         )
-        store.upsertAccount(account)
+        store.upsertAccount(account, makeActive = makeActive)
         return account
     }
 
@@ -1551,7 +1563,6 @@ class WeiboWebSession(context: Context) {
 
     suspend fun prepareAddAccount() {
         clearAllCookies()
-        openLogin()
     }
 
     fun captureCookieSnapshot(): Map<String, String> {
@@ -1597,6 +1608,7 @@ class WeiboWebSession(context: Context) {
         private const val RELATION_LIST_MAX_PAGES = 100
         private const val FRIENDS_CIRCLE_GID = "100097312739005"
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
+        private const val WEIBO_PASSPORT_ORIGIN = "https://passport.weibo.cn/"
         private val COOKIE_ORIGINS = listOf(
             "https://weibo.com/",
             "https://www.weibo.com/",
@@ -1613,4 +1625,58 @@ class WeiboWebSession(context: Context) {
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
                 "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
     }
+}
+
+private class SessionWebViewportCoordinator {
+    private var lastFittedUrl: String? = null
+    private var lastFitAtMs: Long = 0L
+
+    fun shouldFitOnPageFinished(url: String?): Boolean {
+        val normalized = url.orEmpty()
+        if (normalized == lastFittedUrl) return false
+        lastFittedUrl = normalized
+        return true
+    }
+
+    fun debounceAllowed(minIntervalMs: Long = 800L): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastFitAtMs < minIntervalMs) return false
+        lastFitAtMs = now
+        return true
+    }
+}
+
+private fun WebView.fitSessionWebViewport(scrollToTop: Boolean = false) {
+    evaluateJavascript(
+        """
+        (function() {
+            var meta = document.querySelector('meta[name="viewport"]');
+            if (!meta) {
+                meta = document.createElement('meta');
+                meta.name = 'viewport';
+                document.head.appendChild(meta);
+            }
+            var viewport = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
+            if (meta.content !== viewport) {
+                meta.content = viewport;
+            }
+            var width = window.innerWidth + 'px';
+            var height = window.innerHeight + 'px';
+            if (document.documentElement.style.width !== width) {
+                document.documentElement.style.width = width;
+            }
+            if (document.documentElement.style.height !== height) {
+                document.documentElement.style.height = height;
+            }
+            if (document.body.style.width !== width) {
+                document.body.style.width = width;
+            }
+            if (document.body.style.minHeight !== height) {
+                document.body.style.minHeight = height;
+            }
+            ${if (scrollToTop) "window.scrollTo(0, 0);" else ""}
+        })();
+        """.trimIndent(),
+        null,
+    )
 }
