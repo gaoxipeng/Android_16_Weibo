@@ -48,6 +48,8 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.tanh
 
+internal val LiquidGlassBlurRadius = 4.dp
+
 internal val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
 internal val LocalLiquidMenuBackdrop = staticCompositionLocalOf<Backdrop?> { null }
 
@@ -94,7 +96,7 @@ fun LiquidButton(
                 shape = { RoundedCornerShape(percent = 50) },
                 effects = {
                     vibrancy()
-                    blur(2f.dp.toPx())
+                    blur(LiquidGlassBlurRadius.toPx())
                     lens(12f.dp.toPx(), 24f.dp.toPx())
                 },
                 layerBlock = if (isInteractive) {
@@ -173,7 +175,7 @@ fun SurfaceLiquidCapsule(
                     shape = { shape },
                     effects = {
                         vibrancy()
-                        blur(2f.dp.toPx())
+                        blur(LiquidGlassBlurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     },
                     onDrawSurface = { drawRect(surfaceColor) },
@@ -260,7 +262,7 @@ fun TransparentLiquidCapsule(
                 shape = { shape },
                 effects = {
                     vibrancy()
-                    blur(2f.dp.toPx())
+                    blur(LiquidGlassBlurRadius.toPx())
                     lens(12f.dp.toPx(), 24f.dp.toPx())
                 },
                 onDrawSurface = {
@@ -319,7 +321,7 @@ fun SurfaceLiquidMenuCard(
                     shape = { shape },
                     effects = {
                         vibrancy()
-                        blur(2f.dp.toPx())
+                        blur(LiquidGlassBlurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     },
                     onDrawSurface = { drawRect(surfaceColor) },

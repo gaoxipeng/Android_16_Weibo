@@ -51,6 +51,7 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.DecayAnimationSpec
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animate
@@ -178,6 +179,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
@@ -197,6 +199,7 @@ import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -2552,7 +2555,7 @@ fun WeiboApp() {
     }
 
     fun closeDetail() {
-        navigateBack()
+        popNavigation()
     }
 
     fun handleRootBackPress() {
@@ -3951,6 +3954,7 @@ fun WeiboApp() {
             val keepFeedAlive = selectedTab == MainTab.Feed &&
                 visitedUserId != null &&
                 detailOverlayItem == null
+            val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
             val searchUiOnTop = selectedTab == MainTab.Search &&
                 visitedUserId == null &&
                 detailOverlayItem == null &&
@@ -3980,8 +3984,6 @@ fun WeiboApp() {
                 mediaPreview == null &&
                 albumViewerState == null &&
                 followListBelongsToCurrentContext
-            val feedVisibleAlpha = if (feedUiOnTop) 1f else 0f
-
             Box(Modifier.fillMaxSize()) {
                 if (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) {
                     Box(
@@ -4318,7 +4320,7 @@ fun WeiboApp() {
                             }
                             detailScrollPending = null
                         }
-                        BackHandler(onBack = { navigateBack() })
+                        BackHandler(onBack = { closeDetail() })
                         Surface(
                             modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background,
@@ -4337,7 +4339,7 @@ fun WeiboApp() {
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
                                 onLikeClick = ::openLikeUsers,
-                                onBack = { navigateBack() },
+                                onBack = { closeDetail() },
                                 onRefresh = { reloadDetailContent() },
                                 onCommentSortChange = ::changeCommentSort,
                                 onLoadMoreComments = { loadMoreComments() },
@@ -5609,9 +5611,7 @@ private fun QuotedStatus(
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
     val quotedShape = RoundedCornerShape(8.dp)
     ElevatedCard(
-        modifier = modifier
-            .fillMaxWidth()
-            .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant, quotedShape),
+        modifier = modifier.fillMaxWidth(),
         shape = quotedShape,
         colors = CardDefaults.elevatedCardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.58f),
@@ -10201,9 +10201,14 @@ private fun DetailScreen(
     val sectionItems = if (showingReposts) reposts else comments
     val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
     val isLoadingMoreSection = if (showingReposts) isLoadingMoreReposts else isLoadingMoreComments
-    val isRefreshingSection = isLoadingSection && !isLoadingMoreSection
     val sectionHasMore = if (showingReposts) repostsHasMore else commentsHasMore
     val onLoadMoreSection = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
+    var pullRefreshing by remember { mutableStateOf(false) }
+    LaunchedEffect(isLoadingSection) {
+        if (!isLoadingSection) {
+            pullRefreshing = false
+        }
+    }
 
     LaunchedEffect(
         listState,
@@ -10227,8 +10232,11 @@ private fun DetailScreen(
 
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
-        isRefreshing = isRefreshingSection,
-        onRefresh = onRefresh,
+        isRefreshing = pullRefreshing,
+        onRefresh = {
+            pullRefreshing = true
+            onRefresh()
+        },
         modifier = Modifier.fillMaxSize(),
     ) {
         Column(Modifier.fillMaxSize()) {
@@ -10288,6 +10296,19 @@ private fun DetailScreen(
                                 selected = commentSort,
                                 onSelected = onCommentSortChange,
                             )
+                        }
+                    }
+                }
+
+                if (sectionItems.isEmpty() && isLoadingSection) {
+                    item {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
                         }
                     }
                 }
@@ -11942,30 +11963,56 @@ private fun SearchSuggestionUserRow(
 private fun SearchHistoryRow(
     query: String,
     onClick: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
             .padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Text(
-            text = "↺",
-            modifier = Modifier.width(22.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 14.sp,
-            textAlign = TextAlign.Center,
-        )
-        Text(
             text = query,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier
+                .weight(1f)
+                .clickable(onClick = onClick),
             style = MaterialTheme.typography.bodyLarge,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        Text(
+            text = "×",
+            modifier = Modifier
+                .clickable(onClick = onDelete)
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 18.sp,
+            textAlign = TextAlign.Center,
+        )
     }
+}
+
+private data class HotSearchBadgeColors(
+    val container: Color,
+    val content: Color,
+)
+
+private fun hotSearchBadgeColors(label: String): HotSearchBadgeColors {
+    val normalized = label.trim()
+    val content = when {
+        "爆" in normalized -> Color(0xFFFF3852)
+        "沸" in normalized -> Color(0xFFFF6A00)
+        "热" in normalized -> Color(0xFFFF8A00)
+        "新" in normalized -> Color(0xFFFF4081)
+        "荐" in normalized -> Color(0xFF2F80ED)
+        "榜" in normalized -> Color(0xFFFF8A00)
+        else -> Color(0xFFFF8A00)
+    }
+    return HotSearchBadgeColors(
+        container = content.copy(alpha = 0.12f),
+        content = content,
+    )
 }
 
 @Composable
@@ -12005,15 +12052,16 @@ private fun HotSearchRow(
             overflow = TextOverflow.Ellipsis,
         )
         if (item.label.isNotBlank()) {
+            val badgeColors = hotSearchBadgeColors(item.label)
             Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                color = badgeColors.container,
                 shape = RoundedCornerShape(6.dp),
             ) {
                 Text(
                     text = item.label,
                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = badgeColors.content,
                     maxLines = 1,
                 )
             }
@@ -12077,8 +12125,13 @@ private fun SearchScreen(
     var searchHistory by remember { mutableStateOf(searchHistoryStore.read()) }
     var searchHistoryExpanded by remember { mutableStateOf(false) }
     var suggestResult by remember { mutableStateOf(SearchSuggestResult()) }
+    var suggestForQuery by remember { mutableStateOf("") }
     var suggestLoading by remember { mutableStateOf(false) }
+    var suggestLoadingForQuery by remember { mutableStateOf("") }
+    var suggestRequestGeneration by remember { mutableIntStateOf(0) }
     var searchDraft by remember { mutableStateOf(searchBarOverlay.queryInput) }
+    val latestSearchDraft by rememberUpdatedState(searchDraft)
+    val searchDraftText = searchDraft.text
 
     fun resetSearchResults(clearActiveQuery: Boolean) {
         if (clearActiveQuery) {
@@ -12095,8 +12148,17 @@ private fun SearchScreen(
     }
 
     fun updateSearchDraft(value: TextFieldValue) {
+        val oldTerm = searchDraft.text.trim()
+        val newTerm = value.text.trim()
         searchDraft = value
         searchBarOverlay.queryInput = value
+        if (newTerm != oldTerm) {
+            suggestRequestGeneration++
+            suggestResult = SearchSuggestResult()
+            suggestForQuery = ""
+            suggestLoading = false
+            suggestLoadingForQuery = ""
+        }
         if (activeQuery != null && value.text.trim() != activeQuery) {
             resetSearchResults(clearActiveQuery = true)
         }
@@ -12257,22 +12319,50 @@ private fun SearchScreen(
         loadTopicResults(reset = true, generation = searchGeneration)
     }
 
-    LaunchedEffect(searchBarVisible, hasLoginCookie, searchDraft.text) {
-        val query = searchDraft.text.trim()
-        if (!searchBarVisible || !hasLoginCookie || query.isBlank()) {
+    LaunchedEffect(
+        searchDraftText,
+        activeQuery,
+        searchBarVisible,
+        hasLoginCookie,
+    ) {
+        val requestGeneration = ++suggestRequestGeneration
+        if (!searchBarVisible || !hasLoginCookie || activeQuery != null) {
             suggestLoading = false
+            suggestLoadingForQuery = ""
             suggestResult = SearchSuggestResult()
+            suggestForQuery = ""
+            return@LaunchedEffect
+        }
+        val term = searchDraftText.trim()
+        if (term.isBlank()) {
+            suggestLoading = false
+            suggestLoadingForQuery = ""
+            suggestResult = SearchSuggestResult()
+            suggestForQuery = ""
             return@LaunchedEffect
         }
         suggestResult = SearchSuggestResult()
+        suggestForQuery = ""
         suggestLoading = true
-        delay(120)
-        if (query != searchDraft.text.trim()) return@LaunchedEffect
-        val result = runCatching { session.loadSearchSuggest(query) }
-            .getOrElse { SearchSuggestResult() }
-        if (query != searchDraft.text.trim()) return@LaunchedEffect
-        suggestResult = result
-        suggestLoading = false
+        suggestLoadingForQuery = term
+        try {
+            delay(80)
+            if (requestGeneration != suggestRequestGeneration) return@LaunchedEffect
+            if (latestSearchDraft.text.trim() != term) return@LaunchedEffect
+            val result = withTimeoutOrNull(5_000) {
+                runCatching { session.loadSearchSuggest(term) }
+                    .getOrElse { SearchSuggestResult() }
+            } ?: SearchSuggestResult()
+            if (requestGeneration != suggestRequestGeneration) return@LaunchedEffect
+            if (latestSearchDraft.text.trim() != term) return@LaunchedEffect
+            suggestResult = result
+            suggestForQuery = term
+        } finally {
+            if (requestGeneration == suggestRequestGeneration) {
+                suggestLoading = false
+                suggestLoadingForQuery = ""
+            }
+        }
     }
 
     LaunchedEffect(initialResultsReady, activeQuery, searchGeneration) {
@@ -12282,9 +12372,23 @@ private fun SearchScreen(
         }
     }
 
+    LaunchedEffect(listState, activeQuery, searchBarVisible) {
+        if (!searchBarVisible || activeQuery != null) return@LaunchedEffect
+        var lastScrollTotal =
+            listState.firstVisibleItemIndex * 10_000 + listState.firstVisibleItemScrollOffset
+        snapshotFlow {
+            listState.firstVisibleItemIndex * 10_000 + listState.firstVisibleItemScrollOffset
+        }.collect { scrollTotal ->
+            if (scrollTotal > lastScrollTotal + 8) {
+                focusManager.clearFocus(force = true)
+                keyboardController?.hide()
+            }
+            lastScrollTotal = scrollTotal
+        }
+    }
+
     val searchGenerationState by rememberUpdatedState(searchGeneration)
     val initialResultsReadyState by rememberUpdatedState(initialResultsReady)
-    val latestSearchDraft by rememberUpdatedState(searchDraft)
 
     LaunchedEffect(listState, activeQuery, searchGeneration, activeSearchMode, weiboSort) {
         if (activeQuery == null) return@LaunchedEffect
@@ -12334,8 +12438,8 @@ private fun SearchScreen(
     )
     val suggestionPanelInset = if (
         searchBarVisible &&
-        searchDraft.text.trim().isNotBlank() &&
-        activeQuery != searchDraft.text.trim()
+        searchDraftText.trim().isNotBlank() &&
+        activeQuery != searchDraftText.trim()
     ) {
         176.dp
     } else {
@@ -12344,6 +12448,7 @@ private fun SearchScreen(
     val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap + suggestionPanelInset
 
     SideEffect {
+        searchBarOverlay.queryInput = searchDraft
         searchBarOverlay.active = searchBarVisible
         searchBarOverlay.mode = searchMode
         searchBarOverlay.onModeChange = { mode ->
@@ -12363,11 +12468,18 @@ private fun SearchScreen(
         searchBarOverlay.onQueryInputChange = { value -> updateSearchDraft(value) }
         searchBarOverlay.onSearch = { submitQuery(latestSearchDraft.text) }
         searchBarOverlay.onClear = ::clearSearchResults
-        searchBarOverlay.suggestions = suggestResult
-        searchBarOverlay.suggestionsLoading = suggestLoading
+        val currentSuggestTerm = searchDraftText.trim()
+        searchBarOverlay.suggestions = if (suggestForQuery == currentSuggestTerm) {
+            suggestResult
+        } else {
+            SearchSuggestResult()
+        }
+        searchBarOverlay.suggestionsLoading = suggestLoading &&
+            suggestLoadingForQuery == currentSuggestTerm &&
+            currentSuggestTerm.isNotBlank()
         searchBarOverlay.suggestionsVisible = searchBarVisible &&
-            searchDraft.text.trim().isNotBlank() &&
-            activeQuery != searchDraft.text.trim()
+            currentSuggestTerm.isNotBlank() &&
+            activeQuery != currentSuggestTerm
         searchBarOverlay.onSuggestionClick = { query, mode ->
             onSearchModeChange(mode)
             activeSearchMode = mode
@@ -12464,25 +12576,48 @@ private fun SearchScreen(
                             SearchHistoryRow(
                                 query = query,
                                 onClick = { submitQuery(query) },
+                                onDelete = {
+                                    searchHistory = searchHistoryStore.remove(query)
+                                    if (searchHistory.size <= SearchHistoryStore.DISPLAY_COLLAPSED) {
+                                        searchHistoryExpanded = false
+                                    }
+                                },
                             )
                             if (index < visibleHistory.lastIndex) {
                                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
                             }
                         }
-                        if (searchHistory.size > SearchHistoryStore.DISPLAY_COLLAPSED) {
-                            item {
+                        item {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                if (searchHistory.size > SearchHistoryStore.DISPLAY_COLLAPSED) {
+                                    TextButton(
+                                        onClick = { searchHistoryExpanded = !searchHistoryExpanded },
+                                        contentPadding = PaddingValues(vertical = 4.dp),
+                                    ) {
+                                        Text(
+                                            text = if (searchHistoryExpanded) "收起" else "展开更多",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                    }
+                                } else {
+                                    Spacer(Modifier.width(1.dp))
+                                }
                                 TextButton(
-                                    onClick = { searchHistoryExpanded = !searchHistoryExpanded },
+                                    onClick = {
+                                        searchHistory = searchHistoryStore.clear()
+                                        searchHistoryExpanded = false
+                                    },
                                     contentPadding = PaddingValues(vertical = 4.dp),
                                 ) {
                                     Text(
-                                        text = if (searchHistoryExpanded) {
-                                            "收起"
-                                        } else {
-                                            "展开更多（${searchHistory.size - SearchHistoryStore.DISPLAY_COLLAPSED}）"
-                                        },
+                                        text = "清除",
                                         style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.primary,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
                             }
@@ -12543,6 +12678,19 @@ private fun SearchScreen(
                     }
                 } else {
                     when {
+                        resultLoading &&
+                            (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
+                            item {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 48.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    CircularProgressIndicator()
+                                }
+                            }
+                        }
                         resultError != null &&
                             (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
                             item {
@@ -13176,6 +13324,7 @@ private fun MineScreen(
         animatedCollapse >= 1f -> 0.dp
         else -> Dp.Unspecified
     }
+    val tabsOverlapOffset = ProfileHeaderCardCoverOverlap * (1f - animatedCollapse)
 
     Box(Modifier.fillMaxSize()) {
     Column(
@@ -13307,39 +13456,54 @@ private fun MineScreen(
                     }
                 }
 
-                MineContentTabs(
-                    scrollPosition = mineTabScrollPosition,
-                    onTabSelected = { tab ->
-                        val sameTab = tab == MineContentTab.entries[pagerState.currentPage]
-                        if (sameTab) {
-                            coroutineScope.launch {
-                                when (tab) {
-MineContentTab.Posts -> postsListState.animateScrollToTopFixed()
-                MineContentTab.Album -> albumListState.animateScrollToTopFixed()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .offset(y = -tabsOverlapOffset),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surface),
+                    ) {
+                        MineContentTabs(
+                            scrollPosition = mineTabScrollPosition,
+                            onTabSelected = { tab ->
+                                val sameTab = tab == MineContentTab.entries[pagerState.currentPage]
+                                if (sameTab) {
+                                    coroutineScope.launch {
+                                        when (tab) {
+                                            MineContentTab.Posts -> postsListState.animateScrollToTopFixed()
+                                            MineContentTab.Album -> albumListState.animateScrollToTopFixed()
+                                        }
+                                    }
+                                } else {
+                                    coroutineScope.launch {
+                                        pagerState.animateScrollToPage(MineContentTab.entries.indexOf(tab))
+                                    }
                                 }
-                            }
-                        } else {
-                            coroutineScope.launch {
-                                pagerState.animateScrollToPage(MineContentTab.entries.indexOf(tab))
-                            }
+                            },
+                        )
+
+                        postsError?.let { error ->
+                            Text(
+                                text = error,
+                                modifier = Modifier.padding(horizontal = 4.dp),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
                         }
-                    },
-                )
+                    }
 
-                postsError?.let { error ->
-                    Text(
-                        text = error,
-                        modifier = Modifier.padding(horizontal = 4.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-
-                HorizontalPager(
-                    state = pagerState,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    beyondViewportPageCount = 0,
-                ) { page ->
+                    HorizontalPager(
+                        state = pagerState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .background(MaterialTheme.colorScheme.background),
+                        beyondViewportPageCount = 0,
+                    ) { page ->
                     when (MineContentTab.entries[page]) {
                         MineContentTab.Posts -> {
                             LazyColumn(
@@ -13464,6 +13628,7 @@ MineContentTab.Posts -> postsListState.animateScrollToTopFixed()
                             }
                         }
                     }
+                }
                 }
             }
         }
@@ -15715,11 +15880,11 @@ private fun MineContentTabs(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp, top = 2.dp, bottom = 2.dp),
+            .padding(start = 12.dp, bottom = 4.dp),
     ) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(22.dp),
-            verticalAlignment = Alignment.Top,
+            verticalAlignment = Alignment.Bottom,
         ) {
             tabs.forEachIndexed { index, tab ->
                 val selected = index == highlightedIndex
@@ -15733,7 +15898,7 @@ private fun MineContentTabs(
                         }
                         .clip(RoundedCornerShape(3.dp))
                         .clickable { onTabSelected(tab) }
-                        .padding(horizontal = 2.dp, vertical = 4.dp),
+                        .padding(horizontal = 2.dp, vertical = 2.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(

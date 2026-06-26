@@ -143,30 +143,7 @@ class WeiboWebSession(context: Context) {
             referer = "https://s.weibo.com/",
             origin = "https://s.weibo.com",
         )
-        val page = WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
-        return page.copy(items = enrichSearchFeedItems(page.items))
-    }
-
-    private suspend fun enrichSearchFeedItems(items: List<FeedItem>): List<FeedItem> {
-        if (items.isEmpty()) return items
-        return coroutineScope {
-            items.map { item ->
-                async { enrichSearchFeedItem(item) }
-            }.awaitAll()
-        }
-    }
-
-    private suspend fun enrichSearchFeedItem(item: FeedItem): FeedItem {
-        for (candidate in listOf(item.id, item.statusId).distinct()) {
-            if (candidate.isBlank()) continue
-            runCatching { loadStatusDetail(candidate) }
-                .getOrNull()
-                ?.takeIf { detail ->
-                    detail.text.isNotBlank() || detail.images.isNotEmpty() || detail.medias.isNotEmpty()
-                }
-                ?.let { return it }
-        }
-        return item
+        return WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
     }
 
     suspend fun loadWeiboUserSearch(query: String, page: Int = 1): SearchUserPage {

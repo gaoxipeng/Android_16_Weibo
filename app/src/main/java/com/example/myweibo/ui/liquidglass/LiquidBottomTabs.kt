@@ -298,7 +298,7 @@ fun LiquidBottomTabs(
                         shape = { RoundedCornerShape(percent = 50) },
                         effects = {
                             vibrancy()
-                            blur(2.dp.toPx())
+                            blur(LiquidGlassBlurRadius.toPx())
                             lens(12.dp.toPx(), 24.dp.toPx())
                         },
                         layerBlock = {
@@ -339,7 +339,7 @@ fun LiquidBottomTabs(
                         shape = { RoundedCornerShape(percent = 50) },
                         effects = {
                             vibrancy()
-                            blur(2.dp.toPx())
+                            blur(LiquidGlassBlurRadius.toPx())
                             lens(
                                 12.dp.toPx() * indicatorPressProgress.coerceAtLeast(0.01f),
                                 24.dp.toPx() * indicatorPressProgress.coerceAtLeast(0.01f),
