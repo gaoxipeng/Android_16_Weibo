@@ -1,10 +1,10 @@
 package com.example.myweibo.ui
 
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateDp
+import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.updateTransition
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -48,8 +48,15 @@ import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
+import androidx.compose.runtime.CompositionLocalProvider
 import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabBackdropRow
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorIndex
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabGlassMotionProgress
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorScaleX
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorValue
+import com.example.myweibo.ui.liquidglass.liquidBottomTabBackdropRowAlpha
+import com.example.myweibo.ui.liquidglass.liquidBottomTabMainRowAlpha
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabPressProgress
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabTabIndex
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidIconButton
 import com.kyant.backdrop.Backdrop
 import kotlinx.coroutines.Job
@@ -95,13 +102,12 @@ internal fun WeiboLiquidBottomBar(
         tabsMounted = true
     }
 
-    val widthSpring = spring<Dp>(
-        dampingRatio = Spring.DampingRatioLowBouncy,
-        stiffness = 980f,
-    )
-    val contentSpring = spring<Float>(
-        dampingRatio = Spring.DampingRatioLowBouncy,
-        stiffness = 1050f,
+    val barMorphDurationMillis = 220
+    // 中间段更快，首尾平滑，避免 width 布局动画带来的掉帧
+    val barMorphEasing = CubicBezierEasing(0.38f, 0.02f, 0.18f, 1f)
+    val morphTween = tween<Float>(
+        durationMillis = barMorphDurationMillis,
+        easing = barMorphEasing,
     )
 
     BoxWithConstraints(
@@ -112,26 +118,21 @@ internal fun WeiboLiquidBottomBar(
         contentAlignment = Alignment.BottomStart,
     ) {
         val fullBarWidth = maxWidth
+        val collapsedWidthFraction = (collapsedSize / fullBarWidth).coerceIn(0f, 1f)
         val transition = updateTransition(targetState = expanded, label = "bottom-bar-expansion")
         val isMorphing = transition.isRunning
 
-        val barWidth by transition.animateDp(
-            transitionSpec = { widthSpring },
-            label = "bar-width",
-        ) { isExpanded ->
-            if (isExpanded) fullBarWidth else collapsedSize
-        }
-
-        val expandedAlpha by transition.animateFloat(
-            transitionSpec = { contentSpring },
-            label = "expanded-alpha",
+        val morphProgress by transition.animateFloat(
+            transitionSpec = { morphTween },
+            label = "bar-morph-progress",
         ) { isExpanded ->
             if (isExpanded) 1f else 0f
         }
 
-        val collapsedAlpha = (1f - expandedAlpha).coerceIn(0f, 1f)
-        val revealAlpha = expandedAlpha.coerceIn(0f, 1f)
-        val bounceOvershoot = (expandedAlpha - 1f).coerceAtLeast(0f)
+        val collapsedAlpha = (1f - morphProgress).coerceIn(0f, 1f)
+        val revealAlpha = morphProgress.coerceIn(0f, 1f)
+        val widthScale = collapsedWidthFraction + (1f - collapsedWidthFraction) * revealAlpha
+        val bounceOvershoot = (morphProgress - 1f).coerceAtLeast(0f)
         val morphT = 1f - abs(revealAlpha - 0.5f) * 2f
         val morphScaleX = 1f + morphT * 0.06f + bounceOvershoot * 0.1f
         val morphScaleY = 1f - morphT * 0.02f + bounceOvershoot * 0.06f
@@ -142,25 +143,25 @@ internal fun WeiboLiquidBottomBar(
         )
 
         Box(Modifier.width(fullBarWidth).height(barHeight + animationOverflow)) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .width(barWidth)
-                    .height(barHeight)
-                    .graphicsLayer {
-                        clip = false
-                        scaleX = morphScaleX
-                        scaleY = morphScaleY
-                        transformOrigin = TransformOrigin(0f, 1f)
-                    },
-            ) {
-                if (tabsMounted && (revealAlpha > 0.01f || isMorphing)) {
+            if (tabsMounted && (revealAlpha > 0.01f || isMorphing)) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .width(fullBarWidth)
+                        .height(barHeight)
+                        .zIndex(if (collapsedOnTop) 0f else 2f)
+                        .graphicsLayer {
+                            clip = false
+                            alpha = revealAlpha
+                            scaleX = widthScale * morphScaleX
+                            scaleY = morphScaleY
+                            transformOrigin = TransformOrigin(0f, 1f)
+                        },
+                ) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .zIndex(if (collapsedOnTop) 0f else 2f)
                             .graphicsLayer {
-                                alpha = revealAlpha
                                 scaleX = 0.92f + revealAlpha * 0.08f + bounceOvershoot * 0.03f
                                 scaleY = 0.92f + revealAlpha * 0.08f + bounceOvershoot * 0.03f
                             },
@@ -182,28 +183,39 @@ internal fun WeiboLiquidBottomBar(
                         ) {
                             tabs.forEachIndexed { index, tab ->
                                 val isBackdropRow = LocalLiquidBottomTabBackdropRow.current
-                                val indicatorIndex = LocalLiquidBottomTabIndicatorIndex.current
-                                val isSelected = index == selectedIndex
+                                val indicatorValue = LocalLiquidBottomTabIndicatorValue.current
+                                val indicatorScaleX = LocalLiquidBottomTabIndicatorScaleX.current
+                                val pressProgress = LocalLiquidBottomTabPressProgress.current
+                                val glassMotionProgress = LocalLiquidBottomTabGlassMotionProgress.current
+                                val interacting = pressProgress > 0.01f || glassMotionProgress > 0.01f
                                 val tabColor = when {
                                     isBackdropRow -> accentColor
-                                    isSelected -> accentColor
+                                    interacting -> unselectedColor
+                                    index == selectedIndex -> accentColor
                                     else -> unselectedColor
                                 }
-                                val tabAlpha = if (
-                                    !isBackdropRow &&
-                                    (index == indicatorIndex || isSelected && indicatorIndex < 0)
-                                ) {
-                                    0f
+                                val tabAlpha = if (isBackdropRow) {
+                                    liquidBottomTabBackdropRowAlpha(
+                                        pressProgress = pressProgress,
+                                        indicatorValue = indicatorValue,
+                                        tabIndex = index,
+                                        indicatorScaleX = indicatorScaleX,
+                                    )
                                 } else {
-                                    1f
+                                    liquidBottomTabMainRowAlpha(
+                                        pressProgress = pressProgress,
+                                        indicatorValue = indicatorValue,
+                                        tabIndex = index,
+                                        indicatorScaleX = indicatorScaleX,
+                                    )
                                 }
+                                CompositionLocalProvider(LocalLiquidBottomTabTabIndex provides index) {
                                 LiquidBottomTab(
                                     onClick = { onTabChange(tab) },
+                                    modifier = Modifier.graphicsLayer { alpha = tabAlpha },
                                 ) {
                                     Box(
-                                        modifier = Modifier
-                                            .size(28.dp)
-                                            .graphicsLayer { alpha = tabAlpha },
+                                        modifier = Modifier.size(28.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         WeiboTabIcon(tab = tab, color = tabColor)
@@ -214,40 +226,42 @@ internal fun WeiboLiquidBottomBar(
                                         color = tabColor,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.graphicsLayer { alpha = tabAlpha },
                                     )
+                                }
                                 }
                             }
                         }
                     }
                 }
+            }
 
-                if (collapsedAlpha > 0.01f || isMorphing) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .zIndex(if (collapsedOnTop) 2f else 0f)
-                            .graphicsLayer {
-                                alpha = collapsedAlpha
-                                scaleX = 0.9f + collapsedAlpha * 0.1f
-                                scaleY = 0.9f + collapsedAlpha * 0.1f
-                            },
+            if (collapsedAlpha > 0.01f || isMorphing) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .size(collapsedSize)
+                        .zIndex(if (collapsedOnTop) 2f else 0f)
+                        .graphicsLayer {
+                            alpha = collapsedAlpha
+                            scaleX = 0.9f + collapsedAlpha * 0.1f
+                            scaleY = 0.9f + collapsedAlpha * 0.1f
+                            transformOrigin = TransformOrigin(0f, 1f)
+                        },
+                ) {
+                    SurfaceLiquidIconButton(
+                        onClick = onExpandRequest,
+                        onDoubleClick = onCollapsedTap,
+                        backdrop = backdrop,
+                        isInteractive = collapsedOnTop && collapsedAlpha > 0.5f,
+                        inputEnabled = false,
+                        useMenuGlassStyle = true,
+                        modifier = Modifier.fillMaxSize(),
                     ) {
-                        SurfaceLiquidIconButton(
-                            onClick = onExpandRequest,
-                            onDoubleClick = onCollapsedTap,
-                            backdrop = backdrop,
-                            isInteractive = collapsedOnTop && collapsedAlpha > 0.5f,
-                            inputEnabled = false,
-                            useMenuGlassStyle = true,
-                            modifier = Modifier.fillMaxSize(),
-                        ) {
-                            WeiboTabIcon(
-                                tab = selectedTab,
-                                color = accentColor,
-                                size = 24.dp,
-                            )
-                        }
+                        WeiboTabIcon(
+                            tab = selectedTab,
+                            color = accentColor,
+                            size = 24.dp,
+                        )
                     }
                 }
             }
@@ -255,10 +269,10 @@ internal fun WeiboLiquidBottomBar(
             if (!expanded || collapsedGestureActive) {
                 Box(
                     Modifier
-                        .fillMaxSize()
+                        .align(Alignment.BottomStart)
+                        .size(collapsedSize)
                         .zIndex(3f)
                         .pointerInput(tabsGestureController, collapsedSize) {
-                        val collapsedSizePx = collapsedSize.toPx()
                         var pendingSingleTap: Job? = null
                         var lastTapUptime = 0L
                         awaitEachGesture {
@@ -266,12 +280,7 @@ internal fun WeiboLiquidBottomBar(
                                 requireUnconsumed = false,
                                 pass = PointerEventPass.Initial,
                             )
-                            if (
-                                expandedState.value ||
-                                !collapsedInteractiveState.value ||
-                                down.position.x > collapsedSizePx ||
-                                down.position.y < size.height - collapsedSizePx
-                            ) {
+                            if (expandedState.value || !collapsedInteractiveState.value) {
                                 return@awaitEachGesture
                             }
 

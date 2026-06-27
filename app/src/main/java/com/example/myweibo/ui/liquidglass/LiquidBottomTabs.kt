@@ -1,5 +1,6 @@
 package com.example.myweibo.ui.liquidglass
 
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOut
 import androidx.compose.animation.core.spring
@@ -35,7 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -76,7 +77,6 @@ fun LiquidBottomTabs(
     content: @Composable RowScope.() -> Unit,
 ) {
     val isLightTheme = !isSystemInDarkTheme()
-    val accentColor = MaterialTheme.colorScheme.primary
     val surfaceColor = liquidSurfaceColor(isLightTheme)
     val tabsBackdrop = rememberLayerBackdrop()
 
@@ -166,7 +166,6 @@ fun LiquidBottomTabs(
             if (showLongPressMenu && indexAt(position) == currentFeedTabIndex.value) {
                 currentOnTabLongPress.value(currentFeedTabIndex.value)
             }
-            dampedDragAnimation.press()
             dampedDragAnimation.updateValue(valueAt(position))
         }
 
@@ -181,7 +180,6 @@ fun LiquidBottomTabs(
         fun finishControlledGesture() {
             val targetIndex = indexAt(controlledGesturePosition)
             dampedDragAnimation.animateToValue(targetIndex.toFloat())
-            dampedDragAnimation.release()
             if (targetIndex != currentSelectedIndex.value) {
                 currentOnTabSelected.value(targetIndex)
             }
@@ -192,7 +190,6 @@ fun LiquidBottomTabs(
 
         fun cancelControlledGesture() {
             dampedDragAnimation.animateToValue(currentSelectedIndex.value.toFloat())
-            dampedDragAnimation.release()
             animationScope.launch {
                 offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
             }
@@ -210,8 +207,10 @@ fun LiquidBottomTabs(
                     )
 
                 override fun begin(positionFraction: Offset) {
+                    val position = localPosition(positionFraction)
+                    dampedDragAnimation.press()
                     beginControlledGesture(
-                        position = localPosition(positionFraction),
+                        position = position,
                         showLongPressMenu = true,
                     )
                 }
@@ -242,29 +241,29 @@ fun LiquidBottomTabs(
             }
         }
 
-        var indicatorValue by remember(dampedDragAnimation) {
+        var animatedIndicatorValue by remember(dampedDragAnimation) {
             mutableFloatStateOf(dampedDragAnimation.value)
         }
-        var indicatorPressProgress by remember(dampedDragAnimation) {
+        var animatedPressProgress by remember(dampedDragAnimation) {
             mutableFloatStateOf(dampedDragAnimation.pressProgress)
         }
-        var indicatorScaleX by remember(dampedDragAnimation) {
+        var animatedScaleX by remember(dampedDragAnimation) {
             mutableFloatStateOf(dampedDragAnimation.scaleX)
         }
-        var indicatorScaleY by remember(dampedDragAnimation) {
+        var animatedScaleY by remember(dampedDragAnimation) {
             mutableFloatStateOf(dampedDragAnimation.scaleY)
         }
-        var indicatorVelocity by remember(dampedDragAnimation) {
+        var animatedVelocity by remember(dampedDragAnimation) {
             mutableFloatStateOf(dampedDragAnimation.velocity)
         }
         LaunchedEffect(dampedDragAnimation) {
             while (true) {
                 withFrameMillis {
-                    indicatorValue = dampedDragAnimation.value
-                    indicatorPressProgress = dampedDragAnimation.pressProgress
-                    indicatorScaleX = dampedDragAnimation.scaleX
-                    indicatorScaleY = dampedDragAnimation.scaleY
-                    indicatorVelocity = dampedDragAnimation.velocity
+                    animatedIndicatorValue = dampedDragAnimation.value
+                    animatedPressProgress = dampedDragAnimation.pressProgress
+                    animatedScaleX = dampedDragAnimation.scaleX
+                    animatedScaleY = dampedDragAnimation.scaleY
+                    animatedVelocity = dampedDragAnimation.velocity
                 }
             }
         }
@@ -276,8 +275,8 @@ fun LiquidBottomTabs(
                 animationScope = animationScope,
                 position = { size, _ ->
                     Offset(
-                        if (isLtr) (indicatorValue + 0.5f) * tabWidth + panelOffset
-                        else size.width - (indicatorValue + 0.5f) * tabWidth + panelOffset,
+                        if (isLtr) (animatedIndicatorValue + 0.5f) * tabWidth + panelOffset
+                        else size.width - (animatedIndicatorValue + 0.5f) * tabWidth + panelOffset,
                         size.height / 2f,
                     )
                 },
@@ -286,7 +285,32 @@ fun LiquidBottomTabs(
 
         val barShape = RoundedCornerShape(percent = 50)
         val barBorderColor = liquidMenuBorderColor(isLightTheme)
+        val glassMotionTarget by remember(density) {
+            derivedStateOf {
+                val offsetThreshold = with(density) { 6.dp.toPx() }
+                val scaleMotion = (
+                    (abs(animatedScaleX - 1f) + abs(animatedScaleY - 1f)) / 0.28f
+                    ).coerceIn(0f, 1f)
+                maxOf(
+                    animatedPressProgress,
+                    scaleMotion,
+                    (abs(animatedVelocity) / 8f).coerceIn(0f, 1f),
+                    (abs(offsetAnimation.value) / offsetThreshold).coerceIn(0f, 1f),
+                )
+            }
+        }
+        val glassMotionProgress by animateFloatAsState(
+            targetValue = glassMotionTarget,
+            animationSpec = spring(dampingRatio = 0.92f, stiffness = 900f),
+            label = "liquid-tab-glass-motion",
+        )
 
+        CompositionLocalProvider(
+            LocalLiquidBottomTabGlassMotionProgress provides glassMotionProgress,
+            LocalLiquidBottomTabIndicatorValue provides animatedIndicatorValue,
+            LocalLiquidBottomTabPressProgress provides animatedPressProgress,
+            LocalLiquidBottomTabIndicatorScaleX provides animatedScaleX,
+        ) {
         CompositionLocalProvider(
             LocalLiquidBottomTabBackdropRow provides false,
             LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
@@ -300,19 +324,23 @@ fun LiquidBottomTabs(
                     .drawBackdrop(
                         backdrop = backdrop,
                         shape = { barShape },
-                        effects = { liquidMenuGlassEffects() },
+                        effects = {
+                            liquidMenuGlassEffects()
+                        },
                         highlight = null,
                         shadow = null,
                         layerBlock = {
                             val scale = lerp(
                                 1f,
                                 1f + 16.dp.toPx() / size.width,
-                                indicatorPressProgress,
+                                animatedPressProgress,
                             )
                             scaleX = scale
                             scaleY = scale
                         },
-                        onDrawSurface = { drawRect(surfaceColor) },
+                        onDrawSurface = {
+                            drawRect(surfaceColor)
+                        },
                     )
                     .border(LiquidMenuBorderWidth, barBorderColor, barShape)
                     .then(interactiveHighlight.modifier)
@@ -325,11 +353,11 @@ fun LiquidBottomTabs(
         }
 
         CompositionLocalProvider(
-            LocalLiquidBottomTabScale provides {
-                lerp(1f, 1.2f, indicatorPressProgress)
-            },
+            LocalLiquidBottomTabScale provides { 1f },
             LocalLiquidBottomTabBackdropRow provides true,
             LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
+            LocalLiquidBottomTabIndicatorValue provides animatedIndicatorValue,
+            LocalLiquidBottomTabIndicatorScaleX provides animatedScaleX,
         ) {
             Row(
                 Modifier
@@ -344,20 +372,19 @@ fun LiquidBottomTabs(
                             vibrancy()
                             blur(LiquidGlassBlurRadius.toPx())
                             lens(
-                                12.dp.toPx() * indicatorPressProgress.coerceAtLeast(0.01f),
-                                24.dp.toPx() * indicatorPressProgress.coerceAtLeast(0.01f),
+                                12.dp.toPx() * animatedPressProgress.coerceAtLeast(0.01f),
+                                24.dp.toPx() * animatedPressProgress.coerceAtLeast(0.01f),
                             )
                         },
                         highlight = {
-                            Highlight.Default.copy(alpha = indicatorPressProgress)
+                            Highlight.Default.copy(alpha = animatedPressProgress)
                         },
                         onDrawSurface = { drawRect(surfaceColor) },
                     )
                     .then(interactiveHighlight.modifier)
                     .height(56.dp)
                     .fillMaxWidth()
-                    .padding(horizontal = 4.dp)
-                    .graphicsLayer(colorFilter = ColorFilter.tint(accentColor)),
+                    .padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 content = content,
             )
@@ -369,33 +396,33 @@ fun LiquidBottomTabs(
                 .graphicsLayer {
                     clip = false
                     translationX =
-                        if (isLtr) indicatorValue * tabWidth + panelOffset
-                        else size.width - (indicatorValue + 1f) * tabWidth + panelOffset
+                        if (isLtr) animatedIndicatorValue * tabWidth + panelOffset
+                        else size.width - (animatedIndicatorValue + 1f) * tabWidth + panelOffset
                 }
                 .drawBackdrop(
                     backdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop),
                     shape = { RoundedCornerShape(percent = 50) },
                     effects = {
                         lens(
-                            10.dp.toPx() * indicatorPressProgress,
-                            14.dp.toPx() * indicatorPressProgress,
+                            10.dp.toPx() * animatedPressProgress,
+                            14.dp.toPx() * animatedPressProgress,
                             chromaticAberration = true,
                         )
                     },
                     highlight = {
-                        Highlight.Default.copy(alpha = indicatorPressProgress)
+                        Highlight.Default.copy(alpha = animatedPressProgress)
                     },
-                    shadow = { Shadow(alpha = indicatorPressProgress) },
+                    shadow = { Shadow(alpha = animatedPressProgress) },
                     innerShadow = {
                         InnerShadow(
-                            radius = 8.dp * indicatorPressProgress,
-                            alpha = indicatorPressProgress,
+                            radius = 8.dp * animatedPressProgress,
+                            alpha = animatedPressProgress,
                         )
                     },
                     layerBlock = {
-                        scaleX = indicatorScaleX
-                        scaleY = indicatorScaleY
-                        val velocity = indicatorVelocity / 10f
+                        scaleX = animatedScaleX
+                        scaleY = animatedScaleY
+                        val velocity = animatedVelocity / 10f
                         scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
                         scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
                     },
@@ -403,9 +430,9 @@ fun LiquidBottomTabs(
                         drawRect(
                             if (isLightTheme) Color.Black.copy(alpha = 0.1f)
                             else Color.White.copy(alpha = 0.1f),
-                            alpha = 1f - indicatorPressProgress,
+                            alpha = 1f - animatedPressProgress,
                         )
-                        drawRect(Color.Black.copy(alpha = 0.03f * indicatorPressProgress))
+                        drawRect(Color.Black.copy(alpha = 0.03f * animatedPressProgress))
                     },
                 )
                 .height(56.dp)
@@ -459,8 +486,7 @@ fun LiquidBottomTabs(
                         if (completedBeforeTimeout) {
                             if (releasedBeforeLongPress) {
                                 val targetIndex = indexAt(down.position)
-                                dampedDragAnimation.updateValue(targetIndex.toFloat())
-                                dampedDragAnimation.release()
+                                dampedDragAnimation.animateToValue(targetIndex.toFloat())
                                 onTabSelected(targetIndex)
                                 animationScope.launch {
                                     offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
@@ -496,5 +522,6 @@ fun LiquidBottomTabs(
                     }
                 },
         )
+        }
     }
 }

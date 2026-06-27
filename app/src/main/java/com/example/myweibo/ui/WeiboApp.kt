@@ -189,6 +189,7 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.RoundRect
@@ -618,11 +619,17 @@ private fun computeMediaPeekGraphicsMotion(
         right = visualCenterX + visualWidth / 2f,
         bottom = visualCenterY + visualHeight / 2f,
     )
+    val uniformScale = computeMorphCoverScale(
+        morphWidthPx = visualWidth,
+        morphHeightPx = visualHeight,
+        contentWidthPx = layoutWidthPx,
+        contentHeightPx = layoutHeightPx,
+    ) * enterScale
     return MediaPeekGraphicsMotion(
         translationX = translationX,
         translationY = translationY,
-        scaleX = (visualWidth / layoutWidthPx.coerceAtLeast(1f)) * enterScale,
-        scaleY = (visualHeight / layoutHeightPx.coerceAtLeast(1f)) * enterScale,
+        scaleX = uniformScale,
+        scaleY = uniformScale,
         alpha = alpha,
         cornerRadius = cornerRadius,
         visualBounds = visualBounds,
@@ -838,24 +845,33 @@ private data class MorandiThemeColor(
 )
 
 private val MorandiThemeColors = listOf(
-    MorandiThemeColor("dusty_rose", "灰粉", Color(0xFFC78395), Color(0xFFF1D9DF), Color(0xFFB58C98)),
-    MorandiThemeColor("mist_blue", "雾蓝", Color(0xFF7F9CAF), Color(0xFFD8E4EA), Color(0xFF879BA7)),
-    MorandiThemeColor("sage", "鼠尾草", Color(0xFF86A08A), Color(0xFFDCE8DD), Color(0xFF8A9B82)),
-    MorandiThemeColor("clay", "陶土", Color(0xFFC08A72), Color(0xFFEEDDD5), Color(0xFFA98B7C)),
-    MorandiThemeColor("lavender_gray", "薰衣草灰", Color(0xFF9A8EAD), Color(0xFFE3DDEB), Color(0xFF958CA3)),
-    MorandiThemeColor("warm_sand", "暖沙", Color(0xFFA99778), Color(0xFFE8DFCF), Color(0xFF9F927F)),
-    MorandiThemeColor("smoky_teal", "烟青", Color(0xFF789E9B), Color(0xFFD7E5E3), Color(0xFF7F9996)),
-    MorandiThemeColor("mauve", "豆沙紫", Color(0xFFA77F94), Color(0xFFE8D9E1), Color(0xFF9B8792)),
-    MorandiThemeColor("olive_gray", "橄榄灰", Color(0xFF969873), Color(0xFFE4E5D3), Color(0xFF8F9278)),
-    MorandiThemeColor("slate", "石板灰", Color(0xFF7F8C98), Color(0xFFD9E0E5), Color(0xFF858D96)),
+    // 中性色
     MorandiThemeColor("classic_black", "黑色", Color(0xFF202124), Color(0xFFE6E6E6), Color(0xFF4A4A4A)),
     MorandiThemeColor("graphite", "石墨", Color(0xFF4E5965), Color(0xFFDDE2E7), Color(0xFF66717C)),
-    MorandiThemeColor("ocean_blue", "海蓝", Color(0xFF4E7FA8), Color(0xFFD6E5F1), Color(0xFF668AA8)),
-    MorandiThemeColor("clear_green", "青绿", Color(0xFF4F9278), Color(0xFFD8EADF), Color(0xFF6E9B82)),
+    // 红粉
     MorandiThemeColor("wine_red", "酒红", Color(0xFF9A4E5B), Color(0xFFEBD7DB), Color(0xFFA56B73)),
-    MorandiThemeColor("iris", "鸢尾", Color(0xFF7367B2), Color(0xFFE0DDF2), Color(0xFF8279AF)),
-    MorandiThemeColor("amber", "琥珀", Color(0xFFB07A39), Color(0xFFEADDCB), Color(0xFFA4865A)),
     MorandiThemeColor("coral", "珊瑚", Color(0xFFC8665D), Color(0xFFF0D8D5), Color(0xFFB27771)),
+    MorandiThemeColor("ruby_red", "宝石红", Color(0xFFE03A56), Color(0xFFFCE3E8), Color(0xFFD24B63)),
+    MorandiThemeColor("rose_red", "玫红", Color(0xFFFF3B6F), Color(0xFFFFE3EC), Color(0xFFE03568)),
+    // 橙黄
+    MorandiThemeColor("clay", "陶土", Color(0xFFC08A72), Color(0xFFEEDDD5), Color(0xFFA98B7C)),
+    MorandiThemeColor("amber", "琥珀", Color(0xFFB07A39), Color(0xFFEADDCB), Color(0xFFA4865A)),
+    MorandiThemeColor("vivid_orange", "活力橙", Color(0xFFFF6D00), Color(0xFFFFE8D6), Color(0xFFE86200)),
+    // 绿色
+    MorandiThemeColor("sage", "鼠尾草", Color(0xFF86A08A), Color(0xFFDCE8DD), Color(0xFF8A9B82)),
+    MorandiThemeColor("emerald", "翠绿", Color(0xFF00A86B), Color(0xFFD4F5E6), Color(0xFF1A9B65)),
+    MorandiThemeColor("vivid_green", "草绿", Color(0xFF34C759), Color(0xFFE5F9E8), Color(0xFF2DB350)),
+    // 青色
+    MorandiThemeColor("smoky_teal", "烟青", Color(0xFF789E9B), Color(0xFFD7E5E3), Color(0xFF7F9996)),
+    MorandiThemeColor("cyan", "天青", Color(0xFF00BCD4), Color(0xFFD6F5F9), Color(0xFF00A8BA)),
+    // 蓝色
+    MorandiThemeColor("mist_blue", "雾蓝", Color(0xFF7F9CAF), Color(0xFFD8E4EA), Color(0xFF879BA7)),
+    MorandiThemeColor("ocean_blue", "海蓝", Color(0xFF4E7FA8), Color(0xFFD6E5F1), Color(0xFF668AA8)),
+    MorandiThemeColor("electric_blue", "电光蓝", Color(0xFF2B7CFF), Color(0xFFDFECFF), Color(0xFF4A90E8)),
+    MorandiThemeColor("cobalt", "钴蓝", Color(0xFF0057FF), Color(0xFFDDE8FF), Color(0xFF3366E6)),
+    // 紫色
+    MorandiThemeColor("iris", "鸢尾", Color(0xFF7367B2), Color(0xFFE0DDF2), Color(0xFF8279AF)),
+    MorandiThemeColor("violet", "紫罗兰", Color(0xFF8B5CF6), Color(0xFFECE8FE), Color(0xFF7C4FE8)),
 )
 
 private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
@@ -1321,12 +1337,15 @@ private data class FeedCardActionMenuRequest(
 
 private class FeedCardActionMenuController {
     var activeRequest by mutableStateOf<FeedCardActionMenuRequest?>(null)
+    var menuRevealVisible by mutableStateOf(false)
 
     fun open(item: FeedItem, anchorBoundsInRoot: Rect, backHandlerEnabled: Boolean) {
         activeRequest = FeedCardActionMenuRequest(item, anchorBoundsInRoot, backHandlerEnabled)
+        menuRevealVisible = true
     }
 
     fun dismiss() {
+        menuRevealVisible = false
         activeRequest = null
     }
 }
@@ -3911,6 +3930,13 @@ fun WeiboApp() {
                 Box(
                     Modifier
                         .then(if (messagesWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                        .then(
+                            if (messagesWebVisible) {
+                                Modifier.layerBackdrop(bottomBarBackdrop)
+                            } else {
+                                Modifier
+                            },
+                        )
                         .graphicsLayer {
                             alpha = if (messagesWebVisible) 1f else 0f
                             clip = true
@@ -3928,6 +3954,13 @@ fun WeiboApp() {
                 Box(
                     Modifier
                         .then(if (composeWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                        .then(
+                            if (composeWebVisible) {
+                                Modifier.layerBackdrop(bottomBarBackdrop)
+                            } else {
+                                Modifier
+                            },
+                        )
                         .graphicsLayer {
                             alpha = if (composeWebVisible) 1f else 0f
                             clip = true
@@ -4772,8 +4805,22 @@ private fun OpaqueHintCapsule(
     modifier: Modifier = Modifier,
     content: @Composable () -> Unit,
 ) {
-    SurfaceLiquidCapsule(modifier = modifier, cornerRadius = 22.dp) {
-        content()
+    val cornerRadius = 22.dp
+    SurfaceLiquidCapsule(
+        modifier = modifier.drawBehind {
+            drawRoundRect(
+                color = HintCapsuleWhite,
+                cornerRadius = CornerRadius(cornerRadius.toPx()),
+            )
+        },
+        cornerRadius = cornerRadius,
+        useMenuGlassStyle = true,
+    ) {
+        Box(
+            modifier = Modifier.wrapContentSize(),
+            contentAlignment = Alignment.Center,
+            content = { content() },
+        )
     }
 }
 
@@ -5750,30 +5797,35 @@ private fun FeedCardActionMenu(
     }
 
     Box(
-        modifier = Modifier
-            .size(32.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .onGloballyPositioned { coordinates ->
-                anchorBounds = coordinates.boundsInRoot()
-            }
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() },
-                onClick = {
-                    if (isExpanded) {
-                        controller.dismiss()
-                    } else {
-                        val bounds = anchorBounds ?: return@clickable
-                        controller.open(item, bounds, backHandlerEnabled)
-                    }
-                },
-            ),
+        modifier = Modifier.size(32.dp),
         contentAlignment = Alignment.Center,
     ) {
-        SettingsExpandIndicator(
-            modifier = Modifier.size(18.dp),
-            tint = weiboMetaTextColor(),
-        )
+        Box(
+            modifier = Modifier
+                .size(52.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .onGloballyPositioned { coordinates ->
+                    anchorBounds = coordinates.boundsInRoot()
+                }
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {
+                        if (isExpanded) {
+                            controller.dismiss()
+                        } else {
+                            val bounds = anchorBounds ?: return@clickable
+                            controller.open(item, bounds, backHandlerEnabled)
+                        }
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            SettingsExpandIndicator(
+                modifier = Modifier.size(18.dp),
+                tint = weiboMetaTextColor(),
+            )
+        }
     }
 }
 
@@ -5784,14 +5836,11 @@ private fun FeedCardActionMenuOverlay(
 ) {
     val activeRequest = controller.activeRequest
     var displayedRequest by remember { mutableStateOf<FeedCardActionMenuRequest?>(null) }
-    var menuVisible by remember { mutableStateOf(false) }
+    val menuVisible = controller.menuRevealVisible
 
-    LaunchedEffect(activeRequest?.item?.id) {
+    LaunchedEffect(activeRequest) {
         if (activeRequest != null) {
             displayedRequest = activeRequest
-            menuVisible = true
-        } else if (displayedRequest != null) {
-            menuVisible = false
         }
     }
 
@@ -5803,7 +5852,6 @@ private fun FeedCardActionMenuOverlay(
     }
 
     fun dismissMenu() {
-        menuVisible = false
         controller.dismiss()
     }
 
@@ -5848,15 +5896,17 @@ private fun FeedCardActionMenuOverlay(
             menuHeightPx = menuHeightPx,
         )
 
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = { dismissMenu() },
-                ),
-        )
+        if (menuVisible) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = { dismissMenu() },
+                    ),
+            )
+        }
         ActionMenuReveal(
             visible = menuVisible,
             menuWidth = menuWidth,
@@ -6385,8 +6435,9 @@ private fun ImageActionOverlay(
 
     fun requestDismiss(handoffBounds: Rect? = null) {
         if (isFloating && dismissReason == null) {
+            closingAnchorBounds = resolveAnchorBounds()
             peekDismissStartBounds = handoffBounds
-            peekDismissTargetBounds = resolveAnchorBounds()
+            peekDismissTargetBounds = closingAnchorBounds
                 .takeIf { it.width > 0f && it.height > 0f }
                 ?.toOverlayLocal(overlayWindowOrigin)
         }
@@ -6454,8 +6505,9 @@ private fun ImageActionOverlay(
             else -> {
                 actionMenuVisible = false
                 fullscreenExpandProgress.snapTo(0f)
+                closingAnchorBounds = resolveAnchorBounds()
                 if (isFloating) {
-                    peekDismissTargetBounds = resolveAnchorBounds()
+                    peekDismissTargetBounds = closingAnchorBounds
                         .takeIf { it.width > 0f && it.height > 0f }
                         ?.toOverlayLocal(overlayWindowOrigin)
                     peekDismissMorphProgress.snapTo(1f)
@@ -6604,20 +6656,16 @@ private fun ImageActionOverlay(
                 val morphSourceBounds = peekDismissStartBounds ?: floatingBounds
                 val morphTargetBounds = peekDismissTargetBounds
                     ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
-                val fitLayout = computeFitImageLayout(
-                    containerWidthPx = targetWidthPx,
-                    containerHeightPx = targetHeightPx,
-                    imageAspect = safeImageAspect,
-                    scale = 1f,
-                )
                 val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
                 val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
                 val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
                 val morphCenterY = lerp(morphTargetBounds.center.y, morphSourceBounds.center.y, transition)
-                val uniformScale = maxOf(
-                    morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
-                    morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
-                ).coerceIn(0.05f, 4f)
+                val uniformScale = computeMorphCoverScale(
+                    morphWidthPx = morphWidth,
+                    morphHeightPx = morphHeight,
+                    contentWidthPx = targetWidthPx,
+                    contentHeightPx = targetHeightPx,
+                )
                 val morphLeft = morphCenterX - morphWidth / 2f
                 val morphTop = morphCenterY - morphHeight / 2f
                 val morphRight = morphCenterX + morphWidth / 2f
@@ -8045,6 +8093,16 @@ private enum class FullscreenDragAxis {
     Vertical,
 }
 
+private fun computeMorphCoverScale(
+    morphWidthPx: Float,
+    morphHeightPx: Float,
+    contentWidthPx: Float,
+    contentHeightPx: Float,
+): Float = maxOf(
+    morphWidthPx / contentWidthPx.coerceAtLeast(1f),
+    morphHeightPx / contentHeightPx.coerceAtLeast(1f),
+).coerceIn(0.05f, 4f)
+
 private fun computeFitImageLayout(
     containerWidthPx: Float,
     containerHeightPx: Float,
@@ -8262,9 +8320,11 @@ private fun ZoomableFullscreenImage(
                 .fillMaxSize()
                 .pointerInput(image.largeUrl, containerWidthPx, containerHeightPx, imageAspect) {
                     awaitEachGesture {
-                        val velocityTracker = VelocityTracker()
+                        var velocityTracker = VelocityTracker()
                         val touchSlop = viewConfiguration.touchSlop
                         var panningZoomed = false
+                        var pinching = false
+                        var postPinchPanOrigin: Offset? = null
                         var dismissing = false
                         var lockedAxis: FullscreenDragAxis? = null
                         var horizontalPageDragAccum = 0f
@@ -8284,6 +8344,12 @@ private fun ZoomableFullscreenImage(
                             if (pressed.isEmpty()) break
 
                             if (pressed.size >= 2) {
+                                if (!pinching) {
+                                    pinching = true
+                                    postPinchPanOrigin = null
+                                    panningZoomed = false
+                                    velocityTracker = VelocityTracker()
+                                }
                                 dismissTranslationY = 0f
                                 panInertiaJob?.cancel()
                                 val first = pressed[0].position
@@ -8306,17 +8372,22 @@ private fun ZoomableFullscreenImage(
                                     scale = newScale
                                     gestureScale = newScale
                                     updatePagerScrollBlock(newScale, gesturePanOffsetX)
-                                    velocityTracker.addPosition(
-                                        pressed.first().uptimeMillis,
-                                        centroid,
-                                    )
                                 }
                                 lastDistance = distance
                                 event.changes.forEach { it.consume() }
                             } else {
                                 lastDistance = 0f
+                                if (pinching) {
+                                    pinching = false
+                                    postPinchPanOrigin = pressed.first().position
+                                    velocityTracker = VelocityTracker()
+                                    lockedAxis = null
+                                    event.changes.forEach { it.consume() }
+                                    continue
+                                }
                                 val change = pressed.first()
-                                val totalDrag = change.position - down.position
+                                val panOrigin = postPinchPanOrigin ?: down.position
+                                val totalDrag = change.position - panOrigin
                                 val delta = change.position - change.previousPosition
                                 gestureScale = latestScaleState.value
                                 gesturePanOffsetX = latestPanOffsetXState.value
@@ -8396,19 +8467,23 @@ private fun ZoomableFullscreenImage(
                                 }
 
                                 if (gestureScale > 1.01f) {
-                                    panningZoomed = true
-                                    velocityTracker.addPosition(change.uptimeMillis, change.position)
-                                    val (cx, cy) = clampPan(
-                                        gesturePanOffsetX + delta.x,
-                                        gesturePanOffsetY + delta.y,
-                                        layout,
-                                    )
-                                    gesturePanOffsetX = cx
-                                    gesturePanOffsetY = cy
-                                    panOffsetX = gesturePanOffsetX
-                                    panOffsetY = gesturePanOffsetY
-                                    updatePagerScrollBlock(gestureScale, gesturePanOffsetX)
-                                    change.consume()
+                                    if (!panningZoomed && hypot(totalDrag.x, totalDrag.y) > touchSlop) {
+                                        panningZoomed = true
+                                    }
+                                    if (panningZoomed) {
+                                        velocityTracker.addPosition(change.uptimeMillis, change.position)
+                                        val (cx, cy) = clampPan(
+                                            gesturePanOffsetX + delta.x,
+                                            gesturePanOffsetY + delta.y,
+                                            layout,
+                                        )
+                                        gesturePanOffsetX = cx
+                                        gesturePanOffsetY = cy
+                                        panOffsetX = gesturePanOffsetX
+                                        panOffsetY = gesturePanOffsetY
+                                        updatePagerScrollBlock(gestureScale, gesturePanOffsetX)
+                                        change.consume()
+                                    }
                                 } else {
                                     onBlockPagerScroll(false)
                                 }
@@ -11967,6 +12042,7 @@ private fun SearchCapsuleField(
     SurfaceLiquidCapsule(
         modifier = modifier,
         pill = true,
+        useMenuGlassStyle = true,
     ) {
         Row(
             modifier = Modifier
@@ -14498,6 +14574,64 @@ private fun SettingsImageCard(
 }
 
 @Composable
+private fun SettingsThemeColorGrid(
+    options: List<MorandiThemeColor>,
+    selected: MorandiThemeColor,
+    onSelected: (MorandiThemeColor) -> Unit,
+    cellWidth: Dp,
+    columns: Int,
+    gap: Dp,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+        options.chunked(columns).forEach { rowOptions ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(gap),
+            ) {
+                rowOptions.forEach { option ->
+                    val isSelected = selected.storageValue == option.storageValue
+                    val textColor = readableTextColor(option.primary)
+                    Box(
+                        modifier = Modifier
+                            .width(cellWidth)
+                            .height(30.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .border(
+                                width = if (isSelected) 1.5.dp else 1.dp,
+                                color = if (isSelected) {
+                                    textColor.copy(alpha = 0.92f)
+                                } else {
+                                    Color.White.copy(alpha = 0.55f)
+                                },
+                                shape = RoundedCornerShape(999.dp),
+                            )
+                            .background(option.primary)
+                            .clickable { onSelected(option) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = option.label,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = textColor,
+                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+                }
+                repeat(columns - rowOptions.size) {
+                    Spacer(Modifier.width(cellWidth))
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingsThemeColorCard(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
@@ -14572,52 +14706,15 @@ private fun SettingsThemeColorCard(
                     val gap = 4.dp
                     val columns = 4
                     val cellWidth = (maxWidth - gap * (columns - 1)) / columns
-                    Column(verticalArrangement = Arrangement.spacedBy(gap)) {
-                        MorandiThemeColors.chunked(columns).forEach { rowOptions ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(gap),
-                            ) {
-                                rowOptions.forEach { option ->
-                                    val isSelected = selected.storageValue == option.storageValue
-                                    val textColor = readableTextColor(option.primary)
-                                    Box(
-                                        modifier = Modifier
-                                            .width(cellWidth)
-                                            .height(30.dp)
-                                            .clip(RoundedCornerShape(999.dp))
-                                            .border(
-                                                width = if (isSelected) 1.5.dp else 1.dp,
-                                                color = if (isSelected) {
-                                                    textColor.copy(alpha = 0.92f)
-                                                } else {
-                                                    Color.White.copy(alpha = 0.55f)
-                                                },
-                                                shape = RoundedCornerShape(999.dp),
-                                            )
-                                            .background(option.primary)
-                                            .clickable { onSelected(option) },
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            text = option.label,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(horizontal = 2.dp),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = textColor,
-                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                            textAlign = TextAlign.Center,
-                                        )
-                                    }
-                                }
-                                repeat(columns - rowOptions.size) {
-                                    Spacer(Modifier.width(cellWidth))
-                                }
-                            }
-                        }
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsThemeColorGrid(
+                            options = MorandiThemeColors,
+                            selected = selected,
+                            onSelected = onSelected,
+                            cellWidth = cellWidth,
+                            columns = columns,
+                            gap = gap,
+                        )
                     }
                 }
             }
