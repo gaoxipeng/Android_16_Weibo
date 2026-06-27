@@ -810,6 +810,9 @@ private val HintCapsuleText = Color(0xFF1F1F1F)
 private val HintCapsulePlaceholder = Color(0xFFAAAAAA)
 private val HintCapsuleBorderColor = Color(0xFFE6E6E6)
 private val SettingsBottomBarInset = 96.dp
+// 64dp 胶囊高度 + 24dp 底边距 + 12dp 展开动画溢出
+private val LiquidBottomBarReserve = 100.dp
+private val LiquidBottomBarContentGap = 8.dp
 private val SearchBarBottomGap = 20.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
@@ -3920,74 +3923,58 @@ fun WeiboApp() {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
             val composeWebVisible = selectedTab == MainTab.Compose && mainContentClear
-            val webTabBackdropExcluded = messagesWebVisible || composeWebVisible
-            var messagesWebMounted by remember { mutableStateOf(false) }
-            var composeWebMounted by remember { mutableStateOf(false) }
-            if (messagesWebVisible) messagesWebMounted = true
-            if (composeWebVisible) composeWebMounted = true
+            val webTabVisible = messagesWebVisible || composeWebVisible
 
-            if (messagesWebMounted) {
-                Box(
-                    Modifier
-                        .then(if (messagesWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
-                        .then(
-                            if (messagesWebVisible) {
-                                Modifier.layerBackdrop(bottomBarBackdrop)
-                            } else {
-                                Modifier
-                            },
-                        )
-                        .graphicsLayer {
-                            alpha = if (messagesWebVisible) 1f else 0f
-                            clip = true
+            Box(
+                Modifier
+                    .then(if (messagesWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                    .graphicsLayer {
+                        alpha = if (messagesWebVisible) 1f else 0f
+                        clip = true
+                        if (messagesWebVisible) {
+                            // 隔离 WebView 硬件合成层，避免干扰底部玻璃胶囊采样
+                            compositingStrategy = CompositingStrategy.Offscreen
                         }
-                        .zIndex(if (messagesWebVisible) 2f else -10f)
-                        .blockHiddenTouches(messagesWebVisible),
-                ) {
-                    MessagesScreen(
-                        onRootBack = ::handleRootBackPress,
-                        active = messagesWebVisible,
-                    )
-                }
+                    }
+                    .zIndex(if (messagesWebVisible) 2f else -10f)
+                    .blockHiddenTouches(messagesWebVisible),
+            ) {
+                MessagesScreen(
+                    onRootBack = ::handleRootBackPress,
+                    active = messagesWebVisible,
+                )
             }
-            if (composeWebMounted) {
-                Box(
-                    Modifier
-                        .then(if (composeWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
-                        .then(
-                            if (composeWebVisible) {
-                                Modifier.layerBackdrop(bottomBarBackdrop)
-                            } else {
-                                Modifier
-                            },
-                        )
-                        .graphicsLayer {
-                            alpha = if (composeWebVisible) 1f else 0f
-                            clip = true
+            Box(
+                Modifier
+                    .then(if (composeWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                    .graphicsLayer {
+                        alpha = if (composeWebVisible) 1f else 0f
+                        clip = true
+                        if (composeWebVisible) {
+                            compositingStrategy = CompositingStrategy.Offscreen
                         }
-                        .zIndex(if (composeWebVisible) 2f else -10f)
-                        .blockHiddenTouches(composeWebVisible),
-                ) {
-                    MobileWeiboWebScreen(
-                        pageUrl = "https://m.weibo.cn/compose/",
-                        onRootBack = ::handleRootBackPress,
-                        active = composeWebVisible,
-                    )
-                }
+                    }
+                    .zIndex(if (composeWebVisible) 2f else -10f)
+                    .blockHiddenTouches(composeWebVisible),
+            ) {
+                MobileWeiboWebScreen(
+                    pageUrl = "https://m.weibo.cn/compose/",
+                    onRootBack = ::handleRootBackPress,
+                    active = composeWebVisible,
+                )
             }
 
             Box(
                 Modifier
                     .fillMaxSize()
                     .zIndex(1f)
-                    .then(
-                        if (!webTabBackdropExcluded) {
-                            Modifier.layerBackdrop(bottomBarBackdrop)
-                        } else {
-                            Modifier
-                        },
-                    ),
+                    .layerBackdrop(bottomBarBackdrop),
             ) {
+                Box(
+                    Modifier
+                        .matchParentSize()
+                        .background(MaterialTheme.colorScheme.background),
+                )
             val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
@@ -3995,6 +3982,9 @@ fun WeiboApp() {
             val keepFeedAlive = selectedTab == MainTab.Feed &&
                 visitedUserId != null &&
                 detailOverlayItem == null
+            val keepFeedBackdropAlive = webTabVisible && cacheLoaded
+            val feedLayerVisible = (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) ||
+                keepFeedBackdropAlive
             val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
             val searchUiOnTop = selectedTab == MainTab.Search &&
                 visitedUserId == null &&
@@ -4027,7 +4017,7 @@ fun WeiboApp() {
                 albumViewerState == null &&
                 followListBelongsToCurrentContext
             Box(Modifier.fillMaxSize()) {
-                if (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) {
+                if (feedLayerVisible) {
                     Box(
                         Modifier
                             .fillMaxSize()
@@ -13115,10 +13105,13 @@ private fun MobileWeiboWebScreen(
 ) {
     val context = LocalContext.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val bottomNavSpace = 96.dp
-    val bottomBarGap = 8.dp
+    val bottomBarGap = LiquidBottomBarContentGap
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    val bottomInset = if (imeBottom > 0.dp) imeBottom + bottomBarGap else bottomNavSpace + bottomBarGap
+    val bottomInset = if (imeBottom > 0.dp) {
+        imeBottom + bottomBarGap
+    } else {
+        LiquidBottomBarReserve + bottomBarGap
+    }
     val mobileUserAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
             "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
@@ -13141,7 +13134,7 @@ private fun MobileWeiboWebScreen(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            setLayerType(View.LAYER_TYPE_NONE, null)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.apply {
@@ -13192,13 +13185,11 @@ private fun MobileWeiboWebScreen(
 
     LaunchedEffect(active) {
         if (active) {
-            webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
             webView.visibility = View.VISIBLE
             webView.onResume()
         } else {
             webView.onPause()
             webView.visibility = View.GONE
-            webView.setLayerType(View.LAYER_TYPE_NONE, null)
         }
     }
 
@@ -17009,7 +17000,7 @@ private fun AccountLoginWebView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            setLayerType(View.LAYER_TYPE_NONE, null)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.apply {
