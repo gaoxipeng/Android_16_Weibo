@@ -510,6 +510,14 @@ private data class MediaPeekGraphicsMotion(
 private fun Offset.toWindowPosition(anchorBounds: Rect): Offset =
     Offset(anchorBounds.left + x, anchorBounds.top + y)
 
+private fun Rect.toOverlayLocal(overlayOriginInWindow: Offset): Rect =
+    Rect(
+        left = left - overlayOriginInWindow.x,
+        top = top - overlayOriginInWindow.y,
+        right = right - overlayOriginInWindow.x,
+        bottom = bottom - overlayOriginInWindow.y,
+    )
+
 private fun mediaPeekHoldScale(holdProgress: Float): Float {
     val t = holdProgress.coerceIn(0f, 1f)
     if (t <= 0f) return 1f
@@ -1353,6 +1361,7 @@ private data class ImagePeekRequest(
     val imageIndex: Int,
     val anchorBounds: Rect,
     val pressOffset: Offset,
+    val resolveAnchorBounds: () -> Rect,
     val onCancel: () -> Unit,
     val onRelease: () -> Unit,
     val onOpenFullscreenBehind: (Int) -> Unit,
@@ -2029,7 +2038,6 @@ fun WeiboApp() {
 
     fun clearVisitedProfileState() {
         visitedAlbumJob?.cancel()
-        visitedProfileLoadGeneration += 1
         visitedListScrollResetGeneration = -1
         visitedUserId = null
         visitedUserScreenName = ""
@@ -3972,6 +3980,7 @@ fun WeiboApp() {
             val visitedProfileVisible = visitedUserId != null &&
                 selectedItem == null &&
                 albumViewerState == null
+            val visitedProfileCoveredByOverlay = selectedItem != null || albumViewerState != null
             val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
                 when {
                     visitedUserId != null -> visitedUserId == overlay.uid
@@ -4114,12 +4123,12 @@ fun WeiboApp() {
                     target = visitedProfileNavTarget,
                     modifier = Modifier.fillMaxSize().zIndex(540f),
                 ) { uid ->
-                    key(uid, visitedProfileLoadGeneration) {
+                    key(uid) {
                         Box(
                             Modifier
                                 .fillMaxSize()
                                 .graphicsLayer {
-                                    alpha = if (visitedProfileVisible) 1f else 0f
+                                    alpha = if (visitedProfileCoveredByOverlay) 0f else 1f
                                 }
                                 .blockHiddenTouches(visitedProfileVisible),
                         ) {
@@ -4581,25 +4590,36 @@ fun WeiboApp() {
                         }
                     },
                     timelineMenuContent = { dismiss ->
-                        ImageActionFrostedCard(modifier = Modifier.width(136.dp)) {
-                            listOf(TimelineKind.Following, TimelineKind.FriendsCircle).forEachIndexed { index, kind ->
-                                if (index > 0) {
-                                    ImageActionMenuDivider()
-                                }
-                                ImageActionRow(
-                                    label = kind.label,
-                                    enabled = true,
-                                    selected = kind == timelineKind,
-                                    onClick = {
-                                        dismiss()
-                                        dismissFollowListForTabSwitch()
-                                        selectedTab = MainTab.Feed
-                                        switchTimelineKind(kind)
-                                    },
-                                )
-                            }
+                        ImageActionFrostedCard(
+                            modifier = Modifier.width(ActionMenuWidth),
+                            menuHeight = ActionMenuTwoRowHeight,
+                        ) {
+                            ImageActionRow(
+                                label = TimelineKind.Following.label,
+                                enabled = true,
+                                selected = timelineKind == TimelineKind.Following,
+                                onClick = {
+                                    dismiss()
+                                    dismissFollowListForTabSwitch()
+                                    selectedTab = MainTab.Feed
+                                    switchTimelineKind(TimelineKind.Following)
+                                },
+                            )
+                            ImageActionRow(
+                                label = TimelineKind.FriendsCircle.label,
+                                enabled = true,
+                                selected = timelineKind == TimelineKind.FriendsCircle,
+                                onClick = {
+                                    dismiss()
+                                    dismissFollowListForTabSwitch()
+                                    selectedTab = MainTab.Feed
+                                    switchTimelineKind(TimelineKind.FriendsCircle)
+                                },
+                            )
                         }
                     },
+                    timelineMenuWidth = ActionMenuWidth,
+                    timelineMenuHeight = ActionMenuTwoRowHeight,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .zIndex(91f),
@@ -4625,6 +4645,7 @@ fun WeiboApp() {
                     initialImageIndex = request.imageIndex,
                     anchorBounds = request.anchorBounds,
                     pressOffset = request.pressOffset,
+                    resolveAnchorBounds = request.resolveAnchorBounds,
                     isFloating = imagePeekController.isFloating,
                     dismissReason = imagePeekController.pendingDismiss,
                     onRequestCancel = { imagePeekController.cancel() },
@@ -5614,7 +5635,7 @@ private fun QuotedStatus(
         modifier = modifier.fillMaxWidth(),
         shape = quotedShape,
         colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.58f),
+            containerColor = MaterialTheme.colorScheme.background,
         ),
         elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
     ) {
@@ -5761,24 +5782,43 @@ private fun FeedCardActionMenuOverlay(
     controller: FeedCardActionMenuController,
     backdrop: Backdrop,
 ) {
-    val request = controller.activeRequest ?: return
+    val activeRequest = controller.activeRequest
+    var displayedRequest by remember { mutableStateOf<FeedCardActionMenuRequest?>(null) }
+    var menuVisible by remember { mutableStateOf(false) }
+
+    LaunchedEffect(activeRequest?.item?.id) {
+        if (activeRequest != null) {
+            displayedRequest = activeRequest
+            menuVisible = true
+        } else if (displayedRequest != null) {
+            menuVisible = false
+        }
+    }
+
+    val request = displayedRequest ?: return
     val context = LocalContext.current
     val density = LocalDensity.current
     val shareUrl = remember(request.item.id) {
         WeiboStatusActions.weiboUrl(request.item)
     }
 
-    LaunchedEffect(request.backHandlerEnabled) {
-        if (!request.backHandlerEnabled) {
-            controller.dismiss()
-        }
-    }
-
-    BackHandler(enabled = request.backHandlerEnabled) {
+    fun dismissMenu() {
+        menuVisible = false
         controller.dismiss()
     }
 
-    val menuWidth = 140.dp
+    LaunchedEffect(request.backHandlerEnabled) {
+        if (!request.backHandlerEnabled) {
+            dismissMenu()
+        }
+    }
+
+    BackHandler(enabled = request.backHandlerEnabled && menuVisible) {
+        dismissMenu()
+    }
+
+    val menuWidth = ActionMenuWidth
+    val menuHeight = ActionMenuTwoRowHeight
     val gapFromButton = 6.dp
     val screenMargin = 14.dp
     val anchor = request.anchorBoundsInRoot
@@ -5790,14 +5830,22 @@ private fun FeedCardActionMenuOverlay(
     ) {
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenHeightPx = with(density) { maxHeight.toPx() }
+        val menuWidthPx = with(density) { menuWidth.toPx() }
+        val menuHeightPx = with(density) { menuHeight.toPx() }
         val menuPlacement = calculateFeedCardActionMenuOffsetPx(
             anchorBounds = anchor,
             screenWidthPx = screenWidthPx,
             screenHeightPx = screenHeightPx,
-            menuWidthPx = with(density) { menuWidth.toPx() },
-            menuHeightPx = with(density) { ActionMenuTwoRowHeight.toPx() },
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
             marginPx = with(density) { screenMargin.toPx() },
             gapPx = with(density) { gapFromButton.toPx() },
+        )
+        val originInMenu = computeActionMenuOriginInMenu(
+            anchorInRoot = anchor.center,
+            menuOffset = menuPlacement.offset,
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
         )
 
         Box(
@@ -5806,32 +5854,41 @@ private fun FeedCardActionMenuOverlay(
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
-                    onClick = { controller.dismiss() },
+                    onClick = { dismissMenu() },
                 ),
         )
-        ImageActionFrostedCard(
+        ActionMenuReveal(
+            visible = menuVisible,
+            menuWidth = menuWidth,
+            menuHeight = menuHeight,
+            originInMenu = originInMenu,
+            onExitComplete = { displayedRequest = null },
             modifier = Modifier
                 .offset { menuPlacement.offset }
-                .width(menuWidth),
-            backdrop = backdrop,
+                .width(menuWidth)
+                .height(menuHeight),
         ) {
-            ImageActionRow(
-                label = "跳转到微博",
-                enabled = shareUrl != null,
-                onClick = {
-                    controller.dismiss()
-                    WeiboStatusActions.openInWeiboApp(context, request.item)
-                },
-            )
-            ImageActionMenuDivider()
-            ImageActionRow(
-                label = "分享",
-                enabled = shareUrl != null,
-                onClick = {
-                    controller.dismiss()
-                    WeiboStatusActions.shareLink(context, request.item)
-                },
-            )
+            ImageActionFrostedCard(
+                modifier = Modifier.fillMaxSize(),
+                backdrop = backdrop,
+            ) {
+                ImageActionRow(
+                    label = "跳转到微博",
+                    enabled = shareUrl != null,
+                    onClick = {
+                        dismissMenu()
+                        WeiboStatusActions.openInWeiboApp(context, request.item)
+                    },
+                )
+                ImageActionRow(
+                    label = "分享",
+                    enabled = shareUrl != null,
+                    onClick = {
+                        dismissMenu()
+                        WeiboStatusActions.shareLink(context, request.item)
+                    },
+                )
+            }
         }
     }
 }
@@ -6074,6 +6131,11 @@ private fun FeedImageCell(
                 imageIndex = imageIndex,
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
+                resolveAnchorBounds = {
+                    anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
+                        ?: anchorBounds
+                        ?: bounds
+                },
                 onCancel = { resetPeekState() },
                 onRelease = {},
                 onOpenFullscreenBehind = { index ->
@@ -6231,21 +6293,25 @@ private fun FeedImageCell(
 
 }
 
-private val ActionMenuCornerRadius = 14.dp
-private val ActionMenuRowHeight = 40.dp
-private val ActionMenuPaddingHorizontal = 12.dp
-private val ActionMenuPaddingVertical = 0.dp
-private val ActionMenuDividerThickness = 0.5.dp
-private val ActionMenuThreeRowHeight =
-    ActionMenuPaddingVertical * 2 + ActionMenuRowHeight * 3 + ActionMenuDividerThickness * 2
+private val ActionMenuWidth = 160.dp
+private val ActionMenuCornerRadius = 22.dp
+private val ActionMenuBlurRadius = 24.dp
+private val ActionMenuCardInset = 5.dp
+private val ActionMenuItemGap = 3.dp
+private val ActionMenuCapsuleHeight = 38.dp
+private val ActionMenuCapsulePaddingHorizontal = 14.dp
 private val ActionMenuTwoRowHeight =
-    ActionMenuPaddingVertical * 2 + ActionMenuRowHeight * 2 + ActionMenuDividerThickness
+    ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 2 + ActionMenuItemGap
+private val ActionMenuThreeRowHeight =
+    ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 3 + ActionMenuItemGap * 2
 
 @Composable
 private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
     MaterialTheme.typography.bodyMedium.copy(
         fontSize = 15.sp,
-        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        lineHeight = 20.sp,
+        letterSpacing = 0.15.sp,
+        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
         platformStyle = PlatformTextStyle(includeFontPadding = false),
     )
 
@@ -6253,14 +6319,25 @@ private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
 private fun ImageActionFrostedCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
+    menuHeight: Dp? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     SurfaceLiquidMenuCard(
-        modifier = modifier,
+        modifier = modifier.then(
+            if (menuHeight != null) Modifier.height(menuHeight) else Modifier,
+        ),
         backdrop = backdrop ?: LocalLiquidMenuBackdrop.current,
         cornerRadius = ActionMenuCornerRadius,
-        contentPadding = PaddingValues(vertical = ActionMenuPaddingVertical),
-        content = content,
+        blurRadius = ActionMenuBlurRadius,
+        contentPadding = PaddingValues(ActionMenuCardInset),
+        content = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(ActionMenuItemGap),
+            ) {
+                content()
+            }
+        },
     )
 }
 
@@ -6271,6 +6348,7 @@ private fun ImageActionOverlay(
     initialImageIndex: Int,
     anchorBounds: Rect,
     pressOffset: Offset,
+    resolveAnchorBounds: () -> Rect,
     isFloating: Boolean,
     dismissReason: ImagePeekDismissReason?,
     onRequestCancel: () -> Unit,
@@ -6299,6 +6377,21 @@ private fun ImageActionOverlay(
     val fullscreenExpandProgress = remember { Animatable(0f) }
     var fullscreenOpened by remember { mutableStateOf(false) }
     var actionMenuVisible by remember { mutableStateOf(false) }
+    var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
+    var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
+    var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
+    var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
+    val peekDismissMorphProgress = remember { Animatable(1f) }
+
+    fun requestDismiss(handoffBounds: Rect? = null) {
+        if (isFloating && dismissReason == null) {
+            peekDismissStartBounds = handoffBounds
+            peekDismissTargetBounds = resolveAnchorBounds()
+                .takeIf { it.width > 0f && it.height > 0f }
+                ?.toOverlayLocal(overlayWindowOrigin)
+        }
+        onRequestCancel()
+    }
 
     LaunchedEffect(Unit) {
         actionMenuVisible = true
@@ -6361,17 +6454,28 @@ private fun ImageActionOverlay(
             else -> {
                 actionMenuVisible = false
                 fullscreenExpandProgress.snapTo(0f)
-                enterProgress.animateTo(
-                    targetValue = 0f,
-                    animationSpec = MediaPeekDismissAnimationSpec,
-                )
+                if (isFloating) {
+                    peekDismissTargetBounds = resolveAnchorBounds()
+                        .takeIf { it.width > 0f && it.height > 0f }
+                        ?.toOverlayLocal(overlayWindowOrigin)
+                    peekDismissMorphProgress.snapTo(1f)
+                    peekDismissMorphProgress.animateTo(
+                        targetValue = 0f,
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
+                    )
+                } else {
+                    enterProgress.animateTo(
+                        targetValue = 0f,
+                        animationSpec = MediaPeekDismissAnimationSpec,
+                    )
+                }
                 onDismissComplete()
             }
         }
     }
 
     BackHandler(enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen) {
-        onRequestCancel()
+        requestDismiss()
     }
     val expandProgressForBackdrop = fullscreenExpandProgress.value.coerceIn(0f, 1f)
     val expandingToFullscreen = expandProgressForBackdrop > 0f ||
@@ -6380,6 +6484,10 @@ private fun ImageActionOverlay(
     BoxWithConstraints(
         Modifier
             .fillMaxSize()
+            .onGloballyPositioned { coordinates ->
+                val windowBounds = coordinates.boundsInWindow()
+                overlayWindowOrigin = Offset(windowBounds.left, windowBounds.top)
+            }
             .then(
                 if (expandingToFullscreen) {
                     Modifier.background(Color.Black)
@@ -6403,7 +6511,7 @@ private fun ImageActionOverlay(
                             if (!handled) {
                                 val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
                                 if (totalDrag.y > dragGestureThreshold && verticalDominant) {
-                                    onRequestCancel()
+                                    requestDismiss()
                                 } else if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
                                     imagePeekController.enterFullscreen()
                                 }
@@ -6416,7 +6524,7 @@ private fun ImageActionOverlay(
                         if (!verticalDominant) continue
                         if (totalDrag.y > dragGestureThreshold) {
                             change.consume()
-                            onRequestCancel()
+                            requestDismiss()
                             handled = true
                             while (true) {
                                 val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
@@ -6452,14 +6560,13 @@ private fun ImageActionOverlay(
         val enterScale = mediaPeekEnterScale(rawProgress)
         val fingerFollowAlpha = if (isFloating) 0f else (1f - expandProgressForBackdrop).coerceIn(0f, 1f)
         val expandProgress = expandProgressForBackdrop
-        val menuRevealProgress = if (actionMenuVisible && expandProgress == 0f && !fullscreenOpened) {
-            val layoutStart = mediaPeekLayoutStartProgress()
-            ((rawProgress - layoutStart) / (1f - layoutStart)).coerceIn(0f, 1f)
-        } else {
-            0f
-        }
+        val useFloatingDismissMorph = isFloating &&
+            dismissReason != null &&
+            dismissReason != ImagePeekDismissReason.EnterFullscreen
         val scrimAlpha = if (expandingToFullscreen) {
             1f
+        } else if (useFloatingDismissMorph) {
+            0.42f * peekDismissMorphProgress.value.coerceIn(0f, 1f)
         } else {
             0.42f * layoutProgress
         }
@@ -6472,17 +6579,6 @@ private fun ImageActionOverlay(
         } else {
             Modifier
         }
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
-                .clickable(
-                    enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = { onRequestCancel() },
-                ),
-        )
 
             val previewAspect = feedImagePreviewAspectRatio(currentImage)
             val previewWidth = minOf(maxWidth * 0.88f, 340.dp)
@@ -6496,6 +6592,105 @@ private fun ImageActionOverlay(
             val maxWidthPx = with(density) { maxWidth.toPx() }
             val maxHeightPx = with(density) { maxHeight.toPx() }
             val safeImageAspect = previewAspect.coerceIn(0.25f, 4f)
+
+            if (useFloatingDismissMorph) {
+                val transition = peekDismissMorphProgress.value.coerceIn(0f, 1f)
+                val floatingBounds = Rect(
+                    left = targetLeftPx,
+                    top = targetTopPx,
+                    right = targetLeftPx + targetWidthPx,
+                    bottom = targetTopPx + targetHeightPx,
+                )
+                val morphSourceBounds = peekDismissStartBounds ?: floatingBounds
+                val morphTargetBounds = peekDismissTargetBounds
+                    ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
+                val fitLayout = computeFitImageLayout(
+                    containerWidthPx = targetWidthPx,
+                    containerHeightPx = targetHeightPx,
+                    imageAspect = safeImageAspect,
+                    scale = 1f,
+                )
+                val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
+                val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
+                val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
+                val morphCenterY = lerp(morphTargetBounds.center.y, morphSourceBounds.center.y, transition)
+                val uniformScale = maxOf(
+                    morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
+                    morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
+                ).coerceIn(0.05f, 4f)
+                val morphLeft = morphCenterX - morphWidth / 2f
+                val morphTop = morphCenterY - morphHeight / 2f
+                val morphRight = morphCenterX + morphWidth / 2f
+                val morphBottom = morphCenterY + morphHeight / 2f
+                val morphCornerRadiusPx = with(density) {
+                    lerpDp(ThumbnailMorphCornerRadius, 18.dp, transition).toPx()
+                }
+                MorphRevealScrim(
+                    morphLeft = morphLeft,
+                    morphTop = morphTop,
+                    morphRight = morphRight,
+                    morphBottom = morphBottom,
+                    cornerRadiusPx = morphCornerRadiusPx,
+                    scrimColor = Color.Black.copy(alpha = scrimAlpha),
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .morphRevealClip(
+                            morphLeft = morphLeft,
+                            morphTop = morphTop,
+                            morphRight = morphRight,
+                            morphBottom = morphBottom,
+                            cornerRadiusPx = morphCornerRadiusPx,
+                        )
+                        .graphicsLayer {
+                            translationX = morphCenterX - maxWidthPx / 2f
+                            translationY = morphCenterY - maxHeightPx / 2f
+                            scaleX = uniformScale
+                            scaleY = uniformScale
+                            transformOrigin = TransformOrigin.Center
+                        },
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(previewWidth, previewHeight)
+                            .background(Color.Black),
+                    ) {
+                        if (images.size > 1) {
+                            HorizontalPager(
+                                state = pagerState,
+                                modifier = Modifier.fillMaxSize(),
+                                userScrollEnabled = false,
+                                beyondViewportPageCount = 1,
+                                flingBehavior = pagerFlingBehavior,
+                            ) { page ->
+                                ImageActionPreviewImage(
+                                    image = images[page],
+                                    modifier = Modifier.fillMaxSize(),
+                                )
+                            }
+                        } else {
+                            ImageActionPreviewImage(
+                                image = currentImage,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
+                    }
+                }
+            } else {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
+                .clickable(
+                    enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = { requestDismiss() },
+                ),
+        )
+
             val screenAspect = maxWidthPx / maxHeightPx.coerceAtLeast(1f)
             val fullscreenImageWidthPx: Float
             val fullscreenImageHeightPx: Float
@@ -6507,7 +6702,7 @@ private fun ImageActionOverlay(
                 fullscreenImageHeightPx = fullscreenImageWidthPx / safeImageAspect
             }
             val motion = computeMediaPeekGraphicsMotion(
-                anchorBounds = anchorBounds,
+                anchorBounds = closingAnchorBounds,
                 layoutOriginLeftPx = targetLeftPx,
                 layoutOriginTopPx = targetTopPx,
                 layoutWidthPx = targetWidthPx,
@@ -6521,7 +6716,7 @@ private fun ImageActionOverlay(
                 expandCenterX = maxWidthPx / 2f,
                 expandCenterY = maxHeightPx / 2f,
             )
-            val menuWidth = 180.dp
+            val menuWidth = ActionMenuWidth
             val menuHeight = ActionMenuThreeRowHeight
             val menuPlacement = calculateActionMenuOffsetFromAnchorPx(
                 anchorBounds = motion.visualBounds,
@@ -6531,6 +6726,16 @@ private fun ImageActionOverlay(
                 menuHeightPx = with(density) { menuHeight.toPx() },
                 marginPx = with(density) { 14.dp.toPx() },
                 gapPx = with(density) { 10.dp.toPx() },
+            )
+
+            val menuWidthPx = with(density) { menuWidth.toPx() }
+            val menuHeightPx = with(density) { menuHeight.toPx() }
+            val menuRevealVisible = actionMenuVisible && expandProgress == 0f && !fullscreenOpened
+            val originInMenu = computeActionMenuOriginInMenu(
+                anchorInRoot = pressOffset,
+                menuOffset = menuPlacement.offset,
+                menuWidthPx = menuWidthPx,
+                menuHeightPx = menuHeightPx,
             )
 
             Box(
@@ -6583,23 +6788,19 @@ private fun ImageActionOverlay(
                 }
             }
 
-            if (actionMenuVisible && expandProgress == 0f && !fullscreenOpened) {
+            ActionMenuReveal(
+                visible = menuRevealVisible,
+                menuWidth = menuWidth,
+                menuHeight = menuHeight,
+                originInMenu = originInMenu,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .offset { menuPlacement.offset }
+                    .width(menuWidth)
+                    .height(menuHeight),
+            ) {
                 ImageActionFrostedCard(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .offset { menuPlacement.offset }
-                        .width(menuWidth)
-                        .graphicsLayer {
-                            alpha = menuRevealProgress
-                            scaleX = lerp(0.92f, 1f, menuRevealProgress)
-                            scaleY = lerp(0.92f, 1f, menuRevealProgress)
-                            val slideDistance = with(density) { 14.dp.toPx() }
-                            translationY = if (menuPlacement.belowAnchor) {
-                                lerp(-slideDistance, 0f, menuRevealProgress)
-                            } else {
-                                lerp(slideDistance, 0f, menuRevealProgress)
-                            }
-                        },
+                    modifier = Modifier.fillMaxSize(),
                 ) {
                     ImageActionRow(
                         label = "保存",
@@ -6610,7 +6811,7 @@ private fun ImageActionOverlay(
                                 ImageSaveHelper.saveImage(context, currentImage)
                                     .onSuccess { name ->
                                         onMessage("保存成功", "已保存到相册：$name")
-                                        onRequestCancel()
+                                        requestDismiss()
                                     }
                                     .onFailure { error ->
                                         onMessage("保存失败", error.message ?: "请稍后重试")
@@ -6619,7 +6820,6 @@ private fun ImageActionOverlay(
                             }
                         },
                     )
-                    ImageActionMenuDivider()
                     ImageActionRow(
                         label = "保存全部",
                         enabled = !saving && images.isNotEmpty(),
@@ -6629,7 +6829,7 @@ private fun ImageActionOverlay(
                                 ImageSaveHelper.saveAllImages(context, images)
                                     .onSuccess { count ->
                                         onMessage("保存成功", "已保存 $count 张图片到相册")
-                                        onRequestCancel()
+                                        requestDismiss()
                                     }
                                     .onFailure { error ->
                                         onMessage("保存失败", error.message ?: "请稍后重试")
@@ -6638,7 +6838,6 @@ private fun ImageActionOverlay(
                             }
                         },
                     )
-                    ImageActionMenuDivider()
                     ImageActionRow(
                         label = "分享",
                         enabled = !saving,
@@ -6654,6 +6853,7 @@ private fun ImageActionOverlay(
                         },
                     )
                 }
+            }
             }
     }
 }
@@ -7225,34 +7425,24 @@ private fun calculateFeedCardActionMenuOffsetPx(
 }
 
 @Composable
-private fun ImageActionMenuDivider() {
-    HorizontalDivider(
-        modifier = Modifier.padding(horizontal = ActionMenuPaddingHorizontal),
-        thickness = ActionMenuDividerThickness,
-        color = Color.Black.copy(alpha = 0.08f),
-    )
-}
-
-@Composable
 private fun ImageActionRow(
     label: String,
     enabled: Boolean,
     selected: Boolean = false,
     onClick: () -> Unit,
 ) {
-    Row(
+    val capsuleShape = RoundedCornerShape(percent = 50)
+    Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(ActionMenuRowHeight)
-            .clickable(enabled = enabled, onClick = onClick),
-        verticalAlignment = Alignment.CenterVertically,
+            .height(ActionMenuCapsuleHeight)
+            .clip(capsuleShape)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = ActionMenuCapsulePaddingHorizontal),
+        contentAlignment = Alignment.CenterStart,
     ) {
         Text(
             text = label,
-            modifier = Modifier
-                .fillMaxHeight()
-                .wrapContentHeight(Alignment.CenterVertically)
-                .padding(horizontal = ActionMenuPaddingHorizontal),
             style = actionMenuTextStyle(selected = selected),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -8466,35 +8656,44 @@ private fun BoxScope.FullscreenImageActionMenu(
     val density = LocalDensity.current
     var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
-    val menuWidth = 180.dp
+    val menuWidth = ActionMenuWidth
     val estimatedMenuHeight = ActionMenuThreeRowHeight
     val margin = 14.dp
     val gap = 10.dp
+    val menuWidthPx = with(density) { menuWidth.toPx() }
+    val menuHeightPx = with(density) { estimatedMenuHeight.toPx() }
     val menuPlacement = calculateActionMenuOffsetFromPointPx(
         pressOffset = pressOffset,
         screenWidthPx = screenWidthPx,
         screenHeightPx = screenHeightPx,
-        menuWidthPx = with(density) { menuWidth.toPx() },
-        menuHeightPx = with(density) { estimatedMenuHeight.toPx() },
+        menuWidthPx = menuWidthPx,
+        menuHeightPx = menuHeightPx,
         marginPx = with(density) { margin.toPx() },
         gapPx = with(density) { gap.toPx() },
     )
+    val originInMenu = computeActionMenuOriginInMenu(
+        anchorInRoot = pressOffset,
+        menuOffset = menuPlacement.offset,
+        menuWidthPx = menuWidthPx,
+        menuHeightPx = menuHeightPx,
+    )
 
-    AnimatedVisibility(
+    ActionMenuReveal(
         visible = visible,
-        enter = fadeIn(tween(150)) + slideIn(tween(170)) {
-            IntOffset(0, if (menuPlacement.belowAnchor) -it.height / 7 else it.height / 7)
-        },
-        exit = fadeOut(tween(130)) + slideOut(tween(150)) {
-            IntOffset(0, if (menuPlacement.belowAnchor) -it.height / 7 else it.height / 7)
-        },
+        menuWidth = menuWidth,
+        menuHeight = estimatedMenuHeight,
+        originInMenu = originInMenu,
         modifier = Modifier
             .align(Alignment.TopStart)
             .offset { menuPlacement.offset }
             .width(menuWidth)
+            .height(estimatedMenuHeight)
             .zIndex(20f),
     ) {
-        ImageActionFrostedCard(backdrop = backdrop) {
+        ImageActionFrostedCard(
+            modifier = Modifier.fillMaxSize(),
+            backdrop = backdrop,
+        ) {
             ImageActionRow(
                 label = "保存",
                 enabled = !saving,
@@ -8513,7 +8712,6 @@ private fun BoxScope.FullscreenImageActionMenu(
                     }
                 },
             )
-            ImageActionMenuDivider()
             ImageActionRow(
                 label = "保存全部",
                 enabled = !saving && images.isNotEmpty(),
@@ -8532,7 +8730,6 @@ private fun BoxScope.FullscreenImageActionMenu(
                     }
                 },
             )
-            ImageActionMenuDivider()
             ImageActionRow(
                 label = "分享",
                 enabled = !saving,
@@ -12133,6 +12330,20 @@ private fun SearchScreen(
     val latestSearchDraft by rememberUpdatedState(searchDraft)
     val searchDraftText = searchDraft.text
 
+    fun publishSuggestionOverlay(term: String = searchDraft.text.trim()) {
+        searchBarOverlay.suggestions = if (suggestForQuery == term) {
+            suggestResult
+        } else {
+            SearchSuggestResult()
+        }
+        searchBarOverlay.suggestionsLoading = suggestLoading &&
+            suggestLoadingForQuery == term &&
+            term.isNotBlank()
+        searchBarOverlay.suggestionsVisible = searchBarVisible &&
+            term.isNotBlank() &&
+            activeQuery != term
+    }
+
     fun resetSearchResults(clearActiveQuery: Boolean) {
         if (clearActiveQuery) {
             activeQuery = null
@@ -12154,10 +12365,11 @@ private fun SearchScreen(
         searchBarOverlay.queryInput = value
         if (newTerm != oldTerm) {
             suggestRequestGeneration++
-            suggestResult = SearchSuggestResult()
-            suggestForQuery = ""
             suggestLoading = false
             suggestLoadingForQuery = ""
+            suggestResult = SearchSuggestResult()
+            suggestForQuery = ""
+            publishSuggestionOverlay(newTerm)
         }
         if (activeQuery != null && value.text.trim() != activeQuery) {
             resetSearchResults(clearActiveQuery = true)
@@ -12331,6 +12543,7 @@ private fun SearchScreen(
             suggestLoadingForQuery = ""
             suggestResult = SearchSuggestResult()
             suggestForQuery = ""
+            publishSuggestionOverlay("")
             return@LaunchedEffect
         }
         val term = searchDraftText.trim()
@@ -12339,16 +12552,20 @@ private fun SearchScreen(
             suggestLoadingForQuery = ""
             suggestResult = SearchSuggestResult()
             suggestForQuery = ""
+            publishSuggestionOverlay("")
             return@LaunchedEffect
         }
-        suggestResult = SearchSuggestResult()
-        suggestForQuery = ""
+        if (term != suggestForQuery) {
+            suggestResult = SearchSuggestResult()
+        }
         suggestLoading = true
         suggestLoadingForQuery = term
+        publishSuggestionOverlay(term)
         try {
             delay(80)
             if (requestGeneration != suggestRequestGeneration) return@LaunchedEffect
-            if (latestSearchDraft.text.trim() != term) return@LaunchedEffect
+            val latestTerm = latestSearchDraft.text.trim()
+            if (latestTerm.isBlank() || latestTerm != term) return@LaunchedEffect
             val result = withTimeoutOrNull(5_000) {
                 runCatching { session.loadSearchSuggest(term) }
                     .getOrElse { SearchSuggestResult() }
@@ -12357,10 +12574,14 @@ private fun SearchScreen(
             if (latestSearchDraft.text.trim() != term) return@LaunchedEffect
             suggestResult = result
             suggestForQuery = term
+            suggestLoading = false
+            suggestLoadingForQuery = ""
+            publishSuggestionOverlay(term)
         } finally {
             if (requestGeneration == suggestRequestGeneration) {
                 suggestLoading = false
                 suggestLoadingForQuery = ""
+                publishSuggestionOverlay(searchDraftText.trim())
             }
         }
     }
@@ -12372,8 +12593,10 @@ private fun SearchScreen(
         }
     }
 
-    LaunchedEffect(listState, activeQuery, searchBarVisible) {
-        if (!searchBarVisible || activeQuery != null) return@LaunchedEffect
+    LaunchedEffect(listState, activeQuery, searchBarVisible, searchDraftText) {
+        if (!searchBarVisible || activeQuery != null || searchDraftText.trim().isNotBlank()) {
+            return@LaunchedEffect
+        }
         var lastScrollTotal =
             listState.firstVisibleItemIndex * 10_000 + listState.firstVisibleItemScrollOffset
         snapshotFlow {
@@ -12412,7 +12635,7 @@ private fun SearchScreen(
 
     val isRefreshing = when {
         activeQuery == null -> hotSearchLoading
-        else -> searchPullRefreshing || resultLoading
+        else -> searchPullRefreshing
     }
     var searchHeaderHeight by remember { mutableStateOf(0.dp) }
     val density = LocalDensity.current
@@ -12422,11 +12645,7 @@ private fun SearchScreen(
     val searchFieldHeight = 44.dp
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
-    val imeInsetForLayout = if (imeTargetBottom < imeBottom) {
-        imeTargetBottom
-    } else {
-        maxOf(imeBottom, imeTargetBottom)
-    }
+    val imeInsetForLayout = maxOf(imeBottom, imeTargetBottom)
     val searchFieldBottomTarget = maxOf(searchBarBottom, imeInsetForLayout + searchBarGap)
     val searchFieldBottom by animateDpAsState(
         targetValue = searchFieldBottomTarget,

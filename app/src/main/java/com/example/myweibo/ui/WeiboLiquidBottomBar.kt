@@ -30,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -72,6 +73,9 @@ internal fun WeiboLiquidBottomBar(
     selectedTimelineKind: TimelineKind = TimelineKind.Following,
     onTimelineKindChange: (TimelineKind) -> Unit = {},
     timelineMenuContent: @Composable (dismiss: () -> Unit) -> Unit,
+    timelineMenuWidth: Dp = 152.dp,
+    timelineMenuHeight: Dp = 89.dp,
+    timelineMenuGap: Dp = 4.dp,
     modifier: Modifier = Modifier,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
@@ -235,6 +239,7 @@ internal fun WeiboLiquidBottomBar(
                             backdrop = backdrop,
                             isInteractive = collapsedOnTop && collapsedAlpha > 0.5f,
                             inputEnabled = false,
+                            useMenuGlassStyle = true,
                             modifier = Modifier.fillMaxSize(),
                         ) {
                             WeiboTabIcon(
@@ -244,32 +249,6 @@ internal fun WeiboLiquidBottomBar(
                             )
                         }
                     }
-                }
-            }
-
-            if (timelineMenuExpanded) {
-                val timelineMenuWidth = 136.dp
-                val timelineMenuOffsetX = with(density) {
-                    val fullWidthPx = fullBarWidth.toPx()
-                    val menuWidthPx = timelineMenuWidth.toPx()
-                    val barPaddingPx = 18.dp.toPx()
-                    val feedCenterPx = barPaddingPx + (fullBarWidth.toPx() * (feedIndex + 0.5f) / tabs.size)
-                    (feedCenterPx - menuWidthPx / 2f)
-                        .coerceIn(0f, (fullWidthPx - menuWidthPx).coerceAtLeast(0f))
-                        .roundToInt()
-                }
-                Box(
-                    Modifier
-                        .align(Alignment.BottomStart)
-                        .offset {
-                            IntOffset(
-                                timelineMenuOffsetX,
-                                -with(density) { 80.dp.roundToPx() },
-                            )
-                        }
-                        .zIndex(50f),
-                ) {
-                    timelineMenuContent { onTimelineMenuExpandedChange(false) }
                 }
             }
 
@@ -395,6 +374,38 @@ internal fun WeiboLiquidBottomBar(
                         },
                 )
             }
+        }
+
+        val timelineMenuOffsetX = with(density) {
+            val fullWidthPx = fullBarWidth.toPx()
+            val menuWidthPx = timelineMenuWidth.toPx()
+            val barPaddingPx = 18.dp.toPx()
+            val feedCenterPx = barPaddingPx + (fullBarWidth.toPx() * (feedIndex + 0.5f) / tabs.size)
+            (feedCenterPx - menuWidthPx / 2f)
+                .coerceIn(0f, (fullWidthPx - menuWidthPx).coerceAtLeast(0f))
+                .roundToInt()
+        }
+        val menuLift = barHeight + animationOverflow + timelineMenuGap
+        val timelineMenuOriginInMenu = with(density) {
+            Offset(timelineMenuWidth.toPx() / 2f, timelineMenuHeight.toPx())
+        }
+        ActionMenuReveal(
+            visible = timelineMenuExpanded,
+            menuWidth = timelineMenuWidth,
+            menuHeight = timelineMenuHeight,
+            originInMenu = timelineMenuOriginInMenu,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .offset {
+                    IntOffset(
+                        timelineMenuOffsetX,
+                        -with(density) { menuLift.roundToPx() },
+                    )
+                }
+                .zIndex(50f)
+                .graphicsLayer { clip = false },
+        ) {
+            timelineMenuContent { onTimelineMenuExpandedChange(false) }
         }
     }
 }

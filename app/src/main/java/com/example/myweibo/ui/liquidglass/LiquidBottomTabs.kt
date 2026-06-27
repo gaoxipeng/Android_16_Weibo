@@ -3,6 +3,7 @@ package com.example.myweibo.ui.liquidglass
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOut
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -283,6 +284,9 @@ fun LiquidBottomTabs(
             )
         }
 
+        val barShape = RoundedCornerShape(percent = 50)
+        val barBorderColor = liquidMenuBorderColor(isLightTheme)
+
         CompositionLocalProvider(
             LocalLiquidBottomTabBackdropRow provides false,
             LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
@@ -295,12 +299,10 @@ fun LiquidBottomTabs(
                     }
                     .drawBackdrop(
                         backdrop = backdrop,
-                        shape = { RoundedCornerShape(percent = 50) },
-                        effects = {
-                            vibrancy()
-                            blur(LiquidGlassBlurRadius.toPx())
-                            lens(12.dp.toPx(), 24.dp.toPx())
-                        },
+                        shape = { barShape },
+                        effects = { liquidMenuGlassEffects() },
+                        highlight = null,
+                        shadow = null,
                         layerBlock = {
                             val scale = lerp(
                                 1f,
@@ -312,6 +314,7 @@ fun LiquidBottomTabs(
                         },
                         onDrawSurface = { drawRect(surfaceColor) },
                     )
+                    .border(LiquidMenuBorderWidth, barBorderColor, barShape)
                     .then(interactiveHighlight.modifier)
                     .height(64.dp)
                     .fillMaxWidth()

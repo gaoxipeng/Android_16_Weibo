@@ -1,6 +1,7 @@
 package com.example.myweibo.ui.liquidglass
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -37,10 +38,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceAtMost
 import androidx.compose.ui.util.lerp
 import com.kyant.backdrop.Backdrop
+import com.kyant.backdrop.BackdropEffectScope
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.shadow.Shadow
 import dev.chrisbanes.haze.HazeState
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -49,6 +53,17 @@ import kotlin.math.sin
 import kotlin.math.tanh
 
 internal val LiquidGlassBlurRadius = 4.dp
+internal val LiquidMenuGlassBlurRadius = 24.dp
+internal val LiquidMenuBorderWidth = 0.5.dp
+
+internal fun liquidMenuBorderColor(isLightTheme: Boolean): Color =
+    if (isLightTheme) Color(0x24000000) else Color(0x33FFFFFF)
+
+internal fun BackdropEffectScope.liquidMenuGlassEffects() {
+    vibrancy()
+    blur(LiquidMenuGlassBlurRadius.toPx())
+    lens(12f.dp.toPx(), 24f.dp.toPx())
+}
 
 internal val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
 internal val LocalLiquidMenuBackdrop = staticCompositionLocalOf<Backdrop?> { null }
@@ -63,6 +78,7 @@ fun LiquidButton(
     tint: Color = Color.Unspecified,
     surfaceColor: Color = Color.Unspecified,
     onDoubleClick: (() -> Unit)? = null,
+    useMenuGlassStyle: Boolean = false,
     content: @Composable RowScope.() -> Unit,
 ) {
     val animationScope = rememberCoroutineScope()
@@ -88,17 +104,27 @@ fun LiquidButton(
             )
         }
 
+    val pillShape = RoundedCornerShape(percent = 50)
+    val isLightTheme = !isSystemInDarkTheme()
+    val menuBorderColor = liquidMenuBorderColor(isLightTheme)
+
     Row(
         modifier
             .graphicsLayer { clip = false }
             .drawBackdrop(
                 backdrop = backdrop,
-                shape = { RoundedCornerShape(percent = 50) },
+                shape = { pillShape },
                 effects = {
-                    vibrancy()
-                    blur(LiquidGlassBlurRadius.toPx())
-                    lens(12f.dp.toPx(), 24f.dp.toPx())
+                    if (useMenuGlassStyle) {
+                        liquidMenuGlassEffects()
+                    } else {
+                        vibrancy()
+                        blur(LiquidGlassBlurRadius.toPx())
+                        lens(12f.dp.toPx(), 24f.dp.toPx())
+                    }
                 },
+                highlight = if (useMenuGlassStyle) null else ({ Highlight.Default }),
+                shadow = if (useMenuGlassStyle) null else ({ Shadow.Default }),
                 layerBlock = if (isInteractive) {
                     {
                         val width = size.width
@@ -132,6 +158,13 @@ fun LiquidButton(
                     if (surfaceColor.isSpecified) {
                         drawRect(surfaceColor)
                     }
+                },
+            )
+            .then(
+                if (useMenuGlassStyle) {
+                    Modifier.border(LiquidMenuBorderWidth, menuBorderColor, pillShape)
+                } else {
+                    Modifier
                 },
             )
             .then(interactionModifier)
@@ -305,12 +338,14 @@ fun SurfaceLiquidMenuCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
     cornerRadius: Dp = 14.dp,
+    blurRadius: Dp = LiquidGlassBlurRadius,
     contentPadding: PaddingValues = PaddingValues(0.dp),
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val isLightTheme = !isSystemInDarkTheme()
     val shape = RoundedCornerShape(cornerRadius)
     val surfaceColor = liquidSurfaceColor(isLightTheme)
+    val borderColor = liquidMenuBorderColor(isLightTheme)
 
     if (backdrop != null) {
         Column(
@@ -321,11 +356,14 @@ fun SurfaceLiquidMenuCard(
                     shape = { shape },
                     effects = {
                         vibrancy()
-                        blur(LiquidGlassBlurRadius.toPx())
+                        blur(blurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     },
+                    highlight = null,
+                    shadow = null,
                     onDrawSurface = { drawRect(surfaceColor) },
                 )
+                .border(LiquidMenuBorderWidth, borderColor, shape)
                 .padding(contentPadding),
             horizontalAlignment = Alignment.Start,
             content = content,
@@ -335,6 +373,7 @@ fun SurfaceLiquidMenuCard(
             modifier
                 .clip(shape)
                 .background(surfaceColor, shape)
+                .border(LiquidMenuBorderWidth, borderColor, shape)
                 .padding(contentPadding),
             horizontalAlignment = Alignment.Start,
             content = content,
@@ -350,6 +389,7 @@ fun SurfaceLiquidIconButton(
     onDoubleClick: (() -> Unit)? = null,
     isInteractive: Boolean = true,
     inputEnabled: Boolean = true,
+    useMenuGlassStyle: Boolean = false,
     content: @Composable RowScope.() -> Unit,
 ) {
     LiquidButton(
@@ -359,6 +399,7 @@ fun SurfaceLiquidIconButton(
         onDoubleClick = onDoubleClick,
         isInteractive = isInteractive,
         inputEnabled = inputEnabled,
+        useMenuGlassStyle = useMenuGlassStyle,
         surfaceColor = liquidSurfaceColor(!isSystemInDarkTheme()),
         content = content,
     )
