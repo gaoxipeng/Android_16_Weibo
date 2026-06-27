@@ -28,6 +28,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.ImageView
 import android.widget.Toast
+import androidx.exifinterface.media.ExifInterface
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -518,6 +519,70 @@ private fun Rect.toOverlayLocal(overlayOriginInWindow: Offset): Rect =
         right = right - overlayOriginInWindow.x,
         bottom = bottom - overlayOriginInWindow.y,
     )
+
+private fun isMediaAnchorVisibleOnScreen(
+    anchorBounds: Rect,
+    screenWidthPx: Float,
+    screenHeightPx: Float,
+    minVisiblePx: Float = 8f,
+): Boolean {
+    if (anchorBounds.width <= 0f || anchorBounds.height <= 0f) return false
+    val visibleWidth = minOf(anchorBounds.right, screenWidthPx) - maxOf(anchorBounds.left, 0f)
+    val visibleHeight = minOf(anchorBounds.bottom, screenHeightPx) - maxOf(anchorBounds.top, 0f)
+    return visibleWidth >= minVisiblePx && visibleHeight >= minVisiblePx
+}
+
+private fun computeVideoPeekTopExitTargetBounds(
+    sourceBounds: Rect,
+    screenWidthPx: Float,
+    statusBarTopPx: Float,
+    aspectRatio: Float,
+): Rect {
+    val safeAspect = aspectRatio.coerceIn(0.25f, 4f)
+    val targetWidth = sourceBounds.width.coerceAtMost(screenWidthPx * 0.72f) * 0.5f
+    val targetHeight = targetWidth / safeAspect
+    val centerX = screenWidthPx / 2f
+    val centerY = maxOf(statusBarTopPx * 0.25f, targetHeight * 0.15f)
+    return Rect(
+        left = centerX - targetWidth / 2f,
+        top = centerY - targetHeight / 2f,
+        right = centerX + targetWidth / 2f,
+        bottom = centerY + targetHeight / 2f,
+    )
+}
+
+private fun resolveVideoPeekDismissTargetBounds(
+    anchorInWindow: Rect,
+    sourceBoundsInOverlay: Rect,
+    screenWidthPx: Float,
+    screenHeightPx: Float,
+    statusBarTopPx: Float,
+    aspectRatio: Float,
+    overlayOriginInWindow: Offset,
+    forceTopExit: Boolean = false,
+): Pair<Rect, Boolean> {
+    val anchorInOverlay = anchorInWindow.toOverlayLocal(overlayOriginInWindow)
+    val useTopExit = forceTopExit ||
+        !isMediaAnchorVisibleOnScreen(anchorInWindow, screenWidthPx, screenHeightPx)
+    return if (useTopExit) {
+        computeVideoPeekTopExitTargetBounds(
+            sourceBounds = sourceBoundsInOverlay,
+            screenWidthPx = screenWidthPx,
+            statusBarTopPx = statusBarTopPx,
+            aspectRatio = aspectRatio,
+        ) to true
+    } else {
+        (anchorInOverlay.takeIf { it.width > 0f && it.height > 0f } ?: sourceBoundsInOverlay) to false
+    }
+}
+
+private fun resolveVideoAnchorBounds(
+    anchorCoordinates: LayoutCoordinates?,
+    fallback: Rect?,
+): Rect =
+    anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
+        ?: fallback
+        ?: Rect.Zero
 
 private fun mediaPeekHoldScale(holdProgress: Float): Float {
     val t = holdProgress.coerceIn(0f, 1f)
@@ -1233,6 +1298,7 @@ private data class VideoPeekRequest(
     val anchorBounds: Rect,
     val pressOffset: Offset,
     val playbackOwnerId: String,
+    val resolveAnchorBounds: () -> Rect,
     val expandFromAnchor: Boolean = false,
     val fromFullscreen: Boolean = false,
     val dockImmediately: Boolean = false,
@@ -1618,11 +1684,9 @@ private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
 
 private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
     if (bytes.isEmpty()) return null
-    decodeSampledBitmap(bytes, maxDecodeDim)?.let { return it }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        return runCatching {
-            val source = ImageDecoder.createSource(bytes)
-            ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+        runCatching {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(bytes)) { decoder, info, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                 val width = info.size.width
                 val height = info.size.height
@@ -1636,9 +1700,9 @@ private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? 
                     )
                 }
             }
-        }.getOrNull()
+        }.getOrNull()?.let { return it }
     }
-    return null
+    return decodeSampledBitmap(bytes, maxDecodeDim)
 }
 
 private fun decodeSampledBitmap(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
@@ -1655,6 +1719,90 @@ private fun decodeSampledBitmap(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
 }
 
 private fun Bitmap?.takeIfDrawable(): Bitmap? = this?.takeIf { !it.isRecycled }
+
+private fun readExifOrientationFromBytes(bytes: ByteArray): Int =
+    runCatching {
+        ExifInterface(java.io.ByteArrayInputStream(bytes)).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL,
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+private suspend fun readExifOrientationFromFeedImage(image: FeedImage): Int {
+    val candidates = listOfNotNull(image.largeUrl?.takeIf { it.isNotBlank() }) +
+        image.downloadUrls.filter { it.isNotBlank() && it != image.thumbnailUrl }
+    for (url in candidates.distinct()) {
+        RemoteBytesCache.get(url)?.let { return readExifOrientationFromBytes(it) }
+    }
+    for (url in candidates.distinct()) {
+        val bytes = runCatching {
+            fetchRemoteBytes(
+                url = url,
+                connectTimeoutMs = 5000,
+                readTimeoutMs = 8000,
+                maxReadBytes = 512 * 1024,
+            )
+        }.getOrNull() ?: continue
+        if (bytes.isNotEmpty()) {
+            RemoteBytesCache.put(url, bytes)
+            return readExifOrientationFromBytes(bytes)
+        }
+    }
+    return ExifInterface.ORIENTATION_NORMAL
+}
+
+private data class LivePhotoVideoCorrection(
+    val scaleX: Float = 1f,
+    val scaleY: Float = 1f,
+    val rotationZ: Float = 0f,
+)
+
+private fun computeLivePhotoVideoCorrection(
+    exifOrientation: Int,
+    videoRotationDegrees: Int,
+    staticWidth: Int,
+    staticHeight: Int,
+    videoWidth: Int,
+    videoHeight: Int,
+): LivePhotoVideoCorrection {
+    val videoRot = ((videoRotationDegrees % 360) + 360) % 360
+    val exifCorrection = when (exifOrientation) {
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL ->
+            LivePhotoVideoCorrection(scaleX = -1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL ->
+            LivePhotoVideoCorrection(scaleY = -1f)
+        ExifInterface.ORIENTATION_ROTATE_180 ->
+            LivePhotoVideoCorrection(rotationZ = 180f)
+        ExifInterface.ORIENTATION_TRANSPOSE ->
+            LivePhotoVideoCorrection(rotationZ = 90f, scaleX = -1f)
+        ExifInterface.ORIENTATION_ROTATE_90 ->
+            LivePhotoVideoCorrection(rotationZ = 90f)
+        ExifInterface.ORIENTATION_TRANSVERSE ->
+            LivePhotoVideoCorrection(rotationZ = -90f, scaleX = -1f)
+        ExifInterface.ORIENTATION_ROTATE_270 ->
+            LivePhotoVideoCorrection(rotationZ = -90f)
+        else -> LivePhotoVideoCorrection()
+    }
+    if (exifOrientation != ExifInterface.ORIENTATION_NORMAL &&
+        exifOrientation != ExifInterface.ORIENTATION_UNDEFINED
+    ) {
+        val exifRot = ((exifCorrection.rotationZ.toInt() % 360) + 360) % 360
+        val remainingRot = ((exifRot - videoRot + 360) % 360).toFloat()
+        return exifCorrection.copy(rotationZ = remainingRot)
+    }
+    if (staticWidth <= 0 || staticHeight <= 0 || videoWidth <= 0 || videoHeight <= 0) {
+        return LivePhotoVideoCorrection()
+    }
+    val staticPortrait = staticHeight > staticWidth
+    val videoPortrait = when (videoRot) {
+        90, 270 -> videoWidth > videoHeight
+        else -> videoHeight > videoWidth
+    }
+    if (staticPortrait != videoPortrait) {
+        return LivePhotoVideoCorrection(rotationZ = 90f)
+    }
+    return LivePhotoVideoCorrection()
+}
 
 private fun trimImageCaches(keepFraction: Float) {
     val fraction = keepFraction.coerceIn(0f, 1f)
@@ -2471,6 +2619,7 @@ fun WeiboApp() {
                 anchorBounds = anchorBounds,
                 pressOffset = Offset(screenWidthPx / 2f, screenHeightPx / 2f),
                 playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = { anchorBounds },
                 fromFullscreen = true,
                 onCancel = {
                     videoPlaybackCoordinator.cancelPeekHandoff(playbackKey)
@@ -4718,6 +4867,7 @@ fun WeiboApp() {
                     playbackOwnerId = request.playbackOwnerId,
                     anchorBounds = request.anchorBounds,
                     pressOffset = request.pressOffset,
+                    resolveAnchorBounds = request.resolveAnchorBounds,
                     expandFromAnchor = request.expandFromAnchor,
                     fromFullscreen = request.fromFullscreen,
                     dockImmediately = request.dockImmediately,
@@ -6936,6 +7086,7 @@ private fun VideoPeekOverlay(
     playbackOwnerId: String,
     anchorBounds: Rect,
     pressOffset: Offset,
+    resolveAnchorBounds: () -> Rect,
     expandFromAnchor: Boolean = false,
     fromFullscreen: Boolean = false,
     dockImmediately: Boolean = false,
@@ -6954,7 +7105,8 @@ private fun VideoPeekOverlay(
         videoPlaybackKey(media, playbackOwnerId)
     }
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val screenHeight = LocalConfiguration.current.screenHeightDp.dp
+    val configuration = LocalConfiguration.current
+    val screenHeight = configuration.screenHeightDp.dp
     var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
     val enterProgress = remember(fromFullscreen, dockImmediately) {
         Animatable(
@@ -6969,7 +7121,17 @@ private fun VideoPeekOverlay(
         Animatable(if (dockImmediately) 1f else 0f)
     }
     val fullscreenExpandProgress = remember { Animatable(if (isFullscreenMode) 1f else 0f) }
+    var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
+    var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
+    var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
+    var peekDismissUseTopExit by remember { mutableStateOf(false) }
+    var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
+    val peekDismissMorphProgress = remember { Animatable(1f) }
     val isDocked = isFloating || dockProgress.value > 0f || isFullscreenMode
+
+    fun requestDismiss() {
+        onRequestCancel()
+    }
 
     ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
 
@@ -7042,20 +7204,56 @@ private fun VideoPeekOverlay(
             }
             else -> {
                 fullscreenExpandProgress.snapTo(0f)
-                if (dockProgress.value > 0f) {
-                    dockProgress.animateTo(0f, MediaPeekDismissAnimationSpec)
+                videoPeekController.resetFingerDragOffset()
+                if (isFloating) {
+                    closingAnchorBounds = resolveAnchorBounds()
+                    val statusBarTopPx = with(density) { statusBarTop.toPx() }
+                    val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
+                    val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+                    val dockLeftPx = 0f
+                    val dockTopPx = statusBarTopPx + with(density) { 8.dp.toPx() }
+                    val dockWidthPx = screenWidthPx
+                    val dockHeightPx = dockWidthPx / VideoPeekDockAspectRatio
+                    val sourceBounds = Rect(
+                        left = dockLeftPx,
+                        top = dockTopPx,
+                        right = dockLeftPx + dockWidthPx,
+                        bottom = dockTopPx + dockHeightPx,
+                    )
+                    val (targetBounds, useTopExit) = resolveVideoPeekDismissTargetBounds(
+                        anchorInWindow = closingAnchorBounds,
+                        sourceBoundsInOverlay = sourceBounds,
+                        screenWidthPx = screenWidthPx,
+                        screenHeightPx = screenHeightPx,
+                        statusBarTopPx = statusBarTopPx,
+                        aspectRatio = aspectRatio,
+                        overlayOriginInWindow = overlayWindowOrigin,
+                        forceTopExit = fromFullscreen,
+                    )
+                    peekDismissStartBounds = sourceBounds
+                    peekDismissTargetBounds = targetBounds
+                    peekDismissUseTopExit = useTopExit
+                    peekDismissMorphProgress.snapTo(1f)
+                    peekDismissMorphProgress.animateTo(
+                        targetValue = 0f,
+                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
+                    )
+                } else {
+                    if (dockProgress.value > 0f) {
+                        dockProgress.animateTo(0f, MediaPeekDismissAnimationSpec)
+                    }
+                    enterProgress.animateTo(
+                        targetValue = 0f,
+                        animationSpec = MediaPeekDismissAnimationSpec,
+                    )
                 }
-                enterProgress.animateTo(
-                    targetValue = 0f,
-                    animationSpec = MediaPeekDismissAnimationSpec,
-                )
                 onDismissComplete()
             }
         }
     }
 
     BackHandler(enabled = isFullscreenMode || (dismissReason != VideoPeekDismissReason.EnterFullscreen && isDocked)) {
-        onRequestCancel()
+        requestDismiss()
     }
 
     val expandProgressForBackdrop = fullscreenExpandProgress.value.coerceIn(0f, 1f)
@@ -7064,7 +7262,12 @@ private fun VideoPeekOverlay(
         dismissReason == VideoPeekDismissReason.EnterFullscreen
 
     BoxWithConstraints(
-        modifier = modifier.then(
+        modifier = modifier
+            .onGloballyPositioned { coordinates ->
+                val windowBounds = coordinates.boundsInWindow()
+                overlayWindowOrigin = Offset(windowBounds.left, windowBounds.top)
+            }
+            .then(
             if (expandingToFullscreen || !isDocked) {
                 Modifier.fillMaxSize()
             } else {
@@ -7078,6 +7281,9 @@ private fun VideoPeekOverlay(
         val fingerFollowAlpha = if (isFloating || isDocked) 0f else (1f - expandProgressForBackdrop).coerceIn(0f, 1f)
         val expandProgress = expandProgressForBackdrop
         val dockedProgress = dockProgress.value.coerceIn(0f, 1f)
+        val useFloatingDismissMorph = isFloating &&
+            dismissReason != null &&
+            dismissReason != VideoPeekDismissReason.EnterFullscreen
         val effectiveMaxHeight = if (maxHeight == Dp.Infinity) screenHeight else maxHeight
         val safeVideoAspect = aspectRatio.coerceIn(0.25f, 4f)
 
@@ -7130,8 +7336,8 @@ private fun VideoPeekOverlay(
             dockWidthPx = dockWidthPx,
             dockHeightPx = dockHeightPx,
         )
-        val useDockedColumnLayout = isDocked && !expandingToFullscreen
-        val dockedGestureModifier = if (isDocked && dismissReason == null) {
+        val useDockedColumnLayout = isDocked && !expandingToFullscreen && !useFloatingDismissMorph
+        val dockedGestureModifier = if (isDocked && dismissReason == null && !useFloatingDismissMorph) {
             Modifier.pointerInput(media.streamUrl) {
                 val dragGestureThreshold = 82f
                 awaitEachGesture {
@@ -7150,7 +7356,7 @@ private fun VideoPeekOverlay(
                         if (abs(totalDrag.y) > dragGestureThreshold && verticalDominant) {
                             change.consume()
                             requestedDismiss = true
-                            onRequestCancel()
+                            requestDismiss()
                             while (true) {
                                 val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
                                 consumeEvent.changes.forEach { it.consume() }
@@ -7181,7 +7387,7 @@ private fun VideoPeekOverlay(
             )
             .background(Color.Black)
             .then(
-                if (isDocked && dismissReason == null) {
+                if (isDocked && dismissReason == null && !useFloatingDismissMorph) {
                     Modifier.pointerInput(media.streamUrl) {
                         val dragGestureThreshold = 82f
                         awaitEachGesture {
@@ -7201,7 +7407,7 @@ private fun VideoPeekOverlay(
                                 val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
                                 if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
                                     change.consume()
-                                    onRequestCancel()
+                                    requestDismiss()
                                     while (true) {
                                         val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
                                         consumeEvent.changes.forEach { it.consume() }
@@ -7211,7 +7417,7 @@ private fun VideoPeekOverlay(
                                 }
                                 if (totalDrag.y > dragGestureThreshold && verticalDominant) {
                                     change.consume()
-                                    onRequestCancel()
+                                    requestDismiss()
                                     while (true) {
                                         val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
                                         consumeEvent.changes.forEach { it.consume() }
@@ -7270,7 +7476,36 @@ private fun VideoPeekOverlay(
             }
         }
 
-        if (expandingToFullscreen) {
+        if (useFloatingDismissMorph) {
+            val transition = peekDismissMorphProgress.value.coerceIn(0f, 1f)
+            val morphSourceBounds = peekDismissStartBounds ?: Rect(
+                left = dockLeftPx,
+                top = dockTopPx,
+                right = dockLeftPx + dockWidthPx,
+                bottom = dockTopPx + dockHeightPx,
+            )
+            val morphTargetBounds = peekDismissTargetBounds
+                ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
+            val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
+            val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
+            val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
+            val morphCenterY = lerp(morphTargetBounds.center.y, morphSourceBounds.center.y, transition)
+            val morphLeft = morphCenterX - morphWidth / 2f
+            val morphTop = morphCenterY - morphHeight / 2f
+            val morphRight = morphCenterX + morphWidth / 2f
+            val morphBottom = morphCenterY + morphHeight / 2f
+            val morphCornerRadiusPx = with(density) {
+                lerpDp(12.dp, ThumbnailMorphCornerRadius, transition).toPx()
+            }
+            MorphRevealScrim(
+                morphLeft = morphLeft,
+                morphTop = morphTop,
+                morphRight = morphRight,
+                morphBottom = morphBottom,
+                cornerRadiusPx = morphCornerRadiusPx,
+                scrimColor = Color.Transparent,
+            )
+        } else if (expandingToFullscreen) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -7341,8 +7576,59 @@ private fun VideoPeekOverlay(
             )
         }
 
+        val floatingDismissMorphModifier = if (useFloatingDismissMorph) {
+            val transition = peekDismissMorphProgress.value.coerceIn(0f, 1f)
+            val morphSourceBounds = peekDismissStartBounds ?: Rect(
+                left = dockLeftPx,
+                top = dockTopPx,
+                right = dockLeftPx + dockWidthPx,
+                bottom = dockTopPx + dockHeightPx,
+            )
+            val morphTargetBounds = peekDismissTargetBounds
+                ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
+            val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
+            val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
+            val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
+            val morphCenterY = lerp(morphTargetBounds.center.y, morphSourceBounds.center.y, transition)
+            val morphLeft = morphCenterX - morphWidth / 2f
+            val morphTop = morphCenterY - morphHeight / 2f
+            val morphRight = morphCenterX + morphWidth / 2f
+            val morphBottom = morphCenterY + morphHeight / 2f
+            val morphCornerRadiusPx = with(density) {
+                lerpDp(12.dp, ThumbnailMorphCornerRadius, transition).toPx()
+            }
+            val uniformScale = computeMorphCoverScale(
+                morphWidthPx = morphWidth,
+                morphHeightPx = morphHeight,
+                contentWidthPx = dockWidthPx,
+                contentHeightPx = dockHeightPx,
+            )
+            val morphAlpha = if (peekDismissUseTopExit) transition else 1f
+            Modifier
+                .fillMaxSize()
+                .morphRevealClip(
+                    morphLeft = morphLeft,
+                    morphTop = morphTop,
+                    morphRight = morphRight,
+                    morphBottom = morphBottom,
+                    cornerRadiusPx = morphCornerRadiusPx,
+                )
+                .graphicsLayer {
+                    translationX = morphCenterX - maxWidthPx / 2f
+                    translationY = morphCenterY - maxHeightPx / 2f
+                    scaleX = uniformScale
+                    scaleY = uniformScale
+                    alpha = morphAlpha
+                    transformOrigin = TransformOrigin.Center
+                }
+        } else {
+            Modifier
+        }
+
         Box(
-            modifier = if (useDockedColumnLayout) {
+            modifier = if (useFloatingDismissMorph) {
+                Modifier.fillMaxSize()
+            } else if (useDockedColumnLayout) {
                 Modifier
                     .fillMaxWidth()
                     .height(dockTop + dockHeight)
@@ -7350,29 +7636,45 @@ private fun VideoPeekOverlay(
                 Modifier.fillMaxSize()
             },
         ) {
-            // Keep the player at one stable composition location while its layout changes.
-            // Moving it between conditional branches recreates the PlayerView and briefly
-            // exposes the cover fallback at the end of the fullscreen expansion.
-            VideoPeekCard(
-                modifier = when {
-                    isFullscreenMode -> Modifier
-                        .fillMaxSize()
-                        .background(Color.Black)
-                    useDockedColumnLayout -> Modifier
-                        .offset(x = dockLeft, y = dockTop)
-                        .size(dockWidth, dockHeight)
-                        .graphicsLayer {
-                            shape = RoundedCornerShape(12.dp)
-                            clip = true
-                            shadowElevation = 8.dp.toPx()
-                        }
-                        .background(Color.Black)
-                        .then(dockedGestureModifier)
-                    else -> Modifier
-                        .offset(x = holdLeft, y = holdTop)
-                        .then(videoCardModifier)
-                },
-            )
+            Box(
+                modifier = floatingDismissMorphModifier.then(
+                    if (useFloatingDismissMorph) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier
+                    },
+                ),
+            ) {
+                VideoPeekCard(
+                    modifier = when {
+                        isFullscreenMode -> Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                        useFloatingDismissMorph -> Modifier
+                            .align(Alignment.Center)
+                            .size(dockWidth, dockHeight)
+                            .graphicsLayer {
+                                shape = RoundedCornerShape(12.dp)
+                                clip = true
+                                shadowElevation = 8.dp.toPx()
+                            }
+                            .background(Color.Black)
+                        useDockedColumnLayout -> Modifier
+                            .offset(x = dockLeft, y = dockTop)
+                            .size(dockWidth, dockHeight)
+                            .graphicsLayer {
+                                shape = RoundedCornerShape(12.dp)
+                                clip = true
+                                shadowElevation = 8.dp.toPx()
+                            }
+                            .background(Color.Black)
+                            .then(dockedGestureModifier)
+                        else -> Modifier
+                            .offset(x = holdLeft, y = holdTop)
+                            .then(videoCardModifier)
+                    },
+                )
+            }
         }
     }
 }
@@ -7754,11 +8056,12 @@ private fun FullscreenImageViewer(
     var transitionClosing by remember { mutableStateOf(false) }
     var dragDismissProgress by remember { mutableFloatStateOf(0f) }
     var closeStartBounds by remember { mutableStateOf<Rect?>(null) }
+    var dismissBoundsProviders by remember { mutableStateOf<Map<Int, () -> Rect>>(emptyMap()) }
     fun dismissViewer(startBounds: Rect? = null) {
         if (!transitionClosing) {
             val closeBounds = sourceBoundsByIndex[pagerState.currentPage]
             if (closeBounds != null) {
-                closeStartBounds = startBounds
+                closeStartBounds = startBounds ?: dismissBoundsProviders[pagerState.currentPage]?.invoke()
                 transitionClosing = true
                 onCloseStart?.invoke()
                 scope.launch {
@@ -7983,6 +8286,9 @@ private fun FullscreenImageViewer(
                     allImages = images,
                     onDismiss = { dismissViewer() },
                     onDismissFromBounds = { bounds -> dismissViewer(bounds) },
+                    onDismissBoundsProvider = { provider ->
+                        dismissBoundsProviders = dismissBoundsProviders + (page to provider)
+                    },
                     hasMultipleImages = images.size > 1,
                     onBlockPagerScroll = { blockPagerScroll = it },
                     onDragDismissProgress = { dragDismissProgress = it },
@@ -8157,6 +8463,7 @@ private fun ZoomableFullscreenImage(
     allImages: List<FeedImage>,
     onDismiss: () -> Unit,
     onDismissFromBounds: (Rect) -> Unit = { onDismiss() },
+    onDismissBoundsProvider: (((() -> Rect) -> Unit))? = null,
     hasMultipleImages: Boolean = false,
     onBlockPagerScroll: (Boolean) -> Unit = {},
     onDragDismissProgress: (Float) -> Unit = {},
@@ -8297,6 +8604,37 @@ private fun ZoomableFullscreenImage(
             val centerY = containerHeightPx / 2f + panOffsetY + dismissOffset
             return point.x in (centerX - displayedWidth / 2f)..(centerX + displayedWidth / 2f) &&
                 point.y in (centerY - displayedHeight / 2f)..(centerY + displayedHeight / 2f)
+        }
+
+        fun readDisplayedBounds(): Rect {
+            val currentScale = latestScaleState.value
+            val layout = layoutFor(currentScale)
+            val dismissOffset = dismissTranslationY + dismissSnapAnim.value
+            val displayedWidth = layout.fitWidthPx * currentScale
+            val displayedHeight = layout.fitHeightPx * currentScale
+            val centerX = containerWidthPx / 2f + latestPanOffsetXState.value
+            val centerY = containerHeightPx / 2f + latestPanOffsetYState.value + dismissOffset
+            return Rect(
+                left = centerX - displayedWidth / 2f,
+                top = centerY - displayedHeight / 2f,
+                right = centerX + displayedWidth / 2f,
+                bottom = centerY + displayedHeight / 2f,
+            )
+        }
+
+        fun dismissFromCurrentBounds() {
+            val handoffBounds = readDisplayedBounds()
+            dismissTranslationY = 0f
+            panOffsetX = 0f
+            panOffsetY = 0f
+            scale = 1f
+            scope.launch { dismissSnapAnim.snapTo(0f) }
+            onDismissFromBounds(handoffBounds)
+        }
+
+        DisposableEffect(onDismissBoundsProvider) {
+            onDismissBoundsProvider?.invoke(::readDisplayedBounds)
+            onDispose { }
         }
 
         val pageMenuBackdrop = rememberLayerBackdrop()
@@ -8566,7 +8904,7 @@ private fun ZoomableFullscreenImage(
                             if (latestActionMenuVisibleState.value) {
                                 actionMenuVisible = false
                             } else {
-                                onDismiss()
+                                dismissFromCurrentBounds()
                             }
                         },
                         onDoubleTap = {
@@ -8640,26 +8978,28 @@ private fun ZoomableFullscreenImage(
                     translationY = panOffsetY + dismissOffsetY
                     alpha = dismissAlpha
                 }
-            if (image.isGif) {
-                AnimatedRemoteImage(
-                    url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
-                    modifier = imageModifier,
-                    contentScale = ContentScale.Fit,
-                )
-            } else {
-                Image(
-                    bitmap = loadedBitmap.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = imageModifier,
-                    contentScale = ContentScale.Fit,
-                )
-            }
-            if (image.isLivePhoto && livePlaying) {
-                LivePhotoOverlay(
-                    image = image,
-                    modifier = imageModifier,
-                    onEnded = { livePlaying = false },
-                )
+            Box(modifier = imageModifier) {
+                if (image.isGif) {
+                    AnimatedRemoteImage(
+                        url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    Image(
+                        bitmap = loadedBitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                }
+                if (image.isLivePhoto && livePlaying) {
+                    LivePhotoOverlay(
+                        image = image,
+                        modifier = Modifier.fillMaxSize(),
+                        onEnded = { livePlaying = false },
+                    )
+                }
             }
             if (image.isLivePhoto && !livePlaying) {
                 Icon(
@@ -8824,6 +9164,29 @@ private fun LivePhotoOverlay(
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return
     var videoVisible by remember(videoUrl) { mutableStateOf(false) }
+    var exifOrientation by remember(image.largeUrl) {
+        mutableIntStateOf(ExifInterface.ORIENTATION_NORMAL)
+    }
+    var videoRotationDegrees by remember(videoUrl) { mutableIntStateOf(0) }
+    var videoWidth by remember(videoUrl) { mutableIntStateOf(0) }
+    var videoHeight by remember(videoUrl) { mutableIntStateOf(0) }
+    val videoCorrection = remember(
+        exifOrientation,
+        videoRotationDegrees,
+        videoWidth,
+        videoHeight,
+        image.width,
+        image.height,
+    ) {
+        computeLivePhotoVideoCorrection(
+            exifOrientation = exifOrientation,
+            videoRotationDegrees = videoRotationDegrees,
+            staticWidth = image.width ?: 0,
+            staticHeight = image.height ?: 0,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+        )
+    }
     val player = remember(videoUrl) {
         androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
             setMediaSource(buildVideoMediaSource(context, videoUrl))
@@ -8833,12 +9196,22 @@ private fun LivePhotoOverlay(
         }
     }
 
+    LaunchedEffect(image.largeUrl, image.downloadUrls) {
+        exifOrientation = readExifOrientationFromFeedImage(image)
+    }
+
     DisposableEffect(player) {
         val pauseHandler = { player.pause() }
         videoCoordinator.registerPauseHandler(isFullscreen = false, pauseHandler)
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onRenderedFirstFrame() {
                 videoVisible = true
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                videoRotationDegrees = videoSize.unappliedRotationDegrees
+                videoWidth = videoSize.width
+                videoHeight = videoSize.height
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -8857,22 +9230,31 @@ private fun LivePhotoOverlay(
         }
     }
 
-    AndroidView(
-        modifier = modifier.graphicsLayer {
-            alpha = if (videoVisible) 1f else 0f
-        },
-        factory = { ctx ->
-            (android.view.LayoutInflater.from(ctx)
-                .inflate(R.layout.view_live_photo_player, null, false) as androidx.media3.ui.PlayerView).apply {
-                this.player = player
-                useController = false
-                resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
-                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            }
-        },
-        update = { it.player = player },
-    )
+    Box(modifier = modifier) {
+        AndroidView(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    alpha = if (videoVisible) 1f else 0f
+                },
+            factory = { ctx ->
+                (android.view.LayoutInflater.from(ctx)
+                    .inflate(R.layout.view_live_photo_player, null, false) as androidx.media3.ui.PlayerView).apply {
+                    this.player = player
+                    useController = false
+                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                }
+            },
+            update = { playerView ->
+                playerView.player = player
+                playerView.scaleX = videoCorrection.scaleX
+                playerView.scaleY = videoCorrection.scaleY
+                playerView.rotation = videoCorrection.rotationZ
+            },
+        )
+    }
 }
 
 @Composable
@@ -8925,6 +9307,7 @@ private fun InlineVideoPlayer(
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var pressHoldProgress by remember(media.streamUrl) { mutableFloatStateOf(0f) }
     var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
+    var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
     var lastTapUptimeMs by remember(media.streamUrl) { mutableStateOf(0L) }
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
@@ -8951,6 +9334,7 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
                 onCancel = {
                     videoCoordinator.cancelFullscreenHandoff(playbackKey)
                     resetPeekState()
@@ -8981,6 +9365,7 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
                 onCancel = {
                     videoCoordinator.cancelPeekHandoff(playbackKey)
                     resetPeekState()
@@ -9014,6 +9399,7 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
                 expandFromAnchor = true,
                 onCancel = {
                     videoCoordinator.cancelFullscreenHandoff(playbackKey)
@@ -9040,6 +9426,7 @@ private fun InlineVideoPlayer(
                 .fillMaxWidth(VideoMaxWidthFraction)
                 .aspectRatio(displayAspectRatio)
                 .onGloballyPositioned { coordinates ->
+                    anchorCoordinates = coordinates
                     anchorBounds = coordinates.boundsInWindow()
                 }
                 .graphicsLayer {
@@ -16570,6 +16957,7 @@ private fun AlbumVideoTile(
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var pressHoldProgress by remember(media.streamUrl) { mutableFloatStateOf(0f) }
     var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
+    var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
     fun resetPeekState() {
@@ -16592,6 +16980,7 @@ private fun AlbumVideoTile(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
                 onCancel = { resetPeekState() },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
@@ -16605,6 +16994,7 @@ private fun AlbumVideoTile(
         modifier = Modifier
             .size(size)
             .onGloballyPositioned { coordinates ->
+                anchorCoordinates = coordinates
                 anchorBounds = coordinates.boundsInWindow()
             }
             .graphicsLayer {
@@ -16975,11 +17365,18 @@ private fun AccountScreen(session: WeiboWebSession) {
 
 @Composable
 private fun HiddenSessionWebView(session: WeiboWebSession) {
+    val webView = session.webView
+    DisposableEffect(webView) {
+        webView.onResume()
+        onDispose {
+            webView.onPause()
+        }
+    }
     AndroidView(
         modifier = Modifier.size(1.dp),
         factory = {
-            session.webView.detachFromParent()
-            session.webView
+            webView.detachFromParent()
+            webView
         },
     )
 }
@@ -17000,7 +17397,8 @@ private fun AccountLoginWebView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            setLayerType(View.LAYER_TYPE_NONE, null)
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            setBackgroundColor(android.graphics.Color.WHITE)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.apply {
@@ -17014,13 +17412,26 @@ private fun AccountLoginWebView(
                 cacheMode = WebSettings.LOAD_DEFAULT
                 userAgentString = loginUserAgent
             }
-            webViewClient = object : WebViewClient() {}
+            webViewClient = object : WebViewClient() {
+                override fun onReceivedError(
+                    view: WebView?,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String?,
+                ) {
+                    if (failingUrl == loginUrl) {
+                        view?.loadUrl(loginUrl)
+                    }
+                }
+            }
             loadUrl(loginUrl)
         }
     }
 
     DisposableEffect(webView) {
+        webView.onResume()
         onDispose {
+            webView.onPause()
             webView.stopLoading()
             webView.webViewClient = WebViewClient()
             webView.destroy()
@@ -17030,6 +17441,12 @@ private fun AccountLoginWebView(
     AndroidView(
         modifier = modifier,
         factory = { webView },
+        update = { view ->
+            view.visibility = View.VISIBLE
+            if (view.url == "about:blank") {
+                view.loadUrl(loginUrl)
+            }
+        },
     )
 }
 

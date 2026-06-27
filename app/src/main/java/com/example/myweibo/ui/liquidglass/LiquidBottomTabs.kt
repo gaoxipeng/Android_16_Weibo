@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -307,14 +306,9 @@ fun LiquidBottomTabs(
 
         CompositionLocalProvider(
             LocalLiquidBottomTabGlassMotionProgress provides glassMotionProgress,
-            LocalLiquidBottomTabIndicatorValue provides animatedIndicatorValue,
             LocalLiquidBottomTabPressProgress provides animatedPressProgress,
-            LocalLiquidBottomTabIndicatorScaleX provides animatedScaleX,
         ) {
-        CompositionLocalProvider(
-            LocalLiquidBottomTabBackdropRow provides false,
-            LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
-        ) {
+        CompositionLocalProvider(LocalLiquidBottomTabIndicatorIndex provides indicatorIndex) {
             Row(
                 Modifier
                     .graphicsLayer {
@@ -353,18 +347,19 @@ fun LiquidBottomTabs(
         }
 
         CompositionLocalProvider(
-            LocalLiquidBottomTabScale provides { 1f },
-            LocalLiquidBottomTabBackdropRow provides true,
+            LocalLiquidBottomTabScale provides {
+                lerp(1f, 1.2f, animatedPressProgress)
+            },
             LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
-            LocalLiquidBottomTabIndicatorValue provides animatedIndicatorValue,
-            LocalLiquidBottomTabIndicatorScaleX provides animatedScaleX,
         ) {
             Row(
                 Modifier
                     .clearAndSetSemantics {}
                     .alpha(0f)
                     .layerBackdrop(tabsBackdrop)
-                    .graphicsLayer { translationX = panelOffset }
+                    .graphicsLayer {
+                        translationX = panelOffset
+                    }
                     .drawBackdrop(
                         backdrop = backdrop,
                         shape = { RoundedCornerShape(percent = 50) },
@@ -372,8 +367,8 @@ fun LiquidBottomTabs(
                             vibrancy()
                             blur(LiquidGlassBlurRadius.toPx())
                             lens(
-                                12.dp.toPx() * animatedPressProgress.coerceAtLeast(0.01f),
-                                24.dp.toPx() * animatedPressProgress.coerceAtLeast(0.01f),
+                                24.dp.toPx() * animatedPressProgress,
+                                24.dp.toPx() * animatedPressProgress,
                             )
                         },
                         highlight = {

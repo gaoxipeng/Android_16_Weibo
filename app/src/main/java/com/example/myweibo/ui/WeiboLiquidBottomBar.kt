@@ -4,7 +4,6 @@ import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.updateTransition
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
@@ -48,15 +47,6 @@ import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
-import androidx.compose.runtime.CompositionLocalProvider
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabBackdropRow
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabGlassMotionProgress
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorScaleX
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabIndicatorValue
-import com.example.myweibo.ui.liquidglass.liquidBottomTabBackdropRowAlpha
-import com.example.myweibo.ui.liquidglass.liquidBottomTabMainRowAlpha
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabPressProgress
-import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabTabIndex
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidIconButton
 import com.kyant.backdrop.Backdrop
 import kotlinx.coroutines.Job
@@ -85,8 +75,7 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuGap: Dp = 4.dp,
     modifier: Modifier = Modifier,
 ) {
-    val accentColor = MaterialTheme.colorScheme.primary
-    val unselectedColor = Color.Black
+    val tabContentColor = MaterialTheme.colorScheme.primary
     val density = LocalDensity.current
     val collapsedSize = 64.dp
     val barHeight = 64.dp
@@ -182,52 +171,22 @@ internal fun WeiboLiquidBottomBar(
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             tabs.forEachIndexed { index, tab ->
-                                val isBackdropRow = LocalLiquidBottomTabBackdropRow.current
-                                val indicatorValue = LocalLiquidBottomTabIndicatorValue.current
-                                val indicatorScaleX = LocalLiquidBottomTabIndicatorScaleX.current
-                                val pressProgress = LocalLiquidBottomTabPressProgress.current
-                                val glassMotionProgress = LocalLiquidBottomTabGlassMotionProgress.current
-                                val interacting = pressProgress > 0.01f || glassMotionProgress > 0.01f
-                                val tabColor = when {
-                                    isBackdropRow -> accentColor
-                                    interacting -> unselectedColor
-                                    index == selectedIndex -> accentColor
-                                    else -> unselectedColor
-                                }
-                                val tabAlpha = if (isBackdropRow) {
-                                    liquidBottomTabBackdropRowAlpha(
-                                        pressProgress = pressProgress,
-                                        indicatorValue = indicatorValue,
-                                        tabIndex = index,
-                                        indicatorScaleX = indicatorScaleX,
-                                    )
-                                } else {
-                                    liquidBottomTabMainRowAlpha(
-                                        pressProgress = pressProgress,
-                                        indicatorValue = indicatorValue,
-                                        tabIndex = index,
-                                        indicatorScaleX = indicatorScaleX,
-                                    )
-                                }
-                                CompositionLocalProvider(LocalLiquidBottomTabTabIndex provides index) {
                                 LiquidBottomTab(
                                     onClick = { onTabChange(tab) },
-                                    modifier = Modifier.graphicsLayer { alpha = tabAlpha },
                                 ) {
                                     Box(
                                         modifier = Modifier.size(28.dp),
                                         contentAlignment = Alignment.Center,
                                     ) {
-                                        WeiboTabIcon(tab = tab, color = tabColor)
+                                        WeiboTabIcon(tab = tab, color = tabContentColor)
                                     }
                                     Text(
                                         text = if (tab == MainTab.Feed) feedTabLabel else tab.label,
                                         fontSize = 12.sp,
-                                        color = tabColor,
+                                        color = tabContentColor,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
                                     )
-                                }
                                 }
                             }
                         }
@@ -259,7 +218,7 @@ internal fun WeiboLiquidBottomBar(
                     ) {
                         WeiboTabIcon(
                             tab = selectedTab,
-                            color = accentColor,
+                            color = tabContentColor,
                             size = 24.dp,
                         )
                     }

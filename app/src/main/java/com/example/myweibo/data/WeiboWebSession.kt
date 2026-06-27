@@ -62,7 +62,6 @@ class WeiboWebSession(context: Context) {
     }
 
     fun hasLoginCookie(): Boolean {
-        CookieManager.getInstance().flush()
         val cookie = CookieManager.getInstance().getCookie(WEIBO_HOME)
             ?: CookieManager.getInstance().getCookie("https://www.weibo.com/")
             ?: ""
@@ -1539,6 +1538,11 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun prepareAddAccount() {
+        withContext(Dispatchers.Main) {
+            webView.stopLoading()
+            webView.loadUrl("about:blank")
+            webView.onPause()
+        }
         clearAllCookies()
     }
 
