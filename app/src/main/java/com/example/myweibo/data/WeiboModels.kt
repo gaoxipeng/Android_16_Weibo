@@ -48,14 +48,88 @@ data class FeedImage(
     val width: Int? = null,
     val height: Int? = null,
     val type: String? = null,
+    /** 相册/接口可能提供的拍摄时间，不等同于微博发布时间 */
+    val shootTime: String? = null,
+    val cameraMake: String? = null,
+    val cameraModel: String? = null,
 ) {
     val isLivePhoto: Boolean
-        get() = type == "livephoto" && livePhotoVideoUrl != null
+        get() = !livePhotoVideoUrl.isNullOrBlank() && !isGif
     val isGif: Boolean
         get() = type == "gif"
     val isAlbumVideo: Boolean
         get() = type == "video" && !videoStreamUrl.isNullOrBlank()
 }
+
+data class ImageSaveMetadata(
+    val publishTime: String? = null,
+    val publishSource: String? = null,
+    val shootTime: String? = null,
+    val cameraMake: String? = null,
+    val cameraModel: String? = null,
+    val statusId: String? = null,
+    val authorName: String? = null,
+)
+
+private val sinaimgPidRegex =
+    Regex("""/([^/?#]+)\.(?:jpg|jpeg|png|gif|webp)""", RegexOption.IGNORE_CASE)
+
+private fun FeedImage.imageMatchKeys(): Set<String> {
+    val keys = mutableSetOf<String>()
+    sinaimgPidRegex.find(largeUrl)?.groupValues?.get(1)?.let(keys::add)
+    sinaimgPidRegex.find(thumbnailUrl)?.groupValues?.get(1)?.let(keys::add)
+    downloadUrls.forEach { url ->
+        sinaimgPidRegex.find(url)?.groupValues?.get(1)?.let(keys::add)
+    }
+    if (id.isNotBlank() && !id.startsWith("http")) {
+        keys += id.substringBeforeLast('.')
+    }
+    return keys
+}
+
+private fun FeedImage.refersToSamePhoto(other: FeedImage): Boolean {
+    if (largeUrl == other.largeUrl || id == other.id) return true
+    val keys = imageMatchKeys()
+    val otherKeys = other.imageMatchKeys()
+    return keys.isNotEmpty() && keys.any { it in otherKeys }
+}
+
+fun FeedImage.resolveForSave(
+    status: FeedItem? = null,
+    relatedImages: List<FeedImage> = emptyList(),
+): FeedImage {
+    if (isLivePhoto) return this
+    val candidates = buildList {
+        status?.images?.let(::addAll)
+        status?.retweetedStatus?.images?.let(::addAll)
+        addAll(relatedImages)
+    }
+    val match = candidates.firstOrNull { candidate ->
+        candidate.isLivePhoto && refersToSamePhoto(candidate)
+    } ?: candidates.firstOrNull { candidate ->
+        !candidate.livePhotoVideoUrl.isNullOrBlank() && refersToSamePhoto(candidate)
+    }
+    val liveVideo = livePhotoVideoUrl ?: match?.livePhotoVideoUrl
+    if (liveVideo.isNullOrBlank()) return this
+    return copy(
+        livePhotoVideoUrl = liveVideo,
+        type = if (isGif) type else "livephoto",
+        downloadUrls = (downloadUrls + (match?.downloadUrls ?: emptyList())).distinct(),
+        width = width ?: match?.width,
+        height = height ?: match?.height,
+    )
+}
+
+fun FeedImage.buildSaveMetadata(status: FeedItem? = null): ImageSaveMetadata =
+    ImageSaveMetadata(
+        publishTime = status?.createdAt ?: createdAt,
+        publishSource = status?.source?.takeIf { it.isNotBlank() },
+        shootTime = shootTime ?: createdAt,
+        cameraMake = cameraMake,
+        cameraModel = cameraModel,
+        statusId = statusId ?: status?.statusId,
+        authorName = status?.authorName,
+    )
 
 fun FeedImage.toAlbumFeedMedia(): FeedMedia? {
     val streamUrl = videoStreamUrl?.takeIf { it.isNotBlank() } ?: return null

@@ -26,6 +26,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.isSpecified
@@ -59,6 +60,18 @@ internal val LiquidMenuBorderWidth = 0.5.dp
 
 internal fun liquidMenuBorderColor(isLightTheme: Boolean): Color =
     if (isLightTheme) Color(0x24000000) else Color(0x33FFFFFF)
+
+internal fun DrawScope.drawLiquidTintedSurface(
+    tint: Color,
+    surfaceColor: Color,
+) {
+    if (tint.isSpecified) {
+        drawRect(tint, blendMode = BlendMode.Hue)
+        drawRect(tint.copy(alpha = 0.75f))
+    } else {
+        drawRect(surfaceColor)
+    }
+}
 
 internal fun BackdropEffectScope.liquidMenuGlassEffects() {
     vibrancy()
@@ -155,10 +168,8 @@ fun LiquidButton(
                 },
                 onDrawSurface = {
                     if (tint.isSpecified) {
-                        drawRect(tint, blendMode = BlendMode.Hue)
-                        drawRect(tint.copy(alpha = 0.75f))
-                    }
-                    if (surfaceColor.isSpecified) {
+                        drawLiquidTintedSurface(tint = tint, surfaceColor = surfaceColor)
+                    } else if (surfaceColor.isSpecified) {
                         drawRect(surfaceColor)
                     }
                 },
@@ -199,6 +210,7 @@ fun SurfaceLiquidCapsule(
     pill: Boolean = false,
     cornerRadius: Dp = 22.dp,
     useMenuGlassStyle: Boolean = false,
+    tint: Color = Color.Unspecified,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val resolvedBackdrop = backdrop ?: LocalLiquidMenuBackdrop.current
@@ -225,7 +237,9 @@ fun SurfaceLiquidCapsule(
                     },
                     highlight = if (useMenuGlassStyle) null else ({ Highlight.Default }),
                     shadow = if (useMenuGlassStyle) null else ({ Shadow.Default }),
-                    onDrawSurface = { drawRect(surfaceColor) },
+                    onDrawSurface = {
+                        drawLiquidTintedSurface(tint = tint, surfaceColor = surfaceColor)
+                    },
                 )
                 .then(
                     if (useMenuGlassStyle) {
@@ -240,7 +254,10 @@ fun SurfaceLiquidCapsule(
         Box(
             modifier
                 .clip(shape)
-                .background(surfaceColor, shape)
+                .background(
+                    if (tint.isSpecified) tint.copy(alpha = 0.82f) else surfaceColor,
+                    shape,
+                )
                 .then(
                     if (useMenuGlassStyle) {
                         Modifier.border(LiquidMenuBorderWidth, menuBorderColor, shape)

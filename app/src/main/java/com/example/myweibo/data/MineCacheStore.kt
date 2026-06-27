@@ -197,6 +197,9 @@ class MineCacheStore(context: Context) {
             .put("status_id", statusId)
             .put("width", width)
             .put("height", height)
+            .put("shoot_time", shootTime)
+            .put("camera_make", cameraMake)
+            .put("camera_model", cameraModel)
 
     private fun JSONArray?.toFeedImages(): List<FeedImage> {
         if (this == null) return emptyList()
@@ -216,6 +219,9 @@ class MineCacheStore(context: Context) {
                         width = item.optInt("width").takeIf { it > 0 },
                         height = item.optInt("height").takeIf { it > 0 },
                         type = item.optNullableString("type"),
+                        shootTime = item.optNullableString("shoot_time"),
+                        cameraMake = item.optNullableString("camera_make"),
+                        cameraModel = item.optNullableString("camera_model"),
                     )
                 )
             }

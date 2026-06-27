@@ -3,6 +3,7 @@ package com.example.myweibo.data
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.net.http.SslError
 import android.util.Base64
@@ -22,8 +23,10 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
@@ -142,7 +145,29 @@ class WeiboWebSession(context: Context) {
             referer = "https://s.weibo.com/",
             origin = "https://s.weibo.com",
         )
-        return WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
+        val page = WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
+        return page.copy(items = enrichSearchFeedItems(page.items))
+    }
+
+    private suspend fun enrichSearchFeedItems(items: List<FeedItem>): List<FeedItem> {
+        if (items.isEmpty()) return items
+        return coroutineScope {
+            items.map { item ->
+                async { enrichSearchFeedItem(item) }
+            }.awaitAll()
+        }
+    }
+
+    private suspend fun enrichSearchFeedItem(item: FeedItem): FeedItem {
+        for (candidate in listOf(item.statusId, item.id).distinct()) {
+            if (candidate.isBlank()) continue
+            runCatching { loadStatusDetail(candidate) }
+                .getOrNull()
+                ?.let { detail ->
+                    return detail.copy(id = item.id.ifBlank { detail.id })
+                }
+        }
+        return item
     }
 
     suspend fun loadWeiboUserSearch(query: String, page: Int = 1): SearchUserPage {
@@ -568,19 +593,22 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun uploadCommentImage(uri: Uri): String =
-        runCatching {
-            nativeUploadImage(uri)
-        }.recoverCatching { error ->
-            val message = error.message.orEmpty()
-            if (
-                message.contains("image-upload-redirected-to-html") ||
-                message.contains("图片上传失败:302")
-            ) {
-                webViewUploadImage(uri)
-            } else {
-                throw error
-            }
-        }.getOrThrow()
+        withTimeout(COMMENT_IMAGE_UPLOAD_TIMEOUT_MS) {
+            val image = prepareCommentUploadImage(uri)
+            runCatching {
+                nativeUploadImage(image)
+            }.recoverCatching { error ->
+                val message = error.message.orEmpty()
+                if (
+                    message.contains("image-upload-redirected-to-html") ||
+                    message.contains(":302")
+                ) {
+                    webViewUploadImage(image)
+                } else {
+                    throw error
+                }
+            }.getOrThrow()
+        }
 
     suspend fun loadAllRelationUsers(
         uid: String,
@@ -1043,20 +1071,84 @@ class WeiboWebSession(context: Context) {
             responseBody
         }
 
-    private suspend fun nativeUploadImage(uri: Uri): String =
+    private data class PreparedUploadImage(
+        val mime: String,
+        val bytes: ByteArray,
+    )
+
+    private suspend fun prepareCommentUploadImage(uri: Uri): PreparedUploadImage =
+        withContext(Dispatchers.IO) {
+            val resolver = appContext.contentResolver
+            val sourceBytes = resolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: throw IllegalStateException("无法读取所选图片")
+            val compressed = compressCommentImage(sourceBytes)
+            PreparedUploadImage(
+                mime = "image/jpeg",
+                bytes = compressed,
+            )
+        }
+
+    private fun compressCommentImage(bytes: ByteArray): ByteArray {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return bytes.takeIf { it.size <= COMMENT_IMAGE_MAX_UPLOAD_BYTES }
+                ?: throw IllegalStateException("图片格式暂不支持，请换一张图片")
+        }
+        val sampleSize = calculateImageSampleSize(bounds.outWidth, bounds.outHeight, COMMENT_IMAGE_MAX_DIMENSION)
+        val bitmap = BitmapFactory.decodeByteArray(
+            bytes,
+            0,
+            bytes.size,
+            BitmapFactory.Options().apply { inSampleSize = sampleSize },
+        ) ?: throw IllegalStateException("图片解码失败")
+        val scaled = scaleBitmapWithin(bitmap, COMMENT_IMAGE_MAX_DIMENSION)
+        if (scaled !== bitmap) {
+            bitmap.recycle()
+        }
+        return ByteArrayOutputStream().use { output ->
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, COMMENT_IMAGE_JPEG_QUALITY, output)) {
+                throw IllegalStateException("图片压缩失败")
+            }
+            if (!scaled.isRecycled) {
+                scaled.recycle()
+            }
+            output.toByteArray().takeIf { it.isNotEmpty() && it.size <= COMMENT_IMAGE_MAX_UPLOAD_BYTES }
+                ?: throw IllegalStateException("图片体积过大，请换一张较小的图片")
+        }
+    }
+
+    private fun calculateImageSampleSize(width: Int, height: Int, maxDimension: Int): Int {
+        var sampleSize = 1
+        var sampledWidth = width
+        var sampledHeight = height
+        while (sampledWidth / 2 >= maxDimension || sampledHeight / 2 >= maxDimension) {
+            sampleSize *= 2
+            sampledWidth /= 2
+            sampledHeight /= 2
+        }
+        return sampleSize.coerceAtLeast(1)
+    }
+
+    private fun scaleBitmapWithin(bitmap: Bitmap, maxDimension: Int): Bitmap {
+        val largest = maxOf(bitmap.width, bitmap.height)
+        if (largest <= maxDimension) return bitmap
+        val scale = maxDimension.toFloat() / largest.toFloat()
+        val targetWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val targetHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
+    }
+
+    private suspend fun nativeUploadImage(image: PreparedUploadImage): String =
         withContext(Dispatchers.IO) {
             CookieManager.getInstance().flush()
             val cookie = mergedCookieHeader("https://picupload.weibo.com/")
             if (!hasAuthenticatedCookie(cookie)) {
                 throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后重试")
             }
-            val resolver = appContext.contentResolver
-            val mime = resolver.getType(uri)?.takeIf { it.isNotBlank() } ?: "image/jpeg"
-            val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: throw IllegalStateException("无法读取所选图片")
-            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+            val base64 = Base64.encodeToString(image.bytes, Base64.NO_WRAP)
             val params = linkedMapOf(
-                "mime" to mime,
+                "mime" to image.mime,
                 "data" to base64,
                 "url" to "weibo.com",
                 "markpos" to "1",
@@ -1105,14 +1197,8 @@ class WeiboWebSession(context: Context) {
             parseUploadPicId(responseBody)
         }
 
-    private suspend fun webViewUploadImage(uri: Uri): String {
-        val (mime, base64) = withContext(Dispatchers.IO) {
-            val resolver = appContext.contentResolver
-            val resolvedMime = resolver.getType(uri)?.takeIf { it.isNotBlank() } ?: "image/jpeg"
-            val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: throw IllegalStateException("无法读取所选图片")
-            resolvedMime to Base64.encodeToString(bytes, Base64.NO_WRAP)
-        }
+    private suspend fun webViewUploadImage(image: PreparedUploadImage): String {
+        val base64 = Base64.encodeToString(image.bytes, Base64.NO_WRAP)
         ensureOnWeiboOrigin()
         waitForWeiboOrigin()
         val payload = evaluateJson(
@@ -1120,7 +1206,7 @@ class WeiboWebSession(context: Context) {
             (async function() {
               try {
                 const params = new URLSearchParams();
-                params.set('mime', ${mime.jsQuote()});
+                params.set('mime', ${image.mime.jsQuote()});
                 params.set('data', ${base64.jsQuote()});
                 params.set('url', 'weibo.com');
                 params.set('markpos', '1');
@@ -1411,12 +1497,15 @@ class WeiboWebSession(context: Context) {
     }
 
     private suspend fun evaluateJson(script: String): JSONObject =
-        suspendCancellableCoroutine { continuation ->
-            webView.post {
-                webView.evaluateJavascript(script) { result ->
-                    runCatching { decodeEvaluateJavascriptResult(result) }
-                        .onSuccess { continuation.resume(it) }
-                        .onFailure { continuation.resumeWithException(it) }
+        withTimeout(WEBVIEW_EVALUATE_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                webView.post {
+                    webView.evaluateJavascript(script) { result ->
+                        if (!continuation.isActive) return@evaluateJavascript
+                        runCatching { decodeEvaluateJavascriptResult(result) }
+                            .onSuccess { continuation.resume(it) }
+                            .onFailure { continuation.resumeWithException(it) }
+                    }
                 }
             }
         }
@@ -1588,6 +1677,11 @@ class WeiboWebSession(context: Context) {
         private const val MUTUAL_FOLLOW_MENTION_LIMIT = 40
         private const val RELATION_LIST_MAX_PAGES = 100
         private const val FRIENDS_CIRCLE_GID = "100097312739005"
+        private const val COMMENT_IMAGE_UPLOAD_TIMEOUT_MS = 30_000L
+        private const val WEBVIEW_EVALUATE_TIMEOUT_MS = 20_000L
+        private const val COMMENT_IMAGE_MAX_DIMENSION = 1600
+        private const val COMMENT_IMAGE_JPEG_QUALITY = 88
+        private const val COMMENT_IMAGE_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private const val WEIBO_PASSPORT_ORIGIN = "https://passport.weibo.cn/"
         private val COOKIE_ORIGINS = listOf(

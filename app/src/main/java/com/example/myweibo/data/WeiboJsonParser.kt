@@ -951,6 +951,7 @@ object WeiboJsonParser {
             ?: picInfo?.optJSONObject("woriginal")
             ?: picInfo?.optJSONObject("original")
             ?: picInfo?.optJSONObject("large")
+        val captureMeta = parseImageCaptureMetadata(picInfo ?: item)
         return FeedImage(
             id = pid?.ifBlank { normalizedLarge } ?: normalizedLarge,
             thumbnailUrl = normalizedThumb,
@@ -967,11 +968,17 @@ object WeiboJsonParser {
                 ?: item.optInt("width").takeIf { it > 0 },
             height = largeInfo?.optInt("height")?.takeIf { it > 0 }
                 ?: item.optInt("height").takeIf { it > 0 },
+            shootTime = captureMeta.shootTime ?: createdAt,
+            cameraMake = captureMeta.cameraMake,
+            cameraModel = captureMeta.cameraModel,
             type = when (imgType?.lowercase()) {
                 "live", "live_photo", "livephoto" -> "livephoto"
                 "gif" -> "gif"
                 "video", "videos" -> "video"
-                else -> imgType
+                else -> when {
+                    !livePhotoVideoUrl.isNullOrBlank() -> "livephoto"
+                    else -> imgType
+                }
             },
         )
     }
@@ -1176,7 +1183,143 @@ object WeiboJsonParser {
             }
         }
         val fromMixMedia = imagesFromMixMedia(status.optJSONObject("mix_media_info"))
-        return (fromStatus + fromUrlStruct + fromMixMedia).distinctBy { it.largeUrl }
+        return mergeDuplicateFeedImages(fromStatus + fromUrlStruct + fromMixMedia)
+    }
+
+    private fun mergeDuplicateFeedImages(images: List<FeedImage>): List<FeedImage> =
+        images.groupBy { image ->
+            image.largeUrl.ifBlank { image.id }.substringBefore('?')
+        }.map { (_, group) ->
+            group.reduce(::mergeFeedImagePair)
+        }
+
+    private fun mergeFeedImagePair(primary: FeedImage, secondary: FeedImage): FeedImage {
+        val liveVideo = primary.livePhotoVideoUrl ?: secondary.livePhotoVideoUrl
+        val resolvedType = when {
+            primary.type == "livephoto" || secondary.type == "livephoto" ->
+                if (!liveVideo.isNullOrBlank()) "livephoto" else primary.type ?: secondary.type
+            primary.type == "gif" || secondary.type == "gif" -> "gif"
+            else -> primary.type ?: secondary.type
+        }
+        return primary.copy(
+            livePhotoVideoUrl = liveVideo,
+            videoStreamUrl = primary.videoStreamUrl ?: secondary.videoStreamUrl,
+            type = resolvedType,
+            downloadUrls = (primary.downloadUrls + secondary.downloadUrls).distinct(),
+            width = primary.width ?: secondary.width,
+            height = primary.height ?: secondary.height,
+            shootTime = primary.shootTime ?: secondary.shootTime,
+            cameraMake = primary.cameraMake ?: secondary.cameraMake,
+            cameraModel = primary.cameraModel ?: secondary.cameraModel,
+            createdAt = primary.createdAt ?: secondary.createdAt,
+            statusId = primary.statusId ?: secondary.statusId,
+        )
+    }
+
+    private fun parseImageType(info: JSONObject): String? =
+        when (info.optNullableString("type")?.lowercase()) {
+            "live", "live_photo", "livephoto" -> "livephoto"
+            "gif" -> "gif"
+            "video", "videos" -> "video"
+            else -> info.optNullableString("type")
+        }
+
+    private fun parseLivePhotoVideoUrl(info: JSONObject): String? =
+        listOfNotNull(
+            info.optNullableString("video"),
+            info.optNullableString("video_hd"),
+            info.optNullableString("live_photo_video_url"),
+            info.optNullableString("livephoto_video_url"),
+            info.optJSONObject("live_photo")?.optNullableString("video"),
+            info.optJSONObject("live_photo")?.optNullableString("video_hd"),
+            info.optJSONObject("live_photo_info")?.optNullableString("video"),
+            info.optJSONObject("live_photo_info")?.optNullableString("video_hd"),
+        ).firstOrNull { it.isNotBlank() }?.let(::normalizeUrl)
+
+    private fun feedImageFromPicInfo(picId: String, info: JSONObject): FeedImage? {
+        val thumbnail = imageUrl(info, "bmiddle")
+            ?: imageUrl(info, "orj360")
+            ?: imageUrl(info, "thumbnail")
+            ?: imageUrl(info, "large")
+            ?: return null
+        val large = imageUrl(info, "largest")
+            ?: imageUrl(info, "mw2000")
+            ?: imageUrl(info, "woriginal")
+            ?: imageUrl(info, "original")
+            ?: imageUrl(info, "large")
+            ?: thumbnail
+        val largeInfo = info.optJSONObject("largest")
+            ?: info.optJSONObject("mw2000")
+            ?: info.optJSONObject("woriginal")
+            ?: info.optJSONObject("original")
+            ?: info.optJSONObject("large")
+        val downloadUrls = listOfNotNull(
+            imageUrl(info, "largest"),
+            imageUrl(info, "mw2000"),
+            imageUrl(info, "woriginal"),
+            imageUrl(info, "original"),
+            imageUrl(info, "large"),
+            imageUrl(info, "bmiddle"),
+            imageUrl(info, "thumbnail"),
+        ).distinct()
+        val imgType = parseImageType(info)
+        val liveVideo = parseLivePhotoVideoUrl(info)
+        val resolvedType = when {
+            imgType == "gif" -> "gif"
+            imgType == "livephoto" || !liveVideo.isNullOrBlank() -> "livephoto"
+            else -> imgType
+        }
+        val captureMeta = parseImageCaptureMetadata(info)
+        return FeedImage(
+            id = picId,
+            thumbnailUrl = normalizeUrl(thumbnail),
+            largeUrl = normalizeUrl(large),
+            downloadUrls = downloadUrls.map(::normalizeUrl),
+            livePhotoVideoUrl = liveVideo,
+            type = resolvedType,
+            width = largeInfo?.optInt("width")?.takeIf { it > 0 },
+            height = largeInfo?.optInt("height")?.takeIf { it > 0 },
+            shootTime = captureMeta.shootTime,
+            cameraMake = captureMeta.cameraMake,
+            cameraModel = captureMeta.cameraModel,
+        )
+    }
+
+    private data class ImageCaptureMetadata(
+        val shootTime: String?,
+        val cameraMake: String?,
+        val cameraModel: String?,
+    )
+
+    private fun parseImageCaptureMetadata(info: JSONObject): ImageCaptureMetadata {
+        val exif = info.optJSONObject("exif")
+            ?: info.optJSONObject("photo_meta")
+            ?: info.optJSONObject("meta")
+        val shootTime = sequenceOf(
+            info.optNullableString("shoot_time"),
+            info.optNullableString("photo_time"),
+            exif?.optNullableString("shoot_time"),
+            exif?.optNullableString("date_time_original"),
+            exif?.optNullableString("DateTimeOriginal"),
+        ).firstNotNullOfOrNull { it?.takeIf(String::isNotBlank) }
+        val make = sequenceOf(
+            info.optNullableString("make"),
+            info.optNullableString("camera_make"),
+            exif?.optNullableString("make"),
+            exif?.optNullableString("Make"),
+        ).firstNotNullOfOrNull { it?.takeIf(String::isNotBlank) }
+        val model = sequenceOf(
+            info.optNullableString("model"),
+            info.optNullableString("camera_model"),
+            info.optNullableString("camera"),
+            exif?.optNullableString("model"),
+            exif?.optNullableString("Model"),
+        ).firstNotNullOfOrNull { it?.takeIf(String::isNotBlank) }
+        return ImageCaptureMetadata(
+            shootTime = shootTime,
+            cameraMake = make,
+            cameraModel = model,
+        )
     }
 
     private fun imagesFromParts(picIds: JSONArray?, picInfos: JSONObject?): List<FeedImage> {
@@ -1185,48 +1328,7 @@ object WeiboJsonParser {
             for (index in 0 until picIds.length()) {
                 val picId = picIds.optString(index).takeIf { it.isNotBlank() } ?: continue
                 val info = picInfos.optJSONObject(picId) ?: continue
-                val thumbnail = imageUrl(info, "bmiddle")
-                    ?: imageUrl(info, "orj360")
-                    ?: imageUrl(info, "thumbnail")
-                    ?: imageUrl(info, "large")
-                    ?: continue
-                val large = imageUrl(info, "largest")
-                    ?: imageUrl(info, "mw2000")
-                    ?: imageUrl(info, "woriginal")
-                    ?: imageUrl(info, "original")
-                    ?: imageUrl(info, "large")
-                    ?: thumbnail
-                val largeInfo = info.optJSONObject("largest")
-                    ?: info.optJSONObject("mw2000")
-                    ?: info.optJSONObject("woriginal")
-                    ?: info.optJSONObject("original")
-                    ?: info.optJSONObject("large")
-                val downloadUrls = listOfNotNull(
-                    imageUrl(info, "largest"),
-                    imageUrl(info, "mw2000"),
-                    imageUrl(info, "woriginal"),
-                    imageUrl(info, "original"),
-                    imageUrl(info, "large"),
-                    imageUrl(info, "bmiddle"),
-                    imageUrl(info, "thumbnail"),
-                ).distinct()
-                val imgType = info.optNullableString("type")
-                val isLive = imgType == "livephoto"
-                val isGif = imgType == "gif"
-                add(
-                    FeedImage(
-                        id = picId,
-                        thumbnailUrl = normalizeUrl(thumbnail),
-                        largeUrl = normalizeUrl(large),
-                        downloadUrls = downloadUrls.map(::normalizeUrl),
-                        livePhotoVideoUrl = if (isLive || isGif)
-                            (info.optNullableString("video") ?: info.optNullableString("video_hd"))
-                        else null,
-                        type = imgType,
-                        width = largeInfo?.optInt("width")?.takeIf { it > 0 },
-                        height = largeInfo?.optInt("height")?.takeIf { it > 0 },
-                    )
-                )
+                feedImageFromPicInfo(picId, info)?.let(::add)
             }
         }
     }
@@ -1238,36 +1340,26 @@ object WeiboJsonParser {
                 val item = items.optJSONObject(index) ?: continue
                 if (item.optNullableString("type") != "pic") continue
                 val data = item.optJSONObject("data") ?: continue
-                val thumbnail = imageUrl(data, "bmiddle")
-                    ?: imageUrl(data, "orj360")
-                    ?: imageUrl(data, "thumbnail")
-                    ?: imageUrl(data, "large")
+                val picId = data.optBlankString("pic_id")
+                    ?: data.optBlankString("object_id")
+                    ?: data.optBlankString("id")
+                    ?: run {
+                        val largeCandidate = imageUrl(data, "largest")
+                            ?: imageUrl(data, "large")
+                            ?: imageUrl(data, "bmiddle")
+                        largeCandidate?.let(::sinaimgPidFromUrl)
+                    }
                     ?: continue
-                val largeInfo = data.optJSONObject("largest")
-                    ?: data.optJSONObject("mw2000")
-                    ?: data.optJSONObject("original")
-                    ?: data.optJSONObject("large")
-                val large = largeInfo?.optNullableString("url") ?: imageUrl(data, "large") ?: thumbnail
-                add(
-                    FeedImage(
-                        id = large,
-                        thumbnailUrl = normalizeUrl(thumbnail),
-                        largeUrl = normalizeUrl(large),
-                        downloadUrls = listOfNotNull(
-                            imageUrl(data, "largest"),
-                            imageUrl(data, "mw2000"),
-                            imageUrl(data, "original"),
-                            imageUrl(data, "large"),
-                            imageUrl(data, "bmiddle"),
-                            imageUrl(data, "thumbnail"),
-                        ).distinct().map(::normalizeUrl),
-                        width = largeInfo?.optInt("width")?.takeIf { it > 0 },
-                        height = largeInfo?.optInt("height")?.takeIf { it > 0 },
-                    )
-                )
+                feedImageFromPicInfo(picId, data)?.let(::add)
             }
         }
     }
+
+    private fun sinaimgPidFromUrl(url: String): String? =
+        Regex("""/([^/?#]+)\.(?:jpg|jpeg|png|gif|webp)""", RegexOption.IGNORE_CASE)
+            .find(url)
+            ?.groupValues
+            ?.getOrNull(1)
 
     private fun parseVideoOrientation(mediaInfo: JSONObject): String? =
         mediaInfo.optNullableString("video_orientation")?.trim()?.takeIf { it.isNotBlank() }
@@ -2279,10 +2371,11 @@ object WeiboJsonParser {
             RegexOption.IGNORE_CASE,
         ).find(card)?.groupValues?.getOrNull(1)?.let(::normalizeUrl)
         val fromBlock = Regex(
-            """<p\b[^>]*class=['"][^'"]*\bfrom\b[^'"]*['"][^>]*>(.*?)</p>""",
+            """<(?:p|div)\b[^>]*class=['"][^'"]*\bfrom\b[^'"]*['"][^>]*>(.*?)</(?:p|div)>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         ).find(card)?.groupValues?.getOrNull(1).orEmpty()
         val fromMeta = parseSWeiboFromMetadata(fromBlock)
+        val actionCounts = parseSWeiboActionCounts(card)
         val fullTextHtml = Regex(
             """<p\b[^>]*node-type=['"]feed_list_content_full['"][^>]*>(.*?)</p>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
@@ -2307,11 +2400,65 @@ object WeiboJsonParser {
                 .trim(),
             isLongText = fullTextHtml == null && card.contains("feed_list_content_full"),
             emoticons = extractEmoticonsFromHtml(textHtml),
-            repostsCount = parseSWeiboActionCount(card, "转发"),
-            commentsCount = parseSWeiboActionCount(card, "评论"),
-            likesCount = parseSWeiboActionCount(card, "赞"),
+            repostsCount = actionCounts.first,
+            commentsCount = actionCounts.second,
+            likesCount = actionCounts.third,
             images = images,
         )
+    }
+
+    private fun parseSWeiboActionCounts(card: String): Triple<String, String, String> {
+        val actionBlock = extractSWeiboCardActBlock(card)
+        if (actionBlock.isBlank()) {
+            return Triple(
+                parseSWeiboActionCount(card, "转发"),
+                parseSWeiboActionCount(card, "评论"),
+                parseSWeiboActionCount(card, "赞"),
+            )
+        }
+        val liBlocks = Regex(
+            """<li\b[^>]*>(.*?)</li>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).findAll(actionBlock).map { it.groupValues[1] }.toList()
+        if (liBlocks.isEmpty()) {
+            return Triple(
+                parseSWeiboActionCount(actionBlock, "转发"),
+                parseSWeiboActionCount(actionBlock, "评论"),
+                parseSWeiboActionCount(actionBlock, "赞"),
+            )
+        }
+        return Triple(
+            parseSWeiboLiActionCount(liBlocks.getOrNull(0).orEmpty(), "转发"),
+            parseSWeiboLiActionCount(liBlocks.getOrNull(1).orEmpty(), "评论"),
+            parseSWeiboLiActionCount(liBlocks.getOrNull(2).orEmpty(), "赞"),
+        )
+    }
+
+    private fun extractSWeiboCardActBlock(card: String): String {
+        val start = Regex(
+            """<div\b[^>]*class=['"][^'"]*\bcard-act\b[^'"]*['"]""",
+            RegexOption.IGNORE_CASE,
+        ).find(card)?.range?.first ?: return ""
+        val nextCard = Regex(
+            """<div\b[^>]*class=['"][^'"]*\bcard-wrap\b[^'"]*['"]""",
+            RegexOption.IGNORE_CASE,
+        ).find(card, startIndex = start + 1)?.range?.first ?: card.length
+        return card.substring(start, nextCard)
+    }
+
+    private fun parseSWeiboLiActionCount(liBlock: String, label: String): String {
+        if (liBlock.isBlank()) return "0"
+        Regex(
+            """<em\b[^>]*>(.*?)</em>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        ).find(liBlock)?.groupValues?.getOrNull(1)?.let(::plainText)?.trim()?.let { count ->
+            if (count.isNotBlank() && count.any { it.isDigit() }) {
+                return count
+            }
+        }
+        val text = plainText(liBlock).replace(label, "").trim()
+        Regex("""([0-9]+(?:\.[0-9]+)?万?)""").find(text)?.groupValues?.getOrNull(1)?.let { return it }
+        return "0"
     }
 
     private fun parseSWeiboSearchImages(card: String, avatarUrl: String?, statusId: String): List<FeedImage> {
@@ -2406,8 +2553,13 @@ object WeiboJsonParser {
 
     private fun parseSWeiboActionCount(card: String, label: String): String {
         val text = plainText(card)
-        val match = Regex("""$label\s*([0-9万.]+)?""").find(text)
-        return match?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "0"
+        Regex("""$label\s*([0-9]+(?:\.[0-9]+)?万?)""").find(text)?.groupValues?.getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        Regex("""$label\s*([0-9万.]+)?""").find(text)?.groupValues?.getOrNull(1)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+        return "0"
     }
 
     private fun htmlAttribute(tag: String, name: String): String? =

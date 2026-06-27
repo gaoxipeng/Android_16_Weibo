@@ -2,6 +2,7 @@ package com.example.myweibo.data
 
 import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
@@ -17,11 +18,6 @@ private val DATE_TIME_FORMATTER = SimpleDateFormat("MM-dd HH:mm", Locale.getDefa
 }
 private val YEAR_DATE_TIME_FORMATTER = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).apply {
     timeZone = TimeZone.getTimeZone(WEIBO_TZ)
-}
-
-fun parseWeiboCreatedAtMillis(rawCreatedAt: String?): Long? {
-    if (rawCreatedAt == null) return null
-    return runCatching { WEIBO_DATE_PARSER.parse(rawCreatedAt.trim())?.time }.getOrNull()
 }
 
 fun formatWeiboTime(rawCreatedAt: String?): String {
@@ -59,4 +55,36 @@ fun formatWeiboTime(rawCreatedAt: String?): String {
         created.get(Calendar.YEAR) == now.get(Calendar.YEAR) -> DATE_TIME_FORMATTER.format(date)
         else -> YEAR_DATE_TIME_FORMATTER.format(date)
     }
+}
+
+fun parseWeiboCreatedAtMillis(rawCreatedAt: String?): Long? {
+    if (rawCreatedAt == null) return null
+    return runCatching { WEIBO_DATE_PARSER.parse(rawCreatedAt.trim())?.time }.getOrNull()
+        ?: parseFlexibleTimestampMillis(rawCreatedAt)
+}
+
+private val FLEXIBLE_TIMESTAMP_FORMATS = listOf(
+    SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()),
+    SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()),
+    SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.getDefault()),
+    SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault()),
+    SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US),
+)
+
+private fun parseFlexibleTimestampMillis(raw: String): Long? {
+    val trimmed = raw.trim()
+    trimmed.toLongOrNull()?.let { value ->
+        return if (value < 1_000_000_000_000L) value * 1000L else value
+    }
+    FLEXIBLE_TIMESTAMP_FORMATS.forEach { formatter ->
+        runCatching { formatter.parse(trimmed)?.time }?.getOrNull()?.let { return it }
+    }
+    return null
+}
+
+private val EXIF_DATE_FORMATTER = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US)
+
+fun formatExifDateTime(rawCreatedAt: String?): String? {
+    val millis = parseWeiboCreatedAtMillis(rawCreatedAt) ?: return null
+    return EXIF_DATE_FORMATTER.format(Date(millis))
 }
