@@ -10605,9 +10605,12 @@ private fun WeiboVideoSurface(
                         isFullscreen,
                         isPeekPlayback,
                     ) {
-                        val peekDismissThreshold = 82f
+                        val peekDismissActive = onPeekVerticalDismiss != null
+                        val peekDismissThreshold = if (peekDismissActive) 48f else 82f
+                        val peekDismissReleaseThreshold = if (peekDismissActive) 28f else peekDismissThreshold
+                        val verticalDominanceRatio = if (peekDismissActive) 0.85f else 1.15f
                         val horizontalDominanceRatio = 1.15f
-                        val allowSurfaceScrub = isFullscreen || isPeekPlayback
+                        val allowSurfaceScrub = (isFullscreen || isPeekPlayback) && !peekDismissActive
                         var lastTapUptimeMs = 0L
                         var pendingSingleTapJob: Job? = null
                         awaitEachGesture {
@@ -10626,16 +10629,15 @@ private fun WeiboVideoSurface(
                                 val change = event.changes.firstOrNull { it.id == down.id }
                                     ?: event.changes.firstOrNull()
                                     ?: break
-                                val dx = abs(change.position.x - anchorX)
-                                val dy = abs(change.position.y - startY)
+                                val totalDrag = change.position - down.position
+                                val dx = abs(totalDrag.x)
+                                val dy = abs(totalDrag.y)
                                 val duration = durationState
                                 val peekDismiss = peekDismissState.value
+                                val verticalDominant = dy > dx * verticalDominanceRatio
                                 if (peekDismiss != null && change.pressed) {
-                                    val totalDrag = change.position - down.position
                                     peekFingerDragState.value?.invoke(totalDrag)
-                                    val verticalDominant =
-                                        abs(totalDrag.y) > abs(totalDrag.x) * horizontalDominanceRatio
-                                    if (abs(totalDrag.y) > peekDismissThreshold && verticalDominant) {
+                                    if (dy > peekDismissThreshold && verticalDominant) {
                                         change.consume()
                                         peekDismissed = true
                                         pendingSingleTapJob?.cancel()
@@ -10648,7 +10650,12 @@ private fun WeiboVideoSurface(
                                         break
                                     }
                                 }
-                                if (!dragging && dy > slop && dy > dx * horizontalDominanceRatio) {
+                                if (
+                                    !peekDismissActive &&
+                                    !dragging &&
+                                    dy > slop &&
+                                    dy > dx * horizontalDominanceRatio
+                                ) {
                                     // 纵向滑动交给外层列表，避免误触进度拖动。
                                     break
                                 }
@@ -10674,6 +10681,12 @@ private fun WeiboVideoSurface(
                                     }
                                 }
                                 if (event.changes.all { it.changedToUpIgnoreConsumed() }) {
+                                    if (!dragging && !peekDismissed && peekDismiss != null) {
+                                        if (dy > peekDismissReleaseThreshold && verticalDominant) {
+                                            peekDismiss.invoke()
+                                            peekDismissed = true
+                                        }
+                                    }
                                     if (!dragging && !peekDismissed) {
                                         val upUptime = change.uptimeMillis
                                         pendingSingleTapJob?.cancel()
