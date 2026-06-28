@@ -10152,6 +10152,8 @@ private fun InlineVideoPlayer(
     var isCardReadyForFloatReturn by remember(media.streamUrl) { mutableStateOf(false) }
     var autoFloatReturnArmed by remember(media.streamUrl) { mutableStateOf(false) }
     val isAutoScrollFloating = videoCoordinator.isAutoScrollFloating(playbackKey)
+    val inlineHandoffPending = videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+    val suppressPausedCover = actionOpen || peekActive || isAutoScrollFloating || inlineHandoffPending
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
@@ -10452,7 +10454,7 @@ private fun InlineVideoPlayer(
                 autoEnterFloatingOnViewportHidden = false,
                 showPictureInPictureButton = false,
             )
-        } else {
+        } else if (!suppressPausedCover) {
             val coverPlayBackdrop = rememberLayerBackdrop()
             Box(
                 Modifier
@@ -10513,6 +10515,12 @@ private fun InlineVideoPlayer(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.labelLarge,
+            )
+        } else {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
             )
         }
         }
@@ -10829,29 +10837,32 @@ private fun WeiboVideoSurface(
                 return@LaunchedEffect
             }
 
-            val awaitingDetailHandoff = isDetailInlinePlayback &&
+            val awaitingInlineHandoff = videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
                 (
-                    videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                    isDetailInlinePlayback &&
                         videoCoordinator.isDetailHandoffTarget(playbackKey)
                     )
-            if (awaitingDetailHandoff) {
+            if (awaitingInlineHandoff) {
                 inlineWaitingForHandoff = true
                 val deadline = android.os.SystemClock.uptimeMillis() + 2_000L
                 while (android.os.SystemClock.uptimeMillis() < deadline) {
                     claimSharedPlayer()?.let { adopted ->
                         configureExistingPlayer(
                             adopted,
-                            deferPlaybackUntilSurface = true,
+                            deferPlaybackUntilSurface = isDetailInlinePlayback,
                         )
                         inlinePlayer = adopted
                         inlineWaitingForHandoff = false
                         videoCoordinator.requestInlinePlayback(playbackKey)
-                        videoCoordinator.finishDetailHandoff(playbackKey)
+                        if (isDetailInlinePlayback) {
+                            videoCoordinator.finishDetailHandoff(playbackKey)
+                        }
                         return@LaunchedEffect
                     }
                     delay(16)
                 }
                 inlineWaitingForHandoff = false
+                return@LaunchedEffect
             }
 
             val cached = playerCache[videoUrl]
@@ -10877,8 +10888,8 @@ private fun WeiboVideoSurface(
         !seamlessOverlayPlayback &&
         !isFullscreen && !isPeekPlayback &&
         videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
-    val awaitingPeekHandoffConsume = !seamlessOverlayPlayback &&
-        isPeekPlayback && videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+    val awaitingPeekHandoffConsume = isPeekPlayback &&
+        videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
 
     fun resolveOverlayPlayer(): androidx.media3.exoplayer.ExoPlayer? {
         videoCoordinator.adoptSharedPlayer(playbackKey)?.let { handoff ->
@@ -11083,10 +11094,20 @@ private fun WeiboVideoSurface(
             modifier = modifier.background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
-            val showCover = inlineWaitingForHandoff ||
+            val pendingHandoffPlaceholder = inlineWaitingForHandoff ||
                 awaitingFullscreenHandoff ||
-                awaitingPeekHandoffSource
-            if (showCover && !media.coverUrl.isNullOrBlank()) {
+                awaitingPeekHandoffSource ||
+                awaitingPeekHandoffConsume ||
+                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+            val placeholderFrame = transitionFrame
+            if (placeholderFrame != null && !placeholderFrame.isRecycled) {
+                Image(
+                    bitmap = placeholderFrame.asImageBitmap(),
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit,
+                )
+            } else if (!pendingHandoffPlaceholder && !media.coverUrl.isNullOrBlank()) {
                 RemoteImage(
                     url = media.coverUrl.orEmpty(),
                     modifier = Modifier.fillMaxSize(),
@@ -11100,7 +11121,13 @@ private fun WeiboVideoSurface(
         }
         return
     }
-    var videoFrameReady by remember(player) { mutableStateOf(false) }
+    var videoFrameReady by remember(player) {
+        mutableStateOf(
+            player.playbackState == androidx.media3.common.Player.STATE_READY &&
+                player.videoSize.width > 0 &&
+                (player.isPlaying || player.currentPosition > 0L),
+        )
+    }
     LaunchedEffect(videoFrameReady) {
         if (!videoFrameReady || transitionFrame == null) return@LaunchedEffect
         delay(140)
@@ -11146,6 +11173,13 @@ private fun WeiboVideoSurface(
             aspectRatio = aspectRatio,
         )
         onEnterPictureInPicture?.invoke()
+    }
+
+    fun captureHandoffTransitionFrame() {
+        val textureView = playerViewHolder.view?.videoSurfaceView as? android.view.TextureView
+        textureView?.bitmap?.takeIf { it.width > 0 && it.height > 0 }?.let { bitmap ->
+            videoCoordinator.storeTransitionFrame(playbackKey, bitmap)
+        }
     }
 
     DisposableEffect(player) {
@@ -11221,12 +11255,15 @@ private fun WeiboVideoSurface(
                 videoCoordinator.isFullscreenHandoffPending(playbackKey)
             val handoffToPeek = !seamlessOverlayPlayback && !isPeekPlayback &&
                 videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+            val handoffFromPeek = isPeekPlayback && !isFullscreen &&
+                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
             val transferringToDetail = !isDetailInlinePlayback &&
                 videoCoordinator.isTransferringToDetail(playbackKey)
             val alreadyStashedForHandoff = stashedForHandoffState.value
             videoCoordinator.registerSharedPlayer(playbackKey, player)
-            if (handoffToFullscreen || handoffToPeek || transferringToDetail) {
+            if (handoffToFullscreen || handoffToPeek || handoffFromPeek || transferringToDetail) {
                 if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
+                    captureHandoffTransitionFrame()
                     playerViewHolder.view?.player = null
                     videoCoordinator.stashHandoffPlayer(playbackKey, player)
                 }
@@ -11568,7 +11605,16 @@ private fun WeiboVideoSurface(
             visible = !videoFrameReady &&
                 playbackError == null &&
                 !(seamlessOverlayPlayback && isFullscreen) &&
-                (transitionFrame != null || !media.coverUrl.isNullOrBlank()),
+                (
+                    transitionFrame != null ||
+                        (
+                            !inlineWaitingForHandoff &&
+                                !awaitingPeekHandoffSource &&
+                                !awaitingPeekHandoffConsume &&
+                                !videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) &&
+                                !media.coverUrl.isNullOrBlank()
+                            )
+                    ),
             enter = EnterTransition.None,
             exit = fadeOut(tween(120)),
             modifier = Modifier.matchParentSize(),
@@ -15875,13 +15921,18 @@ private val appHelpSections = listOf(
             "长按图片会弹出预览菜单，可保存、保存全部或分享；松手后可进入全屏。",
             "全屏看图支持双指缩放、拖动；在边缘时可左右切换图片。",
             "向下拖动图片可关闭全屏；长按全屏图片同样可保存或分享。",
-            "Live Photo 会在全屏时自动播放动态效果。",
+            "Live Photo 会在全屏时自动播放动态效果；保存时可写入系统相册为动态照片。",
             "视频：点击中心播放按钮可在卡片内播放；双击视频卡片打开底部浮窗播放。",
-            "长按视频会弹出大预览，松手进入全屏；浮窗中可上滑收起、下滑关闭。",
+            "长按视频会弹出大预览，上滑可进入浮窗，下滑可关闭；松手也可进入全屏。",
             "浮窗播放时切换 Tab、进入详情或用户主页，视频会继续播放；返回可回到原页面。",
+            "从首页进入微博详情时，若视频正在播放，会自动续播并保持当前进度。",
+            "详情页内播放视频后向上滑动，卡片滚出屏幕时会自动进入浮窗继续播放。",
+            "详情页浮窗播放时向下滑动，待原视频卡片完全回到屏幕后，会自动缩回卡片内播放。",
+            "用户主页微博列表中的视频卡片，长按、浮窗、全屏等手势与首页一致。",
             "竖屏与横屏视频浮窗使用相同窗口大小；浮窗右上角可点「全屏」。",
             "全屏播放竖屏视频时，右上角可点「横屏」横屏观看；横屏后可点「竖屏」切回。",
             "全屏视频支持「浮窗」退回小窗，也支持画中画；底部胶囊进度条可拖动快进。",
+            "浮窗模式下优先使用上下滑关闭，整屏横向拖动不会误触快进。",
             "可在设置中控制切到后台后是否继续播放声音。",
             "从「我的」或用户主页进入相册，可按日期浏览并查看原图，部分图片可关联到原微博。",
         ),
@@ -15890,6 +15941,7 @@ private val appHelpSections = listOf(
         title = "微博详情与评论",
         items = listOf(
             "详情页下拉可刷新微博与评论；评论列表滚动到底会自动加载更多。",
+            "详情页内视频支持滚动离开卡片后自动浮窗，滑回卡片后自动回到内联播放。",
             "点击评论排序按钮，可在「按时间」与「按热度」之间切换。",
             "支持楼中楼评论展开；长按评论行可回复该评论。",
             "长按底部评论按钮或详情页评论入口，可打开评论输入弹窗。",
@@ -15934,6 +15986,7 @@ private val appHelpSections = listOf(
             "点击粉丝、关注等统计项，可打开关注 / 粉丝列表并查看其他用户。",
             "在粉丝/关注列表页点击底部其他 Tab，会正常切换页面并关闭列表。",
             "访问他人主页时，可关注/取关；互相关注时按钮显示「互相关注」。",
+            "用户主页微博列表中的视频，支持与首页相同的长按预览、浮窗与全屏操作。",
             "在用户主页点击微博中的 #话题#，会进入该话题搜索；返回一次回到该用户主页。",
             "列表滚动到顶部附近时，顶部资料区会随滚动逐渐收起。",
         ),
