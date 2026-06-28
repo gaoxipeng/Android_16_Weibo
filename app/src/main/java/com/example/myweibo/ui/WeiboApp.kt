@@ -130,7 +130,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -2216,7 +2215,6 @@ fun WeiboApp() {
     var commentComposeTarget by remember { mutableStateOf<CommentComposeTarget?>(null) }
     var commentSubmitting by remember { mutableStateOf(false) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
-    var commentSubmitSuccessMessage by remember { mutableStateOf<String?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
     var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
@@ -3739,7 +3737,6 @@ fun WeiboApp() {
         if (commentSubmitting) return
         val job = scope.launch {
             commentSubmitting = true
-            commentSubmitSuccessMessage = null
             try {
                 val timeoutMs = if (photoUris.isNotEmpty()) 90_000L else 45_000L
                 withTimeout(timeoutMs) {
@@ -3755,7 +3752,7 @@ fun WeiboApp() {
                     )
                 }
                 commentComposeTarget = null
-                commentSubmitSuccessMessage = if (target.isReply) {
+                operationCapsuleHint = if (target.isReply) {
                     "已回复 @${target.replyTo?.authorName}"
                 } else {
                     "评论已发布"
@@ -4875,19 +4872,6 @@ fun WeiboApp() {
                             commentComposeTarget = null
                         },
                         onSubmit = { text, photoUris, alsoRepost -> submitComment(target, text, photoUris, alsoRepost) },
-                    )
-                }
-
-                commentSubmitSuccessMessage?.let { message ->
-                    AlertDialog(
-                        onDismissRequest = { commentSubmitSuccessMessage = null },
-                        title = { Text("评论发布成功") },
-                        text = { Text(message) },
-                        confirmButton = {
-                            TextButton(onClick = { commentSubmitSuccessMessage = null }) {
-                                Text("确定")
-                            }
-                        },
                     )
                 }
 
