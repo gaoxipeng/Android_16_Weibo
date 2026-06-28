@@ -10092,6 +10092,9 @@ private fun VideoPlayHintBadge(
     )
 }
 
+private const val CardAutoFloatHideVisibleFraction = 0.35f
+private const val CardAutoFloatReturnVisibleFraction = 0.85f
+
 @Composable
 private fun InlineVideoPlayer(
     media: FeedMedia,
@@ -10145,7 +10148,9 @@ private fun InlineVideoPlayer(
     var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
     var lastTapUptimeMs by remember(media.streamUrl) { mutableStateOf(0L) }
     var isCardViewportVisible by remember(media.streamUrl) { mutableStateOf(true) }
-    var cardWasHiddenWhileAutoFloating by remember(media.streamUrl) { mutableStateOf(false) }
+    var isCardTopVisible by remember(media.streamUrl) { mutableStateOf(true) }
+    var isCardReadyForFloatReturn by remember(media.streamUrl) { mutableStateOf(false) }
+    var autoFloatReturnArmed by remember(media.streamUrl) { mutableStateOf(false) }
     val isAutoScrollFloating = videoCoordinator.isAutoScrollFloating(playbackKey)
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
@@ -10196,6 +10201,8 @@ private fun InlineVideoPlayer(
     fun openInlineFloatingPlayback(pressWindowOffset: Offset, fromAutoScroll: Boolean = false) {
         val bounds = anchorBounds ?: return
         if (fromAutoScroll) {
+            autoFloatReturnArmed = false
+            isCardReadyForFloatReturn = false
             videoCoordinator.markAutoScrollFloating(playbackKey)
         }
         actionOpen = true
@@ -10250,7 +10257,7 @@ private fun InlineVideoPlayer(
 
     LaunchedEffect(isAutoScrollFloating) {
         if (!isAutoScrollFloating) {
-            cardWasHiddenWhileAutoFloating = false
+            autoFloatReturnArmed = false
         }
     }
 
@@ -10275,16 +10282,16 @@ private fun InlineVideoPlayer(
     }
 
     LaunchedEffect(
-        isCardViewportVisible,
+        isCardReadyForFloatReturn,
+        autoFloatReturnArmed,
         isAutoScrollFloating,
-        cardWasHiddenWhileAutoFloating,
         videoCoordinator.peekPlaybackKey,
         videoPeekController.isFloating,
         videoPeekController.pendingDismiss,
     ) {
         if (!isAutoScrollFloating) return@LaunchedEffect
-        if (!cardWasHiddenWhileAutoFloating) return@LaunchedEffect
-        if (!isCardViewportVisible) return@LaunchedEffect
+        if (!autoFloatReturnArmed) return@LaunchedEffect
+        if (!isCardReadyForFloatReturn) return@LaunchedEffect
         if (videoCoordinator.peekPlaybackKey != playbackKey) return@LaunchedEffect
         if (!videoPeekController.isFloating || videoPeekController.pendingDismiss != null) return@LaunchedEffect
         returnToInlineFromScrollFloating()
@@ -10343,10 +10350,13 @@ private fun InlineVideoPlayer(
                         val visibleBottom = min(bounds.bottom, screenHeightPx)
                         val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
                         val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
-                        val nowVisible = fraction >= 0.35f
+                        val nowVisible = fraction >= CardAutoFloatHideVisibleFraction
                         isCardViewportVisible = nowVisible
-                        if (!nowVisible && (autoFloatingOnScrollAway || isAutoScrollFloating)) {
-                            cardWasHiddenWhileAutoFloating = true
+                        isCardTopVisible = bounds.top >= 0f
+                        isCardReadyForFloatReturn =
+                            isCardTopVisible && fraction >= CardAutoFloatReturnVisibleFraction
+                        if (isAutoScrollFloating && !isCardReadyForFloatReturn) {
+                            autoFloatReturnArmed = true
                         }
                     }
                 }
