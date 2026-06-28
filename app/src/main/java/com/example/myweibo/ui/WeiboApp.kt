@@ -291,6 +291,7 @@ import com.example.myweibo.data.extractActiveMentionQuery
 import com.example.myweibo.data.filterMentionCandidatesByQuery
 import com.example.myweibo.data.mentionCandidateKey
 import com.example.myweibo.data.ImageSaveHelper
+import com.example.myweibo.data.LivePhotoMirrorCorrectionStore
 import com.example.myweibo.data.LivePhotoMirrorDetector
 import com.example.myweibo.data.ImageUrlResolver
 import com.example.myweibo.data.BitmapExifOrientation
@@ -327,6 +328,7 @@ import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
 import com.example.myweibo.data.WeiboWebSession
 import com.example.myweibo.data.WeiboArticle
+import com.example.myweibo.data.WeiboLinkResolver
 import com.example.myweibo.data.resolveArticleId
 import com.example.myweibo.data.formatWeiboTime
 import com.example.myweibo.data.collectEmoticons
@@ -1923,53 +1925,50 @@ private suspend fun loadRemoteBitmap(
     return decodeBitmapFromBytes(bytes, maxDecodeDim)
 }
 
-private fun livePhotoMirrorCorrectionKey(image: FeedImage): String? {
-    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return null
-    val stillKey = image.largeUrl.ifBlank { image.thumbnailUrl }.ifBlank { image.id }
-    if (stillKey.isBlank()) return null
-    return "$stillKey|$videoUrl"
-}
-
 @Composable
 private fun rememberLivePhotoMirrorCorrection(
     image: FeedImage,
     stillBitmap: Bitmap?,
 ): LivePhotoMirrorCorrection {
-    val context = LocalContext.current
     val key = remember(image.id, image.largeUrl, image.livePhotoVideoUrl) {
-        livePhotoMirrorCorrectionKey(image)
+        LivePhotoMirrorCorrectionStore.correctionKey(image)
     }
     var correction by remember(key) {
         mutableStateOf(
-            key?.let(LivePhotoMirrorCorrectionCache::get) ?: LivePhotoMirrorCorrection.None,
+            key?.let { cacheKey ->
+                LivePhotoMirrorCorrectionStore.getMirrorVideo(cacheKey)?.let { mirrorVideo ->
+                    if (mirrorVideo) LivePhotoMirrorCorrection.MirrorVideo else LivePhotoMirrorCorrection.None
+                }
+            } ?: LivePhotoMirrorCorrection.None,
         )
     }
 
     LaunchedEffect(key, stillBitmap) {
         val targetKey = key ?: return@LaunchedEffect
-        LivePhotoMirrorCorrectionCache.get(targetKey)?.let {
-            correction = it
+        LivePhotoMirrorCorrectionStore.getMirrorVideo(targetKey)?.let { mirrorVideo ->
+            correction = if (mirrorVideo) LivePhotoMirrorCorrection.MirrorVideo else LivePhotoMirrorCorrection.None
             return@LaunchedEffect
         }
         val detected = withContext(Dispatchers.IO) {
-            detectLivePhotoMirrorCorrection(context, image, stillBitmap)
+            detectLivePhotoMirrorCorrection(image, stillBitmap)
         }
-        LivePhotoMirrorCorrectionCache.put(targetKey, detected)
         correction = detected
     }
     return correction
 }
 
 private suspend fun detectLivePhotoMirrorCorrection(
-    context: Context,
     image: FeedImage,
     stillBitmap: Bitmap?,
 ): LivePhotoMirrorCorrection {
     if (!image.isLivePhoto) return LivePhotoMirrorCorrection.None
     val still = stillBitmap?.takeIfDrawable() ?: loadLivePhotoStillForMirrorDetection(image) ?: return LivePhotoMirrorCorrection.None
-    val frame = loadLivePhotoReferenceFrame(context, image.livePhotoVideoUrl.orEmpty())
+    val videoUrl = image.livePhotoVideoUrl.orEmpty()
+    val frame = LivePhotoMirrorDetector.loadReferenceFrameFromUrl(videoUrl)
         ?: return LivePhotoMirrorCorrection.None
-    return if (LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(still, frame)) {
+    val mirrorVideo = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(still, frame)
+    LivePhotoMirrorCorrectionStore.putMirrorVideo(image, mirrorVideo)
+    return if (mirrorVideo) {
         LivePhotoMirrorCorrection.MirrorVideo
     } else {
         LivePhotoMirrorCorrection.None
@@ -1990,84 +1989,6 @@ private suspend fun loadLivePhotoStillForMirrorDetection(image: FeedImage): Bitm
         }.getOrNull()?.takeIfDrawable()?.let { return it }
     }
     return null
-}
-
-private fun loadLivePhotoReferenceFrame(context: Context, videoUrl: String): Bitmap? {
-    if (videoUrl.isBlank()) return null
-    val headers = livePhotoFrameHeaders()
-    for (candidate in videoUrlCandidates(videoUrl)) {
-        val frame = runCatching {
-            MediaMetadataRetriever().use { retriever ->
-                retriever.setDataSource(candidate, headers)
-                livePhotoReferenceFrameTimesUs(retriever)
-                    .firstNotNullOfOrNull { timeUs ->
-                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                            ?.takeIf(::hasUsableFrameSignal)
-                    }
-                    ?: retriever.frameAtTime?.takeIf(::hasUsableFrameSignal)
-            }
-        }.getOrNull()
-        if (frame != null) return frame
-    }
-    return null
-}
-
-private fun livePhotoReferenceFrameTimesUs(retriever: MediaMetadataRetriever): List<Long> {
-    val durationMs = retriever
-        .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-        ?.toLongOrNull()
-        ?.takeIf { it > 0L }
-    if (durationMs == null) {
-        return listOf(500_000L, 250_000L, 750_000L, 100_000L, 0L)
-    }
-    val durationUs = durationMs * 1000L
-    return listOf(
-        durationUs / 2L,
-        (durationUs * 45L) / 100L,
-        (durationUs * 55L) / 100L,
-        (durationUs * 35L) / 100L,
-        (durationUs * 65L) / 100L,
-        min(100_000L, durationUs),
-        0L,
-    ).distinct()
-}
-
-private fun livePhotoFrameHeaders(): Map<String, String> {
-    val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
-    return buildMap {
-        put("User-Agent", DESKTOP_CHROME_USER_AGENT)
-        put("Referer", "https://weibo.com/")
-        if (cookie.isNotBlank()) put("Cookie", cookie)
-    }
-}
-
-private fun hasUsableFrameSignal(bitmap: Bitmap): Boolean {
-    val sampleCount = 16
-    var minLuma = 255
-    var maxLuma = 0
-    for (yIndex in 0 until sampleCount) {
-        val y = normalizedSampleCoordinate(yIndex, sampleCount, bitmap.height)
-        for (xIndex in 0 until sampleCount) {
-            val x = normalizedSampleCoordinate(xIndex, sampleCount, bitmap.width)
-            val luma = bitmap.getPixel(x, y).pixelLuma()
-            minLuma = min(minLuma, luma)
-            maxLuma = max(maxLuma, luma)
-        }
-    }
-    return maxLuma - minLuma > 12
-}
-
-private fun normalizedSampleCoordinate(index: Int, sampleCount: Int, size: Int): Int {
-    if (size <= 1 || sampleCount <= 1) return 0
-    return ((index.toFloat() / (sampleCount - 1).toFloat()) * (size - 1)).roundToInt()
-        .coerceIn(0, size - 1)
-}
-
-private fun Int.pixelLuma(): Int {
-    val r = (this shr 16) and 0xff
-    val g = (this shr 8) and 0xff
-    val b = this and 0xff
-    return (r * 30 + g * 59 + b * 11) / 100
 }
 
 private fun videoMediaKey(media: FeedMedia): String =
@@ -2780,10 +2701,6 @@ fun WeiboApp() {
 
     fun navigateBack() {
         popNavigation()
-    }
-
-    fun openUrlEntity(entity: FeedUrlEntity) {
-        pushNavigation { loadArticleIntoOverlay(entity) }
     }
 
     fun closeArticleOverlay() {
@@ -3848,6 +3765,29 @@ fun WeiboApp() {
                 scrollToContentSection = false,
             )
         }
+    }
+
+    fun openUrlEntity(entity: FeedUrlEntity) {
+        val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
+        if (articleId != null) {
+            pushNavigation { loadArticleIntoOverlay(entity) }
+            return
+        }
+        val statusCandidates = WeiboLinkResolver.statusIdCandidates(entity.url, entity.shortUrl)
+        if (statusCandidates.isNotEmpty()) {
+            scope.launch {
+                val item = statusCandidates.firstNotNullOfOrNull { candidate ->
+                    runCatching { session.loadStatusDetail(candidate) }.getOrNull()
+                }
+                if (item != null) {
+                    openDetailInternal(item)
+                } else {
+                    pushNavigation { loadArticleIntoOverlay(entity) }
+                }
+            }
+            return
+        }
+        pushNavigation { loadArticleIntoOverlay(entity) }
     }
 
     fun openDetailToSection(item: FeedItem, section: DetailContentSection) {
@@ -6548,21 +6488,29 @@ private fun singleImageDisplayAspectRatio(
     return naturalAspect.coerceIn(minAspectFromHeightCap, 3f)
 }
 
-private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float {
-    val width = media.coverWidth ?: when (media.videoOrientation) {
-        "vertical" -> 9
+private fun feedVideoFeedLayout(
+    media: FeedMedia,
+    width: Int = media.coverWidth ?: 0,
+    height: Int = media.coverHeight ?: 0,
+): SingleImageFeedLayout {
+    val resolvedWidth = width.takeIf { it > 0 } ?: when (media.videoOrientation?.lowercase()) {
+        "vertical", "portrait" -> 9
         else -> 16
     }
-    val height = media.coverHeight ?: when (media.videoOrientation) {
-        "vertical" -> 16
+    val resolvedHeight = height.takeIf { it > 0 } ?: when (media.videoOrientation?.lowercase()) {
+        "vertical", "portrait" -> 16
         else -> 9
     }
-    return singleImageDisplayAspectRatio(
-        width = width,
-        height = height,
+    return singleImageFeedLayout(
+        width = resolvedWidth,
+        height = resolvedHeight,
+        maxWidthFraction = VideoMaxWidthFraction,
         maxHeightToWidth = VideoMaxHeightToWidth,
     )
 }
+
+private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float =
+    feedVideoFeedLayout(media).aspectRatio
 
 private fun isPortraitFeedVideo(aspectRatio: Float, media: FeedMedia): Boolean {
     when (media.videoOrientation?.lowercase()) {
@@ -7756,7 +7704,9 @@ private fun VideoPeekOverlay(
                         else -> VideoPeekFloatingPlaybackSpeed
                     },
                     onPlaybackEnded = onPlaybackEnded,
-                    onAspectRatio = { aspectRatio = it },
+                    onAspectRatio = { width, height ->
+                        aspectRatio = width.toFloat() / height.toFloat()
+                    },
                     onFullscreen = { videoPeekController.enterFullscreen() },
                     onEnterFloatingPlayback = if (isFullscreenMode) {
                         { videoPeekController.exitFullscreenToFloating() }
@@ -9696,13 +9646,25 @@ private fun InlineVideoPlayer(
     val inlinePlaying = videoCoordinator.activeKey == playbackKey &&
         videoCoordinator.fullscreenKey != playbackKey &&
         videoCoordinator.peekPlaybackKey != playbackKey
-    val displayAspectRatio = remember(
+    var measuredVideoWidth by remember(media.streamUrl) {
+        mutableIntStateOf(media.coverWidth ?: 0)
+    }
+    var measuredVideoHeight by remember(media.streamUrl) {
+        mutableIntStateOf(media.coverHeight ?: 0)
+    }
+    val cardLayout = remember(
         media.streamUrl,
         media.videoOrientation,
         media.coverWidth,
         media.coverHeight,
+        measuredVideoWidth,
+        measuredVideoHeight,
     ) {
-        feedVideoDisplayAspectRatio(media)
+        feedVideoFeedLayout(
+            media = media,
+            width = measuredVideoWidth,
+            height = measuredVideoHeight,
+        )
     }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
@@ -9818,14 +9780,12 @@ private fun InlineVideoPlayer(
         videoPeekController.enterFullscreen()
     }
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-    ) {
+    Box(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
-                .fillMaxWidth(VideoMaxWidthFraction)
-                .aspectRatio(displayAspectRatio)
+                .align(Alignment.TopStart)
+                .fillMaxWidth(cardLayout.widthFraction)
+                .aspectRatio(cardLayout.aspectRatio)
                 .onGloballyPositioned { coordinates ->
                     anchorCoordinates = coordinates
                     anchorBounds = coordinates.boundsInWindow()
@@ -9941,7 +9901,12 @@ private fun InlineVideoPlayer(
                 playbackOwnerId = playbackOwnerId,
                 isFullscreen = false,
                 videoResizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
-                onAspectRatio = {},
+                onAspectRatio = { width, height ->
+                    if (width > 0 && height > 0) {
+                        measuredVideoWidth = width
+                        measuredVideoHeight = height
+                    }
+                },
                 onFullscreen = {
                     val bounds = anchorBounds
                     val center = bounds?.let {
@@ -10030,7 +9995,7 @@ private fun WeiboVideoSurface(
     media: FeedMedia,
     playbackOwnerId: String,
     isFullscreen: Boolean,
-    onAspectRatio: (Float) -> Unit,
+    onAspectRatio: (width: Int, height: Int) -> Unit,
     onFullscreen: () -> Unit,
     onEnterPictureInPicture: (() -> Unit)? = null,
     onEnterFloatingPlayback: (() -> Unit)? = null,
@@ -10437,9 +10402,12 @@ private fun WeiboVideoSurface(
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 val width = videoSize.width.takeIf { it > 0 } ?: return
                 val height = videoSize.height.takeIf { it > 0 } ?: return
-                val ratio = width.toFloat() / height.toFloat()
-                aspectRatio = ratio
-                onAspectRatio(ratio)
+                val (displayWidth, displayHeight) = when (videoSize.unappliedRotationDegrees) {
+                    90, 270 -> height to width
+                    else -> width to height
+                }
+                aspectRatio = displayWidth.toFloat() / displayHeight.toFloat()
+                onAspectRatio(displayWidth, displayHeight)
             }
 
             override fun onRenderedFirstFrame() {
@@ -18265,7 +18233,7 @@ private fun FullscreenMediaPreview(
             media = media,
             playbackOwnerId = playbackOwnerId,
             isFullscreen = true,
-            onAspectRatio = {},
+            onAspectRatio = { _: Int, _: Int -> },
             onFullscreen = onDismiss,
             onEnterFloatingPlayback = onEnterFloatingPlayback,
             modifier = Modifier.fillMaxSize(),
@@ -18675,23 +18643,6 @@ private object FullscreenBitmapCache {
 
     fun trimToFraction(keepFraction: Float) {
         cache.trimToFraction(keepFraction)
-    }
-}
-
-private object LivePhotoMirrorCorrectionCache {
-    private const val MaxEntries = 80
-    private val entries = object : LinkedHashMap<String, LivePhotoMirrorCorrection>(16, 0.75f, true) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, LivePhotoMirrorCorrection>?,
-        ): Boolean = size > MaxEntries
-    }
-
-    @Synchronized
-    fun get(key: String): LivePhotoMirrorCorrection? = entries[key]
-
-    @Synchronized
-    fun put(key: String, correction: LivePhotoMirrorCorrection) {
-        entries[key] = correction
     }
 }
 

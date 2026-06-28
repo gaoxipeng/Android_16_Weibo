@@ -24,6 +24,7 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.myweibo.data.FeedMedia
+import com.example.myweibo.data.MediaUrlResolver
 
 class VideoPipActivity : ComponentActivity() {
     private var player: ExoPlayer? = null
@@ -40,13 +41,13 @@ class VideoPipActivity : ComponentActivity() {
         val aspectRatio = intent.getFloatExtra(EXTRA_ASPECT_RATIO, 16f / 9f)
         val startPositionMs = intent.getLongExtra(EXTRA_POSITION_MS, 0L)
         val speed = intent.getFloatExtra(EXTRA_SPEED, 1f)
-        val primaryUrl = when (liveStatus) {
-            3 -> replayUrl?.takeIf { it.isNotBlank() } ?: streamUrl
-            else -> streamUrl
-        }
-        val candidates = listOfNotNull(dashXml?.let(::dashDataUri), primaryUrl, downloadUrl, replayUrl)
-            .flatMap(::videoUrlCandidates)
-            .distinct()
+        val candidates = MediaUrlResolver.pipPlaybackCandidates(
+            streamUrl = streamUrl,
+            downloadUrl = downloadUrl,
+            replayUrl = replayUrl,
+            liveStatus = liveStatus,
+            dashDataUri = dashXml?.let(::dashDataUri),
+        )
 
         playerView = PlayerView(this).apply {
             useController = false
@@ -196,14 +197,6 @@ class VideoPipActivity : ComponentActivity() {
             return PictureInPictureParams.Builder()
                 .setAspectRatio(Rational((safeRatio * 1000).toInt().coerceAtLeast(1), 1000))
                 .build()
-        }
-
-        private fun videoUrlCandidates(url: String): List<String> {
-            val trimmed = url.trim()
-            if (trimmed.isBlank()) return emptyList()
-            if (trimmed.startsWith("data:", ignoreCase = true)) return listOf(trimmed)
-            if (!trimmed.startsWith("http://", ignoreCase = true)) return listOf(trimmed)
-            return listOf(trimmed.replaceFirst("http://", "https://", ignoreCase = true), trimmed)
         }
 
         private fun dashDataUri(xml: String): String {

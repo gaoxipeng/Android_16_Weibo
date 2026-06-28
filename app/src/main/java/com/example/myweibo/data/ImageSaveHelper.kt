@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -38,6 +39,9 @@ object ImageSaveHelper {
     private const val LIVE_PHOTO_SAVE_TIMEOUT_MS = 55_000L
     private const val BATCH_LIVE_PHOTO_SAVE_TIMEOUT_MS = 48_000L
     private const val PER_IMAGE_DOWNLOAD_TIMEOUT_MS = 18_000L
+    private const val PER_IMAGE_DOWNLOAD_MAX_DURATION_MS = 24_000L
+    private const val LIVE_PHOTO_VIDEO_DOWNLOAD_MAX_DURATION_MS = 45_000L
+    private const val VIDEO_DOWNLOAD_MAX_DURATION_MS = 180_000L
     private const val BATCH_PREFETCH_AHEAD = 2
     private const val PER_DOWNLOAD_CONNECT_TIMEOUT_MS = 8_000
     private const val PER_DOWNLOAD_READ_TIMEOUT_MS = 12_000
@@ -58,13 +62,13 @@ object ImageSaveHelper {
     }
 
     suspend fun loadBytes(image: FeedImage): ByteArray? = withContext(Dispatchers.IO) {
-        imageUrlCandidates(image).firstNotNullOfOrNull { url ->
+        ImageUrlResolver.saveCandidates(image).firstNotNullOfOrNull { url ->
             runCatching { downloadBytes(url) }.getOrNull()
         }
     }
 
     suspend fun probeSizeBytes(image: FeedImage): Long? = withContext(Dispatchers.IO) {
-        val url = imageUrlCandidates(image).firstOrNull() ?: return@withContext null
+        val url = ImageUrlResolver.saveCandidates(image).firstOrNull() ?: return@withContext null
         runCatching {
             val connection = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "HEAD"
@@ -139,7 +143,7 @@ object ImageSaveHelper {
                 videoUrl = liveVideoUrl,
                 uniqueSuffix = uniqueSuffix,
                 metadata = resolvedMetadata,
-                verifyTwice = batchOptions?.verifyMotionPhotoTwice ?: true,
+                verifyTwice = batchOptions?.verifyMotionPhotoTwice ?: false,
             )
             if (liveResult.isSuccess || batchOptions?.fallbackToStaticOnLivePhotoFailure != true) {
                 return liveResult
@@ -163,7 +167,7 @@ object ImageSaveHelper {
 
     private data class BatchSaveOptions(
         val fallbackToStaticOnLivePhotoFailure: Boolean = false,
-        val verifyMotionPhotoTwice: Boolean = true,
+        val verifyMotionPhotoTwice: Boolean = false,
     )
 
     private suspend fun loadBytesWithTimeout(
@@ -225,7 +229,7 @@ object ImageSaveHelper {
         videoUrl: String,
         uniqueSuffix: String,
         metadata: ImageSaveMetadata,
-        verifyTwice: Boolean = true,
+        verifyTwice: Boolean = false,
     ): Result<String> {
         val assembled = LivePhotoMotionPhotoAssembler.assemble(
             context = context,
@@ -338,7 +342,15 @@ object ImageSaveHelper {
                 } else {
                     PER_IMAGE_SAVE_TIMEOUT_MS
                 }
-                val preloadedBytes = prefetchJobs.remove(index)?.await()
+                val prefetchJob = prefetchJobs.remove(index)
+                val preloadedBytes = prefetchJob?.let { prefetch ->
+                    withTimeoutOrNull(PER_IMAGE_DOWNLOAD_MAX_DURATION_MS) {
+                        prefetch.await()
+                    }
+                }
+                if (preloadedBytes == null) {
+                    prefetchJob?.cancel()
+                }
                 val result = runCatching {
                     withTimeout(timeoutMs) {
                         saveImageInternal(
@@ -359,7 +371,32 @@ object ImageSaveHelper {
                         else -> Result.failure(error)
                     }
                 }
-                result
+                val finalResult = if (result.isFailure) {
+                    delay(350L)
+                    runCatching {
+                        withTimeout(timeoutMs) {
+                            saveImageInternal(
+                                context = context,
+                                image = resolvedImage,
+                                uniqueSuffix = "_$index",
+                                metadata = resolvedImage.buildSaveMetadata(status),
+                                includeLivePhotoVideo = !resolvedImage.livePhotoVideoUrl.isNullOrBlank() &&
+                                    !resolvedImage.isGif,
+                                preloadedBytes = null,
+                                batchOptions = batchOptions,
+                            )
+                        }
+                    }.getOrElse { error ->
+                        when (error) {
+                            is TimeoutCancellationException ->
+                                Result.failure(IllegalStateException("第$activeIndex 张保存超时"))
+                            else -> Result.failure(error)
+                        }
+                    }
+                } else {
+                    result
+                }
+                finalResult
                     .onSuccess {
                         saved += 1
                         onProgress?.invoke(
@@ -384,10 +421,7 @@ object ImageSaveHelper {
         media: FeedMedia,
         onProgress: ((Float) -> Unit)? = null,
     ): Result<String> = withContext(Dispatchers.IO) {
-        val candidates = listOfNotNull(media.downloadUrl, media.streamUrl)
-            .flatMap(::videoDownloadCandidates)
-            .filter { it.isNotBlank() && !it.contains(".m3u8", ignoreCase = true) }
-            .distinct()
+        val candidates = MediaUrlResolver.downloadableVideoCandidates(media)
         if (candidates.isEmpty()) {
             return@withContext Result.failure(IllegalStateException("没有可下载的视频地址"))
         }
@@ -402,6 +436,7 @@ object ImageSaveHelper {
                 downloadBytes(
                     url = url,
                     maxBytes = 256 * 1024 * 1024,
+                    maxDurationMs = VIDEO_DOWNLOAD_MAX_DURATION_MS,
                     onProgress = { downloaded, total ->
                         val fraction = if (total > 0L) {
                             0.05f + downloaded.toFloat() / total.toFloat() * 0.8f
@@ -436,15 +471,6 @@ object ImageSaveHelper {
         Result.success(displayName)
     }
 
-    private fun videoDownloadCandidates(url: String): List<String> {
-        val trimmed = url.trim()
-        if (trimmed.isBlank()) return emptyList()
-        if (trimmed.startsWith("http://", ignoreCase = true)) {
-            return listOf(trimmed.replaceFirst("http://", "https://", ignoreCase = true), trimmed)
-        }
-        return listOf(trimmed)
-    }
-
     fun formatInfo(image: FeedImage, sizeBytes: Long?): List<String> = buildList {
         add("图片 ID：${image.id}")
         val width = image.width
@@ -468,27 +494,9 @@ object ImageSaveHelper {
             .takeIf { it.isNotBlank() }
             ?.let { add("设备：$it") }
         sizeBytes?.let { add("大小：${formatFileSize(it)}") }
-        imageUrlCandidates(image).firstOrNull()?.let { add("链接：$it") }
+        ImageUrlResolver.saveCandidates(image).firstOrNull()?.let { add("链接：$it") }
         image.livePhotoVideoUrl?.takeIf { it.isNotBlank() }?.let { add("LivePhoto 视频：$it") }
     }
-
-    private fun imageUrlCandidates(image: FeedImage): List<String> =
-        fullscreenLikeImageUrlCandidates(image)
-
-    private fun fullscreenLikeImageUrlCandidates(image: FeedImage): List<String> {
-        val highQuality = (image.downloadUrls + listOf(image.largeUrl))
-            .filter { it.isNotBlank() }
-            .distinct()
-            .filterNot { LowQualityImageUrlPattern.containsMatchIn(it) }
-        if (highQuality.isNotEmpty()) return highQuality
-        return listOfNotNull(
-            image.largeUrl.takeIf { it.isNotBlank() },
-            image.thumbnailUrl.takeIf { it.isNotBlank() },
-        ).distinct()
-    }
-
-    private val LowQualityImageUrlPattern =
-        Regex("""/(?:orj360|orj480|bmiddle|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE)
 
     private fun verifySavedMotionPhoto(
         context: Context,
@@ -525,12 +533,14 @@ object ImageSaveHelper {
             url = url,
             maxBytes = 64 * 1024 * 1024,
             includeWeiboCookie = true,
+            maxDurationMs = LIVE_PHOTO_VIDEO_DOWNLOAD_MAX_DURATION_MS,
         )
 
     private fun downloadBytes(
         url: String,
         maxBytes: Int = 32 * 1024 * 1024,
         includeWeiboCookie: Boolean = false,
+        maxDurationMs: Long = PER_IMAGE_DOWNLOAD_MAX_DURATION_MS,
         onProgress: ((downloaded: Long, total: Long) -> Unit)? = null,
     ): ByteArray {
         var lastError: Exception? = null
@@ -545,6 +555,7 @@ object ImageSaveHelper {
                 return connection.inputStream.use { input ->
                     val buffer = ByteArray(8192)
                     val output = java.io.ByteArrayOutputStream()
+                    val startedAt = System.currentTimeMillis()
                     var downloaded = 0L
                     while (true) {
                         val read = input.read(buffer)
@@ -552,6 +563,9 @@ object ImageSaveHelper {
                         output.write(buffer, 0, read)
                         downloaded += read
                         onProgress?.invoke(downloaded, totalBytes)
+                        if (System.currentTimeMillis() - startedAt > maxDurationMs) {
+                            throw java.net.SocketTimeoutException("download exceeded ${maxDurationMs}ms")
+                        }
                         if (output.size() > maxBytes) {
                             throw IllegalStateException("文件体积过大")
                         }

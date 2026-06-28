@@ -7,14 +7,20 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -55,14 +61,103 @@ object MotionPhotoVideoPreparer {
         if (!looksLikeMp4(normalized)) {
             throw IllegalStateException("Live Photo 视频格式无效")
         }
-        val oriented = if (mirror) {
-            mirrorVideoPixelsHorizontally(context, normalized)
-        } else {
-            normalized
+        if (!mirror) return normalized
+        return mirrorVideoPixelsHorizontally(context, normalized)
+    }
+
+    private data class VideoEncodingHint(
+        val mimeType: String?,
+        val width: Int,
+        val height: Int,
+        val frameRate: Int,
+        val bitrate: Int,
+    )
+
+    private fun readVideoEncodingHint(context: Context, videoBytes: ByteArray): VideoEncodingHint {
+        val file = File.createTempFile("motion_hint_", ".mp4", context.cacheDir)
+        val extractor = MediaExtractor()
+        val initialHint = try {
+            file.writeBytes(videoBytes)
+            extractor.setDataSource(file.absolutePath)
+            var hint: VideoEncodingHint? = null
+            for (trackIndex in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(trackIndex)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (!mime.startsWith("video/")) continue
+                val width = format.getInteger(MediaFormat.KEY_WIDTH)
+                val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+                val bitrate = if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                    format.getInteger(MediaFormat.KEY_BIT_RATE)
+                } else {
+                    0
+                }
+                val frameRate = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                    format.getInteger(MediaFormat.KEY_FRAME_RATE)
+                } else {
+                    30
+                }
+                hint = VideoEncodingHint(
+                    mimeType = mime,
+                    width = width,
+                    height = height,
+                    frameRate = frameRate.coerceAtLeast(24),
+                    bitrate = bitrate,
+                )
+                break
+            }
+            hint ?: VideoEncodingHint(MimeTypes.VIDEO_H264, 720, 1280, 30, 0)
+        } catch (_: Exception) {
+            VideoEncodingHint(MimeTypes.VIDEO_H264, 720, 1280, 30, 0)
+        } finally {
+            runCatching { extractor.release() }
+            file.delete()
         }
-        return runCatching {
-            remuxMp4(context, oriented)
-        }.getOrElse { oriented }
+        if (initialHint.bitrate > 0) return initialHint
+        return readVideoBitrateFromMetadata(context, videoBytes) ?: initialHint
+    }
+
+    private fun readVideoBitrateFromMetadata(context: Context, videoBytes: ByteArray): VideoEncodingHint? {
+        val file = File.createTempFile("motion_meta_", ".mp4", context.cacheDir)
+        return try {
+            file.writeBytes(videoBytes)
+            MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(file.absolutePath)
+                val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
+                    ?.toIntOrNull()
+                    ?.takeIf { it > 0 }
+                    ?: return null
+                val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                    ?.toIntOrNull()
+                    ?.takeIf { it > 0 }
+                    ?: 720
+                val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                    ?.toIntOrNull()
+                    ?.takeIf { it > 0 }
+                    ?: 1280
+                val frameRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                    ?.toFloatOrNull()
+                    ?.toInt()
+                    ?.coerceAtLeast(24)
+                    ?: 30
+                VideoEncodingHint(
+                    mimeType = MimeTypes.VIDEO_H264,
+                    width = width,
+                    height = height,
+                    frameRate = frameRate,
+                    bitrate = bitrate,
+                )
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            file.delete()
+        }
+    }
+
+    private fun targetMirrorEncoderBitrate(hint: VideoEncodingHint): Int {
+        val pixels = hint.width.toLong() * hint.height
+        val estimated = (pixels * 0.14 * hint.frameRate).toLong().toInt()
+        return maxOf(hint.bitrate, estimated, 4_000_000).coerceAtMost(20_000_000)
     }
 
     fun extractMotionPhotoPresentationTimestampUs(
@@ -85,53 +180,93 @@ object MotionPhotoVideoPreparer {
         context: Context,
         videoBytes: ByteArray,
     ): ByteArray {
-        val inputFile = File.createTempFile("motion_mirror_in_", ".mp4", context.cacheDir)
-        val outputFile = File.createTempFile("motion_mirror_out_", ".mp4", context.cacheDir)
-        return try {
-            inputFile.writeBytes(videoBytes)
-            val effect = ScaleAndRotateTransformation.Builder()
-                .setScale(-1f, 1f)
-                .build()
-            val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(inputFile)))
-                .setEffects(Effects(emptyList(), listOf(effect)))
-                .build()
-            val latch = CountDownLatch(1)
-            val errorRef = AtomicReference<Exception?>()
-            val transformer = Transformer.Builder(context)
-                .addListener(
-                    object : Transformer.Listener {
-                        override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                            latch.countDown()
-                        }
+        val appContext = context.applicationContext
+        val completionLatch = CountDownLatch(1)
+        val resultRef = AtomicReference<ByteArray>()
+        val errorRef = AtomicReference<Exception?>()
+        TransformerWorker.handler.post {
+            val inputFile = File.createTempFile("motion_mirror_in_", ".mp4", appContext.cacheDir)
+            val outputFile = File.createTempFile("motion_mirror_out_", ".mp4", appContext.cacheDir)
+            fun cleanupTempFiles() {
+                inputFile.delete()
+                outputFile.delete()
+            }
+            try {
+                inputFile.writeBytes(videoBytes)
+                val encodingHint = readVideoEncodingHint(appContext, videoBytes)
+                val encoderFactory = DefaultEncoderFactory.Builder(appContext)
+                    .setRequestedVideoEncoderSettings(
+                        VideoEncoderSettings.Builder()
+                            .setBitrate(targetMirrorEncoderBitrate(encodingHint))
+                            .build(),
+                    )
+                    .build()
+                val effect = ScaleAndRotateTransformation.Builder()
+                    .setScale(-1f, 1f)
+                    .build()
+                val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(inputFile)))
+                    .setEffects(Effects(emptyList(), listOf(effect)))
+                    .build()
+                val transformerBuilder = Transformer.Builder(appContext)
+                    .setLooper(TransformerWorker.looper)
+                    .setEncoderFactory(encoderFactory)
+                when (encodingHint.mimeType) {
+                    MimeTypes.VIDEO_H264, MimeTypes.VIDEO_H265 -> {
+                        transformerBuilder.setVideoMimeType(encodingHint.mimeType)
+                    }
+                }
+                val transformer = transformerBuilder
+                    .addListener(
+                        object : Transformer.Listener {
+                            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                                try {
+                                    val mirrored = outputFile.readBytes()
+                                    if (!looksLikeMp4(mirrored) || mirrored.isEmpty()) {
+                                        errorRef.set(
+                                            IllegalStateException("Live Photo video mirror transform failed"),
+                                        )
+                                    } else {
+                                        resultRef.set(mirrored)
+                                    }
+                                } catch (error: Exception) {
+                                    errorRef.set(error)
+                                } finally {
+                                    cleanupTempFiles()
+                                    completionLatch.countDown()
+                                }
+                            }
 
-                        override fun onError(
-                            composition: Composition,
-                            exportResult: ExportResult,
-                            exportException: ExportException,
-                        ) {
-                            errorRef.set(exportException)
-                            latch.countDown()
-                        }
-                    },
-                )
-                .build()
-            transformer.start(editedMediaItem, outputFile.absolutePath)
-            if (!latch.await(45, TimeUnit.SECONDS)) {
-                transformer.cancel()
-                throw IllegalStateException("Live Photo video mirror transform timed out")
+                            override fun onError(
+                                composition: Composition,
+                                exportResult: ExportResult,
+                                exportException: ExportException,
+                            ) {
+                                errorRef.set(exportException)
+                                cleanupTempFiles()
+                                completionLatch.countDown()
+                            }
+                        },
+                    )
+                    .build()
+                transformer.start(editedMediaItem, outputFile.absolutePath)
+            } catch (error: Exception) {
+                errorRef.set(error)
+                cleanupTempFiles()
+                completionLatch.countDown()
             }
-            errorRef.get()?.let { throw it }
-            val mirrored = outputFile.readBytes()
-            if (!looksLikeMp4(mirrored) || mirrored.isEmpty()) {
-                throw IllegalStateException("Live Photo video mirror transform failed")
-            }
-            mirrored
-        } catch (_: Exception) {
-            applyHorizontalMirrorDisplayMatrix(videoBytes)
-        } finally {
-            inputFile.delete()
-            outputFile.delete()
         }
+        if (!completionLatch.await(120, TimeUnit.SECONDS)) {
+            throw IllegalStateException("Live Photo video mirror transform timed out")
+        }
+        errorRef.get()?.let { throw it }
+        return resultRef.get()
+            ?: throw IllegalStateException("Live Photo video mirror transform failed")
+    }
+
+    private object TransformerWorker {
+        private val thread = HandlerThread("MotionPhotoTransformer").apply { start() }
+        val looper: Looper = thread.looper
+        val handler = Handler(looper)
     }
 
     private fun normalizeMp4Payload(bytes: ByteArray): ByteArray {
@@ -256,7 +391,6 @@ object MotionPhotoVideoPreparer {
             val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
             for (sourceIndex in embedTrackOrder) {
                 extractor.selectTrack(sourceIndex)
-                extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                 while (true) {
                     buffer.clear()
                     val sampleSize = extractor.readSampleData(buffer, 0)

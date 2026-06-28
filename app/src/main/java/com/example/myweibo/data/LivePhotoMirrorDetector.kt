@@ -3,38 +3,97 @@ package com.example.myweibo.data
 import android.graphics.Bitmap
 import android.media.MediaDataSource
 import android.media.MediaMetadataRetriever
-
+import android.webkit.CookieManager
+import java.io.File
 /**
  * Compares a Live Photo still frame with a reference video frame to decide whether
  * the video needs a horizontal mirror to match the cover image.
  */
 object LivePhotoMirrorDetector {
-    private const val MIRROR_CONFIDENCE_RATIO = 0.9f
+    private const val MIRROR_CONFIDENCE_RATIO = 0.78f
+    private const val MIN_MIRROR_ERROR_IMPROVEMENT = 900f
+    private const val USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-    fun shouldMirrorVideoToMatchStill(still: Bitmap, videoBytes: ByteArray): Boolean {
-        val referenceFrame = loadReferenceFrame(videoBytes) ?: return false
+    fun shouldMirrorVideoToMatchStill(
+        still: Bitmap,
+        videoBytes: ByteArray,
+        videoUrl: String,
+    ): Boolean {
+        val referenceFrame = loadReferenceFrame(videoBytes, videoUrl) ?: return false
         return shouldMirrorVideoToMatchStill(still, referenceFrame)
     }
 
+    fun shouldMirrorVideoToMatchStill(still: Bitmap, videoBytes: ByteArray): Boolean {
+        val referenceFrame = loadReferenceFrameFromBytes(videoBytes) ?: return false
+        return shouldMirrorVideoToMatchStill(still, referenceFrame)
+    }
     fun shouldMirrorVideoToMatchStill(still: Bitmap, referenceFrame: Bitmap): Boolean {
         val normalError = normalizedFrameError(still, referenceFrame, mirrorStill = false)
         val mirroredError = normalizedFrameError(still, referenceFrame, mirrorStill = true)
-        return mirroredError < normalError * MIRROR_CONFIDENCE_RATIO
+        return mirroredError < normalError * MIRROR_CONFIDENCE_RATIO &&
+            normalError - mirroredError > MIN_MIRROR_ERROR_IMPROVEMENT
     }
 
-    fun loadReferenceFrame(videoBytes: ByteArray): Bitmap? =
+    fun loadReferenceFrame(
+        videoBytes: ByteArray,
+        videoUrl: String,
+    ): Bitmap? {
+        if (videoUrl.isNotBlank()) {
+            loadReferenceFrameFromUrl(videoUrl)?.let { return it }
+        }
+        return loadReferenceFrameFromBytes(videoBytes)
+    }
+
+    fun loadReferenceFrameFromBytes(videoBytes: ByteArray): Bitmap? =
         runCatching {
             MediaMetadataRetriever().use { retriever ->
                 retriever.setDataSource(ByteArrayMediaDataSource(videoBytes))
-                livePhotoReferenceFrameTimesUs(retriever)
-                    .firstNotNullOfOrNull { timeUs ->
-                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                            ?.takeIf(::hasUsableFrameSignal)
-                    }
-                    ?: retriever.frameAtTime?.takeIf(::hasUsableFrameSignal)
+                extractReferenceFrame(retriever)
             }
         }.getOrNull()
 
+    fun loadReferenceFrameFromUrl(videoUrl: String): Bitmap? {
+        val headers = livePhotoFrameHeaders()
+        for (candidate in MediaUrlResolver.livePhotoVideoCandidates(videoUrl)) {
+            val frame = runCatching {
+                MediaMetadataRetriever().use { retriever ->
+                    retriever.setDataSource(candidate, headers)
+                    extractReferenceFrame(retriever)
+                }
+            }.getOrNull()
+            if (frame != null) return frame
+        }
+        return null
+    }
+
+    fun loadReferenceFrameFromFile(file: File): Bitmap? =
+        runCatching {
+            MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(file.absolutePath)
+                extractReferenceFrame(retriever)
+            }
+        }.getOrNull()
+
+    private fun extractReferenceFrame(retriever: MediaMetadataRetriever): Bitmap? =
+        livePhotoReferenceFrameTimesUs(retriever)
+            .firstNotNullOfOrNull { timeUs ->
+                retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?.takeIf(::hasUsableFrameSignal)
+            }
+            ?: retriever.frameAtTime?.takeIf(::hasUsableFrameSignal)
+
+    private fun livePhotoFrameHeaders(): Map<String, String> {
+        val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
+        return buildMap {
+            put("User-Agent", USER_AGENT)
+            put("Referer", "https://weibo.com/")
+            if (cookie.isNotBlank()) put("Cookie", cookie)
+        }
+    }
+
+    fun loadReferenceFrame(videoBytes: ByteArray): Bitmap? = loadReferenceFrameFromBytes(videoBytes)
     private fun livePhotoReferenceFrameTimesUs(retriever: MediaMetadataRetriever): List<Long> {
         val durationMs = retriever
             .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)

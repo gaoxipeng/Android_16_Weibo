@@ -24,12 +24,20 @@ object LivePhotoMotionPhotoAssembler {
         val videoBytes = downloadVideoBytes(videoUrl)
         val stillBitmap = decodeStillBitmap(imageBytes)
             ?: throw IllegalStateException("Live Photo still image decode failed")
-        val mirrorVideo = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(stillBitmap, videoBytes)
+        val mirrorVideo = resolveMirrorVideo(image, stillBitmap, videoBytes, videoUrl)
         val preparedVideo = MotionPhotoVideoPreparer.prepareForMotionPhoto(
             context = context,
             sourceBytes = videoBytes,
             mirror = mirrorVideo,
         )
+        if (mirrorVideo) {
+            val referenceFrame = LivePhotoMirrorDetector.loadReferenceFrameFromBytes(preparedVideo)
+            if (referenceFrame != null &&
+                LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(stillBitmap, referenceFrame)
+            ) {
+                throw IllegalStateException("Live Photo video mirror verification failed")
+            }
+        }
         if (preparedVideo.isEmpty()) {
             throw IllegalStateException("Live Photo video is empty")
         }
@@ -39,20 +47,11 @@ object LivePhotoMotionPhotoAssembler {
             context,
             preparedVideo,
         )
-        val motionBytes = runCatching {
-            MotionPhotoMuxer.buildMotionPhoto(
-                context = context,
-                jpegBytes = jpegBytes,
-                videoBytes = preparedVideo,
-                presentationTimestampUs = presentationTimestampUs,
-            )
-        }.getOrElse {
-            MotionPhotoWriter.buildMotionPhoto(
-                jpegBytes = jpegBytes,
-                videoBytes = preparedVideo,
-                presentationTimestampUs = presentationTimestampUs,
-            )
-        }
+        val motionBytes = MotionPhotoWriter.buildMotionPhoto(
+            jpegBytes = jpegBytes,
+            videoBytes = preparedVideo,
+            presentationTimestampUs = presentationTimestampUs,
+        )
         val videoLength = MotionPhotoValidator.embeddedVideoLength(motionBytes) ?: preparedVideo.size
         AssembledMotionPhoto(
             bytes = motionBytes,
@@ -65,6 +64,24 @@ object LivePhotoMotionPhotoAssembler {
         val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
             .format(java.util.Date())
         return "MVIMG_${timestamp}${uniqueSuffix}_MP.jpg"
+    }
+
+    private fun resolveMirrorVideo(
+        image: FeedImage,
+        stillBitmap: Bitmap,
+        videoBytes: ByteArray,
+        videoUrl: String,
+    ): Boolean {
+        LivePhotoMirrorCorrectionStore.getMirrorVideo(image)?.let { cached ->
+            if (!cached) return false
+        }
+        val detected = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(
+            stillBitmap,
+            videoBytes,
+            videoUrl,
+        )
+        LivePhotoMirrorCorrectionStore.putMirrorVideo(image, detected)
+        return detected
     }
 
     private fun decodeStillBitmap(imageBytes: ByteArray): Bitmap? =

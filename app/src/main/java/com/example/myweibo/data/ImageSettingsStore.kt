@@ -40,11 +40,7 @@ enum class FeedThumbnailQuality(
 
 private fun String.withSinaimgVariant(variant: String?): String {
     if (variant.isNullOrBlank()) return this
-    if (!contains("sinaimg.cn", ignoreCase = true)) return this
-    return replace(
-        Regex("""/(?:large|mw2000|woriginal|original|bmiddle|orj360|orj480|mw690|mw1024|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE),
-        "/$variant/",
-    )
+    return ImageUrlResolver.withSinaimgVariant(this, variant)
 }
 
 class ImageSettingsStore(context: Context) {
