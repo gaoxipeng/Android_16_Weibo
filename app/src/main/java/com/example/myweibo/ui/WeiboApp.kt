@@ -4529,6 +4529,7 @@ fun WeiboApp() {
         videoPeekController.pendingDismiss,
         videoPlaybackCoordinator.pendingPeekHandoffKey,
         videoPlaybackCoordinator.activeKey,
+        videoPlaybackCoordinator.peekPlaybackKey,
     ) {
         val homeFeedOnTop = selectedTab == MainTab.Feed &&
             visitedUserId == null &&
@@ -4537,8 +4538,7 @@ fun WeiboApp() {
             articleOverlay == null &&
             followListOverlay == null &&
             albumViewerState == null
-        val keepFloatingPeekPlayback = visitedUserId == null &&
-            videoPeekController.activeRequest != null &&
+        val keepFloatingPeekPlayback = videoPeekController.activeRequest != null &&
             videoPeekController.isFloating &&
             !videoPeekController.isFullscreenMode &&
             videoPeekController.pendingDismiss == null
@@ -4579,11 +4579,24 @@ fun WeiboApp() {
                         .map(::resolveFeedItem)
                         .flatMap(::feedItemInlinePlaybackKeys)
                         .toSet()
+                    fun keyBelongsToProfile(key: String): Boolean =
+                        profilePlaybackKeys.any { candidate ->
+                            videoPlaybackCoordinator.matchesPlaybackKey(candidate, key)
+                        }
+                    val peekKey = videoPlaybackCoordinator.peekPlaybackKey
+                    val peekActiveOnProfile = peekKey != null &&
+                        keyBelongsToProfile(peekKey) &&
+                        videoPeekController.activeRequest != null &&
+                        videoPeekController.pendingDismiss == null
+                    if (peekActiveOnProfile) {
+                        videoPlaybackCoordinator.pauseInlineOnly(exceptKey = peekKey)
+                        return@LaunchedEffect
+                    }
                     val currentKey = videoPlaybackCoordinator.activeKey
                     val preserveKey = currentKey?.takeIf { it in profilePlaybackKeys }
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
                     videoPlaybackCoordinator.activeKey = preserveKey
-                    if (preserveKey == null) {
+                    if (preserveKey == null && peekKey == null) {
                         currentKey?.let(videoPlaybackCoordinator::cancelPeekHandoff)
                         if (videoPeekController.activeRequest != null) {
                             videoPeekController.cancel()
