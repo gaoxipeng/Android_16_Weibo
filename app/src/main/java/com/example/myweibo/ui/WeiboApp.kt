@@ -10831,9 +10831,6 @@ private fun WeiboVideoSurface(
                 inlinePlayer = adopted
                 inlineWaitingForHandoff = false
                 videoCoordinator.requestInlinePlayback(playbackKey)
-                if (isDetailInlinePlayback) {
-                    videoCoordinator.finishDetailHandoff(playbackKey)
-                }
                 return@LaunchedEffect
             }
 
@@ -10854,9 +10851,6 @@ private fun WeiboVideoSurface(
                         inlinePlayer = adopted
                         inlineWaitingForHandoff = false
                         videoCoordinator.requestInlinePlayback(playbackKey)
-                        if (isDetailInlinePlayback) {
-                            videoCoordinator.finishDetailHandoff(playbackKey)
-                        }
                         return@LaunchedEffect
                     }
                     delay(16)
@@ -10876,7 +10870,6 @@ private fun WeiboVideoSurface(
             videoCoordinator.registerSharedPlayer(playbackKey, resolved)
             if (isDetailInlinePlayback) {
                 videoCoordinator.requestInlinePlayback(playbackKey)
-                videoCoordinator.finishDetailHandoff(playbackKey)
             }
         }
     }
@@ -10988,9 +10981,7 @@ private fun WeiboVideoSurface(
         if (!videoCoordinator.isPlaybackKeyActive(playbackKey)) return
         if (resumeAfterSurfaceAttach) return
         configureExistingPlayer(target)
-        if (isDetailInlinePlayback) {
-            videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
-        } else {
+        if (!isDetailInlinePlayback) {
             videoCoordinator.clearInlineHandoffResume(playbackKey)
         }
     }
@@ -11049,9 +11040,6 @@ private fun WeiboVideoSurface(
             }
             target.playWhenReady = true
             target.play()
-            if (pendingDetailHandoffResume) {
-                videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
-            }
             resumeAfterSurfaceAttach = false
         }
         if (view.isAttachedToWindow) {
@@ -11293,6 +11281,9 @@ private fun WeiboVideoSurface(
                 !resumeAfterSurfaceAttach
             ) {
                 resumeInlineHandoffPlaybackIfNeeded(player)
+                if (isDetailInlinePlayback) {
+                    videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
+                }
             }
             return@LaunchedEffect
         }
@@ -11355,8 +11346,14 @@ private fun WeiboVideoSurface(
     val peekFingerDragState = rememberUpdatedState(onPeekFingerDragOffset)
     val peekFingerDragResetState = rememberUpdatedState(onPeekFingerDragReset)
 
-    LaunchedEffect(player, videoFrameReady, playbackKey, videoCoordinator.activeKey, resumeAfterSurfaceAttach) {
+    LaunchedEffect(player, videoFrameReady, playbackKey, videoCoordinator.activeKey, resumeAfterSurfaceAttach, isViewportVisible) {
         if (!videoFrameReady || resumeAfterSurfaceAttach) return@LaunchedEffect
+        if (isDetailInlinePlayback &&
+            videoCoordinator.shouldResumeInlineHandoff(playbackKey) &&
+            !isViewportVisible
+        ) {
+            return@LaunchedEffect
+        }
         resumeInlineHandoffPlaybackIfNeeded(player)
     }
 
