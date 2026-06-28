@@ -40,14 +40,40 @@ object MotionPhotoVideoPreparer {
     fun prepare(
         context: Context,
         sourceBytes: ByteArray,
+    ): ByteArray = prepareForMotionPhoto(
+        context = context,
+        sourceBytes = sourceBytes,
+        mirror = false,
+    )
+
+    fun prepareForMotionPhoto(
+        context: Context,
+        sourceBytes: ByteArray,
+        mirror: Boolean,
     ): ByteArray {
         val normalized = normalizeMp4Payload(sourceBytes)
         if (!looksLikeMp4(normalized)) {
             throw IllegalStateException("Live Photo 视频格式无效")
         }
+        val oriented = if (mirror) {
+            mirrorVideoPixelsHorizontally(context, normalized)
+        } else {
+            normalized
+        }
         return runCatching {
-            remuxMp4(context, normalized)
-        }.getOrElse { normalized }
+            remuxMp4(context, oriented)
+        }.getOrElse { oriented }
+    }
+
+    fun extractMotionPhotoPresentationTimestampUs(
+        context: Context,
+        videoBytes: ByteArray,
+    ): Long {
+        val firstVideoUs = extractPresentationTimestampUs(context, videoBytes)
+        if (firstVideoUs > 0L) return firstVideoUs
+        val durationUs = extractDurationUs(context, videoBytes)
+        if (durationUs > 0L) return durationUs / 2L
+        return 500_000L
     }
 
     fun applyHorizontalMirrorDisplayMatrix(videoBytes: ByteArray): ByteArray {
@@ -184,6 +210,26 @@ object MotionPhotoVideoPreparer {
         }
     }
 
+    private fun extractDurationUs(context: Context, videoBytes: ByteArray): Long {
+        if (videoBytes.isEmpty()) return 0L
+        val inputFile = File.createTempFile("motion_dur_", ".mp4", context.cacheDir)
+        return try {
+            inputFile.writeBytes(videoBytes)
+            MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(inputFile.absolutePath)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.takeIf { it > 0L }
+                    ?.times(1_000L)
+                    ?: 0L
+            }
+        } catch (_: Exception) {
+            0L
+        } finally {
+            inputFile.delete()
+        }
+    }
+
     private fun remuxMp4(context: Context, inputBytes: ByteArray): ByteArray {
         val inputFile = File.createTempFile("motion_in_", ".mp4", context.cacheDir)
         val outputFile = File.createTempFile("motion_out_", ".mp4", context.cacheDir)
@@ -195,30 +241,50 @@ object MotionPhotoVideoPreparer {
             if (extractor.trackCount <= 0) {
                 throw IllegalStateException("Live Photo 视频无可用轨道")
             }
+            val embedTrackOrder = buildMotionPhotoEmbedTrackOrder(extractor)
+            if (embedTrackOrder.isEmpty()) {
+                throw IllegalStateException("Live Photo 视频无可用画面轨道")
+            }
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             readVideoRotationDegrees(inputFile)?.let(muxer::setOrientationHint)
-            val trackIndexMap = IntArray(extractor.trackCount)
-            for (trackIndex in 0 until extractor.trackCount) {
-                trackIndexMap[trackIndex] = muxer.addTrack(extractor.getTrackFormat(trackIndex))
+            val sourceToMuxer = IntArray(extractor.trackCount) { -1 }
+            embedTrackOrder.forEach { sourceIndex ->
+                sourceToMuxer[sourceIndex] = muxer.addTrack(extractor.getTrackFormat(sourceIndex))
             }
             muxer.start()
+            val samples = ArrayList<MuxSample>()
             val buffer = ByteBuffer.allocate(2 * 1024 * 1024)
-            val bufferInfo = MediaCodec.BufferInfo()
-            for (trackIndex in 0 until extractor.trackCount) {
-                extractor.selectTrack(trackIndex)
+            for (sourceIndex in embedTrackOrder) {
+                extractor.selectTrack(sourceIndex)
                 extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
                 while (true) {
                     buffer.clear()
                     val sampleSize = extractor.readSampleData(buffer, 0)
                     if (sampleSize < 0) break
-                    bufferInfo.offset = 0
-                    bufferInfo.size = sampleSize
-                    bufferInfo.presentationTimeUs = extractor.sampleTime
-                    bufferInfo.flags = extractor.sampleFlags
-                    muxer.writeSampleData(trackIndexMap[trackIndex], buffer, bufferInfo)
+                    val sampleBuffer = ByteBuffer.allocate(sampleSize)
+                    buffer.position(0)
+                    buffer.limit(sampleSize)
+                    sampleBuffer.put(buffer)
+                    sampleBuffer.flip()
+                    samples.add(
+                        MuxSample(
+                            muxerTrackIndex = sourceToMuxer[sourceIndex],
+                            buffer = sampleBuffer,
+                            info = MediaCodec.BufferInfo().apply {
+                                offset = 0
+                                size = sampleSize
+                                presentationTimeUs = extractor.sampleTime
+                                flags = extractor.sampleFlags
+                            },
+                        ),
+                    )
                     if (!extractor.advance()) break
                 }
-                extractor.unselectTrack(trackIndex)
+                extractor.unselectTrack(sourceIndex)
+            }
+            samples.sortWith(compareBy({ it.info.presentationTimeUs }, { it.muxerTrackIndex }))
+            samples.forEach { sample ->
+                muxer.writeSampleData(sample.muxerTrackIndex, sample.buffer, sample.info)
             }
             muxer.stop()
             val remuxed = outputFile.readBytes()
@@ -233,6 +299,29 @@ object MotionPhotoVideoPreparer {
             outputFile.delete()
         }
     }
+
+    private fun buildMotionPhotoEmbedTrackOrder(extractor: MediaExtractor): List<Int> {
+        val videoTracks = mutableListOf<Int>()
+        val audioTracks = mutableListOf<Int>()
+        for (trackIndex in 0 until extractor.trackCount) {
+            val mime = extractor.getTrackFormat(trackIndex).getString(MediaFormat.KEY_MIME).orEmpty()
+            when {
+                mime.startsWith("video/") -> videoTracks.add(trackIndex)
+                mime.startsWith("audio/") -> audioTracks.add(trackIndex)
+            }
+        }
+        if (videoTracks.isEmpty()) return emptyList()
+        return buildList {
+            add(videoTracks.first())
+            audioTracks.firstOrNull()?.let(::add)
+        }
+    }
+
+    private data class MuxSample(
+        val muxerTrackIndex: Int,
+        val buffer: ByteBuffer,
+        val info: MediaCodec.BufferInfo,
+    )
 
     private fun readVideoRotationDegrees(file: File): Int? =
         runCatching {

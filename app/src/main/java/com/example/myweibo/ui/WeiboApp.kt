@@ -291,6 +291,8 @@ import com.example.myweibo.data.extractActiveMentionQuery
 import com.example.myweibo.data.filterMentionCandidatesByQuery
 import com.example.myweibo.data.mentionCandidateKey
 import com.example.myweibo.data.ImageSaveHelper
+import com.example.myweibo.data.LivePhotoMirrorDetector
+import com.example.myweibo.data.ImageUrlResolver
 import com.example.myweibo.data.BitmapExifOrientation
 import com.example.myweibo.data.buildSaveMetadata
 import com.example.myweibo.data.resolveForSave
@@ -301,13 +303,13 @@ import com.example.myweibo.data.toRelationUser
 import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.isSavableToAlbum
-import com.example.myweibo.data.shouldOfferSaveAll
 import com.example.myweibo.data.toAlbumFeedMedia
 import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.FeedUrlEntity
 import com.example.myweibo.data.LikeUsersPage
 import com.example.myweibo.data.ProfileLookup
 import com.example.myweibo.data.FeedMedia
+import com.example.myweibo.data.MediaUrlResolver
 import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
 import com.example.myweibo.data.FeedThumbnailQuality
@@ -914,13 +916,19 @@ private val VideoFullscreenTopControlRowSpacing = 8.dp
 private val VideoFullscreenHorizontalControlInset = 16.dp
 private const val VideoMaxWidthFraction = 1f
 private const val AlbumGridMaxDecodeDim = 320
+private const val FullscreenDefaultMaxDecodeDim = 4096
+private const val FullscreenLongImageMaxDecodeDim = 8192
+private const val FullscreenLongImageOriginalMaxPixels = 32_000_000
+private const val FullscreenDefaultMaxZoomScale = 5f
+private const val FullscreenDynamicMaxZoomScale = 32f
+private const val FullscreenFillZoomHeadroom = 1.15f
 private const val AlbumBitmapCacheMaxBytes = 96 * 1024 * 1024
 private const val AlbumGridMaxReadBytes = 768 * 1024
 private const val AlbumGridPrefetchConcurrency = 8
 private const val AlbumGridPrefetchBatchSize = 48
 private const val FeedImageLoadConcurrency = 4
 private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
-private const val FullscreenBitmapCacheMaxBytes = 64 * 1024 * 1024
+private const val FullscreenBitmapCacheMaxBytes = 160 * 1024 * 1024
 
 private data class MorandiThemeColor(
     val storageValue: String,
@@ -1424,8 +1432,13 @@ private class ImageSaveHintController {
         context: Context,
         images: List<FeedImage>,
         status: FeedItem? = null,
+        includeVideos: Boolean = false,
     ): ImageSaveHelper.SaveAllImagesResult {
-        val videos = status?.medias?.filter { it.isSavableToAlbum() }.orEmpty()
+        val videos = if (includeVideos) {
+            status?.medias?.filter { it.isSavableToAlbum() }.orEmpty()
+        } else {
+            emptyList()
+        }
         val total = images.size + videos.size
         if (total == 0) {
             showFailure("没有可保存的内容")
@@ -1775,77 +1788,50 @@ private class FeedImageUpgradeNotifier {
 }
 
 private fun feedImageUrlCandidates(image: FeedImage): List<String> =
-    (listOf(image.thumbnailUrl, downgradeSinaimgForFeed(image.largeUrl, "mw690")) +
-        image.downloadUrls.map { downgradeSinaimgForFeed(it, "mw690") })
-        .filter { it.isNotBlank() }
-        .distinct()
+    ImageUrlResolver.feedBitmapCandidates(image)
 
 private fun feedImageCacheCandidates(
     image: FeedImage,
     quality: FeedThumbnailQuality,
 ): List<String> =
-    listOfNotNull(
-        quality.displayUrl(image).takeIf { it.isNotBlank() },
-        quality.fallbackUrl(image),
-    ).distinct()
+    ImageUrlResolver.feedDisplayCandidates(image, quality)
 
-private fun downgradeSinaimgForFeed(url: String, variant: String): String {
-    if (url.isBlank()) return url
-    if (!url.contains("sinaimg.cn", ignoreCase = true)) return url
-    return url.replace(
-        Regex("""/(?:large|mw2000|woriginal|original|bmiddle|orj360|orj480|mw690|mw1024|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE),
-        "/$variant/",
-    )
-}
-
-private val LowQualityImageUrlPattern =
-    Regex("""/(?:orj360|orj480|bmiddle|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE)
-
-private fun fullscreenImageUrlCandidates(image: FeedImage): List<String> {
-    val highQuality = (image.downloadUrls + listOf(image.largeUrl))
-        .filter { it.isNotBlank() }
-        .distinct()
-        .filterNot { LowQualityImageUrlPattern.containsMatchIn(it) }
-    if (highQuality.isNotEmpty()) return highQuality
-    return listOfNotNull(
-        image.largeUrl.takeIf { it.isNotBlank() },
-        image.thumbnailUrl.takeIf { it.isNotBlank() },
-    ).distinct()
-}
+private fun fullscreenImageUrlCandidates(image: FeedImage): List<String> =
+    ImageUrlResolver.fullscreenCandidates(image)
 
 private fun Bitmap.isFullscreenQuality(image: FeedImage): Boolean {
     val maxDim = maxOf(width, height)
-    if (maxDim >= 960) return true
     val expectedWidth = image.width ?: 0
     val expectedHeight = image.height ?: 0
+    val decodeDim = fullscreenDecodeDim(image)
     if (expectedWidth > 0 && expectedHeight > 0) {
         val expectedMax = maxOf(expectedWidth, expectedHeight)
-        if (maxDim >= (expectedMax * 0.85f).roundToInt()) return true
+        val targetMax = min((expectedMax * 0.85f).roundToInt(), decodeDim)
+        return maxDim >= targetMax
     }
-    return maxDim >= 640
+    return maxDim >= (decodeDim * 0.75f).roundToInt()
 }
 
-private fun downgradeSinaimgForAlbumGrid(url: String): String {
-    if (!url.contains("sinaimg.cn", ignoreCase = true)) return url
-    return url.replace(
-        Regex("""/(?:large|mw2000|woriginal|original|bmiddle)/""", RegexOption.IGNORE_CASE),
-        "/orj360/",
-    )
-}
-
-private fun albumGridUrlCandidates(image: FeedImage): List<String> = buildList {
-    image.thumbnailUrl.takeIf { it.isNotBlank() }
-        ?.let(::downgradeSinaimgForAlbumGrid)
-        ?.let(::add)
-    image.largeUrl.takeIf { it.isNotBlank() }
-        ?.let(::downgradeSinaimgForAlbumGrid)
-        ?.let(::add)
-    image.downloadUrls.forEach { url ->
-        if (url.isNotBlank()) {
-            add(downgradeSinaimgForAlbumGrid(url))
+private fun fullscreenDecodeDim(image: FeedImage): Int {
+    val width = image.width ?: 0
+    val height = image.height ?: 0
+    if (width <= 0 || height <= 0) return FullscreenDefaultMaxDecodeDim
+    val longSide = maxOf(width, height)
+    val shortSide = min(width, height).coerceAtLeast(1)
+    return if (longSide.toFloat() / shortSide.toFloat() >= 3f) {
+        val pixelCount = width.toLong() * height.toLong()
+        if (pixelCount <= FullscreenLongImageOriginalMaxPixels) {
+            longSide
+        } else {
+            FullscreenLongImageMaxDecodeDim
         }
+    } else {
+        FullscreenDefaultMaxDecodeDim
     }
-}.distinct()
+}
+
+private fun albumGridUrlCandidates(image: FeedImage): List<String> =
+    ImageUrlResolver.albumGridCandidates(image)
 
 private suspend fun loadAlbumGridBitmap(
     image: FeedImage,
@@ -1899,7 +1885,8 @@ private suspend fun prefetchAlbumGridThumbnails(images: List<FeedImage>) {
 private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
     maxDecodeDim <= AlbumGridMaxDecodeDim -> 4 * 1024 * 1024
     maxDecodeDim <= 960 -> 4 * 1024 * 1024
-    else -> 12 * 1024 * 1024
+    maxDecodeDim <= FullscreenDefaultMaxDecodeDim -> 16 * 1024 * 1024
+    else -> 48 * 1024 * 1024
 }
 
 private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? =
@@ -1982,9 +1969,7 @@ private suspend fun detectLivePhotoMirrorCorrection(
     val still = stillBitmap?.takeIfDrawable() ?: loadLivePhotoStillForMirrorDetection(image) ?: return LivePhotoMirrorCorrection.None
     val frame = loadLivePhotoReferenceFrame(context, image.livePhotoVideoUrl.orEmpty())
         ?: return LivePhotoMirrorCorrection.None
-    val normalError = normalizedFrameError(still, frame, mirrorStill = false)
-    val mirroredError = normalizedFrameError(still, frame, mirrorStill = true)
-    return if (mirroredError < normalError * 0.9f) {
+    return if (LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(still, frame)) {
         LivePhotoMirrorCorrection.MirrorVideo
     } else {
         LivePhotoMirrorCorrection.None
@@ -1993,10 +1978,7 @@ private suspend fun detectLivePhotoMirrorCorrection(
 
 private suspend fun loadLivePhotoStillForMirrorDetection(image: FeedImage): Bitmap? {
     resolveFullscreenPreviewBitmap(image)?.takeIfDrawable()?.let { return it }
-    val candidates = listOfNotNull(
-        image.largeUrl.takeIf { it.isNotBlank() },
-        image.thumbnailUrl.takeIf { it.isNotBlank() },
-    ).distinct()
+    val candidates = ImageUrlResolver.livePhotoStillCandidates(image)
     for (url in candidates) {
         runCatching {
             loadRemoteBitmap(
@@ -2075,40 +2057,10 @@ private fun hasUsableFrameSignal(bitmap: Bitmap): Boolean {
     return maxLuma - minLuma > 12
 }
 
-private fun normalizedFrameError(
-    still: Bitmap,
-    frame: Bitmap,
-    mirrorStill: Boolean,
-): Float {
-    val sampleCount = 40
-    var error = 0L
-    for (yIndex in 0 until sampleCount) {
-        val stillY = normalizedSampleCoordinate(yIndex, sampleCount, still.height)
-        val frameY = normalizedSampleCoordinate(yIndex, sampleCount, frame.height)
-        for (xIndex in 0 until sampleCount) {
-            val stillX = normalizedSampleCoordinate(
-                if (mirrorStill) sampleCount - 1 - xIndex else xIndex,
-                sampleCount,
-                still.width,
-            )
-            val frameX = normalizedSampleCoordinate(xIndex, sampleCount, frame.width)
-            error += colorDistance(still.getPixel(stillX, stillY), frame.getPixel(frameX, frameY))
-        }
-    }
-    return error.toFloat() / (sampleCount * sampleCount)
-}
-
 private fun normalizedSampleCoordinate(index: Int, sampleCount: Int, size: Int): Int {
     if (size <= 1 || sampleCount <= 1) return 0
     return ((index.toFloat() / (sampleCount - 1).toFloat()) * (size - 1)).roundToInt()
         .coerceIn(0, size - 1)
-}
-
-private fun colorDistance(a: Int, b: Int): Int {
-    val dr = ((a shr 16) and 0xff) - ((b shr 16) and 0xff)
-    val dg = ((a shr 8) and 0xff) - ((b shr 8) and 0xff)
-    val db = (a and 0xff) - (b and 0xff)
-    return dr * dr + dg * dg + db * db
 }
 
 private fun Int.pixelLuma(): Int {
@@ -6970,7 +6922,7 @@ private fun ImageActionOverlay(
     val resolvedImages = remember(images, statusItem) {
         images.map { it.resolveForSave(statusItem, images) }
     }
-    val showSaveAll = statusItem?.shouldOfferSaveAll(images) ?: (images.size > 1)
+    val showSaveAll = images.size > 1
     val safeInitialIndex = initialImageIndex.coerceIn(0, images.lastIndex)
     val pagerState = rememberPagerState(initialPage = safeInitialIndex) { images.size }
     val pagerFlingBehavior = PagerDefaults.flingBehavior(
@@ -9012,9 +8964,18 @@ private fun ZoomableFullscreenImage(
         val imageAspect = remember(loadedBitmap.width, loadedBitmap.height) {
             loadedBitmap.width.toFloat() / loadedBitmap.height.coerceAtLeast(1).toFloat()
         }
-        val fillScreenScale = remember(containerAspect, imageAspect) {
+        val rawFillScreenScale = remember(containerAspect, imageAspect) {
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
-                .coerceIn(1.35f, 5f)
+                .coerceAtLeast(1f)
+        }
+        val maxZoomScale = remember(rawFillScreenScale) {
+            maxOf(
+                FullscreenDefaultMaxZoomScale,
+                rawFillScreenScale * FullscreenFillZoomHeadroom,
+            ).coerceAtMost(FullscreenDynamicMaxZoomScale)
+        }
+        val fillScreenScale = remember(rawFillScreenScale, maxZoomScale) {
+            rawFillScreenScale.coerceIn(1.35f, maxZoomScale)
         }
         val latestScaleState = rememberUpdatedState(scale)
         val latestPanOffsetXState = rememberUpdatedState(panOffsetX)
@@ -9078,15 +9039,17 @@ private fun ZoomableFullscreenImage(
         }
 
         val pageMenuBackdrop = rememberLayerBackdrop()
+        Box(Modifier.fillMaxSize()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .layerBackdrop(pageMenuBackdrop)
+                    .background(Color.Black),
+            ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .layerBackdrop(pageMenuBackdrop),
-        ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(image.largeUrl, containerWidthPx, containerHeightPx, imageAspect) {
+                .pointerInput(image.largeUrl, containerWidthPx, containerHeightPx, imageAspect, maxZoomScale) {
                     awaitEachGesture {
                         var velocityTracker = VelocityTracker()
                         val touchSlop = viewConfiguration.touchSlop
@@ -9126,7 +9089,7 @@ private fun ZoomableFullscreenImage(
                                 val distance = hypot(first.x - second.x, first.y - second.y)
                                 if (lastDistance > 0f) {
                                     val oldScale = gestureScale.coerceAtLeast(0.01f)
-                                    val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, 5f)
+                                    val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, maxZoomScale)
                                     gesturePanOffsetX = centroid.x - boxCenterX -
                                         (centroid.x - boxCenterX - gesturePanOffsetX) * (newScale / oldScale)
                                     gesturePanOffsetY = centroid.y - boxCenterY -
@@ -9478,6 +9441,7 @@ private fun ZoomableFullscreenImage(
             }
         }
         }
+        }
 
         actionMenuOffset?.let { offset ->
             FullscreenImageActionMenu(
@@ -9519,7 +9483,7 @@ private fun BoxScope.FullscreenImageActionMenu(
     val density = LocalDensity.current
     var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
-    val showSaveAll = statusItem?.shouldOfferSaveAll(images) ?: (images.size > 1)
+    val showSaveAll = images.size > 1
     val menuWidth = ActionMenuWidth
     val estimatedMenuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
     val margin = 14.dp
@@ -9621,7 +9585,7 @@ private fun LivePhotoOverlay(
     val playbackKey = remember(image.id, image.largeUrl, videoUrl) {
         "${image.id}:$videoUrl"
     }
-    val mirrorCorrection = rememberLivePhotoMirrorCorrection(image, stillBitmap)
+    val mirrorMode = rememberLivePhotoMirrorCorrection(image, stillBitmap)
     var videoVisible by remember(playbackKey) { mutableStateOf(false) }
     val player = remember(playbackKey) {
         androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
@@ -9675,7 +9639,7 @@ private fun LivePhotoOverlay(
 
     AndroidView(
         modifier = modifier.graphicsLayer {
-            scaleX = if (mirrorCorrection == LivePhotoMirrorCorrection.MirrorVideo) -1f else 1f
+            scaleX = if (mirrorMode == LivePhotoMirrorCorrection.MirrorVideo) -1f else 1f
             alpha = if (videoVisible) 1f else 0f
         },
         factory = { ctx ->
@@ -10191,6 +10155,7 @@ private fun WeiboVideoSurface(
     }
     var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
     var isScrubbing by remember(videoUrl) { mutableStateOf(false) }
+    var isProgressBarScrubbing by remember(videoUrl) { mutableStateOf(false) }
     var downloading by remember(videoUrl) { mutableStateOf(false) }
     var aspectRatio by remember(videoUrl) {
         mutableFloatStateOf(feedVideoDisplayAspectRatio(media))
@@ -10242,8 +10207,12 @@ private fun WeiboVideoSurface(
         }
     }
 
-    LaunchedEffect(isPlaying, isBuffering, playbackError, controlsHideSignal) {
+    LaunchedEffect(isPlaying, isBuffering, playbackError, controlsHideSignal, isProgressBarScrubbing) {
         if (!isPlaying || isBuffering || playbackError != null) {
+            controlsVisible = true
+            return@LaunchedEffect
+        }
+        if (isProgressBarScrubbing) {
             controlsVisible = true
             return@LaunchedEffect
         }
@@ -10597,14 +10566,34 @@ private fun WeiboVideoSurface(
             .background(Color.Black)
             .clipToBounds()
             .then(
-                if (controlsEnabled && !hideProgressControls) {
-                    Modifier.pointerInput(
-                        durationState,
-                        hideProgressControls,
-                        onPeekVerticalDismiss,
-                        isFullscreen,
-                        isPeekPlayback,
-                    ) {
+                if (trackViewportPause) {
+                    Modifier.onGloballyPositioned { coordinates ->
+                        val bounds = coordinates.boundsInWindow()
+                        val visibleTop = max(bounds.top, 0f)
+                        val visibleBottom = min(bounds.bottom, screenHeightPx)
+                        val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
+                        val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
+                        isViewportVisible = fraction >= 0.35f
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        val videoControlBackdrop = rememberLayerBackdrop()
+        Box(
+            Modifier
+                .fillMaxSize()
+                .layerBackdrop(videoControlBackdrop)
+                .then(
+                    if (controlsEnabled && !hideProgressControls) {
+                        Modifier.pointerInput(
+                            durationState,
+                            hideProgressControls,
+                            onPeekVerticalDismiss,
+                            isFullscreen,
+                            isPeekPlayback,
+                        ) {
                         val peekDismissActive = onPeekVerticalDismiss != null
                         val peekDismissThreshold = if (peekDismissActive) 48f else 82f
                         val peekDismissReleaseThreshold = if (peekDismissActive) 28f else peekDismissThreshold
@@ -10727,27 +10716,7 @@ private fun WeiboVideoSurface(
                 } else {
                     Modifier
                 },
-            )
-            .then(
-                if (trackViewportPause) {
-                    Modifier.onGloballyPositioned { coordinates ->
-                        val bounds = coordinates.boundsInWindow()
-                        val visibleTop = max(bounds.top, 0f)
-                        val visibleBottom = min(bounds.bottom, screenHeightPx)
-                        val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
-                        val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
-                        isViewportVisible = fraction >= 0.35f
-                    }
-                } else {
-                    Modifier
-                },
-            ),
-    ) {
-        val videoControlBackdrop = rememberLayerBackdrop()
-        Box(
-            Modifier
-                .fillMaxSize()
-                .layerBackdrop(videoControlBackdrop),
+                ),
         ) {
         BoxWithConstraints(
             modifier = Modifier
@@ -11057,6 +11026,12 @@ private fun WeiboVideoSurface(
                     positionMs = target
                     player.seekTo(target)
                 },
+                onScrubbingChanged = { scrubbing ->
+                    isProgressBarScrubbing = scrubbing
+                    if (!scrubbing) {
+                        showControls()
+                    }
+                },
                 onSpeedClick = {
                     showControls()
                     selectedSpeed = when (selectedSpeed) {
@@ -11104,6 +11079,7 @@ private fun VideoControls(
     onSpeedClick: () -> Unit,
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
+    onScrubbingChanged: (Boolean) -> Unit = {},
 ) {
     val progress = if (durationMs > 0L) {
         (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
@@ -11114,15 +11090,17 @@ private fun VideoControls(
     val positionState by rememberUpdatedState(positionMs)
     val durationState by rememberUpdatedState(durationMs)
     val onSeekState by rememberUpdatedState(onSeek)
+    val onScrubbingChangedState by rememberUpdatedState(onScrubbingChanged)
 
     TransparentLiquidCapsule(
         modifier = modifier
             .pointerInput(durationState) {
                 val horizontalDominanceRatio = 1.15f
                 awaitEachGesture {
-                    isScrubbing = true
+                    var scrubbing = false
                     try {
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        down.consume()
                         val slop = viewConfiguration.touchSlop
                         val duration = durationState
                         val width = size.width.toFloat()
@@ -11130,7 +11108,6 @@ private fun VideoControls(
                         val anchorPosition = positionState
                         val anchorX = down.position.x
                         val anchorY = down.position.y
-                        var scrubbing = false
                         var lastSeekPosition = anchorPosition
                         while (true) {
                             val event = awaitPointerEvent()
@@ -11143,9 +11120,12 @@ private fun VideoControls(
                                 }
                                 if (dx > slop && dx > dy * horizontalDominanceRatio) {
                                     scrubbing = true
+                                    isScrubbing = true
+                                    onScrubbingChangedState(true)
                                 }
                             }
                             if (scrubbing && change.pressed) {
+                                change.consume()
                                 val deltaMs = ((change.position.x - anchorX) / width * duration).toLong()
                                 val newPosition = (anchorPosition + deltaMs).coerceIn(0L, duration)
                                 if (newPosition != lastSeekPosition) {
@@ -11156,7 +11136,10 @@ private fun VideoControls(
                             if (event.changes.all { it.changedToUpIgnoreConsumed() }) break
                         }
                     } finally {
-                        isScrubbing = false
+                        if (isScrubbing) {
+                            isScrubbing = false
+                            onScrubbingChangedState(false)
+                        }
                     }
                 }
             },
@@ -18895,7 +18878,6 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
                 readTimeoutMs = 8_000,
             )
         }.getOrNull()?.let { bitmap ->
-            FullscreenBitmapCache.put(url, bitmap)
             return bitmap
         }
     }
@@ -18904,6 +18886,7 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
 
 private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
     val candidates = fullscreenImageUrlCandidates(image)
+    val decodeDim = fullscreenDecodeDim(image)
     candidates.forEach { url ->
         FullscreenBitmapCache.get(url)?.takeIf { it.isFullscreenQuality(image) }?.let { return it }
     }
@@ -18913,9 +18896,9 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
                 url = url,
                 connectTimeoutMs = 10_000,
                 readTimeoutMs = 20_000,
-                maxReadBytes = remoteReadLimitForDecodeDim(4096),
+                maxReadBytes = remoteReadLimitForDecodeDim(decodeDim),
             )
-            decodeBitmapFromBytes(bytes, 4096)
+            decodeBitmapFromBytes(bytes, decodeDim)
         }.getOrNull()?.let { bitmap ->
             FullscreenBitmapCache.put(url, bitmap)
             return bitmap
@@ -18986,12 +18969,7 @@ private fun weiboDataSourceFactory(
 }
 
 private fun videoUrlCandidates(url: String): List<String> {
-    val trimmed = url.trim()
-    if (trimmed.isBlank()) return emptyList()
-    if (trimmed.startsWith("http://", ignoreCase = true)) {
-        return listOf(trimmed.replaceFirst("http://", "https://", ignoreCase = true), trimmed)
-    }
-    return listOf(trimmed)
+    return MediaUrlResolver.playbackUrlCandidates(url)
 }
 
 private fun formatVideoTime(ms: Long): String {
