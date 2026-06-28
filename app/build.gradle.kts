@@ -90,5 +90,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.10.0")
     implementation("androidx.media3:media3-ui:1.10.0")
     implementation("androidx.media3:media3-muxer:1.10.0")
+    implementation("androidx.media3:media3-transformer:1.10.0")
+    implementation("androidx.media3:media3-effect:1.10.0")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
 }
