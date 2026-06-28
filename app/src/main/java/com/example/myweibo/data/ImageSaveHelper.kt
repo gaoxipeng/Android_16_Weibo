@@ -15,10 +15,13 @@ import android.webkit.CookieManager
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -33,8 +36,17 @@ object ImageSaveHelper {
             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     private const val PER_IMAGE_SAVE_TIMEOUT_MS = 35_000L
     private const val LIVE_PHOTO_SAVE_TIMEOUT_MS = 55_000L
+    private const val BATCH_LIVE_PHOTO_SAVE_TIMEOUT_MS = 48_000L
+    private const val PER_IMAGE_DOWNLOAD_TIMEOUT_MS = 18_000L
+    private const val BATCH_PREFETCH_AHEAD = 2
     private const val PER_DOWNLOAD_CONNECT_TIMEOUT_MS = 8_000
     private const val PER_DOWNLOAD_READ_TIMEOUT_MS = 12_000
+
+    data class SaveAllProgress(
+        val completed: Int,
+        val total: Int,
+        val activeIndex: Int,
+    )
 
     data class SaveAllImagesResult(
         val saved: Int,
@@ -112,21 +124,33 @@ object ImageSaveHelper {
         uniqueSuffix: String,
         metadata: ImageSaveMetadata?,
         includeLivePhotoVideo: Boolean,
+        preloadedBytes: ByteArray? = null,
+        batchOptions: BatchSaveOptions? = null,
     ): Result<String> {
-        val bytes = loadBytes(image) ?: return Result.failure(IllegalStateException("图片下载失败"))
+        val bytes = preloadedBytes ?: loadBytesWithTimeout(image)
+            ?: return Result.failure(IllegalStateException("图片下载失败"))
         val resolvedMetadata = metadata ?: image.buildSaveMetadata()
         val liveVideoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() }
         if (includeLivePhotoVideo && !image.isGif && liveVideoUrl != null) {
-            liveVideoUrl.let { videoUrl ->
-                return saveLivePhotoMotionPhoto(
-                    context = context,
-                    image = image,
-                    imageBytes = bytes,
-                    videoUrl = videoUrl,
-                    uniqueSuffix = uniqueSuffix,
-                    metadata = resolvedMetadata,
-                )
+            val liveResult = saveLivePhotoMotionPhoto(
+                context = context,
+                image = image,
+                imageBytes = bytes,
+                videoUrl = liveVideoUrl,
+                uniqueSuffix = uniqueSuffix,
+                metadata = resolvedMetadata,
+                verifyTwice = batchOptions?.verifyMotionPhotoTwice ?: true,
+            )
+            if (liveResult.isSuccess || batchOptions?.fallbackToStaticOnLivePhotoFailure != true) {
+                return liveResult
             }
+            return saveStaticImage(
+                context = context,
+                image = image,
+                bytes = bytes,
+                uniqueSuffix = uniqueSuffix,
+                metadata = resolvedMetadata,
+            )
         }
         return saveStaticImage(
             context = context,
@@ -135,6 +159,18 @@ object ImageSaveHelper {
             uniqueSuffix = uniqueSuffix,
             metadata = resolvedMetadata,
         )
+    }
+
+    private data class BatchSaveOptions(
+        val fallbackToStaticOnLivePhotoFailure: Boolean = false,
+        val verifyMotionPhotoTwice: Boolean = true,
+    )
+
+    private suspend fun loadBytesWithTimeout(
+        image: FeedImage,
+        timeoutMs: Long = PER_IMAGE_DOWNLOAD_TIMEOUT_MS,
+    ): ByteArray? = withTimeoutOrNull(timeoutMs) {
+        loadBytes(image)
     }
 
     private fun saveStaticImage(
@@ -189,6 +225,7 @@ object ImageSaveHelper {
         videoUrl: String,
         uniqueSuffix: String,
         metadata: ImageSaveMetadata,
+        verifyTwice: Boolean = true,
     ): Result<String> {
         val assembled = LivePhotoMotionPhotoAssembler.assemble(
             context = context,
@@ -222,7 +259,9 @@ object ImageSaveHelper {
             } ?: throw IllegalStateException("无法打开输出流")
             verifySavedMotionPhoto(context, uri, assembled.bytes)
             finalizeMedia(context, uri, metadata, xmpSnippet = xmpSnippet)
-            verifySavedMotionPhoto(context, uri, assembled.bytes)
+            if (verifyTwice) {
+                verifySavedMotionPhoto(context, uri, assembled.bytes)
+            }
         }
         if (writeResult.isFailure) {
             context.contentResolver.delete(uri, null, null)
@@ -260,51 +299,84 @@ object ImageSaveHelper {
         context: Context,
         images: List<FeedImage>,
         status: FeedItem? = null,
-        onProgress: (suspend (Int, Int) -> Unit)? = null,
+        onProgress: (suspend (SaveAllProgress) -> Unit)? = null,
     ): SaveAllImagesResult = withContext(Dispatchers.IO) {
         if (images.isEmpty()) {
             return@withContext SaveAllImagesResult(saved = 0, total = 0, errors = listOf("没有可保存的图片"))
         }
-        var saved = 0
-        val errors = mutableListOf<String>()
-        images.forEachIndexed { index, image ->
-            onProgress?.invoke(index + 1, images.size)
-            if (index > 0) {
-                delay(80)
-            }
-            val resolvedImage = image.resolveForSave(status, images)
-            val timeoutMs = if (
-                !resolvedImage.livePhotoVideoUrl.isNullOrBlank() && !resolvedImage.isGif
-            ) {
-                LIVE_PHOTO_SAVE_TIMEOUT_MS + 2_000L
-            } else {
-                PER_IMAGE_SAVE_TIMEOUT_MS + 2_000L
-            }
-            val result = runCatching {
-                withTimeout(timeoutMs) {
-                    saveImageInternal(
-                        context = context,
-                        image = resolvedImage,
-                        uniqueSuffix = "_$index",
-                        metadata = resolvedImage.buildSaveMetadata(status),
-                        includeLivePhotoVideo = !resolvedImage.livePhotoVideoUrl.isNullOrBlank() &&
-                            !resolvedImage.isGif,
-                    )
-                }
-            }.getOrElse { error ->
-                when (error) {
-                    is TimeoutCancellationException ->
-                        Result.failure(IllegalStateException("第 ${index + 1} 张保存超时"))
-                    else -> Result.failure(error)
+        coroutineScope {
+            var saved = 0
+            val errors = mutableListOf<String>()
+            val resolvedImages = images.map { it.resolveForSave(status, images) }
+            val prefetchJobs = mutableMapOf<Int, Deferred<ByteArray?>>()
+            val batchOptions = BatchSaveOptions(
+                fallbackToStaticOnLivePhotoFailure = true,
+                verifyMotionPhotoTwice = false,
+            )
+
+            fun schedulePrefetch(index: Int) {
+                if (index !in resolvedImages.indices || prefetchJobs.containsKey(index)) return
+                prefetchJobs[index] = async {
+                    loadBytesWithTimeout(resolvedImages[index])
                 }
             }
-            result
-                .onSuccess { saved += 1 }
-                .onFailure { error ->
-                    errors += error.message?.takeIf { it.isNotBlank() } ?: "第 ${index + 1} 张保存失败"
+
+            for (index in 0..minOf(BATCH_PREFETCH_AHEAD, resolvedImages.lastIndex)) {
+                schedulePrefetch(index)
+            }
+
+            resolvedImages.forEachIndexed { index, resolvedImage ->
+                val activeIndex = index + 1
+                onProgress?.invoke(
+                    SaveAllProgress(completed = saved, total = images.size, activeIndex = activeIndex),
+                )
+                schedulePrefetch(index + BATCH_PREFETCH_AHEAD + 1)
+                val timeoutMs = if (
+                    !resolvedImage.livePhotoVideoUrl.isNullOrBlank() && !resolvedImage.isGif
+                ) {
+                    BATCH_LIVE_PHOTO_SAVE_TIMEOUT_MS
+                } else {
+                    PER_IMAGE_SAVE_TIMEOUT_MS
                 }
+                val preloadedBytes = prefetchJobs.remove(index)?.await()
+                val result = runCatching {
+                    withTimeout(timeoutMs) {
+                        saveImageInternal(
+                            context = context,
+                            image = resolvedImage,
+                            uniqueSuffix = "_$index",
+                            metadata = resolvedImage.buildSaveMetadata(status),
+                            includeLivePhotoVideo = !resolvedImage.livePhotoVideoUrl.isNullOrBlank() &&
+                                !resolvedImage.isGif,
+                            preloadedBytes = preloadedBytes,
+                            batchOptions = batchOptions,
+                        )
+                    }
+                }.getOrElse { error ->
+                    when (error) {
+                        is TimeoutCancellationException ->
+                            Result.failure(IllegalStateException("第 $activeIndex 张保存超时"))
+                        else -> Result.failure(error)
+                    }
+                }
+                result
+                    .onSuccess {
+                        saved += 1
+                        onProgress?.invoke(
+                            SaveAllProgress(
+                                completed = saved,
+                                total = images.size,
+                                activeIndex = activeIndex,
+                            ),
+                        )
+                    }
+                    .onFailure { error ->
+                        errors += error.message?.takeIf { it.isNotBlank() }
+                            ?: "第 $activeIndex 张保存失败"
+                    }
+            }
+            SaveAllImagesResult(saved = saved, total = images.size, errors = errors)
         }
-        SaveAllImagesResult(saved = saved, total = images.size, errors = errors)
     }
 
     suspend fun saveVideo(
@@ -361,7 +433,6 @@ object ImageSaveHelper {
                 writeResult.exceptionOrNull() ?: IllegalStateException("视频保存失败"),
             )
         }
-        emitProgress(1f)
         Result.success(displayName)
     }
 
@@ -402,9 +473,22 @@ object ImageSaveHelper {
     }
 
     private fun imageUrlCandidates(image: FeedImage): List<String> =
-        (listOfNotNull(image.largeUrl) + image.downloadUrls + listOfNotNull(image.thumbnailUrl))
+        fullscreenLikeImageUrlCandidates(image)
+
+    private fun fullscreenLikeImageUrlCandidates(image: FeedImage): List<String> {
+        val highQuality = (image.downloadUrls + listOf(image.largeUrl))
             .filter { it.isNotBlank() }
             .distinct()
+            .filterNot { LowQualityImageUrlPattern.containsMatchIn(it) }
+        if (highQuality.isNotEmpty()) return highQuality
+        return listOfNotNull(
+            image.largeUrl.takeIf { it.isNotBlank() },
+            image.thumbnailUrl.takeIf { it.isNotBlank() },
+        ).distinct()
+    }
+
+    private val LowQualityImageUrlPattern =
+        Regex("""/(?:orj360|orj480|bmiddle|thumbnail|thumb(?:180|300|150)?|small|wap360)/""", RegexOption.IGNORE_CASE)
 
     private fun verifySavedMotionPhoto(
         context: Context,

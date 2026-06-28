@@ -142,7 +142,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -205,7 +204,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.lerp
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
@@ -294,6 +292,7 @@ import com.example.myweibo.data.extractActiveMentionQuery
 import com.example.myweibo.data.filterMentionCandidatesByQuery
 import com.example.myweibo.data.mentionCandidateKey
 import com.example.myweibo.data.ImageSaveHelper
+import com.example.myweibo.data.BitmapExifOrientation
 import com.example.myweibo.data.buildSaveMetadata
 import com.example.myweibo.data.resolveForSave
 import com.example.myweibo.data.FriendListTab
@@ -302,6 +301,8 @@ import com.example.myweibo.data.RelationUser
 import com.example.myweibo.data.toRelationUser
 import com.example.myweibo.data.toUserProfile
 import com.example.myweibo.data.FeedImage
+import com.example.myweibo.data.isSavableToAlbum
+import com.example.myweibo.data.shouldOfferSaveAll
 import com.example.myweibo.data.toAlbumFeedMedia
 import com.example.myweibo.data.FeedItem
 import com.example.myweibo.data.FeedUrlEntity
@@ -344,7 +345,6 @@ import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
-import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
@@ -366,7 +366,6 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
-import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -865,12 +864,21 @@ private fun commentFailureMessage(error: Throwable): String {
     val message = error.message.orEmpty()
     return when {
         error is TimeoutCancellationException ->
-            "\u56FE\u7247\u4E0A\u4F20\u6216\u8BC4\u8BBA\u53D1\u9001\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5"
+            "图片上传或评论发送超时，请稍后重试"
+        message.contains("未发现微博登录 Cookie") ->
+            "未检测到微博登录状态，请先在账户页登录"
         message.contains("image-upload-redirected-to-html") ||
             message.contains("weibo-native-post-failed:302") ||
-            message.contains("\u56FE\u7247\u4E0A\u4F20\u5931\u8D25:302") ->
-            "\u56FE\u7247\u4E0A\u4F20\u88AB\u5FAE\u535A\u91CD\u5B9A\u5411\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u540E\u518D\u8BD5"
-        else -> message.ifBlank { "\u8BF7\u7A0D\u540E\u91CD\u8BD5" }
+            message.contains("图片上传失败:302") ||
+            message.contains("微博返回了 HTML") ->
+            "登录状态已失效或被微博重定向，请重新登录后再试"
+        message.contains("无法读取所选图片") ->
+            "无法读取所选图片，请重新选择"
+        message.contains("图片") && message.contains("失败") ->
+            message
+        message.contains("评论") ->
+            message
+        else -> message.ifBlank { "评论发送失败，请稍后重试" }
     }
 }
 
@@ -1328,6 +1336,24 @@ private class ImageSaveHintController {
         )
     }
 
+    fun showBatchSaveProgress(progress: ImageSaveHelper.SaveAllProgress, itemLabel: String = "张") {
+        val message = if (progress.total > 1) {
+            "正在保存第 ${progress.activeIndex}/${progress.total} $itemLabel"
+        } else {
+            "正在保存"
+        }
+        activeHint = AppCapsuleHintState(
+            message = message,
+            tone = CapsuleHintTone.Progress,
+            autoDismissMillis = null,
+            progress = if (progress.total > 0) {
+                progress.completed.toFloat() / progress.total.toFloat()
+            } else {
+                null
+            },
+        )
+    }
+
     fun showVideoProgress(progress: Float?) {
         activeHint = AppCapsuleHintState(
             message = "正在保存视频",
@@ -1400,22 +1426,83 @@ private class ImageSaveHintController {
         images: List<FeedImage>,
         status: FeedItem? = null,
     ): ImageSaveHelper.SaveAllImagesResult {
-        if (images.isEmpty()) {
-            showFailure("没有可保存的图片")
-            return ImageSaveHelper.SaveAllImagesResult(saved = 0, total = 0, errors = listOf("没有可保存的图片"))
+        val videos = status?.medias?.filter { it.isSavableToAlbum() }.orEmpty()
+        val total = images.size + videos.size
+        if (total == 0) {
+            showFailure("没有可保存的内容")
+            return ImageSaveHelper.SaveAllImagesResult(
+                saved = 0,
+                total = 0,
+                errors = listOf("没有可保存的内容"),
+            )
         }
-        showProgress(1, images.size)
-        val result = ImageSaveHelper.saveAllImages(context, images, status = status) { current, total ->
+        var saved = 0
+        val errors = mutableListOf<String>()
+        if (images.isNotEmpty()) {
+            val imageResult = ImageSaveHelper.saveAllImages(context, images, status = status) { progress ->
+                withContext(Dispatchers.Main.immediate) {
+                    showBatchSaveProgress(
+                        progress = progress.copy(total = total),
+                        itemLabel = if (videos.isNotEmpty()) "项" else "张",
+                    )
+                }
+            }
+            saved += imageResult.saved
+            errors += imageResult.errors
+        }
+        for ((index, media) in videos.withIndex()) {
+            val position = images.size + index + 1
             withContext(Dispatchers.Main.immediate) {
-                showProgress(current, total)
+                showBatchSaveProgress(
+                    progress = ImageSaveHelper.SaveAllProgress(
+                        completed = saved,
+                        total = total,
+                        activeIndex = position,
+                    ),
+                    itemLabel = "项",
+                )
+            }
+            val videoSaved = ImageSaveHelper.saveVideo(context, media) { fraction ->
+                showVideoProgress(
+                    if (total > 0) {
+                        ((position - 1) + fraction.coerceIn(0f, 1f)) / total.toFloat()
+                    } else {
+                        fraction
+                    },
+                )
+            }
+                .onFailure { error ->
+                    errors += error.message?.takeIf { it.isNotBlank() } ?: "视频保存失败"
+                }
+                .isSuccess
+            if (videoSaved) {
+                saved += 1
+                withContext(Dispatchers.Main.immediate) {
+                    showBatchSaveProgress(
+                        progress = ImageSaveHelper.SaveAllProgress(
+                            completed = saved,
+                            total = total,
+                            activeIndex = position,
+                        ),
+                        itemLabel = "项",
+                    )
+                }
             }
         }
+        val usesMixedMedia = videos.isNotEmpty()
         when {
-            result.isComplete -> showSuccess("已保存 ${result.saved} 张图片到相册")
-            result.saved > 0 -> showSuccess("已保存 ${result.saved}/${result.total} 张图片")
-            else -> showFailure(result.errors.firstOrNull()?.takeIf { it.isNotBlank() } ?: "保存失败")
+            saved == total && usesMixedMedia ->
+                showSuccess("已保存 ${saved} 项到相册")
+            saved == total ->
+                showSuccess("已保存 ${saved} 张图片到相册")
+            saved > 0 && usesMixedMedia ->
+                showSuccess("已保存 ${saved}/${total} 项")
+            saved > 0 ->
+                showSuccess("已保存 ${saved}/${total} 张图片")
+            else ->
+                showFailure(errors.firstOrNull()?.takeIf { it.isNotBlank() } ?: "保存失败")
         }
-        return result
+        return ImageSaveHelper.SaveAllImagesResult(saved = saved, total = total, errors = errors)
     }
 }
 
@@ -1816,41 +1903,8 @@ private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
     else -> 12 * 1024 * 1024
 }
 
-private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
-    if (bytes.isEmpty()) return null
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        runCatching {
-            ImageDecoder.decodeBitmap(ImageDecoder.createSource(bytes)) { decoder, info, _ ->
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                val width = info.size.width
-                val height = info.size.height
-                if (width > 0 && height > 0) {
-                    val dim = maxDecodeDim.coerceAtLeast(1)
-                    val scale = maxOf(1, (width / dim).coerceAtMost(height / dim))
-                    val sample = Integer.highestOneBit(scale)
-                    decoder.setTargetSize(
-                        (width / sample).coerceAtLeast(1),
-                        (height / sample).coerceAtLeast(1),
-                    )
-                }
-            }
-        }.getOrNull()?.let { return it }
-    }
-    return decodeSampledBitmap(bytes, maxDecodeDim)
-}
-
-private fun decodeSampledBitmap(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
-    val options = BitmapFactory.Options().apply {
-        inJustDecodeBounds = true
-    }
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-    if (options.outWidth <= 0 || options.outHeight <= 0) return null
-    val dim = maxDecodeDim.coerceAtLeast(1)
-    val scale = maxOf(1, (options.outWidth / dim).coerceAtMost(options.outHeight / dim))
-    options.inJustDecodeBounds = false
-    options.inSampleSize = Integer.highestOneBit(scale)
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-}
+private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? =
+    BitmapExifOrientation.decodeSampledBitmap(bytes, maxDecodeDim)
 
 private fun Bitmap?.takeIfDrawable(): Bitmap? = this?.takeIf { !it.isRecycled }
 
@@ -1881,6 +1935,188 @@ private suspend fun loadRemoteBitmap(
         maxReadBytes = remoteReadLimitForDecodeDim(maxDecodeDim),
     )
     return decodeBitmapFromBytes(bytes, maxDecodeDim)
+}
+
+private fun livePhotoMirrorCorrectionKey(image: FeedImage): String? {
+    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return null
+    val stillKey = image.largeUrl.ifBlank { image.thumbnailUrl }.ifBlank { image.id }
+    if (stillKey.isBlank()) return null
+    return "$stillKey|$videoUrl"
+}
+
+@Composable
+private fun rememberLivePhotoMirrorCorrection(
+    image: FeedImage,
+    stillBitmap: Bitmap?,
+): LivePhotoMirrorCorrection {
+    val context = LocalContext.current
+    val key = remember(image.id, image.largeUrl, image.livePhotoVideoUrl) {
+        livePhotoMirrorCorrectionKey(image)
+    }
+    var correction by remember(key) {
+        mutableStateOf(
+            key?.let(LivePhotoMirrorCorrectionCache::get) ?: LivePhotoMirrorCorrection.None,
+        )
+    }
+
+    LaunchedEffect(key, stillBitmap) {
+        val targetKey = key ?: return@LaunchedEffect
+        LivePhotoMirrorCorrectionCache.get(targetKey)?.let {
+            correction = it
+            return@LaunchedEffect
+        }
+        val detected = withContext(Dispatchers.IO) {
+            detectLivePhotoMirrorCorrection(context, image, stillBitmap)
+        }
+        LivePhotoMirrorCorrectionCache.put(targetKey, detected)
+        correction = detected
+    }
+    return correction
+}
+
+private suspend fun detectLivePhotoMirrorCorrection(
+    context: Context,
+    image: FeedImage,
+    stillBitmap: Bitmap?,
+): LivePhotoMirrorCorrection {
+    if (!image.isLivePhoto) return LivePhotoMirrorCorrection.None
+    val still = stillBitmap?.takeIfDrawable() ?: loadLivePhotoStillForMirrorDetection(image) ?: return LivePhotoMirrorCorrection.None
+    val frame = loadLivePhotoReferenceFrame(context, image.livePhotoVideoUrl.orEmpty())
+        ?: return LivePhotoMirrorCorrection.None
+    val normalError = normalizedFrameError(still, frame, mirrorStill = false)
+    val mirroredError = normalizedFrameError(still, frame, mirrorStill = true)
+    return if (mirroredError < normalError * 0.9f) {
+        LivePhotoMirrorCorrection.MirrorVideo
+    } else {
+        LivePhotoMirrorCorrection.None
+    }
+}
+
+private suspend fun loadLivePhotoStillForMirrorDetection(image: FeedImage): Bitmap? {
+    resolveFullscreenPreviewBitmap(image)?.takeIfDrawable()?.let { return it }
+    val candidates = listOfNotNull(
+        image.largeUrl.takeIf { it.isNotBlank() },
+        image.thumbnailUrl.takeIf { it.isNotBlank() },
+    ).distinct()
+    for (url in candidates) {
+        runCatching {
+            loadRemoteBitmap(
+                url = url,
+                maxDecodeDim = 640,
+                connectTimeoutMs = 5_000,
+                readTimeoutMs = 8_000,
+            )
+        }.getOrNull()?.takeIfDrawable()?.let { return it }
+    }
+    return null
+}
+
+private fun loadLivePhotoReferenceFrame(context: Context, videoUrl: String): Bitmap? {
+    if (videoUrl.isBlank()) return null
+    val headers = livePhotoFrameHeaders()
+    for (candidate in videoUrlCandidates(videoUrl)) {
+        val frame = runCatching {
+            MediaMetadataRetriever().use { retriever ->
+                retriever.setDataSource(candidate, headers)
+                livePhotoReferenceFrameTimesUs(retriever)
+                    .firstNotNullOfOrNull { timeUs ->
+                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                            ?.takeIf(::hasUsableFrameSignal)
+                    }
+                    ?: retriever.frameAtTime?.takeIf(::hasUsableFrameSignal)
+            }
+        }.getOrNull()
+        if (frame != null) return frame
+    }
+    return null
+}
+
+private fun livePhotoReferenceFrameTimesUs(retriever: MediaMetadataRetriever): List<Long> {
+    val durationMs = retriever
+        .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+        ?.toLongOrNull()
+        ?.takeIf { it > 0L }
+    if (durationMs == null) {
+        return listOf(500_000L, 250_000L, 750_000L, 100_000L, 0L)
+    }
+    val durationUs = durationMs * 1000L
+    return listOf(
+        durationUs / 2L,
+        (durationUs * 45L) / 100L,
+        (durationUs * 55L) / 100L,
+        (durationUs * 35L) / 100L,
+        (durationUs * 65L) / 100L,
+        min(100_000L, durationUs),
+        0L,
+    ).distinct()
+}
+
+private fun livePhotoFrameHeaders(): Map<String, String> {
+    val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()
+    return buildMap {
+        put("User-Agent", DESKTOP_CHROME_USER_AGENT)
+        put("Referer", "https://weibo.com/")
+        if (cookie.isNotBlank()) put("Cookie", cookie)
+    }
+}
+
+private fun hasUsableFrameSignal(bitmap: Bitmap): Boolean {
+    val sampleCount = 16
+    var minLuma = 255
+    var maxLuma = 0
+    for (yIndex in 0 until sampleCount) {
+        val y = normalizedSampleCoordinate(yIndex, sampleCount, bitmap.height)
+        for (xIndex in 0 until sampleCount) {
+            val x = normalizedSampleCoordinate(xIndex, sampleCount, bitmap.width)
+            val luma = bitmap.getPixel(x, y).pixelLuma()
+            minLuma = min(minLuma, luma)
+            maxLuma = max(maxLuma, luma)
+        }
+    }
+    return maxLuma - minLuma > 12
+}
+
+private fun normalizedFrameError(
+    still: Bitmap,
+    frame: Bitmap,
+    mirrorStill: Boolean,
+): Float {
+    val sampleCount = 40
+    var error = 0L
+    for (yIndex in 0 until sampleCount) {
+        val stillY = normalizedSampleCoordinate(yIndex, sampleCount, still.height)
+        val frameY = normalizedSampleCoordinate(yIndex, sampleCount, frame.height)
+        for (xIndex in 0 until sampleCount) {
+            val stillX = normalizedSampleCoordinate(
+                if (mirrorStill) sampleCount - 1 - xIndex else xIndex,
+                sampleCount,
+                still.width,
+            )
+            val frameX = normalizedSampleCoordinate(xIndex, sampleCount, frame.width)
+            error += colorDistance(still.getPixel(stillX, stillY), frame.getPixel(frameX, frameY))
+        }
+    }
+    return error.toFloat() / (sampleCount * sampleCount)
+}
+
+private fun normalizedSampleCoordinate(index: Int, sampleCount: Int, size: Int): Int {
+    if (size <= 1 || sampleCount <= 1) return 0
+    return ((index.toFloat() / (sampleCount - 1).toFloat()) * (size - 1)).roundToInt()
+        .coerceIn(0, size - 1)
+}
+
+private fun colorDistance(a: Int, b: Int): Int {
+    val dr = ((a shr 16) and 0xff) - ((b shr 16) and 0xff)
+    val dg = ((a shr 8) and 0xff) - ((b shr 8) and 0xff)
+    val db = (a and 0xff) - (b and 0xff)
+    return dr * dr + dg * dg + db * db
+}
+
+private fun Int.pixelLuma(): Int {
+    val r = (this shr 16) and 0xff
+    val g = (this shr 8) and 0xff
+    val b = this and 0xff
+    return (r * 30 + g * 59 + b * 11) / 100
 }
 
 private fun videoMediaKey(media: FeedMedia): String =
@@ -1956,7 +2192,6 @@ fun WeiboApp() {
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
-    var albumFetchCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -1981,6 +2216,7 @@ fun WeiboApp() {
     var commentComposeTarget by remember { mutableStateOf<CommentComposeTarget?>(null) }
     var commentSubmitting by remember { mutableStateOf(false) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
+    var commentSubmitSuccessMessage by remember { mutableStateOf<String?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
     var reposts by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
@@ -2110,8 +2346,6 @@ fun WeiboApp() {
         message = NativeUiMessage(title, detail)
         scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
     }
-
-    fun showAlbumFetchTrace(@Suppress("UNUSED_PARAMETER") page: AlbumPage) = Unit
 
     fun absorbDiscoveredEmoticons(discovered: Map<String, String>) {
         if (discovered.isEmpty()) return
@@ -2295,7 +2529,6 @@ fun WeiboApp() {
                     visitedAlbumImages = enrichAlbumImagesFromPosts(page.images, lookup)
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
-                    showAlbumFetchTrace(page)
                     visitedAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
                         "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                     } else {
@@ -2467,7 +2700,6 @@ fun WeiboApp() {
                     visitedAlbumImages = (visitedAlbumImages + enrichedPage).distinctBy { it.largeUrl }
                     visitedAlbumNextCursor = page.nextCursor
                     visitedAlbumHasMore = page.nextCursor != null
-                    showAlbumFetchTrace(page)
                 }
             visitedAlbumLoadingMore = false
         }
@@ -3038,7 +3270,6 @@ fun WeiboApp() {
                 )
                 mineAlbumNextCursor = page.nextCursor
                 mineAlbumHasMore = page.nextCursor != null
-                showAlbumFetchTrace(page)
                 mineAlbumError = if (page.images.isEmpty() && page.nextCursor == null) {
                     "\u76F8\u518C\u6682\u65E0\u5185\u5BB9"
                 } else {
@@ -3190,7 +3421,6 @@ fun WeiboApp() {
                     mineAlbumNextCursor = page.nextCursor
                     mineAlbumHasMore = page.nextCursor != null
                     mineAlbumError = null
-                    showAlbumFetchTrace(page)
                     mineCacheStore.writeAlbum(
                         AlbumPage(
                             images = mineAlbumImages,
@@ -3509,45 +3739,49 @@ fun WeiboApp() {
         if (commentSubmitting) return
         val job = scope.launch {
             commentSubmitting = true
+            commentSubmitSuccessMessage = null
             try {
-                runCatching {
-                    withTimeout(45_000) {
-                        val picId = photoUris.firstOrNull()?.let { uri ->
-                            session.uploadCommentImage(uri)
-                        }
-                        session.postStatusComment(
-                            item = target.status,
-                            text = text,
-                            replyToCommentId = target.replyTo?.id,
-                            alsoRepost = alsoRepost,
-                            picId = picId,
-                        )
+                val timeoutMs = if (photoUris.isNotEmpty()) 90_000L else 45_000L
+                withTimeout(timeoutMs) {
+                    val picId = photoUris.firstOrNull()?.let { uri ->
+                        session.uploadCommentImage(uri)
                     }
-                }.onSuccess {
-                    commentComposeTarget = null
-                    operationCapsuleHint = if (target.isReply) {
-                        "已回复 @${target.replyTo?.authorName}"
-                    } else {
-                        "评论已发布"
-                    }
-                    val updated = target.status.copy(
-                        commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
-                    ).let { status ->
-                        if (alsoRepost) {
-                            status.copy(
-                                repostsCount = WeiboJsonParser.bumpDisplayCount(status.repostsCount, 1),
-                            )
-                        } else {
-                            status
-                        }
-                    }
-                    applyExpandedItem(updated)
-                    selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
-                    reloadComments()
-                }.onFailure { error ->
-                    if (error is CancellationException && error !is TimeoutCancellationException) throw error
-                    operationCapsuleHint = commentFailureMessage(error)
+                    session.postStatusComment(
+                        item = target.status,
+                        text = text,
+                        replyToCommentId = target.replyTo?.id,
+                        alsoRepost = alsoRepost,
+                        picId = picId,
+                    )
                 }
+                commentComposeTarget = null
+                commentSubmitSuccessMessage = if (target.isReply) {
+                    "已回复 @${target.replyTo?.authorName}"
+                } else {
+                    "评论已发布"
+                }
+                val updated = target.status.copy(
+                    commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
+                ).let { status ->
+                    if (alsoRepost) {
+                        status.copy(
+                            repostsCount = WeiboJsonParser.bumpDisplayCount(status.repostsCount, 1),
+                        )
+                    } else {
+                        status
+                    }
+                }
+                applyExpandedItem(updated)
+                selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
+                reloadComments()
+            } catch (error: CancellationException) {
+                if (error is TimeoutCancellationException) {
+                    operationCapsuleHint = commentFailureMessage(error)
+                } else {
+                    throw error
+                }
+            } catch (error: Throwable) {
+                operationCapsuleHint = commentFailureMessage(error)
             } finally {
                 commentSubmitting = false
                 commentSubmitJob = null
@@ -4644,6 +4878,19 @@ fun WeiboApp() {
                     )
                 }
 
+                commentSubmitSuccessMessage?.let { message ->
+                    AlertDialog(
+                        onDismissRequest = { commentSubmitSuccessMessage = null },
+                        title = { Text("评论发布成功") },
+                        text = { Text(message) },
+                        confirmButton = {
+                            TextButton(onClick = { commentSubmitSuccessMessage = null }) {
+                                Text("确定")
+                            }
+                        },
+                    )
+                }
+
                 likeUsersOverlay?.let { overlay ->
                     val overlayItem = resolveFeedItem(overlay.item)
                     Box(Modifier.fillMaxSize().zIndex(580f)) {
@@ -4734,9 +4981,6 @@ fun WeiboApp() {
                 ?: operationCapsuleHint?.let {
                     AppCapsuleHintState(message = it)
                 }
-                ?: albumFetchCapsuleHint?.let {
-                    AppCapsuleHintState(message = it, autoDismissMillis = 3200L)
-                }
                 ?: feedCapsuleHint?.let {
                     AppCapsuleHintState(message = it)
                 }
@@ -4758,7 +5002,6 @@ fun WeiboApp() {
                         onDismiss = {
                             when {
                                 operationCapsuleHint != null -> operationCapsuleHint = null
-                                albumFetchCapsuleHint != null -> albumFetchCapsuleHint = null
                                 else -> feedRefreshHint = null
                             }
                         },
@@ -5122,28 +5365,44 @@ private fun FeedRefreshCapsuleHint(
             )
             if (tone == CapsuleHintTone.Progress) {
                 Spacer(modifier = Modifier.height(8.dp))
-                val progressModifier = Modifier
-                    .width(132.dp)
-                    .height(3.dp)
                 val trackColor = HintCapsuleProgressText.copy(alpha = 0.18f)
-                if (progress != null) {
-                    LinearProgressIndicator(
-                        progress = { progress.coerceIn(0f, 1f) },
-                        modifier = progressModifier,
-                        color = HintCapsuleProgressText,
-                        trackColor = trackColor,
-                        strokeCap = StrokeCap.Round,
-                    )
-                } else {
-                    LinearProgressIndicator(
-                        modifier = progressModifier,
-                        color = HintCapsuleProgressText,
-                        trackColor = trackColor,
-                        strokeCap = StrokeCap.Round,
-                    )
-                }
+                HintProgressBar(
+                    progress = progress,
+                    modifier = Modifier
+                        .width(132.dp)
+                        .height(3.dp),
+                    color = HintCapsuleProgressText,
+                    trackColor = trackColor,
+                )
             }
         }
+    }
+}
+
+@Composable
+private fun HintProgressBar(
+    progress: Float?,
+    modifier: Modifier = Modifier,
+    color: Color,
+    trackColor: Color,
+) {
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress?.coerceIn(0f, 1f) ?: 0.35f,
+        animationSpec = tween(durationMillis = 220),
+        label = "hint-progress",
+    )
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(trackColor),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(animatedProgress.coerceIn(0.08f, 1f))
+                .clip(RoundedCornerShape(999.dp))
+                .background(color),
+        )
     }
 }
 
@@ -6439,6 +6698,11 @@ private fun FeedImageThumbnailContent(
     }
 }
 
+private enum class LivePhotoMirrorCorrection {
+    None,
+    MirrorVideo,
+}
+
 @Composable
 private fun FeedImageCell(
     image: FeedImage,
@@ -6722,6 +6986,7 @@ private fun ImageActionOverlay(
     val resolvedImages = remember(images, statusItem) {
         images.map { it.resolveForSave(statusItem, images) }
     }
+    val showSaveAll = statusItem?.shouldOfferSaveAll(images) ?: (images.size > 1)
     val safeInitialIndex = initialImageIndex.coerceIn(0, images.lastIndex)
     val pagerState = rememberPagerState(initialPage = safeInitialIndex) { images.size }
     val pagerFlingBehavior = PagerDefaults.flingBehavior(
@@ -7077,7 +7342,7 @@ private fun ImageActionOverlay(
                 expandCenterY = maxHeightPx / 2f,
             )
             val menuWidth = ActionMenuWidth
-            val menuHeight = ActionMenuThreeRowHeight
+            val menuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
             val menuPlacement = calculateActionMenuOffsetFromAnchorPx(
                 anchorBounds = motion.visualBounds,
                 screenWidthPx = maxWidthPx,
@@ -7178,20 +7443,22 @@ private fun ImageActionOverlay(
                             }
                         },
                     )
-                    ImageActionRow(
-                        label = "保存全部",
-                        enabled = !saving && images.isNotEmpty(),
-                        onClick = {
-                            saving = true
-                            scope.launch {
-                                val result = saveHint.saveAll(context, resolvedImages, statusItem)
-                                if (result.saved > 0) {
-                                    requestDismiss()
+                    if (showSaveAll) {
+                        ImageActionRow(
+                            label = "保存全部",
+                            enabled = !saving,
+                            onClick = {
+                                saving = true
+                                scope.launch {
+                                    val result = saveHint.saveAll(context, resolvedImages, statusItem)
+                                    if (result.saved > 0) {
+                                        requestDismiss()
+                                    }
+                                    saving = false
                                 }
-                                saving = false
-                            }
-                        },
-                    )
+                            },
+                        )
+                    }
                     ImageActionRow(
                         label = "分享",
                         enabled = !saving,
@@ -8683,12 +8950,6 @@ private fun ZoomableFullscreenImage(
         livePlaying = isActive && resolvedImage.isLivePhoto
     }
 
-    LaunchedEffect(resolvedImage.id, resolvedImage.isLivePhoto, resolvedImage.livePhotoVideoUrl) {
-        val videoUrl = resolvedImage.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        if (!resolvedImage.isLivePhoto) return@LaunchedEffect
-        prefetchLivePhotoMirrorDecision(context, resolvedImage, videoUrl)
-    }
-
     LaunchedEffect(resolvedImage.largeUrl) {
         dismissTranslationY = 0f
         dismissSnapAnim.snapTo(0f)
@@ -8764,10 +9025,8 @@ private fun ZoomableFullscreenImage(
             val height = maxHeight.value.coerceAtLeast(1f)
             width / height
         }
-        val imageAspect = remember(loadedBitmap.width, loadedBitmap.height, image.width, image.height) {
-            val width = (image.width ?: loadedBitmap.width).coerceAtLeast(1)
-            val height = (image.height ?: loadedBitmap.height).coerceAtLeast(1)
-            width.toFloat() / height.toFloat()
+        val imageAspect = remember(loadedBitmap.width, loadedBitmap.height) {
+            loadedBitmap.width.toFloat() / loadedBitmap.height.coerceAtLeast(1).toFloat()
         }
         val fillScreenScale = remember(containerAspect, imageAspect) {
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
@@ -9194,6 +9453,7 @@ private fun ZoomableFullscreenImage(
                 if (resolvedImage.isLivePhoto) {
                     LivePhotoOverlay(
                         image = resolvedImage,
+                        stillBitmap = loadedBitmap,
                         modifier = Modifier.fillMaxSize(),
                         isActive = isActive && livePlaying,
                         isInFullscreen = true,
@@ -9275,8 +9535,9 @@ private fun BoxScope.FullscreenImageActionMenu(
     val density = LocalDensity.current
     var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
+    val showSaveAll = statusItem?.shouldOfferSaveAll(images) ?: (images.size > 1)
     val menuWidth = ActionMenuWidth
-    val estimatedMenuHeight = ActionMenuThreeRowHeight
+    val estimatedMenuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
     val margin = 14.dp
     val gap = 10.dp
     val menuWidthPx = with(density) { menuWidth.toPx() }
@@ -9326,20 +9587,22 @@ private fun BoxScope.FullscreenImageActionMenu(
                     }
                 },
             )
-            ImageActionRow(
-                label = "保存全部",
-                enabled = !saving && images.isNotEmpty(),
-                onClick = {
-                    saving = true
-                    scope.launch {
-                        val result = saveHint.saveAll(context, images, statusItem)
-                        if (result.saved > 0) {
-                            onDismiss()
+            if (showSaveAll) {
+                ImageActionRow(
+                    label = "保存全部",
+                    enabled = !saving,
+                    onClick = {
+                        saving = true
+                        scope.launch {
+                            val result = saveHint.saveAll(context, images, statusItem)
+                            if (result.saved > 0) {
+                                onDismiss()
+                            }
+                            saving = false
                         }
-                        saving = false
-                    }
-                },
-            )
+                    },
+                )
+            }
             ImageActionRow(
                 label = "分享",
                 enabled = !saving,
@@ -9362,6 +9625,7 @@ private fun BoxScope.FullscreenImageActionMenu(
 @Composable
 private fun LivePhotoOverlay(
     image: FeedImage,
+    stillBitmap: Bitmap? = null,
     modifier: Modifier = Modifier,
     isActive: Boolean = true,
     isInFullscreen: Boolean = false,
@@ -9373,10 +9637,8 @@ private fun LivePhotoOverlay(
     val playbackKey = remember(image.id, image.largeUrl, videoUrl) {
         "${image.id}:$videoUrl"
     }
+    val mirrorCorrection = rememberLivePhotoMirrorCorrection(image, stillBitmap)
     var videoVisible by remember(playbackKey) { mutableStateOf(false) }
-    var mirrorVideoHorizontally by remember(playbackKey) {
-        mutableStateOf(peekLivePhotoMirrorDecision(image, videoUrl))
-    }
     val player = remember(playbackKey) {
         androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
             setMediaSource(buildVideoMediaSource(context, videoUrl))
@@ -9384,15 +9646,6 @@ private fun LivePhotoOverlay(
             volume = 0f
             playWhenReady = false
             prepare()
-        }
-    }
-
-    LaunchedEffect(playbackKey, image.largeUrl, image.downloadUrls, videoUrl) {
-        val resolved = withContext(Dispatchers.IO) {
-            resolveLivePhotoMirrorDecision(context, image, videoUrl)
-        }
-        if (mirrorVideoHorizontally != resolved) {
-            mirrorVideoHorizontally = resolved
         }
     }
 
@@ -9438,6 +9691,7 @@ private fun LivePhotoOverlay(
 
     AndroidView(
         modifier = modifier.graphicsLayer {
+            scaleX = if (mirrorCorrection == LivePhotoMirrorCorrection.MirrorVideo) -1f else 1f
             alpha = if (videoVisible) 1f else 0f
         },
         factory = { ctx ->
@@ -9452,11 +9706,6 @@ private fun LivePhotoOverlay(
         },
         update = { playerView ->
             playerView.player = player
-            val targetScaleX = if (mirrorVideoHorizontally) -1f else 1f
-            if (playerView.scaleX != targetScaleX) {
-                playerView.scaleX = targetScaleX
-                playerView.scaleY = 1f
-            }
         },
     )
 }
@@ -18449,6 +18698,23 @@ private object FullscreenBitmapCache {
     }
 }
 
+private object LivePhotoMirrorCorrectionCache {
+    private const val MaxEntries = 80
+    private val entries = object : LinkedHashMap<String, LivePhotoMirrorCorrection>(16, 0.75f, true) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, LivePhotoMirrorCorrection>?,
+        ): Boolean = size > MaxEntries
+    }
+
+    @Synchronized
+    fun get(key: String): LivePhotoMirrorCorrection? = entries[key]
+
+    @Synchronized
+    fun put(key: String, correction: LivePhotoMirrorCorrection) {
+        entries[key] = correction
+    }
+}
+
 private object RemoteBytesCache {
     private const val MaxTotalBytes = RemoteBytesCacheMaxTotal
     private const val MaxBytesPerEntry = RemoteBytesMaxCachedEntry
@@ -18487,30 +18753,6 @@ private object RemoteBytesCache {
             entries.remove(eldest.key)
             currentBytes -= eldest.value.size
         }
-    }
-}
-
-private val ExifHorizontalMirrorOrientations = setOf(
-    ExifInterface.ORIENTATION_FLIP_HORIZONTAL,
-)
-
-private object RemoteImageExifMirrorCache {
-    private val entries = ConcurrentHashMap<String, Boolean>()
-
-    fun get(url: String): Boolean? = entries[url]
-
-    fun put(url: String, mirrored: Boolean) {
-        entries[url] = mirrored
-    }
-}
-
-private object LivePhotoMirrorDecisionCache {
-    private val entries = ConcurrentHashMap<String, Boolean>()
-
-    fun get(key: String): Boolean? = entries[key]
-
-    fun put(key: String, needsMirror: Boolean) {
-        entries[key] = needsMirror
     }
 }
 
@@ -18616,201 +18858,6 @@ private fun fetchRemoteBytes(
     RemoteBytesCache.put(url, bytes)
     RemoteDiskBytesCache.put(url, bytes)
     return bytes
-}
-
-private fun readExifNeedsHorizontalMirror(bytes: ByteArray): Boolean? =
-    runCatching<Boolean?> {
-        val exif = ExifInterface(ByteArrayInputStream(bytes))
-        val orientation = exif.getAttributeInt(
-            ExifInterface.TAG_ORIENTATION,
-            ExifInterface.ORIENTATION_UNDEFINED,
-        )
-        when (orientation) {
-            ExifInterface.ORIENTATION_UNDEFINED -> null
-            else -> orientation in ExifHorizontalMirrorOrientations
-        }
-    }.getOrNull()
-
-private fun livePhotoMirrorDecisionKey(image: FeedImage, videoUrl: String): String =
-    "${image.id}|$videoUrl|${image.largeUrl}"
-
-private fun livePhotoWeiboRequestHeaders(): Map<String, String> = buildMap {
-    put("User-Agent", DESKTOP_CHROME_USER_AGENT)
-    put("Referer", "https://weibo.com/")
-    put("Origin", "https://weibo.com")
-    CookieManager.getInstance().getCookie("https://weibo.com/")?.takeIf { it.isNotBlank() }?.let {
-        put("Cookie", it)
-    }
-}
-
-private fun peekLivePhotoMirrorDecision(image: FeedImage, videoUrl: String): Boolean {
-    val decisionKey = livePhotoMirrorDecisionKey(image, videoUrl)
-    LivePhotoMirrorDecisionCache.get(decisionKey)?.let { return it }
-    val candidates = (fullscreenImageUrlCandidates(image) + feedImageUrlCandidates(image))
-        .filter { it.isNotBlank() }
-        .distinct()
-    for (url in candidates) {
-        if (RemoteImageExifMirrorCache.get(url) == true) return true
-        val cached = RemoteBytesCache.get(url)
-            ?: RemoteDiskBytesCache.get(url, RemoteBytesMaxCachedEntry)
-        if (cached != null && readExifNeedsHorizontalMirror(cached) == true) {
-            return true
-        }
-    }
-    return false
-}
-
-private suspend fun prefetchLivePhotoMirrorDecision(
-    context: Context,
-    image: FeedImage,
-    videoUrl: String,
-) {
-    withContext(Dispatchers.IO) {
-        resolveLivePhotoMirrorDecision(context, image, videoUrl)
-    }
-}
-
-private suspend fun resolveLivePhotoMirrorDecision(
-    context: Context,
-    image: FeedImage,
-    videoUrl: String,
-): Boolean {
-    val decisionKey = livePhotoMirrorDecisionKey(image, videoUrl)
-    LivePhotoMirrorDecisionCache.get(decisionKey)?.let { return it }
-    val candidates = (fullscreenImageUrlCandidates(image) + feedImageUrlCandidates(image))
-        .filter { it.isNotBlank() }
-        .distinct()
-    for (url in candidates) {
-        when (RemoteImageExifMirrorCache.get(url)) {
-            true -> {
-                LivePhotoMirrorDecisionCache.put(decisionKey, true)
-                return true
-            }
-            false -> continue
-            null -> Unit
-        }
-        val cached = RemoteBytesCache.get(url)
-            ?: RemoteDiskBytesCache.get(url, RemoteBytesMaxCachedEntry)
-        if (cached != null) {
-            val mirrored = readExifNeedsHorizontalMirror(cached) ?: continue
-            RemoteImageExifMirrorCache.put(url, mirrored)
-            if (mirrored) {
-                LivePhotoMirrorDecisionCache.put(decisionKey, true)
-                return true
-            }
-        }
-    }
-    for (url in candidates) {
-        when (RemoteImageExifMirrorCache.get(url)) {
-            true -> {
-                LivePhotoMirrorDecisionCache.put(decisionKey, true)
-                return true
-            }
-            false -> continue
-            null -> Unit
-        }
-        val mirrored = runCatching {
-            readExifNeedsHorizontalMirror(
-                fetchRemoteBytes(
-                    url = url,
-                    connectTimeoutMs = 4_000,
-                    readTimeoutMs = 5_000,
-                    maxReadBytes = RemoteBytesMaxCachedEntry,
-                ),
-            )
-        }.getOrNull() ?: continue
-        RemoteImageExifMirrorCache.put(url, mirrored)
-        if (mirrored) {
-            LivePhotoMirrorDecisionCache.put(decisionKey, true)
-            return true
-        }
-    }
-    val frameDecision = detectLivePhotoMirrorByFirstFrame(context, image, videoUrl) ?: false
-    LivePhotoMirrorDecisionCache.put(decisionKey, frameDecision)
-    return frameDecision
-}
-
-private suspend fun detectLivePhotoMirrorByFirstFrame(
-    context: Context,
-    image: FeedImage,
-    videoUrl: String,
-): Boolean? {
-    val staticBitmap = loadLivePhotoComparisonBitmap(image) ?: return null
-    val videoFrame = loadRemoteVideoFrame(context, videoUrl) ?: return null
-    return compareHorizontalMirror(staticBitmap, videoFrame)
-}
-
-private suspend fun loadLivePhotoComparisonBitmap(image: FeedImage): Bitmap? {
-    val candidates = (fullscreenImageUrlCandidates(image) + feedImageUrlCandidates(image))
-        .filter { it.isNotBlank() }
-        .distinct()
-    for (url in candidates) {
-        runCatching {
-            loadRemoteBitmap(
-                url = url,
-                maxDecodeDim = 192,
-                connectTimeoutMs = 3_000,
-                readTimeoutMs = 4_000,
-            )
-        }.getOrNull()?.takeIfDrawable()?.let { return it }
-    }
-    return null
-}
-
-private fun loadRemoteVideoFrame(context: Context, videoUrl: String): Bitmap? {
-    val headers = HashMap(livePhotoWeiboRequestHeaders())
-    return runCatching {
-        MediaMetadataRetriever().use { retriever ->
-            retriever.setDataSource(videoUrl, headers)
-            retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST)
-        }
-    }.getOrNull() ?: runCatching {
-        MediaMetadataRetriever().use { retriever ->
-            retriever.setDataSource(context, Uri.parse(videoUrl))
-            retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST)
-        }
-    }.getOrNull()
-}
-
-private fun compareHorizontalMirror(staticBitmap: Bitmap, videoFrame: Bitmap): Boolean? {
-    if (staticBitmap.width <= 0 || staticBitmap.height <= 0 || videoFrame.width <= 0 || videoFrame.height <= 0) {
-        return null
-    }
-    val sampleColumns = 18
-    val sampleRows = 18
-    var normalScore = 0L
-    var mirroredScore = 0L
-    var sampleCount = 0
-    for (row in 0 until sampleRows) {
-        val y = (row + 0.5f) / sampleRows
-        for (column in 0 until sampleColumns) {
-            val x = (column + 0.5f) / sampleColumns
-            val staticLuma = sampledLuma(staticBitmap, x, y)
-            val normalLuma = sampledLuma(videoFrame, x, y)
-            val mirroredLuma = sampledLuma(videoFrame, 1f - x, y)
-            normalScore += abs(staticLuma - normalLuma)
-            mirroredScore += abs(staticLuma - mirroredLuma)
-            sampleCount++
-        }
-    }
-    if (sampleCount == 0) return null
-    val threshold = sampleCount * 6L
-    return when {
-        mirroredScore + threshold < normalScore -> true
-        normalScore + threshold < mirroredScore -> false
-        else -> null
-    }
-}
-
-private fun sampledLuma(bitmap: Bitmap, x: Float, y: Float): Int {
-    val px = (x.coerceIn(0f, 1f) * (bitmap.width - 1)).roundToInt()
-    val py = (y.coerceIn(0f, 1f) * (bitmap.height - 1)).roundToInt()
-    val color = bitmap.getPixel(px, py)
-    return (
-        android.graphics.Color.red(color) * 299 +
-            android.graphics.Color.green(color) * 587 +
-            android.graphics.Color.blue(color) * 114
-        ) / 1000
 }
 
 private fun loadRemoteAnimatedDrawable(url: String): Drawable {

@@ -6,7 +6,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.net.http.SslError
-import android.util.Base64
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
 import android.webkit.WebResourceRequest
@@ -224,7 +223,6 @@ class WeiboWebSession(context: Context) {
                 uid = uid,
                 cursor = cursor,
                 onPageLoaded = onPageLoaded,
-                fallbackFromEmptyWall = false,
             )
         }
         if (cursor != null &&
@@ -247,7 +245,6 @@ class WeiboWebSession(context: Context) {
                 uid = uid,
                 cursor = null,
                 onPageLoaded = onPageLoaded,
-                fallbackFromEmptyWall = wallPage != null,
             )
         }
         loadUserAlbumImageWall(uid, cursor, onPageLoaded)
@@ -297,11 +294,6 @@ class WeiboWebSession(context: Context) {
         return AlbumPage(
             images = images,
             nextCursor = nextPageCursor,
-            fetchTrace = AlbumFetchTrace(
-                source = AlbumFetchSource.ImageWall,
-                imageCount = images.size,
-                isFirstPage = isStart,
-            ),
         )
     }
 
@@ -309,14 +301,12 @@ class WeiboWebSession(context: Context) {
         uid: String,
         cursor: String?,
         onPageLoaded: ((List<FeedImage>) -> Unit)?,
-        fallbackFromEmptyWall: Boolean,
     ): AlbumPage {
         val referer = "https://weibo.com/u/$uid?tabtype=album"
         val waterfallCursor = cursor
             ?.removePrefix("waterfall:cursor:")
             ?.ifBlank { "0" }
             ?: "0"
-        val isFirstPage = cursor == null || waterfallCursor == "0"
         val monthContext = WeiboJsonParser.AlbumMonthContext()
         val params = linkedMapOf(
             "uid" to uid,
@@ -336,12 +326,6 @@ class WeiboWebSession(context: Context) {
         return AlbumPage(
             images = images,
             nextCursor = nextPageCursor,
-            fetchTrace = AlbumFetchTrace(
-                source = AlbumFetchSource.Waterfall,
-                imageCount = images.size,
-                isFirstPage = isFirstPage,
-                fallbackFromEmptyWall = fallbackFromEmptyWall,
-            ),
         )
     }
 
@@ -595,19 +579,7 @@ class WeiboWebSession(context: Context) {
     suspend fun uploadCommentImage(uri: Uri): String =
         withTimeout(COMMENT_IMAGE_UPLOAD_TIMEOUT_MS) {
             val image = prepareCommentUploadImage(uri)
-            runCatching {
-                nativeUploadImage(image)
-            }.recoverCatching { error ->
-                val message = error.message.orEmpty()
-                if (
-                    message.contains("image-upload-redirected-to-html") ||
-                    message.contains(":302")
-                ) {
-                    webViewUploadImage(image)
-                } else {
-                    throw error
-                }
-            }.getOrThrow()
+            nativeUploadImageRawBinary(image)
         }
 
     suspend fun loadAllRelationUsers(
@@ -1139,114 +1111,93 @@ class WeiboWebSession(context: Context) {
         return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
     }
 
-    private suspend fun nativeUploadImage(image: PreparedUploadImage): String =
-        withContext(Dispatchers.IO) {
-            CookieManager.getInstance().flush()
-            val cookie = mergedCookieHeader("https://picupload.weibo.com/")
-            if (!hasAuthenticatedCookie(cookie)) {
-                throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后重试")
-            }
-            val base64 = Base64.encodeToString(image.bytes, Base64.NO_WRAP)
-            val params = linkedMapOf(
-                "mime" to image.mime,
-                "data" to base64,
-                "url" to "weibo.com",
-                "markpos" to "1",
-                "logo" to "1",
-                "nick" to "",
-                "marks" to "1",
-                "app" to "miniblog",
-                "s" to "rdxt",
-                "pri" to "null",
-                "file_source" to "1",
-            )
-            val body = params.entries.joinToString("&") { (key, value) ->
-                "${key.urlEncode()}=${value.urlEncode()}"
-            }
-            val connection = (URL("https://picupload.weibo.com/interface/pic_upload.php").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 20_000
-                readTimeout = 30_000
-                instanceFollowRedirects = true
-                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
-                setRequestProperty("Accept", "application/json, text/plain, */*")
-                setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-                setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-                setRequestProperty("Referer", WEIBO_HOME)
-                setRequestProperty("Origin", "https://weibo.com")
-                setRequestProperty("X-Requested-With", "XMLHttpRequest")
-                setRequestProperty("Cookie", cookie)
-            }
-            extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
-                connection.setRequestProperty("X-XSRF-TOKEN", URLDecoder.decode(token, Charsets.UTF_8.name()))
-            }
-            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(body) }
-
-            val status = connection.responseCode
-            syncResponseCookies(connection)
-            val responseBody = if (status in 200..299) {
-                connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-            } else {
-                val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-                throw IllegalStateException("图片上传失败:$status ${errorBody.take(120)}")
-            }
-            if (responseBody.trimStart().startsWith("<")) {
-                throw IllegalStateException("image-upload-redirected-to-html")
-            }
-            parseUploadPicId(responseBody)
+    private suspend fun nativeUploadImageRawBinary(image: PreparedUploadImage): String {
+        val user = loadCurrentUserConfig()
+        val uid = user.getString("uid")
+        val screenName = user.optString("screen_name").trim()
+        val nick = when {
+            screenName.startsWith("@") -> screenName
+            screenName.isNotBlank() -> "@$screenName"
+            else -> ""
         }
-
-    private suspend fun webViewUploadImage(image: PreparedUploadImage): String {
-        val base64 = Base64.encodeToString(image.bytes, Base64.NO_WRAP)
-        ensureOnWeiboOrigin()
-        waitForWeiboOrigin()
-        val payload = evaluateJson(
-            """
-            (async function() {
-              try {
-                const params = new URLSearchParams();
-                params.set('mime', ${image.mime.jsQuote()});
-                params.set('data', ${base64.jsQuote()});
-                params.set('url', 'weibo.com');
-                params.set('markpos', '1');
-                params.set('logo', '1');
-                params.set('nick', '');
-                params.set('marks', '1');
-                params.set('app', 'miniblog');
-                params.set('s', 'rdxt');
-                params.set('pri', 'null');
-                params.set('file_source', '1');
-                const response = await fetch('https://picupload.weibo.com/interface/pic_upload.php', {
-                  method: 'POST',
-                  credentials: 'include',
-                  mode: 'cors',
-                  referrer: 'https://weibo.com/',
-                  headers: {
-                    'accept': 'application/json, text/plain, */*',
-                    'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'x-requested-with': 'XMLHttpRequest'
-                  },
-                  body: params.toString()
-                });
-                const body = await response.text();
-                return { ok: response.ok, status: response.status, body: body, url: response.url };
-              } catch (error) {
-                return { ok: false, status: 0, body: '', error: String(error), url: location.href };
-              }
-            })()
-            """.trimIndent(),
+        val query = linkedMapOf(
+            "data" to "1",
+            "p" to "1",
+            "url" to "weibo.com/u/$uid",
+            "markpos" to "1",
+            "nick" to nick,
+            "marks" to "0",
+            "app" to "miniblog",
+            "s" to "json",
+            "pri" to "null",
+            "file_source" to "1",
         )
-        val body = payload.nullableString("body").orEmpty()
-        if (!payload.optBoolean("ok") || body.isBlank()) {
-            val status = payload.optInt("status")
-            val error = payload.nullableString("error").orEmpty()
-            throw IllegalStateException("图片上传失败:${status.takeUnless { it == 0 } ?: ""} ${error.ifBlank { body.take(120) }}".trim())
+        val uploadUrl = buildPicUploadUrl(query)
+        return postPicUpload(
+            uploadUrl = uploadUrl,
+            contentType = image.mime,
+            bodyBytes = image.bytes,
+        )
+    }
+
+    private suspend fun postPicUpload(
+        uploadUrl: String,
+        contentType: String,
+        bodyBytes: ByteArray,
+    ): String = withContext(Dispatchers.IO) {
+        CookieManager.getInstance().flush()
+        val cookie = mergedCookieHeader("https://picupload.weibo.com/")
+        if (!hasAuthenticatedCookie(cookie)) {
+            throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后重试")
         }
-        if (body.trimStart().startsWith("<")) {
+        val connection = (URL(uploadUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            instanceFollowRedirects = false
+            setFixedLengthStreamingMode(bodyBytes.size)
+            setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+            setRequestProperty("Accept", "application/json, text/plain, */*")
+            setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            setRequestProperty("Content-Type", contentType)
+            setRequestProperty("Referer", WEIBO_HOME)
+            setRequestProperty("Origin", "https://weibo.com")
+            setRequestProperty("X-Requested-With", "XMLHttpRequest")
+            setRequestProperty("Cookie", cookie)
+        }
+        extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
+            connection.setRequestProperty("X-XSRF-TOKEN", URLDecoder.decode(token, Charsets.UTF_8.name()))
+        }
+        connection.outputStream.use { output ->
+            output.write(bodyBytes)
+        }
+
+        val status = connection.responseCode
+        syncResponseCookies(connection)
+        if (status == HttpURLConnection.HTTP_MOVED_TEMP ||
+            status == HttpURLConnection.HTTP_MOVED_PERM ||
+            status == HttpURLConnection.HTTP_SEE_OTHER
+        ) {
             throw IllegalStateException("image-upload-redirected-to-html")
         }
-        return parseUploadPicId(body)
+        val responseBody = if (status in 200..299) {
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            throw IllegalStateException("图片上传失败:$status ${errorBody.take(120)}")
+        }
+        if (responseBody.trimStart().startsWith("<")) {
+            throw IllegalStateException("image-upload-redirected-to-html")
+        }
+        parseUploadPicId(responseBody)
+    }
+
+    private fun buildPicUploadUrl(query: Map<String, String>): String {
+        val encoded = query.entries.joinToString("&") { (key, value) ->
+            "${key.urlEncode()}=${value.urlEncode()}"
+        }
+        return "$PIC_UPLOAD_ENDPOINT?$encoded"
     }
 
     private fun parseUploadPicId(raw: String): String {
@@ -1677,8 +1628,9 @@ class WeiboWebSession(context: Context) {
         private const val MUTUAL_FOLLOW_MENTION_LIMIT = 40
         private const val RELATION_LIST_MAX_PAGES = 100
         private const val FRIENDS_CIRCLE_GID = "100097312739005"
-        private const val COMMENT_IMAGE_UPLOAD_TIMEOUT_MS = 30_000L
+        private const val COMMENT_IMAGE_UPLOAD_TIMEOUT_MS = 60_000L
         private const val WEBVIEW_EVALUATE_TIMEOUT_MS = 20_000L
+        private const val PIC_UPLOAD_ENDPOINT = "https://picupload.weibo.com/interface/pic_upload.php"
         private const val COMMENT_IMAGE_MAX_DIMENSION = 1600
         private const val COMMENT_IMAGE_JPEG_QUALITY = 88
         private const val COMMENT_IMAGE_MAX_UPLOAD_BYTES = 5 * 1024 * 1024

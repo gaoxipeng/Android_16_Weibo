@@ -24,7 +24,10 @@ object MotionPhotoVideoPreparer {
         return false
     }
 
-    fun prepare(context: Context, sourceBytes: ByteArray): ByteArray {
+    fun prepare(
+        context: Context,
+        sourceBytes: ByteArray,
+    ): ByteArray {
         val normalized = normalizeMp4Payload(sourceBytes)
         if (!looksLikeMp4(normalized)) {
             throw IllegalStateException("Live Photo 视频格式无效")

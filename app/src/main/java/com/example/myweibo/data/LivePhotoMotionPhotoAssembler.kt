@@ -4,12 +4,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 
 /**
- * 将微博 Live Photo（静图 + 短视频）组装为 Android Motion Photo 1.0 单文件。
- *
- * 文件结构（小米 / Google MVIMG 通用格式）：
- * ```
- * [Primary JPEG + XMP APP1] + [MP4 直接拼接在文件末尾]
- * ```
+ * Builds an Android Motion Photo from a Weibo Live Photo still image and video.
  */
 object LivePhotoMotionPhotoAssembler {
     data class AssembledMotionPhoto(
@@ -26,25 +21,28 @@ object LivePhotoMotionPhotoAssembler {
         uniqueSuffix: String = "",
     ): Result<AssembledMotionPhoto> = runCatching {
         val jpegBytes = ensureJpegBytes(imageBytes)
-            ?: throw IllegalStateException("Live Photo 静态图解码失败")
+            ?: throw IllegalStateException("Live Photo still image decode failed")
         val videoBytes = downloadVideoBytes(videoUrl)
-        val preparedVideo = MotionPhotoVideoPreparer.prepare(context, videoBytes)
+        val preparedVideo = MotionPhotoVideoPreparer.prepare(
+            context = context,
+            sourceBytes = videoBytes,
+        )
         if (preparedVideo.isEmpty()) {
-            throw IllegalStateException("Live Photo 视频为空")
+            throw IllegalStateException("Live Photo video is empty")
         }
         val presentationTimestampUs = MotionPhotoVideoPreparer.extractPresentationTimestampUs(
             context,
             preparedVideo,
         )
         val motionBytes = runCatching {
-            MotionPhotoMuxer.buildMotionPhoto(
-                context = context,
+            MotionPhotoWriter.buildMotionPhoto(
                 jpegBytes = jpegBytes,
                 videoBytes = preparedVideo,
                 presentationTimestampUs = presentationTimestampUs,
             )
         }.getOrElse {
-            MotionPhotoWriter.buildMotionPhoto(
+            MotionPhotoMuxer.buildMotionPhoto(
+                context = context,
                 jpegBytes = jpegBytes,
                 videoBytes = preparedVideo,
                 presentationTimestampUs = presentationTimestampUs,
@@ -61,7 +59,6 @@ object LivePhotoMotionPhotoAssembler {
     fun buildDisplayName(imageId: String, uniqueSuffix: String = ""): String {
         val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
             .format(java.util.Date())
-        // Gallery apps (Google / Xiaomi / Samsung) often require the MV prefix.
         return "MVIMG_${timestamp}${uniqueSuffix}_MP.jpg"
     }
 
@@ -91,7 +88,7 @@ object LivePhotoMotionPhotoAssembler {
         }
         return candidates.firstNotNullOfOrNull { candidate ->
             runCatching { downloadVideoBytesFromUrl(candidate) }.getOrNull()
-        } ?: throw IllegalStateException("Live Photo 视频下载失败")
+        } ?: throw IllegalStateException("Live Photo video download failed")
     }
 
     private fun downloadVideoBytesFromUrl(url: String): ByteArray {
@@ -117,7 +114,7 @@ object LivePhotoMotionPhotoAssembler {
                         if (read <= 0) break
                         output.write(buffer, 0, read)
                         if (output.size() > 64 * 1024 * 1024) {
-                            throw IllegalStateException("Live Photo 视频体积过大")
+                            throw IllegalStateException("Live Photo video is too large")
                         }
                     }
                     output.toByteArray()
@@ -127,7 +124,7 @@ object LivePhotoMotionPhotoAssembler {
                 if (attempt < 1) Thread.sleep(200L)
             }
         }
-        throw lastError ?: IllegalStateException("Live Photo 视频下载失败")
+        throw lastError ?: IllegalStateException("Live Photo video download failed")
     }
 
     private const val USER_AGENT =

@@ -1,7 +1,10 @@
 package com.example.myweibo.data
 
 object MotionPhotoValidator {
-    private const val XMP_HEADER = "http://ns.adobe.com/xap/1.0\u0000"
+    private val XMP_HEADERS = listOf(
+        "http://ns.adobe.com/xap/1.0/\u0000",
+        "http://ns.adobe.com/xap/1.0\u0000",
+    )
 
     fun embeddedVideoLength(bytes: ByteArray): Int? = readEmbeddedVideoLength(bytes)
 
@@ -34,9 +37,13 @@ object MotionPhotoValidator {
 
     private fun containsMotionPhotoXmp(bytes: ByteArray): Boolean {
         val xmp = extractXmpXmlInternal(bytes) ?: return false
-        return (xmp.contains("GCamera:MotionPhoto=\"1\"") || xmp.contains("Camera:MotionPhoto=\"1\"")) &&
-            (xmp.contains("GCamera:MicroVideo=\"1\"") || xmp.contains("MotionPhoto")) &&
-            xmp.contains("Item:Semantic=\"MotionPhoto\"")
+        val hasMotionFlag = xmp.contains("GCamera:MotionPhoto=\"1\"") ||
+            xmp.contains("Camera:MotionPhoto=\"1\"") ||
+            xmp.contains("GCamera:MicroVideo=\"1\"") ||
+            xmp.contains("MiCamera:")
+        val hasVideoRef = xmp.contains("Item:Semantic=\"MotionPhoto\"") ||
+            xmp.contains("GCamera:MicroVideoOffset=")
+        return hasMotionFlag && hasVideoRef
     }
 
     private fun readEmbeddedVideoLength(bytes: ByteArray): Int? {
@@ -69,7 +76,6 @@ object MotionPhotoValidator {
         Regex("""$tag="(\d+)"""").find(xmp)?.groupValues?.get(1)?.toIntOrNull()
 
     private fun extractXmpXmlInternal(jpeg: ByteArray): String? {
-        val header = XMP_HEADER.toByteArray(Charsets.UTF_8)
         var offset = 2
         while (offset + 4 < jpeg.size) {
             if (jpeg[offset] != 0xFF.toByte()) return null
@@ -78,10 +84,16 @@ object MotionPhotoValidator {
             val length = ((jpeg[offset + 2].toInt() and 0xFF) shl 8) or (jpeg[offset + 3].toInt() and 0xFF)
             val end = offset + 2 + length
             if (length < 2 || end > jpeg.size) return null
-            if (marker == 0xE1 && end - offset - 4 >= header.size) {
+            if (marker == 0xE1 && end - offset - 4 > 0) {
                 val segmentStart = offset + 4
-                if (header.indices.all { jpeg[segmentStart + it] == header[it] }) {
-                    val xmpStart = segmentStart + header.size
+                val header = XMP_HEADERS.firstOrNull { candidate ->
+                    val headerBytes = candidate.toByteArray(Charsets.UTF_8)
+                    segmentStart + headerBytes.size <= end &&
+                        headerBytes.indices.all { jpeg[segmentStart + it] == headerBytes[it] }
+                }
+                if (header != null) {
+                    val headerSize = header.toByteArray(Charsets.UTF_8).size
+                    val xmpStart = segmentStart + headerSize
                     val raw = String(jpeg, xmpStart, end - xmpStart, Charsets.UTF_8)
                     val endTag = "</x:xmpmeta>"
                     val endIndex = raw.indexOf(endTag)

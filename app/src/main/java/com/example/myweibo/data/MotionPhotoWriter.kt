@@ -16,7 +16,7 @@ import java.nio.charset.StandardCharsets
  * File name should start with `MV` (e.g. `MVIMG_*_MP.jpg`).
  */
 object MotionPhotoWriter {
-    private const val XMP_HEADER = "http://ns.adobe.com/xap/1.0\u0000"
+    private const val XMP_HEADER = "http://ns.adobe.com/xap/1.0/\u0000"
     private const val EXIF_HEADER = "Exif\u0000\u0000"
     private const val MARKER_SOI = 0xD8
     private const val MARKER_SOS = 0xDA
@@ -36,7 +36,8 @@ object MotionPhotoWriter {
 
         val trimmedJpeg = trimJpegToEoi(jpegBytes)
         val timestamp = normalizePresentationTimestampUs(presentationTimestampUs)
-        val xmp = buildMotionPhotoXmp(
+        val xmp = MotionPhotoXmpMerger.mergeOrCreate(
+            originalXmp = MotionPhotoValidator.extractXmpXml(trimmedJpeg),
             videoLength = normalizedVideo.size,
             presentationTimestampUs = timestamp,
         )
@@ -73,59 +74,6 @@ object MotionPhotoWriter {
     private fun isDecodableJpeg(jpeg: ByteArray): Boolean =
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) != null
 
-    /**
-     * MicroVideoOffset = video byte length when MP4 is appended directly after JPEG EOI.
-     * HyperOS gallery also indexes MediaStore.XMP for `%MicroVideo%` / `%MotionPhoto%`.
-     */
-    private fun buildMotionPhotoXmp(
-        videoLength: Int,
-        presentationTimestampUs: Long,
-    ): String {
-        val timestamp = presentationTimestampUs.toString()
-        val microVideoOffset = videoLength.toString()
-        val motionVideoLength = videoLength.toString()
-        return buildString {
-            append("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 5.1.0-jc003\">")
-            append("<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">")
-            append("<rdf:Description rdf:about=\"\"")
-            append(" xmlns:Camera=\"http://ns.google.com/photos/1.0/camera/\"")
-            append(" xmlns:GCamera=\"http://ns.google.com/photos/1.0/camera/\"")
-            append(" xmlns:Container=\"http://ns.google.com/photos/1.0/container/\"")
-            append(" xmlns:Item=\"http://ns.google.com/photos/1.0/container/item/\"")
-            append(" Camera:MotionPhoto=\"1\"")
-            append(" Camera:MotionPhotoVersion=\"1\"")
-            append(" Camera:MotionPhotoPresentationTimestampUs=\"$timestamp\"")
-            append(" GCamera:MotionPhoto=\"1\"")
-            append(" GCamera:MotionPhotoVersion=\"1\"")
-            append(" GCamera:MotionPhotoPresentationTimestampUs=\"$timestamp\"")
-            append(" GCamera:MicroVideo=\"1\"")
-            append(" GCamera:MicroVideoVersion=\"1\"")
-            append(" GCamera:MicroVideoOffset=\"$microVideoOffset\"")
-            append(" GCamera:MicroVideoPresentationTimestampUs=\"$timestamp\">")
-            append("<Container:Directory>")
-            append("<rdf:Seq>")
-            append("<rdf:li rdf:parseType=\"Resource\">")
-            append("<Container:Item")
-            append(" Item:Mime=\"image/jpeg\"")
-            append(" Item:Semantic=\"Primary\"")
-            append(" Item:Length=\"0\"")
-            append(" Item:Padding=\"0\"/>")
-            append("</rdf:li>")
-            append("<rdf:li rdf:parseType=\"Resource\">")
-            append("<Container:Item")
-            append(" Item:Mime=\"video/mp4\"")
-            append(" Item:Semantic=\"MotionPhoto\"")
-            append(" Item:Length=\"$motionVideoLength\"")
-            append(" Item:Padding=\"0\"/>")
-            append("</rdf:li>")
-            append("</rdf:Seq>")
-            append("</Container:Directory>")
-            append("</rdf:Description>")
-            append("</rdf:RDF>")
-            append("</x:xmpmeta>")
-        }
-    }
-
     private fun normalizeMp4Payload(bytes: ByteArray): ByteArray {
         val ftypIndex = findAscii(bytes, "ftyp".toByteArray(StandardCharsets.US_ASCII), 0, 256)
         if (ftypIndex == null || ftypIndex < 4) return bytes
@@ -141,7 +89,8 @@ object MotionPhotoWriter {
 
     private fun buildXmpApp1Segment(xmpMeta: String): ByteArray {
         val headerBytes = XMP_HEADER.toByteArray(StandardCharsets.UTF_8)
-        var payload = headerBytes + xmpMeta.toByteArray(StandardCharsets.UTF_8)
+        val payloadText = xmpMeta.trim() + "\n"
+        var payload = headerBytes + payloadText.toByteArray(StandardCharsets.UTF_8)
         if (payload.size % 2 != 0) {
             payload = payload + byteArrayOf(0x00)
         }
