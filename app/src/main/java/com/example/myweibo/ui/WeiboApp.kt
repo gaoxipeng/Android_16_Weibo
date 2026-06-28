@@ -752,14 +752,15 @@ private suspend fun AwaitPointerEventScope.awaitMediaLongPress(
     var cancelledByMoveBeforeLongPress = false
     var releasedBeforeLongPress = false
     var compressHapticFired = false
-    val longPressed = withTimeoutOrNull(MediaLongPressTimeoutMillis) {
+    val longPressTimeout = viewConfiguration.longPressTimeoutMillis
+    val longPressed = withTimeoutOrNull(longPressTimeout) {
         while (true) {
-            val event = awaitPointerEvent()
+            val event = awaitPointerEvent(PointerEventPass.Initial)
             val change = event.changes.firstOrNull { it.id == down.id }
                 ?: event.changes.firstOrNull()
                 ?: return@withTimeoutOrNull false
             val elapsed = change.uptimeMillis - down.uptimeMillis
-            val linearProgress = (elapsed.toFloat() / MediaLongPressTimeoutMillis).coerceIn(0f, 1f)
+            val linearProgress = (elapsed.toFloat() / longPressTimeout).coerceIn(0f, 1f)
             onHoldProgress(linearProgress)
             if (!change.pressed) {
                 releasedBeforeLongPress = true
@@ -794,6 +795,61 @@ private suspend fun AwaitPointerEventScope.awaitMediaLongPress(
         cancelledByMoveBeforeLongPress -> MediaLongPressResult.Cancelled
         else -> MediaLongPressResult.Tap
     }
+}
+
+private data class VideoPeekDragResult(
+    val cancelledByDrag: Boolean,
+    val floatByDrag: Boolean,
+)
+
+private suspend fun AwaitPointerEventScope.awaitVideoPeekDragGesture(
+    down: PointerInputChange,
+    pressWindowOffset: Offset,
+    bounds: Rect,
+    videoPeekController: VideoPeekController,
+): VideoPeekDragResult {
+    val dragGestureThreshold = 82f
+    var lastPosition = down.position
+    var cancelledByDrag = false
+    var floatByDrag = false
+    while (true) {
+        val event = awaitPointerEvent(PointerEventPass.Initial)
+        val change = event.changes.firstOrNull { it.id == down.id }
+            ?: event.changes.firstOrNull()
+            ?: break
+        change.consume()
+        if (!change.pressed) {
+            break
+        }
+        lastPosition = change.position
+        videoPeekController.updateFingerDragOffset(
+            change.position.toWindowPosition(bounds) - pressWindowOffset,
+        )
+        val totalDrag = lastPosition - down.position
+        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
+        if (totalDrag.y > dragGestureThreshold && verticalDominant) {
+            cancelledByDrag = true
+            videoPeekController.cancel()
+            while (true) {
+                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
+                consumeEvent.changes.forEach { it.consume() }
+                if (consumeEvent.changes.all { !it.pressed }) break
+            }
+            break
+        }
+        if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
+            floatByDrag = true
+            videoPeekController.release()
+            while (true) {
+                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
+                consumeEvent.changes.forEach { it.consume() }
+                if (consumeEvent.changes.all { !it.pressed }) break
+            }
+            break
+        }
+    }
+    videoPeekController.resetFingerDragOffset()
+    return VideoPeekDragResult(cancelledByDrag, floatByDrag)
 }
 
 @Composable
@@ -921,9 +977,10 @@ private const val AlbumGridMaxDecodeDim = 320
 private const val FullscreenDefaultMaxDecodeDim = 4096
 private const val FullscreenLongImageMaxDecodeDim = 8192
 private const val FullscreenLongImageOriginalMaxPixels = 32_000_000
-private const val FullscreenDefaultMaxZoomScale = 5f
-private const val FullscreenDynamicMaxZoomScale = 32f
+private const val FullscreenDefaultMaxZoomScale = 8f
+private const val FullscreenDynamicMaxZoomScale = 80f
 private const val FullscreenFillZoomHeadroom = 1.15f
+private const val FullscreenPixelPerfectZoomHeadroom = 2f
 private const val AlbumBitmapCacheMaxBytes = 96 * 1024 * 1024
 private const val AlbumGridMaxReadBytes = 768 * 1024
 private const val AlbumGridPrefetchConcurrency = 8
@@ -1037,19 +1094,71 @@ private class VideoPlaybackCoordinator {
     var pendingFullscreenHandoffKey by mutableStateOf<String?>(null)
     var pendingPeekHandoffKey by mutableStateOf<String?>(null)
     var peekPlaybackKey by mutableStateOf<String?>(null)
+    var detailOverlayOpen by mutableStateOf(false)
+    var detailHandoffActive by mutableStateOf(false)
     var proactiveStashSignalKey by mutableStateOf<String?>(null)
+    var autoScrollFloatingKey by mutableStateOf<String?>(null)
+    private val sharedPlayersByMediaKey = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val handoffPlayers = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val transitionFrames = mutableMapOf<String, Bitmap>()
     private val inlinePauseHandlers = mutableMapOf<String, () -> Unit>()
     private val fullscreenPauseHandlers = mutableMapOf<String, () -> Unit>()
     private val peekPauseHandlers = mutableMapOf<String, () -> Unit>()
     private val peekRestartFromBeginningKeys = mutableSetOf<String>()
+    private val inlineHandoffResumeKeys = mutableSetOf<String>()
+
+    private fun mediaAliasKey(mediaPart: String) = "*|$mediaPart"
+
+    private fun mediaPartFromPlaybackKey(playbackKey: String): String =
+        playbackKey.substringAfter('|', "")
+
+    fun rememberPosition(playbackKey: String, positionMs: Long) {
+        if (positionMs > 0L || positions[playbackKey] == null) {
+            positions[playbackKey] = positionMs
+        }
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            val alias = mediaAliasKey(mediaPart)
+            if (positionMs > 0L || positions[alias] == null) {
+                positions[alias] = positionMs
+            }
+        }
+    }
+
+    fun resolvePosition(playbackKey: String): Long? {
+        positions[playbackKey]?.let { return it }
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isBlank()) return null
+        return positions[mediaAliasKey(mediaPart)]
+    }
+
+    fun clearPosition(playbackKey: String) {
+        positions[playbackKey] = 0L
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            positions[mediaAliasKey(mediaPart)] = 0L
+        }
+    }
+
+    private fun clearHandoffFlagsForKey(playbackKey: String) {
+        if (pendingFullscreenHandoffKey == playbackKey) {
+            pendingFullscreenHandoffKey = null
+        }
+        if (pendingPeekHandoffKey == playbackKey) {
+            pendingPeekHandoffKey = null
+        }
+    }
+
+    private fun findHandoffKeyByMediaPart(mediaPart: String, except: String? = null): String? =
+        handoffPlayers.keys.firstOrNull { key ->
+            key != except && mediaPartFromPlaybackKey(key) == mediaPart
+        }
 
     fun schedulePeekRestartIfAtEnd(playbackKey: String, durationMs: Long?) {
-        val saved = positions[playbackKey] ?: return
+        val saved = resolvePosition(playbackKey) ?: return
         val duration = durationMs?.takeIf { it > VideoEndRestartThresholdMs } ?: return
         if (saved >= duration - VideoEndRestartThresholdMs) {
-            positions[playbackKey] = 0L
+            clearPosition(playbackKey)
             peekRestartFromBeginningKeys += playbackKey
         }
     }
@@ -1075,8 +1184,21 @@ private class VideoPlaybackCoordinator {
         proactiveStashSignalKey = playbackKey
     }
 
-    fun hasStashedHandoff(playbackKey: String): Boolean =
-        handoffPlayers.containsKey(playbackKey)
+    fun isProactiveStashRequested(playbackKey: String): Boolean =
+        proactiveStashSignalKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
+    fun clearProactiveStashRequest(playbackKey: String) {
+        if (isProactiveStashRequested(playbackKey)) {
+            proactiveStashSignalKey = null
+        }
+    }
+
+    fun hasStashedHandoff(playbackKey: String): Boolean {
+        if (handoffPlayers.containsKey(playbackKey)) return true
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isBlank()) return false
+        return findHandoffKeyByMediaPart(mediaPart, except = playbackKey) != null
+    }
 
     fun cancelFullscreenHandoff(playbackKey: String) {
         if (pendingFullscreenHandoffKey == playbackKey) {
@@ -1087,32 +1209,163 @@ private class VideoPlaybackCoordinator {
 
     fun beginPeekHandoff(playbackKey: String) {
         pendingPeekHandoffKey = playbackKey
+        inlineHandoffResumeKeys += playbackKey
     }
 
+    fun beginDetailHandoff(playbackKey: String) {
+        pendingPeekHandoffKey = playbackKey
+        inlineHandoffResumeKeys += playbackKey
+        detailHandoffActive = true
+        activeKey = playbackKey
+    }
+
+    fun isDetailHandoffTarget(playbackKey: String): Boolean =
+        detailHandoffActive &&
+            pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
+    fun finishDetailHandoff(playbackKey: String) {
+        if (detailHandoffActive &&
+            pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+        ) {
+            detailHandoffActive = false
+        }
+    }
+
+    fun completeDetailPlaybackHandoff(playbackKey: String) {
+        if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
+            pendingPeekHandoffKey = null
+        }
+        clearInlineHandoffResume(playbackKey)
+        detailHandoffActive = false
+    }
+
+    fun resumeDetailHandoffPlayback(
+        playbackKey: String,
+        player: androidx.media3.exoplayer.ExoPlayer,
+    ): Boolean {
+        if (!shouldResumeInlineHandoff(playbackKey)) return false
+        player.playWhenReady = true
+        player.play()
+        return true
+    }
+
+    fun isTransferringToDetail(playbackKey: String): Boolean =
+        detailHandoffActive &&
+            (
+                pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true ||
+                    activeKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+                )
+
+    fun registerSharedPlayer(playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer) {
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            sharedPlayersByMediaKey[mediaPart] = player
+        }
+    }
+
+    fun releaseSharedPlayer(playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer) {
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            sharedPlayersByMediaKey.remove(mediaPart, player)
+        }
+    }
+
+    fun adoptSharedPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
+        consumeHandoffPlayer(playbackKey)?.let { player ->
+            registerSharedPlayer(playbackKey, player)
+            return player
+        }
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isBlank()) return null
+        return sharedPlayersByMediaKey.remove(mediaPart)
+    }
+
+    fun playbackKeysShareMedia(first: String, second: String): Boolean {
+        val firstMedia = mediaPartFromPlaybackKey(first)
+        val secondMedia = mediaPartFromPlaybackKey(second)
+        return firstMedia.isNotBlank() && firstMedia == secondMedia
+    }
+
+    fun matchesPlaybackKey(candidate: String, reference: String): Boolean =
+        candidate == reference || playbackKeysShareMedia(candidate, reference)
+
+    fun isPlaybackKeyActive(playbackKey: String): Boolean =
+        activeKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
+    fun isPlaybackKeyHandoffPending(playbackKey: String): Boolean =
+        pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
+    fun shouldResumeInlineHandoff(playbackKey: String): Boolean =
+        inlineHandoffResumeKeys.any { matchesPlaybackKey(it, playbackKey) }
+
+    fun clearInlineHandoffResume(playbackKey: String) {
+        inlineHandoffResumeKeys.removeAll { matchesPlaybackKey(it, playbackKey) }
+    }
+
+    fun markAutoScrollFloating(playbackKey: String) {
+        autoScrollFloatingKey = playbackKey
+    }
+
+    fun isAutoScrollFloating(playbackKey: String): Boolean =
+        autoScrollFloatingKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
+    fun clearAutoScrollFloating(playbackKey: String) {
+        if (isAutoScrollFloating(playbackKey)) {
+            autoScrollFloatingKey = null
+        }
+    }
+
+    fun shouldSuppressInlineForDetailOverlay(playbackKey: String): Boolean =
+        detailOverlayOpen &&
+            (
+                isDetailHandoffTarget(playbackKey) ||
+                    isPlaybackKeyActive(playbackKey) ||
+                    isPlaybackKeyHandoffPending(playbackKey)
+                )
+
+    fun isFullscreenHandoffPending(playbackKey: String): Boolean =
+        pendingFullscreenHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+
     fun cancelPeekHandoff(playbackKey: String) {
-        if (pendingPeekHandoffKey == playbackKey) {
+        if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
             pendingPeekHandoffKey = null
         }
         handoffPlayers.remove(playbackKey)?.release()
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            findHandoffKeyByMediaPart(mediaPart, except = playbackKey)?.let { matched ->
+                handoffPlayers.remove(matched)?.release()
+            }
+        }
     }
 
     fun stashHandoffPlayer(playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer) {
         val currentPosition = player.currentPosition.coerceAtLeast(0L)
-        if (currentPosition > 0L || positions[playbackKey] == null) {
-            positions[playbackKey] = currentPosition
+        rememberPosition(playbackKey, currentPosition)
+        if (detailOverlayOpen && isPlaybackKeyActive(playbackKey)) {
+            player.clearVideoSurface()
+            return
         }
         player.playWhenReady = false
         player.pause()
         player.clearVideoSurface()
         handoffPlayers[playbackKey] = player
+        registerSharedPlayer(playbackKey, player)
     }
 
     fun consumeHandoffPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
-        val player = handoffPlayers.remove(playbackKey) ?: return null
-        if (pendingFullscreenHandoffKey == playbackKey) {
-            pendingFullscreenHandoffKey = null
+        handoffPlayers.remove(playbackKey)?.let { player ->
+            clearHandoffFlagsForKey(playbackKey)
+            clearProactiveStashRequest(playbackKey)
+            return player
         }
-        if (pendingPeekHandoffKey == playbackKey) {
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isBlank()) return null
+        val matchedKey = findHandoffKeyByMediaPart(mediaPart, except = playbackKey) ?: return null
+        val player = handoffPlayers.remove(matchedKey) ?: return null
+        clearHandoffFlagsForKey(matchedKey)
+        clearProactiveStashRequest(playbackKey)
+        if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
             pendingPeekHandoffKey = null
         }
         return player
@@ -1156,7 +1409,8 @@ private class VideoPlaybackCoordinator {
 
     fun pauseInlineOnly(exceptKey: String? = null) {
         inlinePauseHandlers.forEach { (key, handler) ->
-            if (key != exceptKey) handler()
+            if (exceptKey != null && matchesPlaybackKey(key, exceptKey)) return@forEach
+            handler()
         }
     }
 
@@ -1316,6 +1570,7 @@ private fun FeedImage.albumStatusCacheKey(): String =
     statusId?.takeIf { it.isNotBlank() } ?: largeUrl
 
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
+private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
@@ -2000,6 +2255,24 @@ private fun videoMediaKey(media: FeedMedia): String =
 private fun videoPlaybackKey(media: FeedMedia, ownerId: String): String =
     "$ownerId|${videoMediaKey(media)}"
 
+private fun feedItemPlaybackOwnerId(item: FeedItem): String =
+    item.statusId.ifBlank { item.id }
+
+private fun feedItemInlinePlaybackKeys(item: FeedItem): Set<String> {
+    val keys = mutableSetOf<String>()
+    fun register(medias: List<FeedMedia>, ownerId: String) {
+        medias.forEach { media ->
+            keys += videoPlaybackKey(media, ownerId)
+        }
+    }
+    register(item.medias, feedItemPlaybackOwnerId(item))
+    item.retweetedStatus?.let { retweeted ->
+        val retweetOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) }
+        register(retweeted.medias, retweetOwnerId)
+    }
+    return keys
+}
+
 private fun videoDurationMs(media: FeedMedia): Long? =
     media.durationSeconds?.takeIf { it > 0 }?.times(1000L)
 
@@ -2054,6 +2327,7 @@ fun WeiboApp() {
     val followListFansListState = rememberLazyListState()
     val searchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
+    val feedCardActionMenuController = remember { FeedCardActionMenuController() }
     val videoPeekController = remember { VideoPeekController() }
     val profileHeaderHeights = remember { mutableStateMapOf<String, Dp>() }
 
@@ -2073,6 +2347,17 @@ fun WeiboApp() {
     var timelineLoadMoreJob by remember { mutableStateOf<Job?>(null) }
     var timelineRequestGeneration by remember { mutableIntStateOf(0) }
     var selectedItem by remember { mutableStateOf<FeedItem?>(null) }
+
+    LaunchedEffect(selectedItem?.actionMenuKey()) {
+        if (selectedItem != null) {
+            feedCardActionMenuController.dismiss()
+        }
+    }
+
+    SideEffect {
+        videoPlaybackCoordinator.detailOverlayOpen = selectedItem != null
+    }
+
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
@@ -2241,7 +2526,7 @@ fun WeiboApp() {
                         val merged = emoticonCacheStore.merge(synced, overwriteExisting = true)
                         emoticonMap = merged
                         recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in merged }
-                        showMessage("表情同步完成", "已同步 ${synced.size} 个表情")
+                        operationCapsuleHint = "已同步 ${synced.size} 个表情"
                     }
                 }
                 .onFailure { error ->
@@ -2883,7 +3168,36 @@ fun WeiboApp() {
     }
 
     fun closeDetail() {
+        val floatingActive = videoPeekController.activeRequest != null &&
+            videoPeekController.isFloating &&
+            videoPeekController.pendingDismiss == null
+        if (!floatingActive) {
+            videoPlaybackCoordinator.activeKey?.let { key ->
+                videoPlaybackCoordinator.cancelPeekHandoff(key)
+                videoPlaybackCoordinator.clearInlineHandoffResume(key)
+                videoPlaybackCoordinator.clearAutoScrollFloating(key)
+                videoPlaybackCoordinator.finishDetailHandoff(key)
+                videoPlaybackCoordinator.completeDetailPlaybackHandoff(key)
+            }
+            videoPlaybackCoordinator.pauseInlineOnly()
+            videoPlaybackCoordinator.activeKey = null
+        }
         popNavigation()
+    }
+
+    fun prepareInlineVideoHandoffForDetail(item: FeedItem, hostItem: FeedItem? = null) {
+        if (videoPlaybackCoordinator.peekPlaybackKey != null) return
+        val activeKey = videoPlaybackCoordinator.activeKey ?: return
+        val candidateKeys = buildSet {
+            addAll(feedItemInlinePlaybackKeys(item))
+            hostItem?.let { addAll(feedItemInlinePlaybackKeys(it)) }
+        }
+        val shouldHandoff = candidateKeys.any { candidate ->
+            videoPlaybackCoordinator.matchesPlaybackKey(activeKey, candidate)
+        }
+        if (shouldHandoff) {
+            videoPlaybackCoordinator.beginDetailHandoff(activeKey)
+        }
     }
 
     fun handleRootBackPress() {
@@ -3737,6 +4051,8 @@ fun WeiboApp() {
         scrollToContentSection: Boolean,
     ) {
         val resolved = resolveFeedItem(item)
+        prepareInlineVideoHandoffForDetail(resolved)
+        feedCardActionMenuController.dismiss()
         activeDetailInstanceKey = navStack.size
         val scroll = if (scrollToContentSection) {
             ScrollRestore(index = DETAIL_SECTION_HEADER_INDEX)
@@ -3757,7 +4073,11 @@ fun WeiboApp() {
         }
     }
 
-    fun openDetailInternal(item: FeedItem) {
+    fun openDetailInternal(item: FeedItem, hostItem: FeedItem? = null) {
+        prepareInlineVideoHandoffForDetail(
+            resolveFeedItem(item),
+            hostItem?.let(::resolveFeedItem),
+        )
         pushNavigation {
             openDetailPrepared(
                 item = item,
@@ -3791,6 +4111,7 @@ fun WeiboApp() {
     }
 
     fun openDetailToSection(item: FeedItem, section: DetailContentSection) {
+        prepareInlineVideoHandoffForDetail(resolveFeedItem(item))
         pushNavigation {
             openDetailPrepared(
                 item = item,
@@ -3800,19 +4121,21 @@ fun WeiboApp() {
         }
     }
 
-    fun openDetail(item: FeedItem) {
-        openDetailInternal(item)
+    fun openDetail(item: FeedItem, hostItem: FeedItem? = null) {
+        openDetailInternal(item, hostItem)
     }
 
-    fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?) {
-        openDetailInternal(item)
+    fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null) {
+        openDetailInternal(item, hostItem)
     }
 
     fun openDetailFromAlbumViewer(item: FeedItem, viewer: AlbumViewerState) {
+        val resolved = resolveFeedItem(item)
+        prepareInlineVideoHandoffForDetail(resolved)
+        feedCardActionMenuController.dismiss()
         pushNavigation {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = viewer
-            val resolved = resolveFeedItem(item)
             activeDetailInstanceKey = navStack.size
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
@@ -4194,6 +4517,7 @@ fun WeiboApp() {
     LaunchedEffect(
         selectedTab,
         visitedUserId,
+        visitedPosts,
         selectedItem,
         mediaPreview,
         articleOverlay,
@@ -4203,6 +4527,8 @@ fun WeiboApp() {
         videoPeekController.isFloating,
         videoPeekController.isFullscreenMode,
         videoPeekController.pendingDismiss,
+        videoPlaybackCoordinator.pendingPeekHandoffKey,
+        videoPlaybackCoordinator.activeKey,
     ) {
         val homeFeedOnTop = selectedTab == MainTab.Feed &&
             visitedUserId == null &&
@@ -4211,17 +4537,70 @@ fun WeiboApp() {
             articleOverlay == null &&
             followListOverlay == null &&
             albumViewerState == null
-        val keepFloatingPeekPlayback = videoPeekController.activeRequest != null &&
+        val keepFloatingPeekPlayback = visitedUserId == null &&
+            videoPeekController.activeRequest != null &&
             videoPeekController.isFloating &&
             !videoPeekController.isFullscreenMode &&
             videoPeekController.pendingDismiss == null
+        val detailVideoHandoffKey = videoPlaybackCoordinator.pendingPeekHandoffKey
+        val profileInlinePlaybackActive = visitedUserId != null &&
+            selectedItem == null &&
+            albumViewerState == null &&
+            mediaPreview == null &&
+            articleOverlay == null &&
+            followListOverlay == null
+        val searchInlinePlaybackActive = selectedTab == MainTab.Search &&
+            visitedUserId == null &&
+            selectedItem == null &&
+            followListOverlay == null &&
+            articleOverlay == null &&
+            mediaPreview == null &&
+            albumViewerState == null
+        val mineInlinePlaybackActive = selectedTab == MainTab.Mine &&
+            visitedUserId == null &&
+            selectedItem == null &&
+            followListOverlay == null &&
+            articleOverlay == null &&
+            mediaPreview == null &&
+            albumViewerState == null
         if (!homeFeedOnTop) {
-            if (mediaPreview != null || keepFloatingPeekPlayback) {
-                videoPlaybackCoordinator.pauseInlineOnly()
-            } else {
-                videoPlaybackCoordinator.pauseAll()
+            when {
+                mediaPreview != null || keepFloatingPeekPlayback -> {
+                    videoPlaybackCoordinator.pauseInlineOnly()
+                    videoPlaybackCoordinator.activeKey = null
+                }
+                selectedItem != null -> {
+                    val preserveKey = detailVideoHandoffKey ?: videoPlaybackCoordinator.activeKey
+                    videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
+                    videoPlaybackCoordinator.activeKey = preserveKey
+                }
+                profileInlinePlaybackActive -> {
+                    val profilePlaybackKeys = visitedPosts
+                        .map(::resolveFeedItem)
+                        .flatMap(::feedItemInlinePlaybackKeys)
+                        .toSet()
+                    val currentKey = videoPlaybackCoordinator.activeKey
+                    val preserveKey = currentKey?.takeIf { it in profilePlaybackKeys }
+                    videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
+                    videoPlaybackCoordinator.activeKey = preserveKey
+                    if (preserveKey == null) {
+                        currentKey?.let(videoPlaybackCoordinator::cancelPeekHandoff)
+                        if (videoPeekController.activeRequest != null) {
+                            videoPeekController.cancel()
+                        }
+                    }
+                }
+                searchInlinePlaybackActive ||
+                    mineInlinePlaybackActive -> {
+                    val preserveKey = videoPlaybackCoordinator.activeKey
+                    videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
+                    videoPlaybackCoordinator.activeKey = preserveKey
+                }
+                else -> {
+                    videoPlaybackCoordinator.pauseAll()
+                    videoPlaybackCoordinator.activeKey = null
+                }
             }
-            videoPlaybackCoordinator.activeKey = null
         }
     }
 
@@ -4242,12 +4621,12 @@ fun WeiboApp() {
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
         LocalTopicClickHandler provides ::openSearchTopic,
     ) {
+    MediaLongPressConfiguration {
     MyWeiboScaffold(
         snackbarHostState = snackbarHostState,
     ) { innerPadding ->
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
-        val feedCardActionMenuController = remember { FeedCardActionMenuController() }
         val searchBarOverlay = remember { SearchBarOverlayController() }
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
@@ -4325,13 +4704,14 @@ fun WeiboApp() {
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
                 detailOverlayItem == null
-            val keepFeedAlive = selectedTab == MainTab.Feed &&
-                visitedUserId != null &&
-                detailOverlayItem == null
+            val keepFeedAlive = selectedTab == MainTab.Feed && (
+                (visitedUserId != null && detailOverlayItem == null) ||
+                detailOverlayItem != null
+            )
             val keepFeedBackdropAlive = webTabVisible && cacheLoaded
             val feedLayerVisible = (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) ||
                 keepFeedBackdropAlive
-            val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
+            val feedVisibleAlpha = if (feedUiOnTop) 1f else 0f
             val searchUiOnTop = selectedTab == MainTab.Search &&
                 visitedUserId == null &&
                 detailOverlayItem == null &&
@@ -4385,6 +4765,9 @@ fun WeiboApp() {
                             onOpenLoginSettings = ::openAccountLoginManagement,
                             onUserClick = ::openUser,
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                            onRetweetClick = { retweeted, host ->
+                                openDetailFromSource(retweeted, null, host)
+                            },
                             onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
                             onCommentLongClick = { item -> openCommentComposer(item) },
                             onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
@@ -4435,8 +4818,7 @@ fun WeiboApp() {
                     Box(
                         Modifier
                             .fillMaxSize()
-                            .graphicsLayer { alpha = if (searchUiOnTop) 1f else 0f }
-                            .blockHiddenTouches(searchUiOnTop),
+                            .graphicsLayer { alpha = if (searchUiOnTop) 1f else 0f },
                     ) {
                         SearchScreen(
                             session = session,
@@ -4547,6 +4929,7 @@ fun WeiboApp() {
                                     onLoadMoreAlbum = { loadMoreVisitedAlbum() },
                                     onSyncEmoticons = { syncEmoticons() },
                                     onItemClick = ::openDetail,
+                                    onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
                                     onCommentLongClick = ::openCommentComposer,
                                     onOpenAlbumViewer = ::pushAlbumViewer,
                                     onMediaClick = ::pushMediaPreview,
@@ -4567,17 +4950,24 @@ fun WeiboApp() {
                     }
                 }
 
-                if (visitedUserId == null && selectedItem == null) {
+                if (visitedUserId == null) {
                     when (selectedTab) {
                         MainTab.Search -> Unit
                         MainTab.Messages, MainTab.Compose -> Unit
 
                         MainTab.Mine -> {
+                            val mineCoveredByOverlay = selectedItem != null || albumViewerState != null
                             LaunchedEffect(mineProfile) {
                                 if (mineProfile == null && !mineProfileLoading) {
                                     refreshMineProfile()
                                 }
                             }
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer { alpha = if (mineCoveredByOverlay) 0f else 1f }
+                                    .blockHiddenTouches(!mineCoveredByOverlay),
+                            ) {
                             MineScreen(
                                 session = session,
                                 profile = mineProfile,
@@ -4610,6 +5000,7 @@ fun WeiboApp() {
                                 onLoadMoreAlbum = { loadMoreMineAlbum() },
                                 onSyncEmoticons = { syncEmoticons() },
                                 onItemClick = ::openDetail,
+                                onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
                                 onCommentLongClick = ::openCommentComposer,
                                 onOpenAlbumViewer = ::pushAlbumViewer,
                                 onMediaClick = ::pushMediaPreview,
@@ -4654,6 +5045,7 @@ fun WeiboApp() {
                                     themeSettingsStore.writeThemeColor(color.storageValue)
                                 },
                             )
+                            }
                         }
 
                         MainTab.Feed -> Unit
@@ -4703,6 +5095,7 @@ fun WeiboApp() {
                             modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background,
                         ) {
+                            CompositionLocalProvider(LocalDetailInlineVideoPlayback provides true) {
                             DetailScreen(
                                 item = detailItem,
                                 contentSection = detailContentSection,
@@ -4728,13 +5121,14 @@ fun WeiboApp() {
                                 listState = detailListState,
                                 onMediaClick = ::pushMediaPreview,
                                 emoticonMap = emoticonMap,
-                                onRetweetClick = ::openDetail,
+                                onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
                                 onUserClick = ::openUser,
                                 onComposeComment = ::openCommentComposer,
                                 onExpandNestedComments = ::loadNestedCommentsPage,
                                 nestedCommentsLoadingIds = nestedCommentsLoadingIds,
                                 onUrlEntityClick = ::openUrlEntity,
                             )
+                            }
                         }
                     }
                 }
@@ -5138,6 +5532,7 @@ fun WeiboApp() {
     }
     }
     }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -5394,6 +5789,7 @@ private fun FollowFeedScreen(
     onLoadMore: () -> Unit,
     onOpenLoginSettings: () -> Unit,
     onItemClick: (FeedItem, Rect?) -> Unit,
+    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item, null) },
     onCommentClick: (FeedItem) -> Unit,
     onCommentLongClick: (FeedItem) -> Unit,
     onRepostClick: (FeedItem) -> Unit,
@@ -5474,7 +5870,7 @@ private fun FollowFeedScreen(
                     onMediaClick = onMediaClick,
                     emoticonMap = emoticonMap,
                     onUserClick = onUserClick,
-                    onRetweetClick = { retweeted -> onItemClick(retweeted, cardBounds) },
+                    onRetweetClick = { retweeted, host -> onRetweetClick(retweeted, host) },
                     isLongTextLoading = isLongTextLoading,
                     onLoadLongText = onLoadLongText,
                     onToggleLike = onToggleLike,
@@ -5900,12 +6296,13 @@ private fun FeedCard(
     onMediaClick: (FeedMedia, String) -> Unit,
     emoticonMap: Map<String, String> = emptyMap(),
     onUserClick: ((String) -> Unit)? = null,
-    onRetweetClick: ((FeedItem) -> Unit)? = null,
+    onRetweetClick: ((FeedItem, FeedItem) -> Unit)? = null,
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    autoFloatingOnScrollAway: Boolean = false,
     onCommentClick: (() -> Unit)? = null,
     onCommentLongClick: (() -> Unit)? = null,
     onRepostClick: (() -> Unit)? = null,
@@ -5954,10 +6351,12 @@ private fun FeedCard(
                             avatarClickable = true,
                         )
                     }
-                    FeedCardActionMenu(
-                        item = item,
-                        backHandlerEnabled = menuBackEnabled,
-                    )
+                    if (menuBackEnabled) {
+                        FeedCardActionMenu(
+                            item = item,
+                            backHandlerEnabled = menuBackEnabled,
+                        )
+                    }
                 }
             }
             Column(
@@ -5988,24 +6387,26 @@ private fun FeedCard(
                 QuotedStatus(
                     modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                     item = retweeted,
-                    playbackOwnerId = item.statusId,
+                    playbackOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) },
                     onMediaClick = onMediaClick,
                     emoticonMap = emoticonMap,
-                    onClick = onRetweetClick?.let { cb -> { cb(retweeted) } },
+                    onClick = onRetweetClick?.let { cb -> { cb(retweeted, item) } },
                     onUserClick = onUserClick,
                     isLongTextLoading = isLongTextLoading(retweeted),
                     onLoadLongText = onLoadLongText,
                     onUrlEntityClick = onUrlEntityClick,
+                    autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
             MediaStrip(
                 modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                 images = item.images,
                 medias = item.medias,
-                playbackOwnerId = item.statusId,
+                playbackOwnerId = feedItemPlaybackOwnerId(item),
                 onMediaClick = onMediaClick,
                 onDetailClick = if (showAuthorRow) onClick else null,
                 imageOwner = item,
+                autoFloatingOnScrollAway = autoFloatingOnScrollAway,
             )
             StatusActions(
                 modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
@@ -6109,6 +6510,7 @@ private fun QuotedStatus(
     isLongTextLoading: Boolean = false,
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    autoFloatingOnScrollAway: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val resolvedMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
@@ -6164,6 +6566,7 @@ private fun QuotedStatus(
                 onMediaClick = onMediaClick,
                 onDetailClick = onClick,
                 imageOwner = item,
+                autoFloatingOnScrollAway = autoFloatingOnScrollAway,
             )
         }
     }
@@ -6218,14 +6621,17 @@ private fun CommentSortToggle(
     }
 }
 
+private fun FeedItem.actionMenuKey(): String = statusId.ifBlank { id }
+
 @Composable
 private fun FeedCardActionMenu(
     item: FeedItem,
     backHandlerEnabled: Boolean = true,
 ) {
     val controller = LocalFeedCardActionMenuController.current
-    var anchorBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
-    val isExpanded = controller.activeRequest?.item?.id == item.id
+    val menuKey = item.actionMenuKey()
+    var anchorBounds by remember(menuKey) { mutableStateOf<Rect?>(null) }
+    val isExpanded = controller.activeRequest?.item?.actionMenuKey() == menuKey
 
     LaunchedEffect(backHandlerEnabled, isExpanded) {
         if (!backHandlerEnabled && isExpanded) {
@@ -6311,7 +6717,7 @@ private fun FeedCardActionMenuOverlay(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .zIndex(45f),
+            .zIndex(590f),
     ) {
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenHeightPx = with(density) { maxHeight.toPx() }
@@ -8155,6 +8561,7 @@ private fun MediaStrip(
     modifier: Modifier = Modifier,
     onDetailClick: (() -> Unit)? = null,
     imageOwner: FeedItem? = null,
+    autoFloatingOnScrollAway: Boolean = false,
 ) {
     if (images.isEmpty() && medias.isEmpty()) return
 
@@ -8293,6 +8700,8 @@ private fun MediaStrip(
                 playbackOwnerId = playbackOwnerId,
                 onClick = { onMediaClick(media, playbackOwnerId) },
                 onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
+                onDetailClick = onDetailClick,
+                autoFloatingOnScrollAway = autoFloatingOnScrollAway,
             )
         }
     }
@@ -8502,7 +8911,7 @@ private fun FullscreenImageViewer(
                 scale = 1f,
             )
             val transition = transitionProgress.value.coerceIn(0f, 1f)
-            val backdropAlpha = (1f - dragDismissProgress * 0.92f).coerceIn(0f, 1f)
+            val backdropAlpha = (1f - dragDismissProgress).coerceIn(0f, 1f)
             val morphWidth: Float
             val morphHeight: Float
             val morphCenterX: Float
@@ -8533,6 +8942,11 @@ private fun FullscreenImageViewer(
                 uniformScale = 1f
             }
             val activeMorph = morphSourceBounds != null && (transitionClosing || transition < 0.999f)
+            val effectiveBackdropAlpha = when {
+                activeMorph && transitionClosing -> (transition * backdropAlpha).coerceIn(0f, 1f)
+                sourceBoundsByIndex.isEmpty() -> (transition * backdropAlpha).coerceIn(0f, 1f)
+                else -> backdropAlpha
+            }
             val morphLeft = morphCenterX - morphWidth / 2f
             val morphTop = morphCenterY - morphHeight / 2f
             val morphRight = morphCenterX + morphWidth / 2f
@@ -8548,7 +8962,7 @@ private fun FullscreenImageViewer(
                         morphRight = morphRight,
                         morphBottom = morphBottom,
                         cornerRadiusPx = morphCornerRadiusPx,
-                        scrimColor = Color.Black.copy(alpha = transition * backdropAlpha),
+                        scrimColor = Color.Black.copy(alpha = effectiveBackdropAlpha),
                     )
                 }
                 activeMorph -> {
@@ -8565,15 +8979,7 @@ private fun FullscreenImageViewer(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(
-                                Color.Black.copy(
-                                    alpha = if (sourceBoundsByIndex.isEmpty()) {
-                                        transition * backdropAlpha
-                                    } else {
-                                        backdropAlpha
-                                    },
-                                ),
-                            ),
+                            .background(Color.Black.copy(alpha = effectiveBackdropAlpha)),
                     )
                 }
             }
@@ -8755,6 +9161,35 @@ private fun computeFitImageLayout(
     return FitImageLayout(fitWidthPx, fitHeightPx, maxPanX, maxPanY)
 }
 
+private fun computeFullscreenMaxZoomScale(
+    bitmapWidth: Int,
+    bitmapHeight: Int,
+    containerWidthPx: Float,
+    containerHeightPx: Float,
+    imageAspect: Float,
+    rawFillScreenScale: Float,
+    sourceWidth: Int = 0,
+    sourceHeight: Int = 0,
+): Float {
+    val fitLayout = computeFitImageLayout(
+        containerWidthPx = containerWidthPx,
+        containerHeightPx = containerHeightPx,
+        imageAspect = imageAspect,
+        scale = 1f,
+    )
+    val targetWidth = maxOf(bitmapWidth, sourceWidth.coerceAtLeast(0))
+    val targetHeight = maxOf(bitmapHeight, sourceHeight.coerceAtLeast(0))
+    val pixelPerfectScale = maxOf(
+        targetWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
+        targetHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
+    )
+    return maxOf(
+        FullscreenDefaultMaxZoomScale,
+        rawFillScreenScale * FullscreenFillZoomHeadroom,
+        pixelPerfectScale * FullscreenPixelPerfectZoomHeadroom,
+    ).coerceAtMost(FullscreenDynamicMaxZoomScale)
+}
+
 private fun computeVisibleBlackBars(
     offsetY: Float,
     layout: FitImageLayout,
@@ -8918,11 +9353,26 @@ private fun ZoomableFullscreenImage(
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
                 .coerceAtLeast(1f)
         }
-        val maxZoomScale = remember(rawFillScreenScale) {
-            maxOf(
-                FullscreenDefaultMaxZoomScale,
-                rawFillScreenScale * FullscreenFillZoomHeadroom,
-            ).coerceAtMost(FullscreenDynamicMaxZoomScale)
+        val maxZoomScale = remember(
+            loadedBitmap.width,
+            loadedBitmap.height,
+            resolvedImage.width,
+            resolvedImage.height,
+            containerWidthPx,
+            containerHeightPx,
+            imageAspect,
+            rawFillScreenScale,
+        ) {
+            computeFullscreenMaxZoomScale(
+                bitmapWidth = loadedBitmap.width,
+                bitmapHeight = loadedBitmap.height,
+                containerWidthPx = containerWidthPx,
+                containerHeightPx = containerHeightPx,
+                imageAspect = imageAspect,
+                rawFillScreenScale = rawFillScreenScale,
+                sourceWidth = resolvedImage.width ?: 0,
+                sourceHeight = resolvedImage.height ?: 0,
+            )
         }
         val fillScreenScale = remember(rawFillScreenScale, maxZoomScale) {
             rawFillScreenScale.coerceIn(1.35f, maxZoomScale)
@@ -8993,8 +9443,7 @@ private fun ZoomableFullscreenImage(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .layerBackdrop(pageMenuBackdrop)
-                    .background(Color.Black),
+                    .layerBackdrop(pageMenuBackdrop),
             ) {
         Box(
             modifier = Modifier
@@ -9636,6 +10085,8 @@ private fun InlineVideoPlayer(
     playbackOwnerId: String,
     onClick: () -> Unit = {},
     onFullscreenRequest: () -> Unit = onClick,
+    onDetailClick: (() -> Unit)? = null,
+    autoFloatingOnScrollAway: Boolean = false,
 ) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
@@ -9643,7 +10094,15 @@ private fun InlineVideoPlayer(
     val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl, playbackOwnerId) {
         videoPlaybackKey(media, playbackOwnerId)
     }
-    val inlinePlaying = videoCoordinator.activeKey == playbackKey &&
+    val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
+    val suppressedByDetailOverlay = !isDetailInlinePlayback &&
+        videoCoordinator.shouldSuppressInlineForDetailOverlay(playbackKey)
+    val inlinePlaying = !suppressedByDetailOverlay &&
+        (
+            videoCoordinator.isPlaybackKeyActive(playbackKey) ||
+                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                (isDetailInlinePlayback && videoCoordinator.isDetailHandoffTarget(playbackKey))
+            ) &&
         videoCoordinator.fullscreenKey != playbackKey &&
         videoCoordinator.peekPlaybackKey != playbackKey
     var measuredVideoWidth by remember(media.streamUrl) {
@@ -9672,6 +10131,12 @@ private fun InlineVideoPlayer(
     var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
     var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
     var lastTapUptimeMs by remember(media.streamUrl) { mutableStateOf(0L) }
+    var isCardViewportVisible by remember(media.streamUrl) { mutableStateOf(true) }
+    var cardWasHiddenWhileAutoFloating by remember(media.streamUrl) { mutableStateOf(false) }
+    val isAutoScrollFloating = videoCoordinator.isAutoScrollFloating(playbackKey)
+    val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
+    val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
@@ -9715,8 +10180,11 @@ private fun InlineVideoPlayer(
         )
     }
 
-    fun openInlineFloatingPlayback(pressWindowOffset: Offset) {
+    fun openInlineFloatingPlayback(pressWindowOffset: Offset, fromAutoScroll: Boolean = false) {
         val bounds = anchorBounds ?: return
+        if (fromAutoScroll) {
+            videoCoordinator.markAutoScrollFloating(playbackKey)
+        }
         actionOpen = true
         peekActive = true
         pressHoldProgress = 0f
@@ -9730,17 +10198,83 @@ private fun InlineVideoPlayer(
                 playbackOwnerId = playbackOwnerId,
                 resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
                 onCancel = {
-                    videoCoordinator.cancelPeekHandoff(playbackKey)
+                    val returningToInline = videoCoordinator.pendingPeekHandoffKey?.let { pending ->
+                        videoCoordinator.matchesPlaybackKey(pending, playbackKey)
+                    } == true
+                    if (!returningToInline) {
+                        videoCoordinator.clearAutoScrollFloating(playbackKey)
+                        videoCoordinator.cancelPeekHandoff(playbackKey)
+                        videoCoordinator.clearInlineHandoffResume(playbackKey)
+                    }
                     resetPeekState()
+                    if (returningToInline && media.isStreamPlayable()) {
+                        videoCoordinator.clearAutoScrollFloating(playbackKey)
+                        videoCoordinator.releasePeekPlayback(playbackKey)
+                        videoCoordinator.requestInlinePlayback(playbackKey)
+                    }
                 },
                 onRelease = {},
-                onPlaybackEnded = { resetPeekState() },
+                onPlaybackEnded = {
+                    videoCoordinator.clearAutoScrollFloating(playbackKey)
+                    resetPeekState()
+                },
                 onOpenFullscreenBehind = {},
                 onEnterFullscreenHandoffComplete = {
                     resetPeekState()
                 },
             ),
         )
+    }
+
+    fun returnToInlineFromScrollFloating() {
+        if (!videoCoordinator.isAutoScrollFloating(playbackKey)) return
+        if (videoCoordinator.peekPlaybackKey != playbackKey || !videoPeekController.isFloating) return
+        if (videoPeekController.pendingDismiss != null) return
+        videoCoordinator.clearAutoScrollFloating(playbackKey)
+        videoCoordinator.beginPeekHandoff(playbackKey)
+        videoPeekController.cancel()
+    }
+
+    LaunchedEffect(isAutoScrollFloating) {
+        if (!isAutoScrollFloating) {
+            cardWasHiddenWhileAutoFloating = false
+        }
+    }
+
+    LaunchedEffect(
+        autoFloatingOnScrollAway,
+        isCardViewportVisible,
+        inlinePlaying,
+        videoCoordinator.peekPlaybackKey,
+        actionOpen,
+        peekActive,
+    ) {
+        if (!autoFloatingOnScrollAway || isCardViewportVisible) return@LaunchedEffect
+        if (!inlinePlaying || !media.isStreamPlayable()) return@LaunchedEffect
+        if (videoCoordinator.peekPlaybackKey == playbackKey) return@LaunchedEffect
+        if (actionOpen || peekActive) return@LaunchedEffect
+        val bounds = anchorBounds ?: return@LaunchedEffect
+        val center = Offset(
+            bounds.left + bounds.width / 2f,
+            bounds.top + bounds.height / 2f,
+        )
+        openInlineFloatingPlayback(center, fromAutoScroll = true)
+    }
+
+    LaunchedEffect(
+        isCardViewportVisible,
+        isAutoScrollFloating,
+        cardWasHiddenWhileAutoFloating,
+        videoCoordinator.peekPlaybackKey,
+        videoPeekController.isFloating,
+        videoPeekController.pendingDismiss,
+    ) {
+        if (!isAutoScrollFloating) return@LaunchedEffect
+        if (!cardWasHiddenWhileAutoFloating) return@LaunchedEffect
+        if (!isCardViewportVisible) return@LaunchedEffect
+        if (videoCoordinator.peekPlaybackKey != playbackKey) return@LaunchedEffect
+        if (!videoPeekController.isFloating || videoPeekController.pendingDismiss != null) return@LaunchedEffect
+        returnToInlineFromScrollFloating()
     }
 
     fun openInlineFullscreenTransition(pressWindowOffset: Offset) {
@@ -9786,9 +10320,22 @@ private fun InlineVideoPlayer(
                 .align(Alignment.TopStart)
                 .fillMaxWidth(cardLayout.widthFraction)
                 .aspectRatio(cardLayout.aspectRatio)
+                .zIndex(if (actionOpen || peekActive) 10f else 0f)
                 .onGloballyPositioned { coordinates ->
                     anchorCoordinates = coordinates
                     anchorBounds = coordinates.boundsInWindow()
+                    if (autoFloatingOnScrollAway || isAutoScrollFloating) {
+                        val bounds = coordinates.boundsInWindow()
+                        val visibleTop = max(bounds.top, 0f)
+                        val visibleBottom = min(bounds.bottom, screenHeightPx)
+                        val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
+                        val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
+                        val nowVisible = fraction >= 0.35f
+                        isCardViewportVisible = nowVisible
+                        if (!nowVisible && (autoFloatingOnScrollAway || isAutoScrollFloating)) {
+                            cardWasHiddenWhileAutoFloating = true
+                        }
+                    }
                 }
                 .graphicsLayer {
                     scaleX = holdScale
@@ -9801,7 +10348,6 @@ private fun InlineVideoPlayer(
                 awaitEachGesture {
                     val bounds = anchorBounds ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
-                    var lastPosition = down.position
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
                         down = down,
@@ -9842,54 +10388,13 @@ private fun InlineVideoPlayer(
                     openVideoPeek(pressWindowOffset)
                     videoPeekController.updateFingerDragOffset(Offset.Zero)
 
-                    val dragGestureThreshold = 82f
-                    var cancelledByDrag = false
-                    var floatByDrag = false
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        change.consume()
-                        if (!change.pressed) {
-                            break
-                        }
-                        lastPosition = change.position
-                        videoPeekController.updateFingerDragOffset(
-                            change.position.toWindowPosition(bounds) - pressWindowOffset,
-                        )
-                        val totalDrag = lastPosition - down.position
-                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                        if (
-                            totalDrag.y > dragGestureThreshold &&
-                            verticalDominant
-                        ) {
-                            cancelledByDrag = true
-                            videoPeekController.cancel()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                        if (
-                            totalDrag.y < -dragGestureThreshold &&
-                            verticalDominant
-                        ) {
-                            floatByDrag = true
-                            videoPeekController.release()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                    }
-
-                    videoPeekController.resetFingerDragOffset()
-                    if (!cancelledByDrag && !floatByDrag) {
+                    val dragResult = awaitVideoPeekDragGesture(
+                        down = down,
+                        pressWindowOffset = pressWindowOffset,
+                        bounds = bounds,
+                        videoPeekController = videoPeekController,
+                    )
+                    if (!dragResult.cancelledByDrag && !dragResult.floatByDrag) {
                         videoPeekController.enterFullscreen()
                     }
                 }
@@ -9919,8 +10424,9 @@ private fun InlineVideoPlayer(
                     val center = bounds?.let {
                         Offset(it.left + it.width / 2f, it.top + it.height / 2f)
                     } ?: Offset.Zero
-                    openInlineFloatingPlayback(center)
+                    openInlineFloatingPlayback(center, fromAutoScroll = true)
                 },
+                autoEnterFloatingOnViewportHidden = false,
                 showPictureInPictureButton = false,
             )
         } else {
@@ -9987,6 +10493,23 @@ private fun InlineVideoPlayer(
             )
         }
         }
+        if (onDetailClick != null) {
+            Box(
+                modifier = Modifier.matchParentSize(),
+                contentAlignment = Alignment.TopEnd,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(1f - cardLayout.widthFraction)
+                        .fillMaxHeight()
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember(media.streamUrl) { MutableInteractionSource() },
+                            onClick = onDetailClick,
+                        ),
+                )
+            }
+        }
     }
 }
 
@@ -10008,6 +10531,7 @@ private fun WeiboVideoSurface(
     videoResizeMode: Int = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
     initialControlsVisible: Boolean = true,
     trackViewportPauseOverride: Boolean? = null,
+    autoEnterFloatingOnViewportHidden: Boolean = false,
     showFullscreenButton: Boolean = true,
     showPictureInPictureButton: Boolean = true,
     isPeekPlayback: Boolean = false,
@@ -10020,6 +10544,8 @@ private fun WeiboVideoSurface(
     val saveHint = LocalImageSaveHint.current
     val scope = rememberCoroutineScope()
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
+    val isInlineFeedOrDetail = !isPeekPlayback && !isFullscreen && !seamlessOverlayPlayback
     val isLiveBroadcast = media.isLiveBroadcast()
     val isLiveReplay = media.isLiveReplay()
     val hideProgressControls = isLiveBroadcast
@@ -10153,7 +10679,12 @@ private fun WeiboVideoSurface(
         orientation = forcedOrientation,
         enabled = isFullscreen,
     )
-    val trackViewportPause = trackViewportPauseOverride ?: (!isFullscreen && controlsEnabled)
+    val trackViewportPause = trackViewportPauseOverride ?: (
+        !isFullscreen &&
+            controlsEnabled &&
+            !videoCoordinator.shouldResumeInlineHandoff(playbackKey) &&
+            !(isDetailInlinePlayback && videoCoordinator.detailHandoffActive)
+        )
     val screenHeightPx = remember(context) {
         context.resources.displayMetrics.heightPixels.toFloat()
     }
@@ -10186,32 +10717,39 @@ private fun WeiboVideoSurface(
     }
 
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
-    val awaitingFullscreenHandoff = !seamlessOverlayPlayback &&
-        videoCoordinator.pendingFullscreenHandoffKey == playbackKey &&
-        (isFullscreen || isPeekPlayback)
-    val awaitingPeekHandoffSource = !seamlessOverlayPlayback &&
-        !isFullscreen && !isPeekPlayback &&
-        videoCoordinator.pendingPeekHandoffKey == playbackKey
-    val awaitingPeekHandoffConsume = !seamlessOverlayPlayback &&
-        isPeekPlayback && videoCoordinator.pendingPeekHandoffKey == playbackKey
+    var resumeAfterSurfaceAttach by remember(playbackKey, videoUrl) { mutableStateOf(false) }
 
-    fun configureExistingPlayer(target: androidx.media3.exoplayer.ExoPlayer) {
+    fun configureExistingPlayer(
+        target: androidx.media3.exoplayer.ExoPlayer,
+        deferPlaybackUntilSurface: Boolean = false,
+    ) {
         if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
             target.seekTo(0)
-            videoCoordinator.positions[playbackKey] = 0L
+            videoCoordinator.clearPosition(playbackKey)
         } else if (target.playbackState == androidx.media3.common.Player.STATE_ENDED &&
             playbackSpeedOverride != null
         ) {
             target.seekTo(0)
-            videoCoordinator.positions[playbackKey] = 0L
+            videoCoordinator.clearPosition(playbackKey)
+        } else if (effectiveResumePosition) {
+            val resumeAt = videoCoordinator.resolvePosition(playbackKey)?.takeIf { it > 0L }
+            if (resumeAt != null && target.currentPosition.coerceAtLeast(0L) < 500L) {
+                target.seekTo(resumeAt)
+            }
         }
-        target.playWhenReady = true
         if (playbackSpeedOverride != null) {
             target.setPlaybackSpeed(playbackSpeedOverride)
         } else {
             target.setPlaybackSpeed(1f)
         }
-        target.play()
+        if (deferPlaybackUntilSurface) {
+            resumeAfterSurfaceAttach = true
+            target.playWhenReady = false
+            target.pause()
+        } else {
+            target.playWhenReady = true
+            target.play()
+        }
     }
 
     fun createFreshPlayer(): androidx.media3.exoplayer.ExoPlayer =
@@ -10228,17 +10766,100 @@ private fun WeiboVideoSurface(
             prepare()
             if (videoCoordinator.consumePeekRestartFromBeginning(playbackKey)) {
                 seekTo(0)
-                videoCoordinator.positions[playbackKey] = 0L
+                videoCoordinator.clearPosition(playbackKey)
             } else if (effectiveResumePosition) {
-                videoCoordinator.positions[playbackKey]?.takeIf { it > 0L }?.let { seekTo(it) }
+                videoCoordinator.resolvePosition(playbackKey)?.takeIf { it > 0L }?.let { seekTo(it) }
             }
             playbackSpeedOverride?.let { setPlaybackSpeed(it) }
             playWhenReady = true
         }
 
-    fun resolveImmediatePlayer(): androidx.media3.exoplayer.ExoPlayer? {
-        videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-            configureExistingPlayer(handoff)
+    var inlinePlayer by remember(playbackKey, videoUrl) {
+        mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null)
+    }
+    var inlineWaitingForHandoff by remember(playbackKey) { mutableStateOf(false) }
+
+    if (isInlineFeedOrDetail) {
+        LaunchedEffect(
+            playbackKey,
+            videoUrl,
+            isDetailInlinePlayback,
+            videoCoordinator.pendingPeekHandoffKey,
+            videoCoordinator.detailHandoffActive,
+        ) {
+            if (inlinePlayer != null) return@LaunchedEffect
+
+            suspend fun claimSharedPlayer(): androidx.media3.exoplayer.ExoPlayer? =
+                videoCoordinator.adoptSharedPlayer(playbackKey)
+
+            claimSharedPlayer()?.let { adopted ->
+                configureExistingPlayer(
+                    adopted,
+                    deferPlaybackUntilSurface = isDetailInlinePlayback,
+                )
+                inlinePlayer = adopted
+                inlineWaitingForHandoff = false
+                videoCoordinator.requestInlinePlayback(playbackKey)
+                if (isDetailInlinePlayback) {
+                    videoCoordinator.finishDetailHandoff(playbackKey)
+                }
+                return@LaunchedEffect
+            }
+
+            val awaitingDetailHandoff = isDetailInlinePlayback &&
+                (
+                    videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                        videoCoordinator.isDetailHandoffTarget(playbackKey)
+                    )
+            if (awaitingDetailHandoff) {
+                inlineWaitingForHandoff = true
+                val deadline = android.os.SystemClock.uptimeMillis() + 2_000L
+                while (android.os.SystemClock.uptimeMillis() < deadline) {
+                    claimSharedPlayer()?.let { adopted ->
+                        configureExistingPlayer(
+                            adopted,
+                            deferPlaybackUntilSurface = true,
+                        )
+                        inlinePlayer = adopted
+                        inlineWaitingForHandoff = false
+                        videoCoordinator.requestInlinePlayback(playbackKey)
+                        videoCoordinator.finishDetailHandoff(playbackKey)
+                        return@LaunchedEffect
+                    }
+                    delay(16)
+                }
+                inlineWaitingForHandoff = false
+            }
+
+            val cached = playerCache[videoUrl]
+            val resolved = cached ?: createFreshPlayer().also { playerCache[videoUrl] = it }
+            configureExistingPlayer(
+                resolved,
+                deferPlaybackUntilSurface = isDetailInlinePlayback &&
+                    videoCoordinator.shouldResumeInlineHandoff(playbackKey),
+            )
+            inlinePlayer = resolved
+            videoCoordinator.registerSharedPlayer(playbackKey, resolved)
+            if (isDetailInlinePlayback) {
+                videoCoordinator.requestInlinePlayback(playbackKey)
+                videoCoordinator.finishDetailHandoff(playbackKey)
+            }
+        }
+    }
+
+    val awaitingFullscreenHandoff = !seamlessOverlayPlayback &&
+        videoCoordinator.isFullscreenHandoffPending(playbackKey) &&
+        (isFullscreen || isPeekPlayback)
+    val awaitingPeekHandoffSource = !isInlineFeedOrDetail &&
+        !seamlessOverlayPlayback &&
+        !isFullscreen && !isPeekPlayback &&
+        videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+    val awaitingPeekHandoffConsume = !seamlessOverlayPlayback &&
+        isPeekPlayback && videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+
+    fun resolveOverlayPlayer(): androidx.media3.exoplayer.ExoPlayer? {
+        videoCoordinator.adoptSharedPlayer(playbackKey)?.let { handoff ->
+            configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
             return handoff
         }
         playerCache[videoUrl]?.let { cached ->
@@ -10249,74 +10870,208 @@ private fun WeiboVideoSurface(
     }
 
     var handoffPlayerResolved by remember(playbackKey, videoUrl) { mutableStateOf(false) }
-    val immediatePlayer = remember(
-        playbackKey,
-        videoUrl,
-        awaitingFullscreenHandoff,
-        awaitingPeekHandoffSource,
-        handoffPlayerResolved,
-    ) {
-        if (
-            handoffPlayerResolved ||
-            awaitingFullscreenHandoff ||
-            awaitingPeekHandoffSource ||
-            awaitingPeekHandoffConsume
+    val immediatePlayer = if (isInlineFeedOrDetail) {
+        null
+    } else {
+        remember(
+            playbackKey,
+            videoUrl,
+            awaitingFullscreenHandoff,
+            awaitingPeekHandoffSource,
+            handoffPlayerResolved,
         ) {
-            null
-        } else {
-            resolveImmediatePlayer()
+            if (
+                handoffPlayerResolved ||
+                awaitingFullscreenHandoff ||
+                awaitingPeekHandoffSource
+            ) {
+                null
+            } else if (awaitingPeekHandoffConsume) {
+                null
+            } else {
+                resolveOverlayPlayer()
+            }
         }
     }
     var deferredPlayer by remember(playbackKey, videoUrl) {
         mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null)
     }
 
-    LaunchedEffect(
-        awaitingFullscreenHandoff,
-        awaitingPeekHandoffSource,
-        awaitingPeekHandoffConsume,
-        playbackKey,
-        videoUrl,
-    ) {
-        if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
-            return@LaunchedEffect
-        }
-        val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
-        while (android.os.SystemClock.uptimeMillis() < deadline) {
-            videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-                configureExistingPlayer(handoff)
-                deferredPlayer = handoff
-                handoffPlayerResolved = true
+    if (!isInlineFeedOrDetail) {
+        LaunchedEffect(
+            awaitingFullscreenHandoff,
+            awaitingPeekHandoffSource,
+            awaitingPeekHandoffConsume,
+            playbackKey,
+            videoUrl,
+        ) {
+            if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
                 return@LaunchedEffect
             }
-            if (videoCoordinator.pendingFullscreenHandoffKey != playbackKey &&
-                videoCoordinator.pendingPeekHandoffKey != playbackKey
-            ) {
-                break
+            val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
+            while (android.os.SystemClock.uptimeMillis() < deadline) {
+                videoCoordinator.adoptSharedPlayer(playbackKey)?.let { handoff ->
+                    configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
+                    deferredPlayer = handoff
+                    handoffPlayerResolved = true
+                    if (!isPeekPlayback && !isFullscreen) {
+                        videoCoordinator.requestInlinePlayback(playbackKey)
+                    }
+                    return@LaunchedEffect
+                }
+                if (
+                    !videoCoordinator.isFullscreenHandoffPending(playbackKey) &&
+                    !videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+                ) {
+                    break
+                }
+                delay(16)
             }
-            delay(16)
+            if (videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                videoCoordinator.hasStashedHandoff(playbackKey)
+            ) {
+                videoCoordinator.adoptSharedPlayer(playbackKey)?.let { handoff ->
+                    configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
+                    deferredPlayer = handoff
+                    handoffPlayerResolved = true
+                    if (!isPeekPlayback && !isFullscreen) {
+                        videoCoordinator.requestInlinePlayback(playbackKey)
+                    }
+                    return@LaunchedEffect
+                }
+            }
+            val resolved = resolveOverlayPlayer()
+            deferredPlayer = resolved
+            handoffPlayerResolved = true
+            if (!isPeekPlayback && !isFullscreen) {
+                videoCoordinator.requestInlinePlayback(playbackKey)
+            }
         }
-        videoCoordinator.cancelFullscreenHandoff(playbackKey)
-        videoCoordinator.cancelPeekHandoff(playbackKey)
-        deferredPlayer = resolveImmediatePlayer()
-        handoffPlayerResolved = true
     }
 
-    val player = immediatePlayer ?: deferredPlayer
+    fun resumeInlineHandoffPlaybackIfNeeded(target: androidx.media3.exoplayer.ExoPlayer) {
+        if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return
+        if (!videoCoordinator.isPlaybackKeyActive(playbackKey)) return
+        if (resumeAfterSurfaceAttach) return
+        configureExistingPlayer(target)
+        if (isDetailInlinePlayback) {
+            videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
+        } else {
+            videoCoordinator.clearInlineHandoffResume(playbackKey)
+        }
+    }
+
+    LaunchedEffect(videoCoordinator.detailOverlayOpen) {
+        if (!isInlineFeedOrDetail) return@LaunchedEffect
+        if (!videoCoordinator.detailOverlayOpen && inlinePlayer != null) {
+            // no-op: keep inline player alive for return navigation
+        }
+    }
+
+    val player = when {
+        isInlineFeedOrDetail -> inlinePlayer
+        else -> immediatePlayer ?: deferredPlayer
+    }
     val playerViewHolder = remember { object { var view: androidx.media3.ui.PlayerView? = null } }
+    var stashedForHandoff by remember(playbackKey, videoUrl) { mutableStateOf(false) }
+    val stashedForHandoffState = rememberUpdatedState(stashedForHandoff)
     var transitionFrame by remember(playbackKey) {
         mutableStateOf(videoCoordinator.consumeTransitionFrame(playbackKey))
     }
-    if (player == null) {
+
+    if (!isInlineFeedOrDetail) {
+        LaunchedEffect(
+            player,
+            playbackKey,
+            isFullscreen,
+            isPeekPlayback,
+            videoCoordinator.proactiveStashSignalKey,
+            resumeAfterSurfaceAttach,
+        ) {
+            val target = player ?: return@LaunchedEffect
+            if (isFullscreen || isPeekPlayback || stashedForHandoff || resumeAfterSurfaceAttach) {
+                return@LaunchedEffect
+            }
+            if (!videoCoordinator.isProactiveStashRequested(playbackKey)) return@LaunchedEffect
+            videoCoordinator.clearProactiveStashRequest(playbackKey)
+            playerViewHolder.view?.player = null
+            videoCoordinator.stashHandoffPlayer(playbackKey, target)
+            stashedForHandoff = true
+        }
+    }
+
+    fun attachPlayerToView(view: androidx.media3.ui.PlayerView) {
+        val target = player ?: return
+        playerViewHolder.view = view
+        view.player = target
+        val pendingDetailHandoffResume = isInlineFeedOrDetail &&
+            isDetailInlinePlayback &&
+            videoCoordinator.shouldResumeInlineHandoff(playbackKey)
+        val shouldResumeOnAttach = resumeAfterSurfaceAttach || pendingDetailHandoffResume
+        if (!shouldResumeOnAttach) return
+        fun resumePlayback() {
+            if (view.player !== target) {
+                view.player = target
+            }
+            target.playWhenReady = true
+            target.play()
+            if (pendingDetailHandoffResume) {
+                videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
+            }
+            resumeAfterSurfaceAttach = false
+        }
+        if (view.isAttachedToWindow) {
+            view.post { resumePlayback() }
+        } else {
+            view.addOnAttachStateChangeListener(
+                object : android.view.View.OnAttachStateChangeListener {
+                    override fun onViewAttachedToWindow(v: android.view.View) {
+                        view.removeOnAttachStateChangeListener(this)
+                        view.post { resumePlayback() }
+                    }
+
+                    override fun onViewDetachedFromWindow(v: android.view.View) = Unit
+                },
+            )
+        }
+    }
+
+    LaunchedEffect(
+        player,
+        isDetailInlinePlayback,
+        isViewportVisible,
+        resumeAfterSurfaceAttach,
+        videoCoordinator.pendingPeekHandoffKey,
+    ) {
+        if (!isInlineFeedOrDetail || !isDetailInlinePlayback || player == null) return@LaunchedEffect
+        if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
+        if (!isViewportVisible || resumeAfterSurfaceAttach) return@LaunchedEffect
+        player.playWhenReady = true
+        player.play()
+        playerViewHolder.view?.post {
+            player.playWhenReady = true
+            player.play()
+            videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
+        }
+    }
+
+    if (player == null || (!isInlineFeedOrDetail && stashedForHandoff)) {
         Box(
             modifier = modifier.background(Color.Black),
             contentAlignment = Alignment.Center,
         ) {
-            if (awaitingFullscreenHandoff && !media.coverUrl.isNullOrBlank()) {
+            val showCover = inlineWaitingForHandoff ||
+                awaitingFullscreenHandoff ||
+                awaitingPeekHandoffSource
+            if (showCover && !media.coverUrl.isNullOrBlank()) {
                 RemoteImage(
                     url = media.coverUrl.orEmpty(),
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit,
+                    contentScale = if (awaitingFullscreenHandoff) {
+                        ContentScale.Fit
+                    } else {
+                        ContentScale.Crop
+                    },
                 )
             }
         }
@@ -10342,7 +11097,7 @@ private fun WeiboVideoSurface(
         if (playbackSpeedOverride == null) return@LaunchedEffect
         if (player.playbackState == androidx.media3.common.Player.STATE_ENDED) {
             player.seekTo(0)
-            videoCoordinator.positions[playbackKey] = 0L
+            videoCoordinator.clearPosition(playbackKey)
         }
     }
 
@@ -10358,7 +11113,7 @@ private fun WeiboVideoSurface(
     fun enterPictureInPicture() {
         showControls()
         val currentPosition = player.currentPosition.coerceAtLeast(0L)
-        videoCoordinator.positions[playbackKey] = currentPosition
+        videoCoordinator.rememberPosition(playbackKey, currentPosition)
         player.pause()
         VideoPipActivity.start(
             context = context,
@@ -10373,9 +11128,7 @@ private fun WeiboVideoSurface(
     DisposableEffect(player) {
         val pauseHandler = {
             val currentPosition = player.currentPosition.coerceAtLeast(0L)
-            if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
-                videoCoordinator.positions[playbackKey] = currentPosition
-            }
+            videoCoordinator.rememberPosition(playbackKey, currentPosition)
             player.pause()
         }
         if (isPeekPlayback) {
@@ -10434,40 +11187,69 @@ private fun WeiboVideoSurface(
             }
             if (effectiveSavePosition) {
                 if (videoCoordinator.isPeekRestartFromBeginning(playbackKey)) {
-                    videoCoordinator.positions[playbackKey] = 0L
+                    videoCoordinator.clearPosition(playbackKey)
                 } else {
                     val currentPosition = player.currentPosition.coerceAtLeast(0L)
-                    if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
-                        videoCoordinator.positions[playbackKey] = currentPosition
-                    }
+                    videoCoordinator.rememberPosition(playbackKey, currentPosition)
                 }
             }
             player.removeListener(listener)
             val handoffToFullscreen = !seamlessOverlayPlayback && !isFullscreen &&
-                videoCoordinator.pendingFullscreenHandoffKey == playbackKey
+                videoCoordinator.isFullscreenHandoffPending(playbackKey)
             val handoffToPeek = !seamlessOverlayPlayback && !isPeekPlayback &&
-                videoCoordinator.pendingPeekHandoffKey == playbackKey
-            if (handoffToFullscreen || handoffToPeek) {
+                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
+            val transferringToDetail = !isDetailInlinePlayback &&
+                videoCoordinator.isTransferringToDetail(playbackKey)
+            val alreadyStashedForHandoff = stashedForHandoffState.value
+            videoCoordinator.registerSharedPlayer(playbackKey, player)
+            if (handoffToFullscreen || handoffToPeek || transferringToDetail) {
                 if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
                     playerViewHolder.view?.player = null
                     videoCoordinator.stashHandoffPlayer(playbackKey, player)
                 }
-            } else {
-                player.pause()
-                if (trackViewportPause && videoCoordinator.activeKey == playbackKey) {
-                    videoCoordinator.activeKey = null
+            } else if (!alreadyStashedForHandoff) {
+                val adoptedByDetail = videoCoordinator.detailOverlayOpen &&
+                    !isDetailInlinePlayback &&
+                    videoCoordinator.isPlaybackKeyActive(playbackKey)
+                if (adoptedByDetail) {
+                    playerViewHolder.view?.player = null
+                } else {
+                    videoCoordinator.releaseSharedPlayer(playbackKey, player)
+                    player.pause()
+                    if (trackViewportPause && videoCoordinator.isPlaybackKeyActive(playbackKey)) {
+                        videoCoordinator.activeKey = null
+                    }
+                    player.release()
                 }
-                player.release()
             }
         }
     }
 
-    LaunchedEffect(isViewportVisible, trackViewportPause, player) {
-        if (!trackViewportPause || isViewportVisible) return@LaunchedEffect
-        val currentPosition = player.currentPosition.coerceAtLeast(0L)
-        if (currentPosition > 0L || videoCoordinator.positions[playbackKey] == null) {
-            videoCoordinator.positions[playbackKey] = currentPosition
+    LaunchedEffect(isViewportVisible, trackViewportPause, player, autoEnterFloatingOnViewportHidden, resumeAfterSurfaceAttach) {
+        if (videoCoordinator.shouldResumeInlineHandoff(playbackKey)) {
+            if (
+                videoCoordinator.isPlaybackKeyActive(playbackKey) &&
+                isViewportVisible &&
+                !resumeAfterSurfaceAttach
+            ) {
+                resumeInlineHandoffPlaybackIfNeeded(player)
+            }
+            return@LaunchedEffect
         }
+        if (!trackViewportPause || isViewportVisible) return@LaunchedEffect
+        if (
+            autoEnterFloatingOnViewportHidden &&
+            onEnterFloatingPlayback != null &&
+            !isPeekPlayback &&
+            !isFullscreen &&
+            videoCoordinator.peekPlaybackKey != playbackKey &&
+            (player.isPlaying || player.playWhenReady)
+        ) {
+            onEnterFloatingPlayback()
+            return@LaunchedEffect
+        }
+        val currentPosition = player.currentPosition.coerceAtLeast(0L)
+        videoCoordinator.rememberPosition(playbackKey, currentPosition)
         player.pause()
         player.playWhenReady = false
         isPlaying = false
@@ -10513,11 +11295,16 @@ private fun WeiboVideoSurface(
     val peekFingerDragState = rememberUpdatedState(onPeekFingerDragOffset)
     val peekFingerDragResetState = rememberUpdatedState(onPeekFingerDragReset)
 
+    LaunchedEffect(player, videoFrameReady, playbackKey, videoCoordinator.activeKey, resumeAfterSurfaceAttach) {
+        if (!videoFrameReady || resumeAfterSurfaceAttach) return@LaunchedEffect
+        resumeInlineHandoffPlaybackIfNeeded(player)
+    }
+
     LaunchedEffect(player, isScrubbing) {
         while (true) {
             if (!isScrubbing) {
                 positionMs = player.currentPosition.coerceAtLeast(0L)
-                videoCoordinator.positions[playbackKey] = positionMs
+                videoCoordinator.rememberPosition(playbackKey, positionMs)
                 durationMs = player.duration.takeIf { it > 0 } ?: durationMs
                 isPlaying = player.isPlaying
             }
@@ -10709,8 +11496,7 @@ private fun WeiboVideoSurface(
             factory = { ctx ->
                 (android.view.LayoutInflater.from(ctx)
                     .inflate(R.layout.view_video_player, null, false) as androidx.media3.ui.PlayerView).apply {
-                    playerViewHolder.view = this
-                    this.player = player
+                    attachPlayerToView(this)
                     useController = false
                     resizeMode = effectiveResizeMode
                     keepScreenOn = isPlaying
@@ -10719,11 +11505,7 @@ private fun WeiboVideoSurface(
                 }
             },
             update = { view ->
-                playerViewHolder.view = view
-                if (view.player !== player) {
-                    view.player = null
-                    view.player = player
-                }
+                attachPlayerToView(view)
                 view.resizeMode = effectiveResizeMode
                 view.keepScreenOn = isPlaying
                 view.requestLayout()
@@ -11356,7 +12138,7 @@ private fun DetailScreen(
     onSelectContentSection: (DetailContentSection) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
     emoticonMap: Map<String, String> = emptyMap(),
-    onRetweetClick: ((FeedItem) -> Unit)? = null,
+    onRetweetClick: ((FeedItem, FeedItem) -> Unit)? = null,
     onUserClick: ((String) -> Unit)? = null,
     commentsHasMore: Boolean = true,
     repostsHasMore: Boolean = true,
@@ -11372,7 +12154,6 @@ private fun DetailScreen(
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
-    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var commentImagePreview by remember { mutableStateOf<Pair<List<FeedImage>, Int>?>(null) }
     val openCommentImage: (List<FeedImage>, Int) -> Unit = { images, index ->
         if (images.isNotEmpty()) {
@@ -11412,6 +12193,13 @@ private fun DetailScreen(
             }
     }
 
+    val autoFloatVideoOnScrollAway by remember(listState) {
+        derivedStateOf {
+            listState.firstVisibleItemIndex > 0 ||
+                listState.firstVisibleItemScrollOffset > 64
+        }
+    }
+
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
         isRefreshing = pullRefreshing,
@@ -11425,7 +12213,6 @@ private fun DetailScreen(
             DetailStickyAuthorHeader(
                 item = item,
                 onUserClick = onUserClick,
-                modifier = Modifier.padding(top = topInset),
             )
             LazyColumn(
                 state = listState,
@@ -11453,6 +12240,7 @@ private fun DetailScreen(
                             onRepostClick = { onSelectContentSection(DetailContentSection.Reposts) },
                             showAuthorRow = false,
                             insetRounded = true,
+                            autoFloatingOnScrollAway = autoFloatVideoOnScrollAway,
                         )
                     }
                 }
@@ -11551,6 +12339,7 @@ private fun DetailStickyAuthorHeader(
     onUserClick: ((String) -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
+    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surface,
@@ -11560,7 +12349,7 @@ private fun DetailStickyAuthorHeader(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 26.dp)
-                    .padding(top = 12.dp, bottom = 10.dp),
+                    .padding(top = topInset + 12.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.Top,
             ) {
                 Box(modifier = Modifier.weight(1f).consumeTouchEvents()) {
@@ -11570,7 +12359,9 @@ private fun DetailStickyAuthorHeader(
                         avatarClickable = true,
                     )
                 }
-                FeedCardActionMenu(item = item)
+                Box(Modifier.zIndex(1f)) {
+                    FeedCardActionMenu(item = item)
+                }
             }
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = 26.dp),
@@ -13968,7 +14759,7 @@ private fun SearchScreen(
                     }
                 }
             }
-            if (activeQuery != null) {
+            if (activeQuery != null && searchBarVisible) {
                 Column(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -14307,6 +15098,7 @@ private fun MineScreen(
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
     onItemClick: (FeedItem) -> Unit,
+    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
     onCommentLongClick: (FeedItem) -> Unit = {},
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
@@ -14415,6 +15207,13 @@ private fun MineScreen(
                 },
             ) {
                 AccountLoginPanel(
+                    session = session,
+                    onLoginSuccess = {
+                        coroutineScope.launch {
+                            onPersistLoginSession()
+                            onSyncEmoticons()
+                        }
+                    },
                     onReturnToFeed = {
                         coroutineScope.launch {
                             onPersistLoginSession()
@@ -14531,6 +15330,9 @@ private fun MineScreen(
         else -> Dp.Unspecified
     }
     val tabsOverlapOffset = ProfileHeaderCardCoverOverlap * (1f - animatedCollapse)
+    val videoPeekController = LocalVideoPeekController.current
+    val blockMinePagerScroll = videoPeekController.activeRequest != null &&
+        videoPeekController.pendingDismiss == null
 
     Box(Modifier.fillMaxSize()) {
     Column(
@@ -14704,6 +15506,7 @@ private fun MineScreen(
 
                     HorizontalPager(
                         state = pagerState,
+                        userScrollEnabled = !blockMinePagerScroll,
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
@@ -14732,7 +15535,7 @@ private fun MineScreen(
                                             onMediaClick = onMediaClick,
                                             emoticonMap = emoticonMap,
                                             onUserClick = onUserClick,
-                                            onRetweetClick = onItemClick,
+                                            onRetweetClick = onRetweetClick,
                                             onCommentLongClick = { onCommentLongClick(post) },
                                             isLongTextLoading = isLongTextLoading,
                                             onLoadLongText = onLoadLongText,
@@ -16408,6 +17211,7 @@ private fun VisitedUserProfileContent(
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
     onItemClick: (FeedItem) -> Unit,
+    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
     onCommentLongClick: (FeedItem) -> Unit,
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
@@ -16452,6 +17256,7 @@ private fun VisitedUserProfileContent(
         onLoadMoreAlbum = onLoadMoreAlbum,
         onSyncEmoticons = onSyncEmoticons,
         onItemClick = onItemClick,
+        onRetweetClick = onRetweetClick,
         onCommentLongClick = onCommentLongClick,
         onOpenAlbumViewer = onOpenAlbumViewer,
         onMediaClick = onMediaClick,
@@ -17534,6 +18339,7 @@ private fun AlbumVideoTile(
     Box(
         modifier = Modifier
             .size(size)
+            .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
                 anchorCoordinates = coordinates
                 anchorBounds = coordinates.boundsInWindow()
@@ -17575,55 +18381,15 @@ private fun AlbumVideoTile(
                     openVideoPeek(pressWindowOffset)
                     videoPeekController.updateFingerDragOffset(Offset.Zero)
 
-                    val dragCancelThreshold = 82f
-                    var cancelledByDrag = false
-                    var floatByDrag = false
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        change.consume()
-                        if (!change.pressed) {
-                            break
-                        }
-                        videoPeekController.updateFingerDragOffset(
-                            change.position.toWindowPosition(bounds) - pressWindowOffset,
-                        )
-                        val totalDrag = change.position - down.position
-                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                        if (
-                            totalDrag.y > dragCancelThreshold &&
-                            verticalDominant
-                        ) {
-                            cancelledByDrag = true
-                            videoPeekController.cancel()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                        if (
-                            totalDrag.y < -dragCancelThreshold &&
-                            verticalDominant
-                        ) {
-                            floatByDrag = true
-                            videoPeekController.release()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                    }
-
-                    videoPeekController.resetFingerDragOffset()
-                    if (cancelledByDrag) {
+                    val dragResult = awaitVideoPeekDragGesture(
+                        down = down,
+                        pressWindowOffset = pressWindowOffset,
+                        bounds = bounds,
+                        videoPeekController = videoPeekController,
+                    )
+                    if (dragResult.cancelledByDrag) {
                         resetPeekState()
-                    } else if (!floatByDrag) {
+                    } else if (!dragResult.floatByDrag) {
                         videoPeekController.enterFullscreen()
                     }
                 }
@@ -17833,6 +18599,8 @@ private fun MineInfoLine(label: String, value: String) {
 
 @Composable
 private fun AccountLoginPanel(
+    session: WeiboWebSession,
+    onLoginSuccess: () -> Unit = {},
     onReturnToFeed: () -> Unit,
 ) {
     var loginReloadKey by remember { mutableIntStateOf(0) }
@@ -17864,7 +18632,9 @@ private fun AccountLoginPanel(
             }
         }
         AccountLoginWebView(
+            session = session,
             reloadKey = loginReloadKey,
+            onLoginSuccess = onLoginSuccess,
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
@@ -17898,6 +18668,7 @@ private fun AccountScreen(session: WeiboWebSession) {
             }
         }
         AccountLoginWebView(
+            session = session,
             reloadKey = loginReloadKey,
             modifier = Modifier.fillMaxWidth().weight(1f),
         )
@@ -17924,10 +18695,14 @@ private fun HiddenSessionWebView(session: WeiboWebSession) {
 
 @Composable
 private fun AccountLoginWebView(
+    session: WeiboWebSession,
     reloadKey: Int,
+    onLoginSuccess: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val onLoginSuccessState = rememberUpdatedState(onLoginSuccess)
+    val loginSuccessNotified = remember(reloadKey) { java.util.concurrent.atomic.AtomicBoolean(false) }
     val loginUrl = "https://passport.weibo.cn/signin/login"
     val loginUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -17954,6 +18729,16 @@ private fun AccountLoginWebView(
                 userAgentString = loginUserAgent
             }
             webViewClient = object : WebViewClient() {
+                private fun notifyLoginSuccessIfNeeded() {
+                    if (session.hasLoginCookie() && loginSuccessNotified.compareAndSet(false, true)) {
+                        onLoginSuccessState.value()
+                    }
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    notifyLoginSuccessIfNeeded()
+                }
+
                 override fun onReceivedError(
                     view: WebView?,
                     errorCode: Int,

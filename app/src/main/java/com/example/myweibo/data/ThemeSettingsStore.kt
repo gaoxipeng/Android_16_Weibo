@@ -15,6 +15,6 @@ class ThemeSettingsStore(context: Context) {
     private companion object {
         const val PREFS_NAME = "weibo_app_prefs"
         const val KEY_THEME_COLOR = "theme_color"
-        const val DEFAULT_THEME_COLOR = "dusty_rose"
+        const val DEFAULT_THEME_COLOR = "sage"
     }
 }
