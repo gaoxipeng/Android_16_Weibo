@@ -3,7 +3,6 @@ package com.example.myweibo.data
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.net.http.SslError
 import android.webkit.CookieManager
@@ -25,7 +24,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLDecoder
@@ -1053,63 +1051,12 @@ class WeiboWebSession(context: Context) {
             val resolver = appContext.contentResolver
             val sourceBytes = resolver.openInputStream(uri)?.use { it.readBytes() }
                 ?: throw IllegalStateException("无法读取所选图片")
-            val compressed = compressCommentImage(sourceBytes)
+            require(sourceBytes.isNotEmpty()) { "无法读取所选图片" }
             PreparedUploadImage(
-                mime = "image/jpeg",
-                bytes = compressed,
+                mime = resolver.getType(uri)?.takeIf { it.startsWith("image/") } ?: "image/jpeg",
+                bytes = sourceBytes,
             )
         }
-
-    private fun compressCommentImage(bytes: ByteArray): ByteArray {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-            return bytes.takeIf { it.size <= COMMENT_IMAGE_MAX_UPLOAD_BYTES }
-                ?: throw IllegalStateException("图片格式暂不支持，请换一张图片")
-        }
-        val sampleSize = calculateImageSampleSize(bounds.outWidth, bounds.outHeight, COMMENT_IMAGE_MAX_DIMENSION)
-        val bitmap = BitmapFactory.decodeByteArray(
-            bytes,
-            0,
-            bytes.size,
-            BitmapFactory.Options().apply { inSampleSize = sampleSize },
-        ) ?: throw IllegalStateException("图片解码失败")
-        val scaled = scaleBitmapWithin(bitmap, COMMENT_IMAGE_MAX_DIMENSION)
-        if (scaled !== bitmap) {
-            bitmap.recycle()
-        }
-        return ByteArrayOutputStream().use { output ->
-            if (!scaled.compress(Bitmap.CompressFormat.JPEG, COMMENT_IMAGE_JPEG_QUALITY, output)) {
-                throw IllegalStateException("图片压缩失败")
-            }
-            if (!scaled.isRecycled) {
-                scaled.recycle()
-            }
-            output.toByteArray().takeIf { it.isNotEmpty() && it.size <= COMMENT_IMAGE_MAX_UPLOAD_BYTES }
-                ?: throw IllegalStateException("图片体积过大，请换一张较小的图片")
-        }
-    }
-
-    private fun calculateImageSampleSize(width: Int, height: Int, maxDimension: Int): Int {
-        var sampleSize = 1
-        var sampledWidth = width
-        var sampledHeight = height
-        while (sampledWidth / 2 >= maxDimension || sampledHeight / 2 >= maxDimension) {
-            sampleSize *= 2
-            sampledWidth /= 2
-            sampledHeight /= 2
-        }
-        return sampleSize.coerceAtLeast(1)
-    }
-
-    private fun scaleBitmapWithin(bitmap: Bitmap, maxDimension: Int): Bitmap {
-        val largest = maxOf(bitmap.width, bitmap.height)
-        if (largest <= maxDimension) return bitmap
-        val scale = maxDimension.toFloat() / largest.toFloat()
-        val targetWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
-        val targetHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
-        return Bitmap.createScaledBitmap(bitmap, targetWidth, targetHeight, true)
-    }
 
     private suspend fun nativeUploadImageRawBinary(image: PreparedUploadImage): String {
         val user = loadCurrentUserConfig()
@@ -1631,9 +1578,6 @@ class WeiboWebSession(context: Context) {
         private const val COMMENT_IMAGE_UPLOAD_TIMEOUT_MS = 60_000L
         private const val WEBVIEW_EVALUATE_TIMEOUT_MS = 20_000L
         private const val PIC_UPLOAD_ENDPOINT = "https://picupload.weibo.com/interface/pic_upload.php"
-        private const val COMMENT_IMAGE_MAX_DIMENSION = 1600
-        private const val COMMENT_IMAGE_JPEG_QUALITY = 88
-        private const val COMMENT_IMAGE_MAX_UPLOAD_BYTES = 5 * 1024 * 1024
         private const val WEIBO_PASSPORT_LOGIN = "https://passport.weibo.cn/signin/login"
         private const val WEIBO_PASSPORT_ORIGIN = "https://passport.weibo.cn/"
         private val COOKIE_ORIGINS = listOf(

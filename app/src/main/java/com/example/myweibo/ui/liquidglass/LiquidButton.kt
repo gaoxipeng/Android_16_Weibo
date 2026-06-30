@@ -28,6 +28,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.input.pointer.pointerInput
@@ -47,6 +48,8 @@ import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.Shadow
 import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.materials.HazeMaterials
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -389,15 +392,36 @@ fun TransparentLiquidTextButton(
 fun SurfaceLiquidMenuCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
+    hazeState: HazeState? = null,
     cornerRadius: Dp = 14.dp,
     blurRadius: Dp = LiquidGlassBlurRadius,
+    surfaceColor: Color = Color.Unspecified,
     contentPadding: PaddingValues = PaddingValues(0.dp),
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val isLightTheme = !isSystemInDarkTheme()
     val shape = RoundedCornerShape(cornerRadius)
-    val surfaceColor = liquidSurfaceColor(isLightTheme)
+    val resolvedSurfaceColor =
+        if (surfaceColor.isSpecified) surfaceColor else liquidSurfaceColor(isLightTheme)
     val borderColor = liquidMenuBorderColor(isLightTheme)
+    val menuHazeStyle = HazeMaterials.thick(containerColor = resolvedSurfaceColor)
+
+    if (hazeState != null) {
+        Column(
+            modifier
+                .clip(shape)
+                .hazeEffect(state = hazeState) {
+                    style = menuHazeStyle
+                    this.blurRadius = blurRadius
+                }
+                .background(resolvedSurfaceColor, shape)
+                .border(LiquidMenuBorderWidth, borderColor, shape)
+                .padding(contentPadding),
+            horizontalAlignment = Alignment.Start,
+            content = content,
+        )
+        return
+    }
 
     if (backdrop != null) {
         Column(
@@ -408,12 +432,14 @@ fun SurfaceLiquidMenuCard(
                     shape = { shape },
                     effects = {
                         vibrancy()
-                        blur(blurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
+                        blur(blurRadius.toPx(), TileMode.Decal)
                     },
                     highlight = null,
                     shadow = null,
-                    onDrawSurface = { drawRect(surfaceColor) },
+                    onDrawSurface = {
+                        drawRect(resolvedSurfaceColor)
+                    },
                 )
                 .border(LiquidMenuBorderWidth, borderColor, shape)
                 .padding(contentPadding),
@@ -424,7 +450,7 @@ fun SurfaceLiquidMenuCard(
         Column(
             modifier
                 .clip(shape)
-                .background(surfaceColor, shape)
+                .background(resolvedSurfaceColor, shape)
                 .border(LiquidMenuBorderWidth, borderColor, shape)
                 .padding(contentPadding),
             horizontalAlignment = Alignment.Start,

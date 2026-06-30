@@ -217,6 +217,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
@@ -244,6 +245,7 @@ import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextDecoration
@@ -5320,6 +5322,10 @@ fun WeiboApp() {
                             ),
                     )
                 }
+                val timelineMenuLabels = remember {
+                    listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
+                }
+                val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
@@ -5373,7 +5379,7 @@ fun WeiboApp() {
                     },
                     timelineMenuContent = { dismiss ->
                         ImageActionFrostedCard(
-                            modifier = Modifier.width(ActionMenuWidth),
+                            modifier = Modifier.width(timelineMenuWidth),
                             menuHeight = ActionMenuTwoRowHeight,
                         ) {
                             ImageActionRow(
@@ -5400,7 +5406,7 @@ fun WeiboApp() {
                             )
                         }
                     },
-                    timelineMenuWidth = ActionMenuWidth,
+                    timelineMenuWidth = timelineMenuWidth,
                     timelineMenuHeight = ActionMenuTwoRowHeight,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
@@ -6721,7 +6727,7 @@ private fun FeedCardActionMenuOverlay(
         dismissMenu()
     }
 
-    val menuWidth = ActionMenuWidth
+    val menuLabels = remember { listOf("\u8df3\u8f6c\u5230\u5fae\u535a", "\u5206\u4eab") }
     val menuHeight = ActionMenuTwoRowHeight
     val gapFromButton = 6.dp
     val screenMargin = 14.dp
@@ -6734,6 +6740,7 @@ private fun FeedCardActionMenuOverlay(
     ) {
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenHeightPx = with(density) { maxHeight.toPx() }
+        val menuWidth = rememberActionMenuWidth(menuLabels, maxWidth - screenMargin * 2)
         val menuWidthPx = with(density) { menuWidth.toPx() }
         val menuHeightPx = with(density) { menuHeight.toPx() }
         val menuPlacement = calculateFeedCardActionMenuOffsetPx(
@@ -7214,9 +7221,10 @@ private fun FeedImageCell(
 
 }
 
-private val ActionMenuWidth = 160.dp
+private val ActionMenuMaxWidth = 220.dp
 private val ActionMenuCornerRadius = 22.dp
-private val ActionMenuBlurRadius = 24.dp
+private val ActionMenuBlurRadius = 16.dp
+private val ActionMenuSurfaceColor = Color(0x8AF0F0F0)
 private val ActionMenuCardInset = 5.dp
 private val ActionMenuItemGap = 3.dp
 private val ActionMenuCapsuleHeight = 38.dp
@@ -7237,6 +7245,32 @@ private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
     )
 
 @Composable
+private fun rememberActionMenuWidth(
+    labels: List<String>,
+    maxWidth: Dp = ActionMenuMaxWidth,
+): Dp {
+    val textMeasurer = rememberTextMeasurer()
+    val style = actionMenuTextStyle()
+    val density = LocalDensity.current
+    val horizontalPadding = ActionMenuCapsulePaddingHorizontal * 2 + ActionMenuCardInset * 2
+
+    return remember(labels, maxWidth, style, density) {
+        val maxTextWidthPx = labels.maxOfOrNull { label ->
+            textMeasurer.measure(
+                text = label,
+                style = style,
+                maxLines = 1,
+                overflow = TextOverflow.Clip,
+            ).size.width
+        } ?: 0
+        val widthDp = with(density) {
+            (maxTextWidthPx.toFloat() + horizontalPadding.toPx()).toDp()
+        }
+        minOf(widthDp, maxWidth)
+    }
+}
+
+@Composable
 private fun ImageActionFrostedCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
@@ -7250,6 +7284,7 @@ private fun ImageActionFrostedCard(
         backdrop = backdrop ?: LocalLiquidMenuBackdrop.current,
         cornerRadius = ActionMenuCornerRadius,
         blurRadius = ActionMenuBlurRadius,
+        surfaceColor = ActionMenuSurfaceColor,
         contentPadding = PaddingValues(ActionMenuCardInset),
         content = {
             Column(
@@ -7644,8 +7679,13 @@ private fun ImageActionOverlay(
                 expandCenterX = maxWidthPx / 2f,
                 expandCenterY = maxHeightPx / 2f,
             )
-            val menuWidth = ActionMenuWidth
+            val menuLabels = buildList {
+                add("\u4fdd\u5b58")
+                if (showSaveAll) add("\u4fdd\u5b58\u5168\u90e8")
+                add("\u5206\u4eab")
+            }
             val menuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
+            val menuWidth = rememberActionMenuWidth(menuLabels, maxWidth - 28.dp)
             val menuPlacement = calculateActionMenuOffsetFromAnchorPx(
                 anchorBounds = motion.visualBounds,
                 screenWidthPx = maxWidthPx,
@@ -7665,7 +7705,6 @@ private fun ImageActionOverlay(
                 menuWidthPx = menuWidthPx,
                 menuHeightPx = menuHeightPx,
             )
-
             Box(
                 modifier = Modifier
                     .offset(x = targetLeft, y = targetTop)
@@ -8658,10 +8697,10 @@ private fun MediaStrip(
                         }
                     }
                 } else {
-                    rows.forEach { row ->
+                    rows.forEachIndexed { rowIndex, row ->
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            row.forEach { image ->
-                                val cellIndex = images.indexOf(image)
+                            row.forEachIndexed { indexInRow, image ->
+                                val cellIndex = rowIndex * gridColumns + indexInRow
                                 FeedImageCell(
                                     image = image,
                                     allImages = images,
@@ -8680,7 +8719,22 @@ private fun MediaStrip(
                                 )
                             }
                             repeat(gridColumns - row.size) {
-                                Spacer(Modifier.weight(1f))
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .aspectRatio(1f)
+                                        .then(
+                                            if (onDetailClick != null) {
+                                                Modifier.clickable(
+                                                    indication = null,
+                                                    interactionSource = remember { MutableInteractionSource() },
+                                                    onClick = onDetailClick,
+                                                )
+                                            } else {
+                                                Modifier
+                                            },
+                                        ),
+                                )
                             }
                         }
                     }
@@ -9458,6 +9512,11 @@ private fun ZoomableFullscreenImage(
                     .fillMaxSize()
                     .layerBackdrop(pageMenuBackdrop),
             ) {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(Color.Black),
+                )
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -9896,10 +9955,16 @@ private fun BoxScope.FullscreenImageActionMenu(
     var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
     val showSaveAll = images.size > 1
-    val menuWidth = ActionMenuWidth
     val estimatedMenuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
     val margin = 14.dp
     val gap = 10.dp
+    val menuLabels = buildList {
+        add("\u4fdd\u5b58")
+        if (showSaveAll) add("\u4fdd\u5b58\u5168\u90e8")
+        add("\u5206\u4eab")
+    }
+    val maxMenuWidth = with(density) { screenWidthPx.toDp() } - margin * 2
+    val menuWidth = rememberActionMenuWidth(menuLabels, maxMenuWidth)
     val menuWidthPx = with(density) { menuWidth.toPx() }
     val menuHeightPx = with(density) { estimatedMenuHeight.toPx() }
     val menuPlacement = calculateActionMenuOffsetFromPointPx(
@@ -9917,7 +9982,6 @@ private fun BoxScope.FullscreenImageActionMenu(
         menuWidthPx = menuWidthPx,
         menuHeightPx = menuHeightPx,
     )
-
     ActionMenuReveal(
         visible = visible,
         menuWidth = menuWidth,
@@ -13999,37 +14063,190 @@ private fun SearchSuggestionUserRow(
     }
 }
 
+private val SearchHistoryChipBackground = Color(0xFFECECEC)
+private val SearchHistoryChipRadius = 8.dp
+private val SearchHistoryChipMaxWidth = 168.dp
+private val SearchHistoryTitleToChipsGap = 2.dp
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun SearchHistoryRow(
+private fun SearchHistoryChipFlow(
+    queries: List<String>,
+    maxLines: Int,
+    deleteHistoryQuery: String?,
+    onDeleteHistoryQueryChange: (String?) -> Unit,
+    onHistoryClick: (String) -> Unit,
+    onHistoryDelete: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    FlowRow(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        maxLines = maxLines,
+    ) {
+        queries.forEach { query ->
+            key(query) {
+                SearchHistoryChip(
+                    query = query,
+                    showDelete = deleteHistoryQuery == query,
+                    onClick = {
+                        onDeleteHistoryQueryChange(null)
+                        onHistoryClick(query)
+                    },
+                    onLongClick = { onDeleteHistoryQueryChange(query) },
+                    onDelete = {
+                        onDeleteHistoryQueryChange(null)
+                        onHistoryDelete(query)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SearchHistoryChipsSection(
+    searchHistory: List<String>,
+    searchHistoryExpanded: Boolean,
+    deleteHistoryQuery: String?,
+    onDeleteHistoryQueryChange: (String?) -> Unit,
+    onHistoryClick: (String) -> Unit,
+    onHistoryDelete: (String) -> Unit,
+    onHistoryExpandToggle: () -> Unit,
+) {
+    val maxRows = SearchHistoryStore.DISPLAY_MAX_ROWS
+
+    SubcomposeLayout(Modifier.fillMaxWidth()) { constraints ->
+        val fullHeight = subcompose("measure-full") {
+            SearchHistoryChipFlow(
+                queries = searchHistory,
+                maxLines = Int.MAX_VALUE,
+                deleteHistoryQuery = deleteHistoryQuery,
+                onDeleteHistoryQueryChange = onDeleteHistoryQueryChange,
+                onHistoryClick = onHistoryClick,
+                onHistoryDelete = onHistoryDelete,
+            )
+        }.first().measure(constraints).height
+
+        val cappedHeight = subcompose("measure-capped") {
+            SearchHistoryChipFlow(
+                queries = searchHistory,
+                maxLines = maxRows,
+                deleteHistoryQuery = deleteHistoryQuery,
+                onDeleteHistoryQueryChange = onDeleteHistoryQueryChange,
+                onHistoryClick = onHistoryClick,
+                onHistoryDelete = onHistoryDelete,
+            )
+        }.first().measure(constraints).height
+
+        val exceeds = fullHeight > cappedHeight
+
+        subcompose("sync-collapse") {
+            LaunchedEffect(exceeds, searchHistoryExpanded) {
+                if (!exceeds && searchHistoryExpanded) {
+                    onHistoryExpandToggle()
+                }
+            }
+        }.forEach { it.measure(constraints.copy(minWidth = 0, maxWidth = 0, minHeight = 0, maxHeight = 0)) }
+
+        val visiblePlaceable = subcompose("visible") {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                SearchHistoryChipFlow(
+                    queries = searchHistory,
+                    maxLines = if (searchHistoryExpanded) Int.MAX_VALUE else maxRows,
+                    deleteHistoryQuery = deleteHistoryQuery,
+                    onDeleteHistoryQueryChange = onDeleteHistoryQueryChange,
+                    onHistoryClick = onHistoryClick,
+                    onHistoryDelete = onHistoryDelete,
+                )
+                if (exceeds) {
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = if (searchHistoryExpanded) "收起" else "展开更多",
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .padding(end = 12.dp)
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null,
+                                    onClick = onHistoryExpandToggle,
+                                )
+                                .padding(vertical = 2.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            }
+        }.first().measure(constraints)
+
+        layout(visiblePlaceable.width, visiblePlaceable.height) {
+            visiblePlaceable.place(0, 0)
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SearchHistoryChip(
     query: String,
+    showDelete: Boolean,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Row(
+    val chipShape = RoundedCornerShape(SearchHistoryChipRadius)
+    Box(
         modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+            .widthIn(max = SearchHistoryChipMaxWidth)
+            .clip(chipShape)
+            .background(SearchHistoryChipBackground)
+            .combinedClickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onClick,
+                onLongClick = onLongClick,
+            ),
     ) {
         Text(
             text = query,
-            modifier = Modifier
-                .weight(1f)
-                .clickable(onClick = onClick),
-            style = MaterialTheme.typography.bodyLarge,
+            modifier = Modifier.padding(
+                start = 12.dp,
+                end = if (showDelete) 26.dp else 12.dp,
+                top = 8.dp,
+                bottom = 8.dp,
+            ),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        Text(
-            text = "×",
-            modifier = Modifier
-                .clickable(onClick = onDelete)
-                .padding(horizontal = 6.dp, vertical = 4.dp),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 18.sp,
-            textAlign = TextAlign.Center,
-        )
+        if (showDelete) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 4.dp, end = 4.dp)
+                    .size(16.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFF999999))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDelete,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "×",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    lineHeight = 12.sp,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
     }
 }
 
@@ -14164,6 +14381,7 @@ private fun SearchScreen(
     var searchPullRefreshing by remember { mutableStateOf(false) }
     var searchHistory by remember { mutableStateOf(searchHistoryStore.read()) }
     var searchHistoryExpanded by remember { mutableStateOf(false) }
+    var deleteHistoryQuery by remember { mutableStateOf<String?>(null) }
     var suggestResult by remember { mutableStateOf(SearchSuggestResult()) }
     var suggestForQuery by remember { mutableStateOf("") }
     var suggestLoading by remember { mutableStateOf(false) }
@@ -14172,6 +14390,12 @@ private fun SearchScreen(
     var searchDraft by remember { mutableStateOf(searchBarOverlay.queryInput) }
     val latestSearchDraft by rememberUpdatedState(searchDraft)
     val searchDraftText = searchDraft.text
+
+    LaunchedEffect(searchHistory, searchHistoryExpanded) {
+        if (deleteHistoryQuery != null && deleteHistoryQuery !in searchHistory) {
+            deleteHistoryQuery = null
+        }
+    }
 
     fun publishSuggestionOverlay(term: String = searchDraft.text.trim()) {
         searchBarOverlay.suggestions = if (suggestForQuery == term) {
@@ -14621,70 +14845,49 @@ private fun SearchScreen(
                     ) {
                 if (activeQuery == null) {
                     if (searchHistory.isNotEmpty()) {
-                        item {
-                            Text(
-                                text = "搜索历史",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(bottom = 8.dp),
-                            )
-                        }
-                        val visibleHistory = if (searchHistoryExpanded) {
-                            searchHistory
-                        } else {
-                            searchHistory.take(SearchHistoryStore.DISPLAY_COLLAPSED)
-                        }
-                        itemsIndexed(visibleHistory, key = { _, query -> "history-$query" }) { index, query ->
-                            SearchHistoryRow(
-                                query = query,
-                                onClick = { submitQuery(query) },
-                                onDelete = {
-                                    searchHistory = searchHistoryStore.remove(query)
-                                    if (searchHistory.size <= SearchHistoryStore.DISPLAY_COLLAPSED) {
-                                        searchHistoryExpanded = false
-                                    }
-                                },
-                            )
-                            if (index < visibleHistory.lastIndex) {
-                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                            }
-                        }
-                        item {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (searchHistory.size > SearchHistoryStore.DISPLAY_COLLAPSED) {
+                        item(key = "history-chip-section") {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = "搜索历史",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
                                     TextButton(
-                                        onClick = { searchHistoryExpanded = !searchHistoryExpanded },
+                                        onClick = {
+                                            deleteHistoryQuery = null
+                                            searchHistory = searchHistoryStore.clear()
+                                            searchHistoryExpanded = false
+                                        },
                                         contentPadding = PaddingValues(vertical = 4.dp),
                                     ) {
                                         Text(
-                                            text = if (searchHistoryExpanded) "收起" else "展开更多",
+                                            text = "清除",
                                             style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.primary,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
                                     }
-                                } else {
-                                    Spacer(Modifier.width(1.dp))
                                 }
-                                TextButton(
-                                    onClick = {
-                                        searchHistory = searchHistoryStore.clear()
-                                        searchHistoryExpanded = false
+                                Spacer(Modifier.height(SearchHistoryTitleToChipsGap))
+                                SearchHistoryChipsSection(
+                                    searchHistory = searchHistory,
+                                    searchHistoryExpanded = searchHistoryExpanded,
+                                    deleteHistoryQuery = deleteHistoryQuery,
+                                    onDeleteHistoryQueryChange = { deleteHistoryQuery = it },
+                                    onHistoryClick = { submitQuery(it) },
+                                    onHistoryDelete = { query ->
+                                        searchHistory = searchHistoryStore.remove(query)
+                                        deleteHistoryQuery = null
                                     },
-                                    contentPadding = PaddingValues(vertical = 4.dp),
-                                ) {
-                                    Text(
-                                        text = "清除",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
+                                    onHistoryExpandToggle = { searchHistoryExpanded = !searchHistoryExpanded },
+                                )
                             }
                         }
-                        item {
+                        item(key = "history-chip-spacer") {
                             Spacer(Modifier.height(16.dp))
                         }
                     }

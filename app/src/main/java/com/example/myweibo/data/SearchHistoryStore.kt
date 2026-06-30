@@ -49,6 +49,6 @@ class SearchHistoryStore(context: Context) {
         const val PREFS_NAME = "weibo_app_prefs"
         const val KEY_HISTORY = "search_history"
         const val MAX_ITEMS = 100
-        const val DISPLAY_COLLAPSED = 5
+        const val DISPLAY_MAX_ROWS = 4
     }
 }
