@@ -1355,6 +1355,11 @@ private class VideoPlaybackCoordinator {
         registerSharedPlayer(playbackKey, player)
     }
 
+    fun isAnotherInlinePlaybackActive(playbackKey: String): Boolean {
+        val current = activeKey ?: return false
+        return !matchesPlaybackKey(current, playbackKey)
+    }
+
     fun consumeHandoffPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
         handoffPlayers.remove(playbackKey)?.let { player ->
             clearHandoffFlagsForKey(playbackKey)
@@ -2256,6 +2261,25 @@ private fun videoMediaKey(media: FeedMedia): String =
 
 private fun videoPlaybackKey(media: FeedMedia, ownerId: String): String =
     "$ownerId|${videoMediaKey(media)}"
+
+private fun isMediaInlineExpanded(
+    media: FeedMedia,
+    playbackOwnerId: String,
+    videoCoordinator: VideoPlaybackCoordinator,
+    isDetailInlinePlayback: Boolean,
+): Boolean {
+    val playbackKey = videoPlaybackKey(media, playbackOwnerId)
+    val suppressedByDetailOverlay = !isDetailInlinePlayback &&
+        videoCoordinator.shouldSuppressInlineForDetailOverlay(playbackKey)
+    return !suppressedByDetailOverlay &&
+        (
+            videoCoordinator.isPlaybackKeyActive(playbackKey) ||
+                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                (isDetailInlinePlayback && videoCoordinator.isDetailHandoffTarget(playbackKey))
+            ) &&
+        videoCoordinator.fullscreenKey != playbackKey &&
+        videoCoordinator.peekPlaybackKey != playbackKey
+}
 
 private fun feedItemPlaybackOwnerId(item: FeedItem): String =
     item.statusId.ifBlank { item.id }
@@ -8761,15 +8785,91 @@ private fun MediaStrip(
             }
         }
 
-        medias.forEach { media ->
-            InlineVideoPlayer(
-                media = media,
-                playbackOwnerId = playbackOwnerId,
-                onClick = { onMediaClick(media, playbackOwnerId) },
-                onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
-                onDetailClick = onDetailClick,
-                autoFloatingOnScrollAway = autoFloatingOnScrollAway,
-            )
+        medias.takeIf { it.isNotEmpty() }?.let { videoMedias ->
+            val videoCoordinator = LocalVideoPlaybackCoordinator.current
+            val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
+            val activeInlineMedia = videoMedias.firstOrNull { media ->
+                isMediaInlineExpanded(
+                    media = media,
+                    playbackOwnerId = playbackOwnerId,
+                    videoCoordinator = videoCoordinator,
+                    isDetailInlinePlayback = isDetailInlinePlayback,
+                )
+            }
+            val gridMedias = if (activeInlineMedia != null) {
+                videoMedias.filter { it != activeInlineMedia }
+            } else {
+                videoMedias
+            }
+            val gridColumns = when (gridMedias.size) {
+                1 -> 1
+                2 -> 2
+                3 -> 3
+                4 -> 2
+                else -> 3
+            }
+            val rows = gridMedias.chunked(gridColumns)
+
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (videoMedias.size == 1) {
+                    InlineVideoPlayer(
+                        media = videoMedias.first(),
+                        playbackOwnerId = playbackOwnerId,
+                        onClick = { onMediaClick(videoMedias.first(), playbackOwnerId) },
+                        onFullscreenRequest = { onMediaClick(videoMedias.first(), playbackOwnerId) },
+                        onDetailClick = onDetailClick,
+                        autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                    )
+                } else {
+                    activeInlineMedia?.let { media ->
+                        InlineVideoPlayer(
+                            media = media,
+                            playbackOwnerId = playbackOwnerId,
+                            onClick = { onMediaClick(media, playbackOwnerId) },
+                            onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
+                            onDetailClick = onDetailClick,
+                            autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                        )
+                    }
+                    if (gridMedias.isNotEmpty()) {
+                        rows.forEachIndexed { _, row ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                row.forEach { media ->
+                                    InlineVideoPlayer(
+                                        media = media,
+                                        playbackOwnerId = playbackOwnerId,
+                                        onClick = { onMediaClick(media, playbackOwnerId) },
+                                        onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
+                                        autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .aspectRatio(1f),
+                                        gridCell = true,
+                                    )
+                                }
+                                repeat(gridColumns - row.size) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .aspectRatio(1f)
+                                            .then(
+                                                if (onDetailClick != null) {
+                                                    Modifier.clickable(
+                                                        indication = null,
+                                                        interactionSource = remember { MutableInteractionSource() },
+                                                        onClick = onDetailClick,
+                                                    )
+                                                } else {
+                                                    Modifier
+                                                },
+                                            ),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -10167,6 +10267,8 @@ private fun InlineVideoPlayer(
     onFullscreenRequest: () -> Unit = onClick,
     onDetailClick: (() -> Unit)? = null,
     autoFloatingOnScrollAway: Boolean = false,
+    modifier: Modifier = Modifier,
+    gridCell: Boolean = false,
 ) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
@@ -10198,12 +10300,17 @@ private fun InlineVideoPlayer(
         media.coverHeight,
         measuredVideoWidth,
         measuredVideoHeight,
+        gridCell,
     ) {
-        feedVideoFeedLayout(
-            media = media,
-            width = measuredVideoWidth,
-            height = measuredVideoHeight,
-        )
+        if (gridCell) {
+            SingleImageFeedLayout(aspectRatio = 1f, widthFraction = 1f)
+        } else {
+            feedVideoFeedLayout(
+                media = media,
+                width = measuredVideoWidth,
+                height = measuredVideoHeight,
+            )
+        }
     }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
@@ -10400,12 +10507,23 @@ private fun InlineVideoPlayer(
         videoPeekController.enterFullscreen()
     }
 
-    Box(modifier = Modifier.fillMaxWidth()) {
+    val cornerRadius = if (gridCell) 4.dp else 8.dp
+    val playButtonSize = if (gridCell) 44.dp else 65.dp
+    val playIconSize = if (gridCell) 36.dp else 60.dp
+
+    Box(modifier = if (gridCell) modifier else Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
-                .align(Alignment.TopStart)
-                .fillMaxWidth(cardLayout.widthFraction)
-                .aspectRatio(cardLayout.aspectRatio)
+                .then(
+                    if (gridCell) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier
+                            .align(Alignment.TopStart)
+                            .fillMaxWidth(cardLayout.widthFraction)
+                            .aspectRatio(cardLayout.aspectRatio)
+                    },
+                )
                 .zIndex(if (actionOpen || peekActive) 10f else 0f)
                 .onGloballyPositioned { coordinates ->
                     anchorCoordinates = coordinates
@@ -10431,7 +10549,7 @@ private fun InlineVideoPlayer(
                     scaleY = holdScale
                     alpha = if (actionOpen) 0f else 1f
                 }
-                .clip(RoundedCornerShape(8.dp))
+                .clip(RoundedCornerShape(cornerRadius))
                 .background(Color.Black)
                 .pointerInput(media.streamUrl, media.type) {
                 awaitEachGesture {
@@ -10449,6 +10567,10 @@ private fun InlineVideoPlayer(
                         if (pressResult == MediaLongPressResult.Tap) {
                             val tapUptime = down.uptimeMillis
                             val pressWindowOffset = down.position.toWindowPosition(bounds)
+                            if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
+                                videoCoordinator.requestInlinePlayback(playbackKey)
+                                return@awaitEachGesture
+                            }
                             val isDoubleTap = lastTapUptimeMs > 0L &&
                                 tapUptime - lastTapUptimeMs <= viewConfiguration.doubleTapTimeoutMillis
                             if (isDoubleTap) {
@@ -10494,9 +10616,13 @@ private fun InlineVideoPlayer(
                 media = media,
                 playbackOwnerId = playbackOwnerId,
                 isFullscreen = false,
-                videoResizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
+                videoResizeMode = if (gridCell) {
+                    androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                } else {
+                    androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                },
                 onAspectRatio = { width, height ->
-                    if (width > 0 && height > 0) {
+                    if (!gridCell && width > 0 && height > 0) {
                         measuredVideoWidth = width
                         measuredVideoHeight = height
                     }
@@ -10544,12 +10670,12 @@ private fun InlineVideoPlayer(
                         }
                     },
                     backdrop = coverPlayBackdrop,
-                    modifier = Modifier.size(65.dp),
+                    modifier = Modifier.size(playButtonSize),
                 ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_video_play),
                         contentDescription = "播放",
-                        modifier = Modifier.size(60.dp),
+                        modifier = Modifier.size(playIconSize),
                         tint = Color.White,
                     )
                 }
@@ -10572,14 +10698,16 @@ private fun InlineVideoPlayer(
                         .padding(top = 6.dp, end = 10.dp),
                 )
             }
-            Text(
-                text = media.title,
-                modifier = Modifier.align(Alignment.BottomStart).padding(12.dp),
-                color = Color.White,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.labelLarge,
-            )
+            if (!gridCell) {
+                Text(
+                    text = media.title,
+                    modifier = Modifier.align(Alignment.BottomStart).padding(12.dp),
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
         } else {
             Box(
                 Modifier
@@ -10588,7 +10716,7 @@ private fun InlineVideoPlayer(
             )
         }
         }
-        if (onDetailClick != null) {
+        if (onDetailClick != null && !gridCell) {
             Box(
                 modifier = Modifier.matchParentSize(),
                 contentAlignment = Alignment.TopEnd,
@@ -10881,8 +11009,17 @@ private fun WeiboVideoSurface(
             isDetailInlinePlayback,
             videoCoordinator.pendingPeekHandoffKey,
             videoCoordinator.detailHandoffActive,
+            videoCoordinator.activeKey,
         ) {
-            if (inlinePlayer != null) return@LaunchedEffect
+            if (inlinePlayer != null) {
+                if (videoCoordinator.isPlaybackKeyActive(playbackKey) &&
+                    !inlinePlayer!!.isPlaying &&
+                    inlinePlayer!!.playbackState != androidx.media3.common.Player.STATE_BUFFERING
+                ) {
+                    configureExistingPlayer(inlinePlayer!!)
+                }
+                return@LaunchedEffect
+            }
 
             suspend fun claimSharedPlayer(): androidx.media3.exoplayer.ExoPlayer? =
                 videoCoordinator.adoptSharedPlayer(playbackKey)
@@ -10894,7 +11031,9 @@ private fun WeiboVideoSurface(
                 )
                 inlinePlayer = adopted
                 inlineWaitingForHandoff = false
-                videoCoordinator.requestInlinePlayback(playbackKey)
+                if (videoCoordinator.isPlaybackKeyActive(playbackKey)) {
+                    videoCoordinator.requestInlinePlayback(playbackKey)
+                }
                 return@LaunchedEffect
             }
 
@@ -10914,7 +11053,9 @@ private fun WeiboVideoSurface(
                         )
                         inlinePlayer = adopted
                         inlineWaitingForHandoff = false
-                        videoCoordinator.requestInlinePlayback(playbackKey)
+                        if (videoCoordinator.isPlaybackKeyActive(playbackKey)) {
+                            videoCoordinator.requestInlinePlayback(playbackKey)
+                        }
                         return@LaunchedEffect
                     }
                     delay(16)
@@ -10923,7 +11064,10 @@ private fun WeiboVideoSurface(
                 return@LaunchedEffect
             }
 
-            val cached = playerCache[videoUrl]
+            val cached = playerCache[videoUrl]?.takeUnless {
+                it.playbackState == androidx.media3.common.Player.STATE_IDLE &&
+                    it.playerError != null
+            }
             val resolved = cached ?: createFreshPlayer().also { playerCache[videoUrl] = it }
             configureExistingPlayer(
                 resolved,
@@ -10932,7 +11076,7 @@ private fun WeiboVideoSurface(
             )
             inlinePlayer = resolved
             videoCoordinator.registerSharedPlayer(playbackKey, resolved)
-            if (isDetailInlinePlayback) {
+            if (videoCoordinator.isPlaybackKeyActive(playbackKey)) {
                 videoCoordinator.requestInlinePlayback(playbackKey)
             }
         }
@@ -11311,11 +11455,21 @@ private fun WeiboVideoSurface(
                 videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
             val transferringToDetail = !isDetailInlinePlayback &&
                 videoCoordinator.isTransferringToDetail(playbackKey)
+            val switchingToAnotherInline = isInlineFeedOrDetail &&
+                !isPeekPlayback &&
+                !isFullscreen &&
+                !seamlessOverlayPlayback &&
+                videoCoordinator.isAnotherInlinePlaybackActive(playbackKey)
             val alreadyStashedForHandoff = stashedForHandoffState.value
             videoCoordinator.registerSharedPlayer(playbackKey, player)
             if (handoffToFullscreen || handoffToPeek || handoffFromPeek || transferringToDetail) {
                 if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
                     captureHandoffTransitionFrame()
+                    playerViewHolder.view?.player = null
+                    videoCoordinator.stashHandoffPlayer(playbackKey, player)
+                }
+            } else if (switchingToAnotherInline) {
+                if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
                     playerViewHolder.view?.player = null
                     videoCoordinator.stashHandoffPlayer(playbackKey, player)
                 }
