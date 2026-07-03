@@ -40,10 +40,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
+import com.example.myweibo.ui.theme.fixedSp
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
@@ -182,7 +182,7 @@ internal fun WeiboLiquidBottomBar(
                                     }
                                     Text(
                                         text = if (tab == MainTab.Feed) feedTabLabel else tab.label,
-                                        fontSize = 12.sp,
+                                        fontSize = fixedSp(12),
                                         color = tabContentColor,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
