@@ -316,8 +316,11 @@ import com.example.myweibo.data.MediaUrlResolver
 import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
 import com.example.myweibo.data.FeedThumbnailQuality
+import com.example.myweibo.data.FeedFontSize
+import com.example.myweibo.data.FeedLineSpacing
 import com.example.myweibo.data.ImageSettingsStore
 import com.example.myweibo.data.PlaybackSettingsStore
+import com.example.myweibo.data.TypographySettingsStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
 import com.example.myweibo.data.StoredWeiboAccount
@@ -340,6 +343,7 @@ import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
+import com.example.myweibo.ui.theme.fixedSp
 import com.example.myweibo.ui.liquidglass.LocalHazeState
 import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidCapsule
@@ -2040,6 +2044,8 @@ private class ImagePeekController {
 private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
 private val LocalFeedThumbnailQuality = staticCompositionLocalOf { FeedThumbnailQuality.Medium }
+private val LocalFeedLineSpacing = staticCompositionLocalOf { FeedLineSpacing.Compact }
+private val LocalFeedFontSize = staticCompositionLocalOf { FeedFontSize.Medium }
 private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
 
 private class FeedImageUpgradeNotifier {
@@ -2337,6 +2343,7 @@ fun WeiboApp() {
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
     val imageSettingsStore = remember { ImageSettingsStore(context) }
     val themeSettingsStore = remember { ThemeSettingsStore(context) }
+    val typographySettingsStore = remember { TypographySettingsStore(context) }
     LaunchedEffect(context) {
         withContext(Dispatchers.IO) {
             RemoteDiskBytesCache.configure(java.io.File(context.cacheDir, "remote-image-bytes"))
@@ -2411,6 +2418,8 @@ fun WeiboApp() {
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
     var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
+    var feedLineSpacing by remember { mutableStateOf(typographySettingsStore.readLineSpacing()) }
+    var feedFontSize by remember { mutableStateOf(typographySettingsStore.readFontSize()) }
     var selectedThemeColor by remember {
         mutableStateOf(morandiThemeColorFromStorage(themeSettingsStore.readThemeColor()))
     }
@@ -4679,6 +4688,8 @@ fun WeiboApp() {
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
+            LocalFeedLineSpacing provides feedLineSpacing,
+            LocalFeedFontSize provides feedFontSize,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
             Box(Modifier.fillMaxSize()) {
@@ -5078,6 +5089,17 @@ fun WeiboApp() {
                                     feedThumbnailQuality = quality
                                     imageSettingsStore.writeThumbnailQuality(quality)
                                 },
+                                feedLineSpacing = feedLineSpacing,
+                                onFeedLineSpacingChange = { spacing ->
+                                    feedLineSpacing = spacing
+                                    typographySettingsStore.writeLineSpacing(spacing)
+                                },
+                                feedFontSize = feedFontSize,
+                                onFeedFontSizeChange = { size ->
+                                    feedFontSize = size
+                                    typographySettingsStore.writeFontSize(size)
+                                },
+                                feedPreviewItem = items.firstOrNull()?.let(::resolveFeedItem),
                                 selectedThemeColor = selectedThemeColor,
                                 onThemeColorChange = { color ->
                                     selectedThemeColor = color
@@ -6333,6 +6355,18 @@ private fun EmojiImage(url: String) {
 }
 
 @Composable
+private fun feedBodyTextStyle(): TextStyle {
+    val fontSize = LocalFeedFontSize.current
+    val lineSpacing = LocalFeedLineSpacing.current
+    val size = fixedSp(fontSize.sizeSp)
+    return MaterialTheme.typography.bodyMedium.copy(
+        fontSize = size,
+        lineHeight = size * lineSpacing.lineHeightMultiplier,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+    )
+}
+
+@Composable
 private fun FeedCard(
     item: FeedItem,
     onClick: () -> Unit,
@@ -6416,7 +6450,7 @@ private fun FeedCard(
                 StatusTextSection(
                     item = item,
                     emoticonMap = resolvedEmoticonMap,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = feedBodyTextStyle(),
                     onUserClick = onUserClick,
                     isLongTextLoading = isLongTextLoading(item),
                     onLoadLongText = onLoadLongText,
@@ -6586,7 +6620,7 @@ private fun QuotedStatus(
                 StatusTextSection(
                     item = item,
                     emoticonMap = resolvedMap,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = feedBodyTextStyle(),
                     onUserClick = onUserClick,
                     isLongTextLoading = isLongTextLoading,
                     onLoadLongText = onLoadLongText,
@@ -13833,7 +13867,7 @@ private fun CommentRow(
                 EmoticonText(
                     text = comment.text,
                     emoticonMap = resolvedMap,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = feedBodyTextStyle(),
                     onUserClick = onUserClick,
                     modifier = if (pictureCommentText && comment.images.isNotEmpty()) {
                         Modifier.clickable { requestCommentImageOpenIndex = 0 }
@@ -15580,6 +15614,11 @@ private fun MineScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
     feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
+    feedLineSpacing: FeedLineSpacing = FeedLineSpacing.Compact,
+    onFeedLineSpacingChange: (FeedLineSpacing) -> Unit = {},
+    feedFontSize: FeedFontSize = FeedFontSize.Medium,
+    onFeedFontSizeChange: (FeedFontSize) -> Unit = {},
+    feedPreviewItem: FeedItem? = null,
     selectedThemeColor: MorandiThemeColor = MorandiThemeColors.first(),
     onThemeColorChange: (MorandiThemeColor) -> Unit = {},
     showFollowActions: Boolean = false,
@@ -15693,6 +15732,11 @@ private fun MineScreen(
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                 feedThumbnailQuality = feedThumbnailQuality,
                 onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
+                feedLineSpacing = feedLineSpacing,
+                onFeedLineSpacingChange = onFeedLineSpacingChange,
+                feedFontSize = feedFontSize,
+                onFeedFontSizeChange = onFeedFontSizeChange,
+                feedPreviewItem = feedPreviewItem,
                 selectedThemeColor = selectedThemeColor,
                 onThemeColorChange = onThemeColorChange,
                 onBack = {
@@ -16165,6 +16209,11 @@ private fun SettingsScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit,
     feedThumbnailQuality: FeedThumbnailQuality,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
+    feedLineSpacing: FeedLineSpacing,
+    onFeedLineSpacingChange: (FeedLineSpacing) -> Unit,
+    feedFontSize: FeedFontSize,
+    onFeedFontSizeChange: (FeedFontSize) -> Unit,
+    feedPreviewItem: FeedItem?,
     selectedThemeColor: MorandiThemeColor,
     onThemeColorChange: (MorandiThemeColor) -> Unit,
     onBack: () -> Unit,
@@ -16176,6 +16225,7 @@ private fun SettingsScreen(
     var accountExpanded by remember { mutableStateOf(false) }
     var emoticonExpanded by remember { mutableStateOf(false) }
     var imageExpanded by remember { mutableStateOf(false) }
+    var typographyExpanded by remember { mutableStateOf(false) }
     var themeExpanded by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -16234,6 +16284,18 @@ private fun SettingsScreen(
                         onExpandedChange = { imageExpanded = it },
                         quality = feedThumbnailQuality,
                         onQualityChange = onFeedThumbnailQualityChange,
+                    )
+                }
+                item {
+                    SettingsTypographyCard(
+                        expanded = typographyExpanded,
+                        onExpandedChange = { typographyExpanded = it },
+                        lineSpacing = feedLineSpacing,
+                        onLineSpacingChange = onFeedLineSpacingChange,
+                        fontSize = feedFontSize,
+                        onFontSizeChange = onFeedFontSizeChange,
+                        previewItem = feedPreviewItem,
+                        emoticonMap = emoticonMap,
                     )
                 }
                 item {
@@ -16748,6 +16810,245 @@ private fun SettingsImageCard(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsLineSpacingIcon(
+    lineHeightMultiplier: Float,
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    val gap = when {
+        lineHeightMultiplier <= 1.2f -> 1.5.dp
+        lineHeightMultiplier <= 1.4f -> 2.5.dp
+        lineHeightMultiplier <= 1.6f -> 3.5.dp
+        lineHeightMultiplier <= 1.8f -> 5.dp
+        else -> 6.5.dp
+    }
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(gap),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        repeat(3) {
+            Box(
+                Modifier
+                    .width(14.dp)
+                    .height(1.5.dp)
+                    .background(tint, RoundedCornerShape(1.dp)),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsFontSizeIcon(
+    sizeSp: Int,
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = "A",
+        modifier = modifier,
+        color = tint,
+        fontSize = (sizeSp * 0.9f).sp,
+        fontWeight = FontWeight.SemiBold,
+        textAlign = TextAlign.Center,
+    )
+}
+
+@Composable
+private fun <T> SettingsSegmentedControl(
+    selected: T,
+    options: List<T>,
+    onSelected: (T) -> Unit,
+    modifier: Modifier = Modifier,
+    segmentContent: @Composable (option: T, selected: Boolean) -> Unit,
+) {
+    val shape = RoundedCornerShape(12.dp)
+    val borderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+    Row(
+        modifier = modifier
+            .height(44.dp)
+            .clip(shape)
+            .border(1.dp, borderColor, shape)
+            .background(MaterialTheme.colorScheme.surface),
+    ) {
+        options.forEachIndexed { index, option ->
+            val isSelected = selected == option
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = { onSelected(option) },
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                segmentContent(option, isSelected)
+            }
+            if (index < options.lastIndex) {
+                Box(
+                    Modifier
+                        .fillMaxHeight()
+                        .width(0.5.dp)
+                        .background(borderColor),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsTypographyCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    lineSpacing: FeedLineSpacing,
+    onLineSpacingChange: (FeedLineSpacing) -> Unit,
+    fontSize: FeedFontSize,
+    onFontSizeChange: (FeedFontSize) -> Unit,
+    previewItem: FeedItem?,
+    emoticonMap: Map<String, String>,
+) {
+    val subtitle = "行距 ${lineSpacing.label} · 字号 ${fontSize.label}"
+    val selectedTint = MaterialTheme.colorScheme.primary
+    val unselectedTint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+
+    SettingsPlainCard {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "行距与字号",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = fontSize.label,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            text = "行距",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        SettingsSegmentedControl(
+                            selected = lineSpacing,
+                            options = FeedLineSpacing.entries,
+                            onSelected = onLineSpacingChange,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { option, isSelected ->
+                            SettingsLineSpacingIcon(
+                                lineHeightMultiplier = option.lineHeightMultiplier,
+                                tint = if (isSelected) selectedTint else unselectedTint,
+                            )
+                        }
+                        Text(
+                            text = "字号",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        SettingsSegmentedControl(
+                            selected = fontSize,
+                            options = FeedFontSize.entries,
+                            onSelected = onFontSizeChange,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { option, isSelected ->
+                            SettingsFontSizeIcon(
+                                sizeSp = option.sizeSp,
+                                tint = if (isSelected) selectedTint else unselectedTint,
+                            )
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "预览",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                            border = BorderStroke(
+                                0.5.dp,
+                                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+                            ),
+                        ) {
+                            if (previewItem != null) {
+                                FeedCard(
+                                    item = previewItem,
+                                    emoticonMap = emoticonMap,
+                                    onClick = {},
+                                    onMediaClick = { _, _ -> },
+                                    menuBackEnabled = false,
+                                    showAuthorRow = true,
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 28.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "暂无微博，请先在首页刷新",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
                         }
                     }
