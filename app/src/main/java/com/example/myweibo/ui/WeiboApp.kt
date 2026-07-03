@@ -12284,12 +12284,6 @@ private fun DetailScreen(
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
-    var commentImagePreview by remember { mutableStateOf<Pair<List<FeedImage>, Int>?>(null) }
-    val openCommentImage: (List<FeedImage>, Int) -> Unit = { images, index ->
-        if (images.isNotEmpty()) {
-            commentImagePreview = images to index.coerceIn(0, images.lastIndex)
-        }
-    }
     val showingReposts = contentSection == DetailContentSection.Reposts
     val sectionItems = if (showingReposts) reposts else comments
     val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
@@ -12434,7 +12428,6 @@ private fun DetailScreen(
                         onUserClick = onUserClick,
                         onExpandNestedComments = if (showingReposts) null else onExpandNestedComments,
                         nestedCommentsLoadingIds = nestedCommentsLoadingIds,
-                        onCommentImageClick = openCommentImage,
                         onReplyClick = if (showingReposts) null else { comment -> onComposeComment?.invoke(item, comment) },
                     )
                     if (index < sectionItems.lastIndex) {
@@ -12451,14 +12444,6 @@ private fun DetailScreen(
                 }
             }
         }
-    }
-
-    commentImagePreview?.let { (images, index) ->
-        FullscreenImageViewer(
-            images = images,
-            initialIndex = index,
-            onDismiss = { commentImagePreview = null },
-        )
     }
     }
 }
@@ -13609,7 +13594,6 @@ private fun CommentRow(
     onUserClick: ((String) -> Unit)? = null,
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
-    onCommentImageClick: ((List<FeedImage>, Int) -> Unit)? = null,
     onReplyClick: ((CommentItem) -> Unit)? = null,
 ) {
     val resolvedMap = comment.emoticons.ifEmpty { emptyMap() }
@@ -13620,9 +13604,7 @@ private fun CommentRow(
         comment.replyToAuthor != null &&
         !commentTextContainsReplyTo(comment.text, comment.replyToAuthor)
     val nestedContentStart = rowStart + CommentAvatarSize + CommentAvatarTextGap
-    val openCommentImage: (Int) -> Unit = { index ->
-        onCommentImageClick?.invoke(comment.images, index)
-    }
+    var requestCommentImageOpenIndex by remember(comment.id) { mutableStateOf<Int?>(null) }
     val pictureCommentText = comment.text.trim() == "图片评论" && comment.images.isNotEmpty()
     val haptic = LocalHapticFeedback.current
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -13699,8 +13681,8 @@ private fun CommentRow(
                     emoticonMap = resolvedMap,
                     style = MaterialTheme.typography.bodyMedium,
                     onUserClick = onUserClick,
-                    modifier = if (pictureCommentText && onCommentImageClick != null) {
-                        Modifier.clickable { openCommentImage(0) }
+                    modifier = if (pictureCommentText && comment.images.isNotEmpty()) {
+                        Modifier.clickable { requestCommentImageOpenIndex = 0 }
                     } else {
                         Modifier
                     },
@@ -13708,7 +13690,8 @@ private fun CommentRow(
                 if (comment.images.isNotEmpty()) {
                     CommentImageStrip(
                         images = comment.images,
-                        onImageClick = openCommentImage,
+                        requestOpenIndex = requestCommentImageOpenIndex,
+                        onRequestOpenConsumed = { requestCommentImageOpenIndex = null },
                     )
                 }
                 Text(
@@ -13729,7 +13712,6 @@ private fun CommentRow(
                 onUserClick = onUserClick,
                 onExpandNestedComments = onExpandNestedComments,
                 nestedCommentsLoadingIds = nestedCommentsLoadingIds,
-                onCommentImageClick = onCommentImageClick,
                 onReplyClick = onReplyClick,
             )
         }
@@ -13767,24 +13749,77 @@ private fun CommentRow(
 @Composable
 private fun CommentImageStrip(
     images: List<FeedImage>,
-    onImageClick: (Int) -> Unit,
+    requestOpenIndex: Int? = null,
+    onRequestOpenConsumed: () -> Unit = {},
 ) {
     if (images.isEmpty()) return
 
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        modifier = Modifier.padding(top = 4.dp),
+    var viewerOpen by remember { mutableStateOf(false) }
+    var viewerIndex by remember { mutableStateOf(0) }
+    var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
+    var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
+    var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
+    var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    fun openImageViewer(
+        index: Int,
+        sourceBounds: Rect?,
+        onClosed: (() -> Unit)? = null,
     ) {
-        images.forEachIndexed { index, image ->
-            FeedImageCell(
-                image = image,
-                allImages = images,
-                imageIndex = index,
-                modifier = Modifier.size(72.dp),
-                previewUrl = image.thumbnailUrl,
-                contentScale = ContentScale.Crop,
-                showLiveBadge = true,
-                onOpenViewer = { index, _, _, _ -> onImageClick(index) },
+        viewerIndex = index
+        if (sourceBounds != null) {
+            thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
+        }
+        viewerSourceBoundsByIndex = thumbnailBoundsByIndex
+        viewerAnimateOpenFromSource = sourceBounds != null
+        viewerDismissHook = onClosed
+        viewerOpen = true
+    }
+
+    LaunchedEffect(requestOpenIndex) {
+        requestOpenIndex?.let { index ->
+            openImageViewer(index.coerceIn(0, images.lastIndex), null)
+            onRequestOpenConsumed()
+        }
+    }
+
+    Column {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(top = 4.dp),
+        ) {
+            images.forEachIndexed { index, image ->
+                FeedImageCell(
+                    image = image,
+                    allImages = images,
+                    imageIndex = index,
+                    modifier = Modifier.size(72.dp),
+                    previewUrl = image.thumbnailUrl,
+                    contentScale = ContentScale.Crop,
+                    showLiveBadge = true,
+                    onOpenViewer = { cellIndex, bounds, onClosed, _ ->
+                        openImageViewer(cellIndex, bounds, onClosed)
+                    },
+                    onAnchorBoundsChanged = { bounds ->
+                        thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to bounds)
+                    },
+                )
+            }
+        }
+
+        if (viewerOpen) {
+            FullscreenImageViewer(
+                images = images,
+                initialIndex = viewerIndex,
+                sourceBoundsByIndex = viewerSourceBoundsByIndex,
+                animateOpenFromSource = viewerAnimateOpenFromSource,
+                onDismiss = {
+                    viewerOpen = false
+                    viewerSourceBoundsByIndex = emptyMap()
+                    viewerAnimateOpenFromSource = true
+                    viewerDismissHook?.invoke()
+                    viewerDismissHook = null
+                },
             )
         }
     }
@@ -13954,15 +13989,15 @@ private fun SearchSuggestionPanel(
         exit = fadeOut(tween(100)),
         modifier = modifier,
     ) {
-        Surface(
+        SurfaceLiquidCapsule(
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(14.dp),
-            color = Color.White.copy(alpha = 0.96f),
-            tonalElevation = 0.dp,
-            shadowElevation = 8.dp,
+            cornerRadius = 14.dp,
+            useMenuGlassStyle = true,
         ) {
             Column(
-                modifier = Modifier.padding(vertical = 6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
             ) {
                 if (loading && querySuggestions.isEmpty() && userSuggestions.isEmpty()) {
                     Row(
@@ -16092,6 +16127,7 @@ private val appHelpSections = listOf(
             "底部共有五个入口：首页、消息、搜索、写微博、我的。",
             "向下滚动列表时，底部栏会自动收起到左侧小胶囊；单击小胶囊可展开。",
             "展开后点击空白区域可再次收起；点击其他 Tab 时选中块会滑向目标位置。",
+            "底部栏文字大小固定，不受系统字体缩放影响。",
             "在小胶囊上长按并左右拖动，可快速切换 Tab；松手后停留在目标页。",
             "双击小胶囊：在首页刷新信息流；在「我的」回到顶部并刷新资料。",
             "再次点击当前选中的「首页」，也会从顶部刷新关注流。",
@@ -16144,6 +16180,8 @@ private val appHelpSections = listOf(
             "详情页内视频支持滚动离开卡片后自动浮窗，滑回卡片后自动回到内联播放。",
             "点击评论排序按钮，可在「按时间」与「按热度」之间切换。",
             "支持楼中楼评论展开；长按评论行可回复该评论。",
+            "点击评论中的图片缩略图，会以与信息流一致的过渡动画进入全屏；收起时回到原缩略图位置。",
+            "长按评论图片可弹出保存、保存全部或分享菜单；松手后可进入全屏。",
             "长按底部评论按钮或详情页评论入口，可打开评论输入弹窗。",
             "评论弹窗支持文字、表情、图片；回复时可勾选「同时转发」。",
             "评论中的图片、链接、话题与首页规则一致。",
@@ -16165,6 +16203,7 @@ private val appHelpSections = listOf(
             "搜索框左侧按钮用于切换「微博 / 用户」搜索模式，点击即可循环切换。",
             "搜索微博时，结果页可切换「综合 / 实时」排序。",
             "未登录时无法加载热搜与搜索结果，请先到设置中登录。",
+            "输入关键词时，搜索框上方会显示毛玻璃联想词面板，可快速选择热搜词或相关用户。",
             "输入关键词后搜索；在结果页按返回键可清空结果并回到搜索首页。",
             "从首页或用户主页点击 #话题# 进入搜索时，会临时使用「搜微博」模式，不影响搜索页原有模式设置。",
             "搜索结果中的微博、用户交互方式与首页、个人主页一致。",
