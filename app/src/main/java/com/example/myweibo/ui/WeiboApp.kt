@@ -71,6 +71,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.gestures.AnchoredDraggableDefaults
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.gestures.Orientation
@@ -109,6 +110,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
@@ -331,6 +333,7 @@ import com.example.myweibo.data.UserProfile
 import com.example.myweibo.data.WeiboStatusActions
 import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
+import com.example.myweibo.data.WeiboPostVisibility
 import com.example.myweibo.data.WeiboWebSession
 import com.example.myweibo.data.WeiboArticle
 import com.example.myweibo.data.WeiboLinkResolver
@@ -2405,6 +2408,8 @@ fun WeiboApp() {
     var commentsHasMore by remember { mutableStateOf(true) }
     var commentComposeTarget by remember { mutableStateOf<CommentComposeTarget?>(null) }
     var commentSubmitting by remember { mutableStateOf(false) }
+    var composeSubmitting by remember { mutableStateOf(false) }
+    var composeSessionKey by remember { mutableIntStateOf(0) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
@@ -3257,7 +3262,11 @@ fun WeiboApp() {
             return@BackHandler
         }
         when {
-            selectedTab == MainTab.Messages || selectedTab == MainTab.Compose -> Unit
+            selectedTab == MainTab.Messages -> Unit
+            selectedTab == MainTab.Compose -> {
+                lastHomeBackPressAt = 0L
+                selectedTab = MainTab.Feed
+            }
             selectedTab != MainTab.Feed -> {
                 lastHomeBackPressAt = 0L
                 selectedTab = MainTab.Feed
@@ -4005,6 +4014,37 @@ fun WeiboApp() {
         commentSubmitJob = job
     }
 
+    fun submitComposeWeibo(text: String, visibility: WeiboPostVisibility, photoUris: List<Uri>) {
+        if (composeSubmitting) return
+        scope.launch {
+            composeSubmitting = true
+            try {
+                val timeoutMs = if (photoUris.isNotEmpty()) 120_000L else 60_000L
+                withTimeout(timeoutMs) {
+                    session.postStatus(
+                        content = text,
+                        visibility = visibility,
+                        photoUris = photoUris,
+                    )
+                }
+                operationCapsuleHint = "微博已发布"
+                composeSessionKey += 1
+                selectedTab = MainTab.Feed
+                refreshTimelineFromTop()
+            } catch (error: CancellationException) {
+                if (error is TimeoutCancellationException) {
+                    operationCapsuleHint = "发布超时，请稍后重试"
+                } else {
+                    throw error
+                }
+            } catch (error: Throwable) {
+                operationCapsuleHint = error.message ?: "微博发布失败"
+            } finally {
+                composeSubmitting = false
+            }
+        }
+    }
+
     fun reloadReposts() {
         val item = selectedItem ?: return
         repostsRequestJob?.cancel()
@@ -4698,6 +4738,26 @@ fun WeiboApp() {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
             val composeWebVisible = selectedTab == MainTab.Compose && mainContentClear
+            val composeDisplayName = mineProfile?.screenName?.takeIf { it.isNotBlank() }
+                ?: storedAccounts.firstOrNull { it.id == activeAccountId }?.screenName?.takeIf { it.isNotBlank() }
+                ?: "微博用户"
+            val composeAvatarUrl = mineProfile?.avatarUrl
+                ?: storedAccounts.firstOrNull { it.id == activeAccountId }?.avatarUrl
+            LaunchedEffect(composeWebVisible, activeAccountId, hasLoginCookie) {
+                if (!composeWebVisible || !hasLoginCookie) return@LaunchedEffect
+                runCatching {
+                    refreshMentionSuggestions(showLoadingIfEmpty = true)
+                    if (mineProfile == null && !mineProfileLoading) {
+                        refreshMineProfile()
+                    }
+                }
+            }
+            var previousComposeAccountId by remember { mutableStateOf(activeAccountId) }
+            LaunchedEffect(activeAccountId) {
+                if (activeAccountId == previousComposeAccountId) return@LaunchedEffect
+                previousComposeAccountId = activeAccountId
+                composeSessionKey += 1
+            }
             val webTabVisible = messagesWebVisible || composeWebVisible
 
             Box(
@@ -4725,18 +4785,30 @@ fun WeiboApp() {
                     .graphicsLayer {
                         alpha = if (composeWebVisible) 1f else 0f
                         clip = true
-                        if (composeWebVisible) {
-                            compositingStrategy = CompositingStrategy.Offscreen
-                        }
                     }
-                    .zIndex(if (composeWebVisible) 2f else -10f)
+                    .zIndex(if (composeWebVisible) 85f else -10f)
                     .blockHiddenTouches(composeWebVisible),
             ) {
-                MobileWeiboWebScreen(
-                    pageUrl = "https://m.weibo.cn/compose/",
-                    onRootBack = ::handleRootBackPress,
-                    active = composeWebVisible,
-                )
+                key(composeSessionKey) {
+                    ComposeWeiboScreen(
+                        active = composeWebVisible,
+                        loggedIn = hasLoginCookie,
+                        screenName = composeDisplayName,
+                        avatarUrl = composeAvatarUrl,
+                        submitting = composeSubmitting,
+                        emoticonMap = emoticonMap,
+                        recentEmoticons = recentCommentEmoticons,
+                        mentionAvatarSuggestions = mentionAvatarSuggestions,
+                        mentionNameIndex = mentionNameIndex,
+                        mentionSuggestionsLoading = mentionSuggestionsLoading,
+                        onEmoticonUsed = { phrase ->
+                            recentCommentEmoticons = emoticonCacheStore
+                                .touchRecent(phrase)
+                                .filter { it in emoticonMap }
+                        },
+                        onSubmit = ::submitComposeWeibo,
+                    )
+                }
             }
 
             Box(
@@ -4799,7 +4871,7 @@ fun WeiboApp() {
                             .fillMaxSize()
                             .background(MaterialTheme.colorScheme.background)
                             .graphicsLayer { alpha = feedVisibleAlpha }
-                            .blockHiddenTouches(feedUiOnTop),
+                            .blockHiddenTouches(feedUiOnTop || composeWebVisible),
                     ) {
                         FollowFeedScreen(
                             session = session,
@@ -5372,6 +5444,7 @@ fun WeiboApp() {
                     listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
                 }
                 val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
+                if (selectedTab != MainTab.Compose) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
@@ -5458,6 +5531,7 @@ fun WeiboApp() {
                         .align(Alignment.BottomStart)
                         .zIndex(91f),
                 )
+                }
             }
 
             ExitConfirmCapsule(
@@ -11442,12 +11516,8 @@ private fun WeiboVideoSurface(
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 val width = videoSize.width.takeIf { it > 0 } ?: return
                 val height = videoSize.height.takeIf { it > 0 } ?: return
-                val (displayWidth, displayHeight) = when (videoSize.unappliedRotationDegrees) {
-                    90, 270 -> height to width
-                    else -> width to height
-                }
-                aspectRatio = displayWidth.toFloat() / displayHeight.toFloat()
-                onAspectRatio(displayWidth, displayHeight)
+                aspectRatio = width.toFloat() / height.toFloat()
+                onAspectRatio(width, height)
             }
 
             override fun onRenderedFirstFrame() {
@@ -13139,6 +13209,664 @@ private fun CommentComposerDialog(
     }
 }
 
+private const val ComposeWeiboMaxTextLength = 2000
+private const val ComposeWeiboMaxPhotos = 18
+private val ComposeWeiboToolbarMutedColor = Color(0xFF999999)
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ComposeWeiboScreen(
+    active: Boolean,
+    loggedIn: Boolean,
+    screenName: String,
+    avatarUrl: String?,
+    submitting: Boolean,
+    emoticonMap: Map<String, String>,
+    recentEmoticons: List<String>,
+    mentionAvatarSuggestions: List<MentionCandidate>,
+    mentionNameIndex: List<MentionCandidate>,
+    mentionSuggestionsLoading: Boolean,
+    onEmoticonUsed: (String) -> Unit,
+    onSubmit: (String, WeiboPostVisibility, List<Uri>) -> Unit,
+) {
+    if (!loggedIn) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .statusBarsPadding(),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = "请先在设置中登录微博",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        return
+    }
+
+    var text by remember { mutableStateOf(TextFieldValue("")) }
+    var visibility by remember { mutableStateOf(WeiboPostVisibility.Public) }
+    var visibilityMenuVisible by remember { mutableStateOf(false) }
+    var visibilityMenuAnchor by remember { mutableStateOf<Rect?>(null) }
+    var displayedVisibilityAnchor by remember { mutableStateOf<Rect?>(null) }
+    var visibilityChipBounds by remember { mutableStateOf(Rect.Zero) }
+    var emoticonPanelVisible by remember { mutableStateOf(false) }
+    var selectedPhotoUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val accentColor = MaterialTheme.colorScheme.primary
+    val inputTextStyle = feedBodyTextStyle().copy(
+        color = MaterialTheme.colorScheme.onSurface,
+        lineHeight = 24.sp,
+    )
+    val recentEntries = remember(emoticonMap, recentEmoticons) {
+        recentEmoticons.mapNotNull { phrase -> emoticonMap[phrase]?.let { phrase to it } }
+    }
+    val allEntries = remember(emoticonMap) {
+        emoticonMap.entries.sortedBy { it.key }.map { it.key to it.value }
+    }
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents(),
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        val merged = (selectedPhotoUris + uris).distinctBy { it.toString() }
+        selectedPhotoUris = merged.take(ComposeWeiboMaxPhotos)
+    }
+    val mentionCursor = min(text.selection.start, text.selection.end)
+    val activeMentionQuery = extractActiveMentionQuery(text.text, mentionCursor)
+    val displayedMentionSuggestions = remember(
+        text.text,
+        text.selection.end,
+        mentionAvatarSuggestions,
+        mentionNameIndex,
+    ) {
+        when (val query = activeMentionQuery) {
+            null -> emptyList()
+            "" -> mentionAvatarSuggestions
+            else -> filterMentionCandidatesByQuery(mentionNameIndex, query)
+        }
+    }
+    val mentionPanelExpanded = activeMentionQuery != null
+    val canSubmit = (text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
+
+    fun insertAtCursor(value: String, requestKeyboard: Boolean = false) {
+        val selection = text.selection
+        val start = min(selection.start, selection.end).coerceIn(0, text.text.length)
+        val end = max(selection.start, selection.end).coerceIn(0, text.text.length)
+        val nextText = (text.text.substring(0, start) + value + text.text.substring(end))
+            .take(ComposeWeiboMaxTextLength)
+        val nextCursor = (start + value.length).coerceAtMost(nextText.length)
+        text = TextFieldValue(
+            text = nextText,
+            selection = TextRange(nextCursor),
+        )
+        if (requestKeyboard) {
+            emoticonPanelVisible = false
+            runCatching { focusRequester.requestFocus() }
+            keyboard?.show()
+        }
+    }
+
+    fun appendEmoticon(phrase: String) {
+        insertAtCursor(phrase)
+        onEmoticonUsed(phrase)
+    }
+
+    fun insertMention() {
+        insertAtCursor("@", requestKeyboard = true)
+    }
+
+    fun insertMentionUser(user: MentionCandidate) {
+        val cursor = min(text.selection.start, text.selection.end).coerceIn(0, text.text.length)
+        val before = text.text.substring(0, cursor)
+        val after = text.text.substring(cursor)
+        val atIndex = before.lastIndexOf('@')
+        val mention = "@${user.name} "
+        val nextText = if (atIndex >= 0) {
+            before.substring(0, atIndex) + mention + after
+        } else if (cursor > 0 && text.text.getOrNull(cursor - 1) == '@') {
+            before + "${user.name} " + after
+        } else {
+            before + mention + after
+        }.take(ComposeWeiboMaxTextLength)
+        val nextCursor = if (atIndex >= 0) {
+            (atIndex + mention.length).coerceAtMost(nextText.length)
+        } else {
+            (cursor + mention.length).coerceAtMost(nextText.length)
+        }
+        text = TextFieldValue(
+            text = nextText,
+            selection = TextRange(nextCursor),
+        )
+        runCatching { focusRequester.requestFocus() }
+        keyboard?.show()
+    }
+
+    fun openEmoticons() {
+        emoticonPanelVisible = !emoticonPanelVisible
+        if (emoticonPanelVisible) {
+            keyboard?.hide()
+            focusManager.clearFocus()
+        }
+    }
+
+    LaunchedEffect(visibilityMenuAnchor) {
+        if (visibilityMenuAnchor != null) {
+            displayedVisibilityAnchor = visibilityMenuAnchor
+        }
+    }
+
+    var hasAutoFocused by remember { mutableStateOf(false) }
+    LaunchedEffect(active) {
+        if (!active || hasAutoFocused) return@LaunchedEffect
+        hasAutoFocused = true
+        delay(150)
+        runCatching { focusRequester.requestFocus() }
+            .onSuccess { keyboard?.show() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.White)
+            .consumeTouchEvents()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .imePadding(),
+    ) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    RemoteImage(
+                        url = avatarUrl,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape),
+                        contentScale = ContentScale.Crop,
+                        maxDecodeDim = 96,
+                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+                        Text(
+                            text = screenName,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 16.sp,
+                            lineHeight = 18.sp,
+                            color = accentColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .onGloballyPositioned { coordinates ->
+                                    visibilityChipBounds = coordinates.boundsInRoot()
+                                }
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    onClick = {
+                                        visibilityMenuAnchor = visibilityChipBounds
+                                        visibilityMenuVisible = true
+                                    },
+                                )
+                                .padding(top = 1.dp, bottom = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = visibility.label,
+                                fontSize = 13.sp,
+                                lineHeight = 15.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Icon(
+                                painter = painterResource(R.drawable.ic_chevron_down),
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(
+                            enabled = canSubmit,
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick = {
+                                if (canSubmit) {
+                                    onSubmit(text.text, visibility, selectedPhotoUris)
+                                }
+                            },
+                        )
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (submitting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                            color = accentColor,
+                        )
+                    } else {
+                        Text(
+                            text = "发送",
+                            fontSize = 16.sp,
+                            lineHeight = 18.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (canSubmit) {
+                                accentColor
+                            } else {
+                                accentColor.copy(alpha = 0.35f)
+                            },
+                        )
+                    }
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                AnimatedVisibility(visible = mentionPanelExpanded && displayedMentionSuggestions.isNotEmpty()) {
+                    MentionSuggestionPanel(
+                        users = displayedMentionSuggestions,
+                        vertical = !activeMentionQuery.isNullOrBlank(),
+                        onSelect = { insertMentionUser(it) },
+                    )
+                }
+                if (mentionSuggestionsLoading && mentionPanelExpanded && displayedMentionSuggestions.isEmpty()) {
+                    Text(
+                        text = "正在加载 @ 联系人…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                ) {
+                    BasicTextField(
+                        value = text,
+                        onValueChange = { value ->
+                            val next = if (value.text.length <= ComposeWeiboMaxTextLength) {
+                                value
+                            } else {
+                                value.copy(
+                                    text = value.text.take(ComposeWeiboMaxTextLength),
+                                    selection = TextRange(ComposeWeiboMaxTextLength),
+                                )
+                            }
+                            text = next
+                        },
+                        enabled = !submitting,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusRequester(focusRequester),
+                        textStyle = inputTextStyle,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
+                        decorationBox = { innerTextField ->
+                            Box(Modifier.fillMaxSize()) {
+                                if (text.text.isEmpty()) {
+                                    Text(
+                                        text = "分享新鲜事儿...",
+                                        style = inputTextStyle.copy(
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                                        ),
+                                    )
+                                }
+                                innerTextField()
+                            }
+                        },
+                    )
+                }
+
+                if (selectedPhotoUris.isNotEmpty()) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        selectedPhotoUris.forEach { uri ->
+                            Box {
+                                LocalUriThumbnail(
+                                    uri = uri,
+                                    modifier = Modifier
+                                        .size(72.dp)
+                                        .clip(RoundedCornerShape(8.dp)),
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .offset(x = 4.dp, y = (-4).dp)
+                                        .size(18.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.Black.copy(alpha = 0.55f))
+                                        .clickable {
+                                            selectedPhotoUris = selectedPhotoUris.filterNot { it == uri }
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        text = "×",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        lineHeight = 12.sp,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.End,
+            ) {
+                Text(
+                    text = text.text.length.toString(),
+                    fontSize = 20.sp,
+                    lineHeight = 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ComposeWeiboToolbarMutedColor,
+                )
+                Spacer(Modifier.width(14.dp))
+                CommentComposerTextButton(
+                    text = "@",
+                    onClick = { insertMention() },
+                    contentDescription = "@",
+                    color = ComposeWeiboToolbarMutedColor,
+                )
+                Spacer(Modifier.width(6.dp))
+                CommentComposerIconButton(
+                    iconRes = R.drawable.ic_comment_photo,
+                    onClick = {
+                        emoticonPanelVisible = false
+                        photoPickerLauncher.launch("image/*")
+                    },
+                    contentDescription = "照片",
+                    tint = ComposeWeiboToolbarMutedColor,
+                )
+                Spacer(Modifier.width(6.dp))
+                CommentComposerIconButton(
+                    iconRes = R.drawable.ic_comment_emoji,
+                    onClick = { openEmoticons() },
+                    contentDescription = "表情",
+                    tint = ComposeWeiboToolbarMutedColor,
+                )
+            }
+
+            AnimatedVisibility(visible = emoticonPanelVisible) {
+                CommentEmoticonPanel(
+                    recentEntries = recentEntries,
+                    allEntries = allEntries,
+                    onSelect = { appendEmoticon(it) },
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
+        }
+
+        displayedVisibilityAnchor?.let { anchor ->
+            ComposeVisibilityPickerOverlay(
+                visible = visibilityMenuVisible,
+                selected = visibility,
+                anchorBounds = anchor,
+                onDismiss = { visibilityMenuVisible = false },
+                onExitComplete = { visibilityMenuAnchor = null },
+                onSelected = { option ->
+                    visibility = option
+                    visibilityMenuVisible = false
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposeVisibilityPickerOverlay(
+    visible: Boolean,
+    selected: WeiboPostVisibility,
+    anchorBounds: Rect,
+    onDismiss: () -> Unit,
+    onExitComplete: () -> Unit,
+    onSelected: (WeiboPostVisibility) -> Unit,
+) {
+    val backdrop = LocalLiquidMenuBackdrop.current
+    val density = LocalDensity.current
+    val options = WeiboPostVisibility.entries
+    val menuHeight = visibilityMenuHeight(options)
+    val gapFromAnchor = 4.dp
+    val screenMargin = 14.dp
+
+    BackHandler(enabled = visible) { onDismiss() }
+
+    var overlayOriginInRoot by remember { mutableStateOf(Offset.Zero) }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { coordinates ->
+                overlayOriginInRoot = coordinates.localToRoot(Offset.Zero)
+            }
+            .zIndex(20f),
+    ) {
+        val screenWidthPx = with(density) { maxWidth.toPx() }
+        val screenHeightPx = with(density) { maxHeight.toPx() }
+        val localAnchorBounds = remember(anchorBounds, overlayOriginInRoot) {
+            Rect(
+                left = anchorBounds.left - overlayOriginInRoot.x,
+                top = anchorBounds.top - overlayOriginInRoot.y,
+                right = anchorBounds.right - overlayOriginInRoot.x,
+                bottom = anchorBounds.bottom - overlayOriginInRoot.y,
+            )
+        }
+        val menuWidth = rememberVisibilityMenuWidth(options, maxWidth - screenMargin * 2)
+        val menuWidthPx = with(density) { menuWidth.toPx() }
+        val menuHeightPx = with(density) { menuHeight.toPx() }
+        val menuPlacement = calculateVisibilityMenuOffsetPx(
+            anchorBounds = localAnchorBounds,
+            screenWidthPx = screenWidthPx,
+            screenHeightPx = screenHeightPx,
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
+            marginPx = with(density) { screenMargin.toPx() },
+            gapPx = with(density) { gapFromAnchor.toPx() },
+        )
+        val originInMenu = computeActionMenuOriginInMenu(
+            anchorInRoot = Offset(
+                localAnchorBounds.left,
+                if (menuPlacement.belowAnchor) localAnchorBounds.bottom else localAnchorBounds.top,
+            ),
+            menuOffset = menuPlacement.offset,
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
+        )
+
+        if (visible) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = onDismiss,
+                    ),
+            )
+        }
+        ActionMenuReveal(
+            visible = visible,
+            menuWidth = menuWidth,
+            menuHeight = menuHeight,
+            originInMenu = originInMenu,
+            onExitComplete = onExitComplete,
+            modifier = Modifier
+                .offset { menuPlacement.offset }
+                .width(menuWidth)
+                .height(menuHeight),
+        ) {
+            ImageActionFrostedCard(
+                modifier = Modifier.fillMaxSize(),
+                backdrop = backdrop,
+                menuHeight = menuHeight,
+            ) {
+                options.forEach { option ->
+                    VisibilityMenuRow(
+                        label = option.label,
+                        subtitle = option.subtitle,
+                        selected = selected == option,
+                        onClick = { onSelected(option) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+private val VisibilityMenuRowTallHeight = 56.dp
+private val VisibilityMenuWidthExtra = 12.dp
+private val VisibilityMenuSubtitleColor = Color(0xFF999999)
+
+@Composable
+private fun VisibilityMenuRow(
+    label: String,
+    subtitle: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val titleStyle = actionMenuTextStyle(selected = selected)
+    val titleColor = when {
+        selected -> MaterialTheme.colorScheme.primary
+        else -> Color(0xFF1C1C1E)
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(VisibilityMenuRowTallHeight)
+            .clip(RoundedCornerShape(percent = 50))
+            .clickable(onClick = onClick)
+            .padding(horizontal = ActionMenuCapsulePaddingHorizontal),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+                text = label,
+                style = titleStyle,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = titleColor,
+            )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    fontSize = 11.sp,
+                    lineHeight = 13.sp,
+                    color = VisibilityMenuSubtitleColor,
+                    maxLines = 2,
+                    overflow = TextOverflow.Clip,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun rememberVisibilityMenuWidth(
+    options: List<WeiboPostVisibility>,
+    maxWidth: Dp,
+): Dp {
+    val textMeasurer = rememberTextMeasurer()
+    val titleStyle = actionMenuTextStyle()
+    val subtitleStyle = MaterialTheme.typography.bodySmall.copy(
+        fontSize = 11.sp,
+        lineHeight = 13.sp,
+    )
+    val density = LocalDensity.current
+    val horizontalPadding = ActionMenuCapsulePaddingHorizontal * 2 + ActionMenuCardInset * 2
+
+    return remember(options, maxWidth, titleStyle, subtitleStyle, density) {
+        val maxTextWidthPx = options.maxOf { option ->
+            val titleWidth = textMeasurer.measure(
+                text = option.label,
+                style = titleStyle,
+                maxLines = 1,
+                overflow = TextOverflow.Clip,
+            ).size.width
+            val subtitleWidth = if (option.subtitle.isBlank()) {
+                0
+            } else {
+                textMeasurer.measure(
+                    text = option.subtitle,
+                    style = subtitleStyle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Clip,
+                ).size.width
+            }
+            maxOf(titleWidth, subtitleWidth)
+        }
+        val widthDp = with(density) {
+            (maxTextWidthPx.toFloat() + horizontalPadding.toPx()).toDp() + VisibilityMenuWidthExtra
+        }
+        minOf(widthDp, maxWidth)
+    }
+}
+
+private fun visibilityMenuHeight(options: List<WeiboPostVisibility>): Dp {
+    val gaps = (options.size - 1).coerceAtLeast(0)
+    val rowsHeight = VisibilityMenuRowTallHeight * options.size
+    return ActionMenuCardInset * 2 + rowsHeight + ActionMenuItemGap * gaps
+}
+
+private fun calculateVisibilityMenuOffsetPx(
+    anchorBounds: Rect,
+    screenWidthPx: Float,
+    screenHeightPx: Float,
+    menuWidthPx: Float,
+    menuHeightPx: Float,
+    marginPx: Float,
+    gapPx: Float,
+): ActionMenuPlacement {
+    val maxX = (screenWidthPx - menuWidthPx - marginPx).coerceAtLeast(marginPx)
+    val x = anchorBounds.left.coerceIn(marginPx, maxX)
+    val hasSpaceAbove = anchorBounds.top - gapPx - menuHeightPx >= marginPx
+    val hasSpaceBelow = anchorBounds.bottom + gapPx + menuHeightPx <= screenHeightPx - marginPx
+    val (targetY, belowAnchor) = when {
+        hasSpaceAbove -> anchorBounds.top - gapPx - menuHeightPx to false
+        hasSpaceBelow -> anchorBounds.bottom + gapPx to true
+        else -> anchorBounds.top - gapPx - menuHeightPx to false
+    }
+    val maxY = (screenHeightPx - menuHeightPx - marginPx).coerceAtLeast(marginPx)
+    val y = targetY.coerceIn(marginPx, maxY)
+    return ActionMenuPlacement(IntOffset(x.roundToInt(), y.roundToInt()), belowAnchor)
+}
+
+private fun actionMenuHeightForRowCount(rowCount: Int): Dp {
+    val gaps = (rowCount - 1).coerceAtLeast(0)
+    return ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * rowCount + ActionMenuItemGap * gaps
+}
+
 private fun FeedItem.hasNoLikes(): Boolean {
     val value = likesCount.trim()
     return value == "0" || value == "--" || value.equals("null", ignoreCase = true) || value.isEmpty()
@@ -13623,17 +14351,19 @@ private fun LocalUriThumbnail(
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CommentEmoticonPanel(
     recentEntries: List<Pair<String, String>>,
     allEntries: List<Pair<String, String>>,
     onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val displayedRecentEntries = recentEntries.take(14)
     val recentPhrases = displayedRecentEntries.map { it.first }.toSet()
     val remainingEntries = allEntries.filter { it.first !in recentPhrases }
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .heightIn(max = 260.dp)
             .verticalScroll(rememberScrollState())
@@ -13654,9 +14384,9 @@ private fun CommentEmoticonPanel(
         }
         if (displayedRecentEntries.isNotEmpty()) {
             FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
-                maxItemsInEachRow = 7,
             ) {
                 displayedRecentEntries.forEach { (phrase, url) ->
                     CommentEmoticonTile(
@@ -13671,9 +14401,9 @@ private fun CommentEmoticonPanel(
             )
         }
         FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
             verticalArrangement = Arrangement.spacedBy(6.dp),
-            maxItemsInEachRow = 7,
         ) {
             remainingEntries.forEach { (phrase, url) ->
                 CommentEmoticonTile(
@@ -13727,6 +14457,7 @@ private fun CommentComposerTextButton(
     text: String,
     contentDescription: String,
     onClick: () -> Unit,
+    color: Color = MaterialTheme.colorScheme.onSurfaceVariant,
 ) {
     Box(
         modifier = Modifier
@@ -13744,7 +14475,7 @@ private fun CommentComposerTextButton(
             fontSize = 20.sp,
             lineHeight = 20.sp,
             fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = color,
         )
     }
 }
@@ -13754,6 +14485,7 @@ private fun CommentComposerIconButton(
     iconRes: Int,
     contentDescription: String,
     onClick: () -> Unit,
+    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
 ) {
     Box(
         modifier = Modifier
@@ -13770,7 +14502,7 @@ private fun CommentComposerIconButton(
             painter = painterResource(iconRes),
             contentDescription = contentDescription,
             modifier = Modifier.size(20.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            tint = tint,
         )
     }
 }
@@ -16333,7 +17065,7 @@ private val appHelpSections = listOf(
         title = "开始使用",
         items = listOf(
             "本应用通过微博网页登录态读取数据，首次使用请到「我的 → 设置 → 账号管理」完成登录。",
-            "登录后可浏览首页信息流、搜索、个人主页，以及写微博、查看消息等网页功能。",
+            "登录后可浏览首页信息流、搜索、个人主页，以及原生写微博、查看消息等功能。",
             "若首页为空，请确认已登录，并在首页下拉刷新或再次点击底部「首页」同步内容。",
         ),
     ),
@@ -16348,7 +17080,8 @@ private val appHelpSections = listOf(
             "双击小胶囊：在首页刷新信息流；在「我的」回到顶部并刷新资料。",
             "再次点击当前选中的「首页」，也会从顶部刷新关注流。",
             "长按底部「首页」按钮，可在「最新微博」与「朋友圈」之间切换。",
-            "在「消息」「写微博」页按系统返回键，优先网页内后退；无法后退时留在当前页。",
+            "写微博页为全屏编辑界面，不显示底部五个按钮；按返回键回到首页。",
+            "在「消息」页按系统返回键，优先网页内后退；无法后退时留在当前页。",
             "在其他 Tab 按返回键会先回到首页；在首页连按两次返回键退出应用。",
         ),
     ),
@@ -16428,9 +17161,11 @@ private val appHelpSections = listOf(
     HelpSection(
         title = "写微博与消息",
         items = listOf(
-            "「写微博」「消息」使用移动版微博网页（m.weibo.cn），登录态与首页共用。",
-            "写微博时可从相册选择图片发布；网页内返回优先于切 Tab。",
-            "消息页地址为 m.weibo.cn/message，可查看私信与通知。",
+            "「写微博」为原生编辑界面：顶部显示头像、昵称与「发送」，可点选公开范围。",
+            "公开范围支持：公开、好友圈、粉丝、仅自己可见；点「公开 ▼」在上方弹出选项。",
+            "支持文字、@ 提及、表情与相册图片，最多可选 18 张；@ 候选与评论弹窗规则一致。",
+            "离开发微博页再回来，已输入的文字、图片与可见范围会保留；发布成功或切换账号后清空。",
+            "「消息」使用移动版微博网页（m.weibo.cn/message），登录态与首页共用。",
         ),
     ),
     HelpSection(
@@ -16453,6 +17188,8 @@ private val appHelpSections = listOf(
             "表情同步：从微博拉取表情配置到本地，改善正文与评论中的表情显示。",
             "浏览信息流时，正文里出现的表情也会自动收录到本地，同步时不会删除这些表情。",
             "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
+            "行距与字号：五档行距、五档字号，作用于首页微博正文、引用区与评论区。",
+            "主题颜色：更换应用强调色，影响底部导航、按钮与高亮文字等界面元素。",
             "后台播放声音：关闭后，应用切到后台时会暂停视频；浮窗播放时切换页面不会暂停。",
         ),
     ),
@@ -16620,22 +17357,23 @@ private fun SettingsAccountRow(
     } else {
         Color.White
     }
-    val dragState = remember(account.id, deleteActionWidthPx, density) {
+    val dragState = remember(account.id, deleteActionWidthPx) {
         AnchoredDraggableState(
             initialValue = SettingsAccountSwipeAnchor.Closed,
             anchors = DraggableAnchors {
                 SettingsAccountSwipeAnchor.Closed at 0f
                 SettingsAccountSwipeAnchor.Open at -deleteActionWidthPx
             },
-            positionalThreshold = { distance -> distance * 0.35f },
-            velocityThreshold = { with(density) { 120.dp.toPx() } },
-            snapAnimationSpec = spring(
-                dampingRatio = 0.82f,
-                stiffness = Spring.StiffnessMedium,
-            ),
-            decayAnimationSpec = exponentialDecay(),
         )
     }
+    val flingBehavior = AnchoredDraggableDefaults.flingBehavior(
+        state = dragState,
+        positionalThreshold = { distance -> distance * 0.35f },
+        animationSpec = spring(
+            dampingRatio = 0.82f,
+            stiffness = Spring.StiffnessMedium,
+        ),
+    )
     val scope = rememberCoroutineScope()
     val swipeOffsetPx = dragState.requireOffset()
     val isRevealed = dragState.currentValue == SettingsAccountSwipeAnchor.Open
@@ -16681,6 +17419,7 @@ private fun SettingsAccountRow(
                 .anchoredDraggable(
                     state = dragState,
                     orientation = Orientation.Horizontal,
+                    flingBehavior = flingBehavior,
                 )
                 .background(rowBackground, rowShape)
                 .clickable(

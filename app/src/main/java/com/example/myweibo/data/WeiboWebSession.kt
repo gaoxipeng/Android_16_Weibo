@@ -580,6 +580,115 @@ class WeiboWebSession(context: Context) {
             nativeUploadImageRawBinary(image)
         }
 
+    suspend fun postStatus(
+        content: String,
+        visibility: WeiboPostVisibility,
+        photoUris: List<Uri> = emptyList(),
+    ) {
+        val text = content.trim()
+        require(text.isNotBlank() || photoUris.isNotEmpty()) { "微博内容不能为空" }
+        ensureMweiboSession()
+        val xsrf = loadMweiboXsrfToken()
+        val picIds = if (photoUris.isEmpty()) {
+            emptyList()
+        } else {
+            coroutineScope {
+                photoUris.map { uri ->
+                    async { uploadCommentImage(uri) }
+                }.awaitAll()
+            }
+        }
+        val params = linkedMapOf(
+            "content" to text,
+            "visible" to visibility.apiValue.toString(),
+            "st" to xsrf,
+            "_spr" to "screen:412x915",
+        )
+        if (picIds.isNotEmpty()) {
+            params["picId"] = picIds.joinToString(",")
+        }
+        val raw = nativePostMweiboForm(
+            url = "https://m.weibo.cn/api/statuses/update",
+            params = params,
+            referer = "https://m.weibo.cn/compose/",
+        )
+        assertMweiboMutationSuccess(raw, "微博发布失败")
+    }
+
+    private suspend fun loadMweiboXsrfToken(): String {
+        val raw = nativeFetchMweiboJson("https://m.weibo.cn/api/config")
+        val root = JSONObject(raw)
+        root.optJSONObject("data")?.optString("st")?.takeIf { it.isNotBlank() }?.let { return it }
+        val cookie = mergedCookieHeader("https://m.weibo.cn/")
+        return extractCookieValue(cookie, "XSRF-TOKEN")
+            ?.let { URLDecoder.decode(it, Charsets.UTF_8.name()) }
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IllegalStateException("无法获取发布令牌，请稍后重试")
+    }
+
+    private fun assertMweiboMutationSuccess(raw: String, defaultError: String) {
+        val root = JSONObject(raw)
+        if (root.optInt("ok", 0) == 1) return
+        val message = root.optString("msg").takeIf { it.isNotBlank() }
+            ?: root.optString("message").takeIf { it.isNotBlank() }
+            ?: defaultError
+        throw IllegalStateException(message)
+    }
+
+    private suspend fun nativePostMweiboForm(
+        url: String,
+        params: Map<String, String>,
+        referer: String,
+    ): String = withContext(Dispatchers.IO) {
+        CookieManager.getInstance().flush()
+        val cookie = mergedCookieHeader("https://m.weibo.cn/")
+        if (!hasAuthenticatedCookie(cookie)) {
+            throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后重试")
+        }
+
+        val body = params.entries.joinToString("&") { (key, value) ->
+            "${key.urlEncode()}=${value.urlEncode()}"
+        }
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", MWEIBO_USER_AGENT)
+            setRequestProperty("Accept", "application/json, text/plain, */*")
+            setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+            setRequestProperty("Referer", referer)
+            setRequestProperty("Origin", "https://m.weibo.cn")
+            setRequestProperty("X-Requested-With", "XMLHttpRequest")
+            setRequestProperty("mweibo-pwa", "1")
+            setRequestProperty("Cookie", cookie)
+        }
+        extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
+            connection.setRequestProperty(
+                "X-XSRF-TOKEN",
+                URLDecoder.decode(token, Charsets.UTF_8.name()),
+            )
+        }
+        connection.outputStream.use { output ->
+            output.write(body.toByteArray(Charsets.UTF_8))
+        }
+
+        val status = connection.responseCode
+        syncResponseCookies(connection)
+        val responseBody = if (status in 200..299) {
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            throw IllegalStateException("微博发布失败:$status ${errorBody.take(120)}")
+        }
+        if (responseBody.trimStart().startsWith("<")) {
+            throw IllegalStateException("微博发布返回了 HTML 页面，请确认登录状态")
+        }
+        responseBody
+    }
+
     suspend fun loadAllRelationUsers(
         uid: String,
         tab: FriendListTab,
