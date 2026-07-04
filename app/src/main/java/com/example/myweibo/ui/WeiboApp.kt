@@ -2137,9 +2137,31 @@ private class ImagePeekController {
 private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
 private val LocalFeedThumbnailQuality = staticCompositionLocalOf { FeedThumbnailQuality.Medium }
-private val LocalFeedLineSpacing = staticCompositionLocalOf { FeedLineSpacing.Compact }
-private val LocalFeedFontSize = staticCompositionLocalOf { FeedFontSize.Medium }
+private val LocalFeedBodyTextStyle = staticCompositionLocalOf {
+    val size = 15.sp
+    TextStyle(
+        fontSize = size,
+        lineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+    )
+}
 private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
+
+@Composable
+private fun rememberFeedBodyTextStyle(
+    fontSize: FeedFontSize,
+    lineSpacing: FeedLineSpacing,
+): TextStyle {
+    val bodyMedium = MaterialTheme.typography.bodyMedium
+    val size = fixedSp(fontSize.sizeSp)
+    return remember(fontSize, lineSpacing, size, bodyMedium) {
+        bodyMedium.copy(
+            fontSize = size,
+            lineHeight = size * lineSpacing.lineHeightMultiplier,
+            platformStyle = PlatformTextStyle(includeFontPadding = false),
+        )
+    }
+}
 
 private class FeedImageUpgradeNotifier {
     var revision by mutableIntStateOf(0)
@@ -4876,6 +4898,7 @@ fun WeiboApp() {
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
         val imageSaveHintController = remember { ImageSaveHintController() }
+        val feedBodyTextStyleValue = rememberFeedBodyTextStyle(feedFontSize, feedLineSpacing)
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
             LocalLiquidMenuBackdrop provides bottomBarBackdrop,
@@ -4885,8 +4908,7 @@ fun WeiboApp() {
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
-            LocalFeedLineSpacing provides feedLineSpacing,
-            LocalFeedFontSize provides feedFontSize,
+            LocalFeedBodyTextStyle provides feedBodyTextStyleValue,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
             Box(Modifier.fillMaxSize()) {
@@ -6387,12 +6409,14 @@ private fun EmoticonText(
     }
 
     val primaryColor = MaterialTheme.colorScheme.primary
-    val emojiSize = style.fontSize.times(1.4f)
-    val lineH = style.lineHeight.takeIf { it != TextUnit.Unspecified } ?: style.fontSize * 1.5f
+    val fontSize = style.fontSize
+    val lineHeight = style.lineHeight
+    val emojiSize = fontSize.times(1.4f)
+    val lineH = lineHeight.takeIf { it != TextUnit.Unspecified } ?: fontSize * 1.5f
     val tokenRegex = remember(inlineImageLinks, urlEntities) {
         buildStatusTokenRegex(inlineImageLinks, urlEntities)
     }
-    val inlineContent = remember(emoticonMap, emojiSize, lineH, style, primaryColor) {
+    val inlineContent = remember(emoticonMap, emojiSize, lineH, fontSize, lineHeight, primaryColor) {
         buildMap {
             emoticonMap.forEach { (phrase, url) ->
                 put(
@@ -6647,19 +6671,7 @@ private fun EmojiImage(url: String) {
 }
 
 @Composable
-private fun feedBodyTextStyle(): TextStyle {
-    val fontSize = LocalFeedFontSize.current
-    val lineSpacing = LocalFeedLineSpacing.current
-    val size = fixedSp(fontSize.sizeSp)
-    val bodyMedium = MaterialTheme.typography.bodyMedium
-    return remember(fontSize, lineSpacing, size, bodyMedium) {
-        bodyMedium.copy(
-            fontSize = size,
-            lineHeight = size * lineSpacing.lineHeightMultiplier,
-            platformStyle = PlatformTextStyle(includeFontPadding = false),
-        )
-    }
-}
+private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
 
 @Composable
 private fun FeedCard(
