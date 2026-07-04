@@ -83,8 +83,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
-import androidx.compose.foundation.gestures.FlingBehavior
-import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
@@ -446,7 +444,6 @@ private fun feedRefreshHintMessage(
 }
 
 private const val ListScrollToTopDurationMillis = 320
-private const val WeiboListFlingFrictionMultiplier = 0.46f
 private const val BottomBarCollapseScrollDelta = 12
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
@@ -2865,6 +2862,7 @@ fun WeiboApp() {
     var commentSubmitting by remember { mutableStateOf(false) }
     var composeSubmitting by remember { mutableStateOf(false) }
     var composeSessionKey by remember { mutableIntStateOf(0) }
+    var messagesSessionKey by remember { mutableIntStateOf(0) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
@@ -5310,6 +5308,17 @@ fun WeiboApp() {
                 previousComposeAccountId = activeAccountId
                 composeSessionKey += 1
             }
+            var messagesWebAuthSnapshot by remember {
+                mutableStateOf<Triple<Boolean, String?, Boolean>?>(null)
+            }
+            LaunchedEffect(hasLoginCookie, activeAccountId, cacheLoaded) {
+                val snapshot = Triple(hasLoginCookie, activeAccountId, cacheLoaded)
+                if (snapshot == messagesWebAuthSnapshot) return@LaunchedEffect
+                messagesWebAuthSnapshot = snapshot
+                if (cacheLoaded && hasLoginCookie) {
+                    messagesSessionKey += 1
+                }
+            }
             val webTabVisible = messagesWebVisible || composeWebVisible
 
             Box(
@@ -5326,10 +5335,16 @@ fun WeiboApp() {
                     .zIndex(if (messagesWebVisible) 2f else -10f)
                     .blockHiddenTouches(messagesWebVisible),
             ) {
-                MessagesScreen(
-                    onRootBack = ::handleRootBackPress,
-                    active = messagesWebVisible,
-                )
+                if (!hasLoginCookie) {
+                    WebTabLoginPlaceholder()
+                } else {
+                    key(messagesSessionKey) {
+                        MessagesScreen(
+                            onRootBack = ::handleRootBackPress,
+                            active = messagesWebVisible,
+                        )
+                    }
+                }
             }
             Box(
                 Modifier
@@ -6446,42 +6461,6 @@ private fun Modifier.blockHiddenTouches(visible: Boolean): Modifier =
     }
 
 @Composable
-private fun rememberWeiboListFlingBehavior(): FlingBehavior {
-    val decay = remember {
-        exponentialDecay<Float>(
-            frictionMultiplier = WeiboListFlingFrictionMultiplier,
-            absVelocityThreshold = 12f,
-        )
-    }
-    return remember(decay) {
-        object : FlingBehavior {
-            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
-                if (initialVelocity == 0f) return 0f
-
-                var previousValue = 0f
-                var velocityLeft = initialVelocity
-                var stoppedAtBoundary = false
-                AnimationState(
-                    initialValue = 0f,
-                    initialVelocity = initialVelocity,
-                ).animateDecay(decay) {
-                    val delta = value - previousValue
-                    val consumed = scrollBy(delta)
-                    previousValue = value
-                    velocityLeft = velocity
-                    if (consumed == 0f && abs(delta) > 0.5f) {
-                        stoppedAtBoundary = true
-                        cancelAnimation()
-                    }
-                }
-                // 边界处返回 0，避免残余速度再次触发滚动造成单帧顿挫
-                return if (stoppedAtBoundary) 0f else velocityLeft
-            }
-        }
-    }
-}
-
-@Composable
 private fun AppPullToRefreshBox(
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
@@ -6646,11 +6625,9 @@ private fun FeedScreen(
     onItemClick: (FeedItem) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
 ) {
-    val listFlingBehavior = rememberWeiboListFlingBehavior()
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 24.dp),
-        flingBehavior = listFlingBehavior,
     ) {
         item {
             FeedHeader(
@@ -13336,7 +13313,6 @@ private fun DetailScreen(
                 listState.firstVisibleItemScrollOffset > 64
         }
     }
-    val listFlingBehavior = rememberWeiboListFlingBehavior()
 
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
@@ -13358,7 +13334,6 @@ private fun DetailScreen(
                     .weight(1f)
                     .fillMaxWidth(),
                 contentPadding = PaddingValues(bottom = 24.dp),
-                flingBehavior = listFlingBehavior,
             ) {
                 item(key = "detail-feed") {
                     Box(Modifier.padding(top = 8.dp)) {
@@ -16448,7 +16423,6 @@ private fun SearchScreen(
         0.dp
     }
     val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap + suggestionPanelInset
-    val listFlingBehavior = rememberWeiboListFlingBehavior()
 
     SideEffect {
         searchBarOverlay.queryInput = searchDraft
@@ -16559,7 +16533,6 @@ private fun SearchScreen(
                             end = if (activeQuery == null) 16.dp else 0.dp,
                             bottom = listBottomInset,
                         ),
-                        flingBehavior = listFlingBehavior,
                     ) {
                 if (activeQuery == null) {
                     if (searchHistory.isNotEmpty()) {
@@ -16934,6 +16907,23 @@ private fun MobileWeiboWebScreen(
 }
 
 @Composable
+private fun WebTabLoginPlaceholder() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = "请先在设置中登录微博",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun MessagesScreen(
     onRootBack: () -> Unit,
     active: Boolean = true,
@@ -17209,10 +17199,17 @@ private fun MineScreen(
             ) {
                 AccountLoginPanel(
                     session = session,
+                    autoReturnToFeedOnLogin = storedAccounts.isEmpty(),
                     onLoginSuccess = {
+                        val isFirstLogin = storedAccounts.isEmpty()
                         coroutineScope.launch {
                             onPersistLoginSession()
                             onSyncEmoticons()
+                        }
+                        if (isFirstLogin) {
+                            showAccountManagement = false
+                            showSettings = false
+                            onReturnToFeed()
                         }
                     },
                     onReturnToFeed = {
@@ -17498,7 +17495,6 @@ private fun MineScreen(
                         }
                     }
 
-                    val listFlingBehavior = rememberWeiboListFlingBehavior()
                     HorizontalPager(
                         state = pagerState,
                         userScrollEnabled = !blockMinePagerScroll,
@@ -17514,7 +17510,6 @@ private fun MineScreen(
                                 state = postsListState,
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(bottom = 96.dp),
-                                flingBehavior = listFlingBehavior,
                             ) {
                                 if (posts.isEmpty()) {
                                     item {
@@ -17572,7 +17567,6 @@ private fun MineScreen(
                                     state = albumListState,
                                     modifier = Modifier.fillMaxSize(),
                                     contentPadding = PaddingValues(bottom = 96.dp),
-                                    flingBehavior = listFlingBehavior,
                                 ) {
                                     if (albumRows.isEmpty()) {
                                         item(key = "album-empty") {
@@ -19851,12 +19845,10 @@ private fun FollowListTabPage(
         onRefresh = ::refreshList,
         modifier = Modifier.fillMaxSize(),
     ) {
-        val listFlingBehavior = rememberWeiboListFlingBehavior()
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 24.dp),
-            flingBehavior = listFlingBehavior,
         ) {
             when {
                 loading && users.isEmpty() -> {
@@ -20932,6 +20924,7 @@ private fun MineInfoLine(label: String, value: String) {
 @Composable
 private fun AccountLoginPanel(
     session: WeiboWebSession,
+    autoReturnToFeedOnLogin: Boolean = false,
     onLoginSuccess: () -> Unit = {},
     onReturnToFeed: () -> Unit,
 ) {
@@ -20950,7 +20943,11 @@ private fun AccountLoginPanel(
             ) {
                 Text("\u5FAE\u535A\u767B\u5F55", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "\u4F7F\u7528\u4E0E\u6D88\u606F\u3001\u5199\u5FAE\u535A\u76F8\u540C\u7684\u72EC\u7ACB\u7F51\u9875\u5BB9\u5668\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u70B9\u51FB\u56DE\u5230\u5FAE\u535A\u9996\u9875\u540C\u6B65\u6570\u636E\u3002",
+                    if (autoReturnToFeedOnLogin) {
+                        "\u4F7F\u7528\u4E0E\u6D88\u606F\u3001\u5199\u5FAE\u535A\u76F8\u540C\u7684\u72EC\u7ACB\u7F51\u9875\u5BB9\u5668\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u5C06\u81EA\u52A8\u8FD4\u56DE\u5FAE\u535A\u9996\u9875\u540C\u6B65\u6570\u636E\u3002"
+                    } else {
+                        "\u4F7F\u7528\u4E0E\u6D88\u606F\u3001\u5199\u5FAE\u535A\u76F8\u540C\u7684\u72EC\u7ACB\u7F51\u9875\u5BB9\u5668\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u70B9\u51FB\u56DE\u5230\u5FAE\u535A\u9996\u9875\u540C\u6B65\u6570\u636E\u3002"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
