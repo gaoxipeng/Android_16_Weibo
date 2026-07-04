@@ -360,7 +360,10 @@ import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import androidx.compose.foundation.MutatePriority
+import androidx.compose.foundation.gestures.stopScroll
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.TimeoutCancellationException
@@ -444,7 +447,7 @@ private fun feedRefreshHintMessage(
 
 private const val ListScrollToTopDurationMillis = 320
 private const val WeiboListFlingFrictionMultiplier = 0.46f
-private const val BottomBarCollapseAfterScrollDelayMillis = 180L
+private const val BottomBarCollapseScrollDelta = 12
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
     try {
@@ -1996,6 +1999,32 @@ private class NavTransitionCoordinator {
 
 private val LocalNavTransitionCoordinator = staticCompositionLocalOf { NavTransitionCoordinator() }
 
+private class FeedListScrollCoordinator {
+    var isListScrolling by mutableStateOf(false)
+    var stopScrollAction: (suspend () -> Unit)? = null
+
+    suspend fun interruptIfScrolling(): Boolean {
+        if (!isListScrolling) return false
+        stopScrollAction?.invoke()
+        return true
+    }
+}
+
+private val LocalFeedListScrollCoordinator = staticCompositionLocalOf { FeedListScrollCoordinator() }
+
+private fun cancelFeedListScrollOnTap(
+    coordinator: FeedListScrollCoordinator,
+    scope: CoroutineScope,
+    pointerChange: androidx.compose.ui.input.pointer.PointerInputChange,
+): Boolean {
+    if (!coordinator.isListScrolling) return false
+    pointerChange.consume()
+    scope.launch {
+        coordinator.interruptIfScrolling()
+    }
+    return true
+}
+
 @Composable
 private fun NavTransitionTouchShield(
     coordinator: NavTransitionCoordinator,
@@ -2615,6 +2644,7 @@ fun WeiboApp() {
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
     val navTransitionCoordinator = remember { NavTransitionCoordinator() }
+    val feedListScrollCoordinator = remember { FeedListScrollCoordinator() }
     val videoPeekController = remember { VideoPeekController() }
     val profileHeaderHeights = remember { mutableStateMapOf<String, Dp>() }
 
@@ -4842,36 +4872,29 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(bottomBarListState) {
-        val state = bottomBarListState ?: return@LaunchedEffect
-        var scrollTotalAtRest =
+        val state = bottomBarListState ?: run {
+            feedListScrollCoordinator.isListScrolling = false
+            feedListScrollCoordinator.stopScrollAction = null
+            return@LaunchedEffect
+        }
+        feedListScrollCoordinator.stopScrollAction = { state.stopScroll(MutatePriority.UserInput) }
+        var lastScrollTotal =
             state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
-        var scrollTotalAtGestureStart = scrollTotalAtRest
-        var maxScrollTotalDuringGesture = scrollTotalAtRest
-        var gestureActive = false
-        snapshotFlow {
-            state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset to
-                state.isScrollInProgress
-        }.collect { (scrollTotal, scrolling) ->
-            if (scrolling) {
-                if (!gestureActive) {
-                    gestureActive = true
-                    scrollTotalAtGestureStart = scrollTotalAtRest
-                    maxScrollTotalDuringGesture = scrollTotal
-                } else if (scrollTotal > maxScrollTotalDuringGesture) {
-                    maxScrollTotalDuringGesture = scrollTotal
+        try {
+            snapshotFlow {
+                state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset to
+                    state.isScrollInProgress
+            }.collect { (scrollTotal, scrolling) ->
+                feedListScrollCoordinator.isListScrolling = scrolling
+                if (scrollTotal > lastScrollTotal + BottomBarCollapseScrollDelta) {
+                    bottomBarExpanded = false
+                    bottomBarAwaitingOutsideDismiss = false
                 }
-            } else if (gestureActive) {
-                gestureActive = false
-                val shouldCollapse = maxScrollTotalDuringGesture > scrollTotalAtGestureStart + 12
-                scrollTotalAtRest = scrollTotal
-                if (shouldCollapse) {
-                    delay(BottomBarCollapseAfterScrollDelayMillis)
-                    if (!state.isScrollInProgress) {
-                        bottomBarExpanded = false
-                        bottomBarAwaitingOutsideDismiss = false
-                    }
-                }
+                lastScrollTotal = scrollTotal
             }
+        } finally {
+            feedListScrollCoordinator.stopScrollAction = null
+            feedListScrollCoordinator.isListScrolling = false
         }
     }
 
@@ -5039,6 +5062,7 @@ fun WeiboApp() {
             LocalLiquidMenuBackdrop provides bottomBarBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
+            LocalFeedListScrollCoordinator provides feedListScrollCoordinator,
             LocalImagePeekController provides imagePeekController,
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
@@ -7607,6 +7631,8 @@ private fun FeedImageCell(
     var pressHoldProgress by remember(image.id) { mutableFloatStateOf(0f) }
     val anchorHolder = remember(image.id) { LayoutAnchorHolder() }
     val imagePeekController = LocalImagePeekController.current
+    val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
+    val gestureScope = rememberCoroutineScope()
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
@@ -7665,6 +7691,9 @@ private fun FeedImageCell(
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    if (cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)) {
+                        return@awaitEachGesture
+                    }
                     var lastPosition = down.position
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
@@ -10866,6 +10895,8 @@ private fun InlineVideoPlayer(
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+    val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
+    val gestureScope = rememberCoroutineScope()
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
@@ -11105,6 +11136,9 @@ private fun InlineVideoPlayer(
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    if (cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)) {
+                        return@awaitEachGesture
+                    }
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
                         down = down,
@@ -20309,6 +20343,8 @@ private fun AlbumVideoTile(
 ) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
+    val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
+    val gestureScope = rememberCoroutineScope()
     val mediaHaptics = rememberMediaPeekHaptics()
     val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl, playbackOwnerId) {
         videoPlaybackKey(media, playbackOwnerId)
@@ -20368,6 +20404,9 @@ private fun AlbumVideoTile(
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    if (cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)) {
+                        return@awaitEachGesture
+                    }
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
                         down = down,
