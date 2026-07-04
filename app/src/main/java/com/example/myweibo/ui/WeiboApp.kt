@@ -50,6 +50,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationState
@@ -82,6 +83,8 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.FlingBehavior
+import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
@@ -378,10 +381,13 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
-import java.net.HttpURLConnection
-import java.net.URL
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
@@ -437,6 +443,8 @@ private fun feedRefreshHintMessage(
 }
 
 private const val ListScrollToTopDurationMillis = 320
+private const val WeiboListFlingFrictionMultiplier = 0.46f
+private const val BottomBarCollapseAfterScrollDelayMillis = 180L
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
     try {
@@ -970,6 +978,17 @@ private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
+
+private class LayoutAnchorHolder {
+    var coordinates: LayoutCoordinates? = null
+
+    fun boundsInWindow(): Rect? =
+        coordinates?.takeIf { it.isAttached }?.boundsInWindow()
+
+    fun boundsInRoot(): Rect? =
+        coordinates?.takeIf { it.isAttached }?.boundsInRoot()
+}
+
 private const val SingleImageMaxHeightToWidth = 1.2f
 private const val SingleImageMaxWidthFraction = 0.7f
 private const val VideoMaxHeightToWidth = 1f
@@ -992,8 +1011,8 @@ private const val FullscreenFillZoomHeadroom = 1.15f
 private const val FullscreenPixelPerfectZoomHeadroom = 2f
 private const val AlbumBitmapCacheMaxBytes = 96 * 1024 * 1024
 private const val AlbumGridMaxReadBytes = 768 * 1024
-private const val AlbumGridPrefetchConcurrency = 8
-private const val AlbumGridPrefetchBatchSize = 48
+private const val AlbumGridPrefetchConcurrency = 4
+private const val AlbumGridPrefetchBatchSize = 24
 private const val FeedImageLoadConcurrency = 4
 private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
 private const val FullscreenBitmapCacheMaxBytes = 160 * 1024 * 1024
@@ -1043,13 +1062,14 @@ private val FeedImageLoadSemaphore = Semaphore(FeedImageLoadConcurrency)
 
 private const val RemoteBytesCacheMaxTotal = 32 * 1024 * 1024
 private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
-private const val RemoteBytesAnimatedMaxRead = 12 * 1024 * 1024
-private const val RemoteDiskBytesCacheMaxTotal = 192 * 1024 * 1024
+private const val RemoteBytesAnimatedMaxRead = 64 * 1024 * 1024
+private const val RemoteDiskBytesCacheMaxTotal = 256 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
 // ComponentCallbacks2.TRIM_MEMORY_* 在较新 SDK 中已标记 deprecated，数值仍稳定可用。
 private const val TrimMemoryRunningLow = 10
 private const val TrimMemoryRunningCritical = 15
 private const val TrimMemoryComplete = 80
+private const val ImageAcceptHeader = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
 
 private fun navStackEnterTransition() =
     slideInHorizontally(
@@ -1072,13 +1092,36 @@ private fun <T> NavAnimatedOverlay(
     exitHoldMillis: Long = NavTransitionDurationMs.toLong(),
     content: @Composable (T) -> Unit,
 ) {
+    val navTransitions = LocalNavTransitionCoordinator.current
     var displayed by remember { mutableStateOf<T?>(null) }
     if (target != null) {
         displayed = target
     }
     val visible = target != null
+    var skipAnimationToken by remember { mutableIntStateOf(0) }
+    val transitionState = remember(skipAnimationToken) {
+        MutableTransitionState(visible).apply { targetState = visible }
+    }
+    SideEffect {
+        transitionState.targetState = visible
+    }
+    val isAnimating = !transitionState.isIdle
+
+    DisposableEffect(Unit) {
+        val unregister = navTransitions.registerSkipHandler { skipAnimationToken++ }
+        onDispose { unregister() }
+    }
+    DisposableEffect(isAnimating) {
+        if (isAnimating) {
+            navTransitions.onTransitionStart()
+            onDispose { navTransitions.onTransitionEnd() }
+        } else {
+            onDispose {}
+        }
+    }
+
     AnimatedVisibility(
-        visible = visible,
+        visibleState = transitionState,
         modifier = modifier,
         enter = enter,
         exit = exit,
@@ -1087,11 +1130,14 @@ private fun <T> NavAnimatedOverlay(
         displayed?.let { item -> content(item) }
     }
     if (!visible && displayed != null) {
-        LaunchedEffect(displayed) {
+        LaunchedEffect(displayed, transitionState.isIdle) {
+            if (!transitionState.isIdle || transitionState.targetState) return@LaunchedEffect
             if (exitHoldMillis > 0L) {
                 delay(exitHoldMillis)
             }
-            displayed = null
+            if (!transitionState.targetState && transitionState.isIdle) {
+                displayed = null
+            }
         }
     }
 }
@@ -1924,6 +1970,50 @@ private class FeedCardActionMenuController {
 
 private val LocalFeedCardActionMenuController = staticCompositionLocalOf { FeedCardActionMenuController() }
 
+private class NavTransitionCoordinator {
+    var activeTransitions by mutableIntStateOf(0)
+    val isTransitioning: Boolean
+        get() = activeTransitions > 0
+    private val skipHandlers = mutableListOf<() -> Unit>()
+
+    fun onTransitionStart() {
+        activeTransitions++
+    }
+
+    fun onTransitionEnd() {
+        activeTransitions = (activeTransitions - 1).coerceAtLeast(0)
+    }
+
+    fun registerSkipHandler(handler: () -> Unit): () -> Unit {
+        skipHandlers.add(handler)
+        return { skipHandlers.remove(handler) }
+    }
+
+    fun skipAllTransitions() {
+        skipHandlers.toList().forEach { it.invoke() }
+    }
+}
+
+private val LocalNavTransitionCoordinator = staticCompositionLocalOf { NavTransitionCoordinator() }
+
+@Composable
+private fun NavTransitionTouchShield(
+    coordinator: NavTransitionCoordinator,
+    modifier: Modifier = Modifier,
+) {
+    if (!coordinator.isTransitioning) return
+    Box(
+        modifier
+            .fillMaxSize()
+            .pointerInput(coordinator.isTransitioning) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false).consume()
+                    coordinator.skipAllTransitions()
+                }
+            },
+    )
+}
+
 private class SearchBarOverlayController {
     var active by mutableStateOf(false)
     var queryInput by mutableStateOf(TextFieldValue(""))
@@ -2354,7 +2444,11 @@ fun WeiboApp() {
     }
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-    val feedListState = rememberLazyListState()
+    val initialFollowingScroll = remember { timelineCacheStore.readFollowingScroll() }
+    val feedListState = rememberLazyListState(
+        initialFirstVisibleItemIndex = initialFollowingScroll.first,
+        initialFirstVisibleItemScrollOffset = initialFollowingScroll.second,
+    )
     val minePostsListState = rememberLazyListState()
     val mineAlbumListState = rememberLazyListState()
     val visitedPostsListState = rememberLazyListState()
@@ -2364,6 +2458,7 @@ fun WeiboApp() {
     val searchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
+    val navTransitionCoordinator = remember { NavTransitionCoordinator() }
     val videoPeekController = remember { VideoPeekController() }
     val profileHeaderHeights = remember { mutableStateMapOf<String, Dp>() }
 
@@ -2438,6 +2533,7 @@ fun WeiboApp() {
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var cacheLoaded by remember { mutableStateOf(false) }
+    var feedScrollRestoreApplied by remember { mutableStateOf(false) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -2974,10 +3070,6 @@ fun WeiboApp() {
     fun applyNavRestoreState(state: NavRestoreState) {
         selectedTab = state.selectedTab
         minePagerPage = state.minePagerPage
-        selectedItem = null
-        comments = emptyList()
-        commentsCursor = null
-        commentsHasMore = true
         mediaPreview = null
         articleOverlay = null
         albumViewerState = null
@@ -3001,10 +3093,16 @@ fun WeiboApp() {
 
         if (state.detail != null) {
             restoreDetailSnapshot(state.detail)
-        } else if (state.albumViewerState != null) {
-            albumViewerState = state.albumViewerState
-            restoreProfilePagerFromViewer(state.albumViewerState)
-            restoreAlbumScrollFromViewer(state.albumViewerState)
+        } else {
+            selectedItem = null
+            comments = emptyList()
+            commentsCursor = null
+            commentsHasMore = true
+            if (state.albumViewerState != null) {
+                albumViewerState = state.albumViewerState
+                restoreProfilePagerFromViewer(state.albumViewerState)
+                restoreAlbumScrollFromViewer(state.albumViewerState)
+            }
         }
 
         articleOverlay = state.articleOverlay
@@ -3164,10 +3262,11 @@ fun WeiboApp() {
         if (isCurrentUser) return
 
         pushNavigation {
-            selectedItem = null
-            comments = emptyList()
-            commentsCursor = null
-            commentsHasMore = true
+            if (selectedItem == null) {
+                comments = emptyList()
+                commentsCursor = null
+                commentsHasMore = true
+            }
             loadVisitedUserProfile(
                 if (value.all { it.isDigit() }) {
                     ProfileLookup.Uid(value)
@@ -3193,10 +3292,11 @@ fun WeiboApp() {
             return
         }
         pushNavigation {
-            selectedItem = null
-            comments = emptyList()
-            commentsCursor = null
-            commentsHasMore = true
+            if (selectedItem == null) {
+                comments = emptyList()
+                commentsCursor = null
+                commentsHasMore = true
+            }
             loadVisitedUserProfile(
                 if (value.all { it.isDigit() }) {
                     ProfileLookup.Uid(value)
@@ -3662,9 +3762,12 @@ fun WeiboApp() {
 
     fun resolveFeedItem(item: FeedItem): FeedItem {
         val base = expandedFeedItems[item.statusId] ?: item
-        return base.copy(
-            retweetedStatus = base.retweetedStatus?.let { resolveFeedItem(it) },
-        )
+        val resolvedRetweet = base.retweetedStatus?.let { resolveFeedItem(it) }
+        return when {
+            base === item && resolvedRetweet === base.retweetedStatus -> item
+            resolvedRetweet === base.retweetedStatus -> base
+            else -> base.copy(retweetedStatus = resolvedRetweet)
+        }
     }
 
     fun mergeExpandedIntoItem(item: FeedItem, expanded: FeedItem): FeedItem =
@@ -4475,9 +4578,29 @@ fun WeiboApp() {
         hasLoginCookie = session.hasLoginCookie()
         mineHasLoginCookie = hasLoginCookie
         cacheLoaded = true
+        feedScrollRestoreApplied = true
         if (items.isEmpty() && hasLoginCookie) {
             refreshTimeline()
         }
+    }
+
+    LaunchedEffect(feedListState, timelineKind) {
+        snapshotFlow {
+            feedListState.isScrollInProgress
+        }
+            .distinctUntilChanged()
+            .collect { scrolling ->
+                if (!scrolling &&
+                    timelineKind == TimelineKind.Following &&
+                    cacheLoaded &&
+                    feedScrollRestoreApplied
+                ) {
+                    timelineCacheStore.writeFollowingScroll(
+                        feedListState.firstVisibleItemIndex,
+                        feedListState.firstVisibleItemScrollOffset,
+                    )
+                }
+            }
     }
 
     LaunchedEffect(activeAccountId, mineProfile?.id, hasLoginCookie) {
@@ -4564,29 +4687,62 @@ fun WeiboApp() {
 
     LaunchedEffect(bottomBarListState) {
         val state = bottomBarListState ?: return@LaunchedEffect
-        var lastScrollTotal =
+        var scrollTotalAtRest =
             state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
+        var scrollTotalAtGestureStart = scrollTotalAtRest
+        var maxScrollTotalDuringGesture = scrollTotalAtRest
+        var gestureActive = false
         snapshotFlow {
-            state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
-        }.collect { scrollTotal ->
-            if (scrollTotal > lastScrollTotal + 12) {
-                bottomBarExpanded = false
-                bottomBarAwaitingOutsideDismiss = false
+            state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset to
+                state.isScrollInProgress
+        }.collect { (scrollTotal, scrolling) ->
+            if (scrolling) {
+                if (!gestureActive) {
+                    gestureActive = true
+                    scrollTotalAtGestureStart = scrollTotalAtRest
+                    maxScrollTotalDuringGesture = scrollTotal
+                } else if (scrollTotal > maxScrollTotalDuringGesture) {
+                    maxScrollTotalDuringGesture = scrollTotal
+                }
+            } else if (gestureActive) {
+                gestureActive = false
+                val shouldCollapse = maxScrollTotalDuringGesture > scrollTotalAtGestureStart + 12
+                scrollTotalAtRest = scrollTotal
+                if (shouldCollapse) {
+                    delay(BottomBarCollapseAfterScrollDelayMillis)
+                    if (!state.isScrollInProgress) {
+                        bottomBarExpanded = false
+                        bottomBarAwaitingOutsideDismiss = false
+                    }
+                }
             }
-            lastScrollTotal = scrollTotal
         }
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, backgroundPlaybackEnabled) {
+    DisposableEffect(lifecycleOwner, backgroundPlaybackEnabled, timelineKind, cacheLoaded, feedScrollRestoreApplied) {
+        fun persistFeedScrollNow() {
+            if (timelineKind == TimelineKind.Following && cacheLoaded && feedScrollRestoreApplied) {
+                timelineCacheStore.writeFollowingScroll(
+                    feedListState.firstVisibleItemIndex,
+                    feedListState.firstVisibleItemScrollOffset,
+                )
+            }
+        }
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP && !backgroundPlaybackEnabled) {
-                videoPlaybackCoordinator.pauseAll()
-                videoPlaybackCoordinator.activeKey = null
+            if (event == Lifecycle.Event.ON_STOP) {
+                persistFeedScrollNow()
+                if (!backgroundPlaybackEnabled) {
+                    videoPlaybackCoordinator.pauseAll()
+                    videoPlaybackCoordinator.activeKey = null
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            persistFeedScrollNow()
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     LaunchedEffect(
@@ -4724,6 +4880,7 @@ fun WeiboApp() {
             LocalHazeState provides hazeState,
             LocalLiquidMenuBackdrop provides bottomBarBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
+            LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalImagePeekController provides imagePeekController,
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
@@ -4849,9 +5006,9 @@ fun WeiboApp() {
                     mediaPreview != null ||
                     albumViewerState != null)
             val visitedProfileVisible = visitedUserId != null &&
-                selectedItem == null &&
+                detailOverlayItem == null &&
                 albumViewerState == null
-            val visitedProfileCoveredByOverlay = selectedItem != null || albumViewerState != null
+            val visitedProfileCoveredByOverlay = detailOverlayItem != null || albumViewerState != null
             val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
                 when {
                     visitedUserId != null -> visitedUserId == overlay.uid
@@ -5658,6 +5815,10 @@ fun WeiboApp() {
                     onRetry = { loadArticleIntoOverlay(overlay.entity) },
                 )
             }
+            NavTransitionTouchShield(
+                coordinator = navTransitionCoordinator,
+                modifier = Modifier.zIndex(595f),
+            )
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -5888,6 +6049,42 @@ private fun Modifier.blockHiddenTouches(visible: Boolean): Modifier =
     }
 
 @Composable
+private fun rememberWeiboListFlingBehavior(): FlingBehavior {
+    val decay = remember {
+        exponentialDecay<Float>(
+            frictionMultiplier = WeiboListFlingFrictionMultiplier,
+            absVelocityThreshold = 12f,
+        )
+    }
+    return remember(decay) {
+        object : FlingBehavior {
+            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+                if (initialVelocity == 0f) return 0f
+
+                var previousValue = 0f
+                var velocityLeft = initialVelocity
+                var stoppedAtBoundary = false
+                AnimationState(
+                    initialValue = 0f,
+                    initialVelocity = initialVelocity,
+                ).animateDecay(decay) {
+                    val delta = value - previousValue
+                    val consumed = scrollBy(delta)
+                    previousValue = value
+                    velocityLeft = velocity
+                    if (consumed == 0f && abs(delta) > 0.5f) {
+                        stoppedAtBoundary = true
+                        cancelAnimation()
+                    }
+                }
+                // 边界处返回 0，避免残余速度再次触发滚动造成单帧顿挫
+                return if (stoppedAtBoundary) 0f else velocityLeft
+            }
+        }
+    }
+}
+
+@Composable
 private fun AppPullToRefreshBox(
     isRefreshing: Boolean,
     onRefresh: () -> Unit,
@@ -5942,23 +6139,26 @@ private fun FollowFeedScreen(
     feedUiOnTop: Boolean = true,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val listFlingBehavior = rememberWeiboListFlingBehavior()
 
-    AppPullToRefreshBox(
-        isRefreshing = isLoading,
-        onRefresh = onRefresh,
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        val shouldLoadMore by remember {
-            derivedStateOf {
+    if (!cacheLoaded) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
+        ) {
+            CircularProgressIndicator()
+        }
+        return
+    }
+
+    val feedContent: @Composable BoxScope.() -> Unit = {
+        LaunchedEffect(listState) {
+            snapshotFlow {
                 val layoutInfo = listState.layoutInfo
                 val totalItems = layoutInfo.totalItemsCount
                 val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
                 totalItems > 0 && lastVisibleItem >= totalItems - 3
             }
-        }
-
-        LaunchedEffect(shouldLoadMore) {
-            snapshotFlow { shouldLoadMore }
                 .distinctUntilChanged()
                 .filter { it }
                 .collect { onLoadMore() }
@@ -5968,17 +6168,9 @@ private fun FollowFeedScreen(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
+            flingBehavior = listFlingBehavior,
         ) {
-            if (!cacheLoaded) {
-                item {
-                    Box(
-                        modifier = Modifier.fillMaxWidth().padding(32.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                }
-            } else if (items.isEmpty() && !isLoading) {
+            if (items.isEmpty() && !isLoading) {
                 item {
                     EmptyState(
                         title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
@@ -5999,13 +6191,11 @@ private fun FollowFeedScreen(
                 }
             }
 
-            items(items, key = { it.id }) { item ->
+            items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
                 val resolved = resolveFeedItem(item)
-                var cardBounds by remember(resolved.id) { mutableStateOf<Rect?>(null) }
                 FeedCard(
                     item = resolved,
-                    onClick = { onItemClick(resolved, cardBounds) },
-                    onBoundsChange = { cardBounds = it },
+                    onClick = { onItemClick(resolved, null) },
                     onMediaClick = onMediaClick,
                     emoticonMap = emoticonMap,
                     onUserClick = onUserClick,
@@ -6034,6 +6224,13 @@ private fun FollowFeedScreen(
             }
         }
     }
+
+    AppPullToRefreshBox(
+        isRefreshing = isLoading,
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize(),
+        content = feedContent,
+    )
 }
 
 @Composable
@@ -6049,9 +6246,11 @@ private fun FeedScreen(
     onItemClick: (FeedItem) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
 ) {
+    val listFlingBehavior = rememberWeiboListFlingBehavior()
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 24.dp),
+        flingBehavior = listFlingBehavior,
     ) {
         item {
             FeedHeader(
@@ -6074,7 +6273,7 @@ private fun FeedScreen(
             }
         }
 
-        items(items, key = { it.id }) { item ->
+        items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
             FeedCard(
                 item = item,
                 onClick = { onItemClick(item) },
@@ -6188,31 +6387,47 @@ private fun EmoticonText(
     }
 
     val primaryColor = MaterialTheme.colorScheme.primary
-    val inlineContent = mutableMapOf<String, InlineTextContent>()
     val emojiSize = style.fontSize.times(1.4f)
-
-    // 娣诲姞琛ㄦ儏 inline content
-    emoticonMap.forEach { (phrase, url) ->
-        inlineContent[phrase] = InlineTextContent(
-            Placeholder(width = emojiSize, height = emojiSize, placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter)
-        ) { EmojiImage(url = url) }
-    }
-
-    // Reserve inline slots for emoticons that also look like @mentions.
     val lineH = style.lineHeight.takeIf { it != TextUnit.Unspecified } ?: style.fontSize * 1.5f
-    emoticonMap.keys.filter { it.startsWith("@") }.forEach { token ->
-        val estWidth = style.fontSize * (tokenWidthEm(token) + 0.16f)
-        inlineContent[token] = InlineTextContent(
-            Placeholder(width = estWidth, height = lineH, placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter)
-        ) {
-            Text(
-                text = token,
-                color = primaryColor,
-                fontWeight = FontWeight.Medium,
-                style = style,
-                softWrap = false,
-                maxLines = 1,
-            )
+    val tokenRegex = remember(inlineImageLinks, urlEntities) {
+        buildStatusTokenRegex(inlineImageLinks, urlEntities)
+    }
+    val inlineContent = remember(emoticonMap, emojiSize, lineH, style, primaryColor) {
+        buildMap {
+            emoticonMap.forEach { (phrase, url) ->
+                put(
+                    phrase,
+                    InlineTextContent(
+                        Placeholder(
+                            width = emojiSize,
+                            height = emojiSize,
+                            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+                        ),
+                    ) { EmojiImage(url = url) },
+                )
+            }
+            emoticonMap.keys.filter { it.startsWith("@") }.forEach { token ->
+                val estWidth = style.fontSize * (tokenWidthEm(token) + 0.16f)
+                put(
+                    token,
+                    InlineTextContent(
+                        Placeholder(
+                            width = estWidth,
+                            height = lineH,
+                            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+                        ),
+                    ) {
+                        Text(
+                            text = token,
+                            color = primaryColor,
+                            fontWeight = FontWeight.Medium,
+                            style = style,
+                            softWrap = false,
+                            maxLines = 1,
+                        )
+                    },
+                )
+            }
         }
     }
 
@@ -6242,7 +6457,6 @@ private fun EmoticonText(
             }
         }
         var last = 0
-        val tokenRegex = buildStatusTokenRegex(inlineImageLinks, urlEntities)
         tokenRegex.findAll(text).forEach { match ->
             if (match.range.first > last) {
                 append(text.substring(last, match.range.first))
@@ -6409,10 +6623,14 @@ private fun EmojiImage(url: String) {
     LaunchedEffect(url) {
         runCatching {
             withContext(Dispatchers.IO) {
-                val bytes = URL(url).openConnection().apply {
-                    (this as HttpURLConnection).connectTimeout = 5000
-                    readTimeout = 5000
-                }.inputStream.use { it.readBytes() }
+                val bytes = FeedImageLoadSemaphore.withPermit {
+                    fetchRemoteBytes(
+                        url = url,
+                        connectTimeoutMs = 5000,
+                        readTimeoutMs = 5000,
+                        maxReadBytes = 2 * 1024 * 1024,
+                    )
+                }
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             }
         }.onSuccess { bitmap = it }
@@ -6433,11 +6651,14 @@ private fun feedBodyTextStyle(): TextStyle {
     val fontSize = LocalFeedFontSize.current
     val lineSpacing = LocalFeedLineSpacing.current
     val size = fixedSp(fontSize.sizeSp)
-    return MaterialTheme.typography.bodyMedium.copy(
-        fontSize = size,
-        lineHeight = size * lineSpacing.lineHeightMultiplier,
-        platformStyle = PlatformTextStyle(includeFontPadding = false),
-    )
+    val bodyMedium = MaterialTheme.typography.bodyMedium
+    return remember(fontSize, lineSpacing, size, bodyMedium) {
+        bodyMedium.copy(
+            fontSize = size,
+            lineHeight = size * lineSpacing.lineHeightMultiplier,
+            platformStyle = PlatformTextStyle(includeFontPadding = false),
+        )
+    }
 }
 
 @Composable
@@ -6460,9 +6681,13 @@ private fun FeedCard(
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
     insetRounded: Boolean = false,
-    onBoundsChange: (Rect) -> Unit = {},
 ) {
-    val resolvedEmoticonMap = resolveEmoticonMap(emoticonMap, item.collectEmoticons())
+    val resolvedEmoticonMap = remember(emoticonMap, item.emoticons, item.retweetedStatus?.emoticons) {
+        resolveEmoticonMap(emoticonMap, item.collectEmoticons())
+    }
+    val urlEntityMap = remember(item.urlEntities) {
+        item.urlEntities.associateBy { entity -> entity.shortUrl }
+    }
     var inlineImagePreview by remember(item.statusId) { mutableStateOf<List<FeedImage>?>(null) }
     val cardContainerColor = MaterialTheme.colorScheme.surface
     val contentVerticalPadding = when {
@@ -6530,7 +6755,7 @@ private fun FeedCard(
                     onLoadLongText = onLoadLongText,
                     inlineImageLinks = item.inlineImageLinks,
                     onInlineImageClick = { inlineImagePreview = it },
-                    urlEntities = item.urlEntities.associateBy { entity -> entity.shortUrl },
+                    urlEntities = urlEntityMap,
                     onUrlEntityClick = onUrlEntityClick,
                 )
             }
@@ -6571,11 +6796,7 @@ private fun FeedCard(
         }
     }
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .onGloballyPositioned { coordinates ->
-                onBoundsChange(coordinates.boundsInWindow())
-            },
+        modifier = Modifier.fillMaxWidth(),
     ) {
         if (insetRounded) {
             ElevatedCard(
@@ -6781,7 +7002,7 @@ private fun FeedCardActionMenu(
 ) {
     val controller = LocalFeedCardActionMenuController.current
     val menuKey = item.actionMenuKey()
-    var anchorBounds by remember(menuKey) { mutableStateOf<Rect?>(null) }
+    val anchorHolder = remember(menuKey) { LayoutAnchorHolder() }
     val isExpanded = controller.activeRequest?.item?.actionMenuKey() == menuKey
 
     LaunchedEffect(backHandlerEnabled, isExpanded) {
@@ -6799,7 +7020,7 @@ private fun FeedCardActionMenu(
                 .size(52.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .onGloballyPositioned { coordinates ->
-                    anchorBounds = coordinates.boundsInRoot()
+                    anchorHolder.coordinates = coordinates
                 }
                 .clickable(
                     indication = null,
@@ -6808,7 +7029,7 @@ private fun FeedCardActionMenu(
                         if (isExpanded) {
                             controller.dismiss()
                         } else {
-                            val bounds = anchorBounds ?: return@clickable
+                            val bounds = anchorHolder.boundsInRoot() ?: return@clickable
                             controller.open(item, bounds, backHandlerEnabled)
                         }
                     },
@@ -7163,8 +7384,7 @@ private fun FeedImageCell(
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
     var pressHoldProgress by remember(image.id) { mutableFloatStateOf(0f) }
-    var anchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
-    var anchorCoordinates by remember(image.id) { mutableStateOf<LayoutCoordinates?>(null) }
+    val anchorHolder = remember(image.id) { LayoutAnchorHolder() }
     val imagePeekController = LocalImagePeekController.current
     val mediaHaptics = rememberMediaPeekHaptics()
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
@@ -7177,9 +7397,7 @@ private fun FeedImageCell(
     }
 
     fun openImagePeek(pressWindowOffset: Offset) {
-        val bounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
-            ?: anchorBounds
-            ?: return
+        val bounds = anchorHolder.boundsInWindow() ?: return
         actionOpen = true
         peekActive = true
         pressHoldProgress = 1f
@@ -7192,9 +7410,7 @@ private fun FeedImageCell(
                 pressOffset = pressWindowOffset,
                 statusItem = imageOwner,
                 resolveAnchorBounds = {
-                    anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
-                        ?: anchorBounds
-                        ?: bounds
+                    anchorHolder.boundsInWindow() ?: bounds
                 },
                 onCancel = { resetPeekState() },
                 onRelease = {},
@@ -7213,10 +7429,7 @@ private fun FeedImageCell(
         modifier = modifier
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
-                anchorCoordinates = coordinates
-                val bounds = coordinates.boundsInWindow()
-                anchorBounds = bounds
-                onAnchorBoundsChanged(bounds)
+                anchorHolder.coordinates = coordinates
             }
             .graphicsLayer {
                 scaleX = holdScale
@@ -7229,9 +7442,7 @@ private fun FeedImageCell(
             )
             .pointerInput(image.id) {
                 awaitEachGesture {
-                    val bounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
-                        ?: anchorBounds
-                        ?: return@awaitEachGesture
+                    val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var lastPosition = down.position
                     var pressResult = MediaLongPressResult.Tap
@@ -7244,8 +7455,7 @@ private fun FeedImageCell(
 
                     when (pressResult) {
                         MediaLongPressResult.Tap -> {
-                            val currentBounds = anchorCoordinates?.takeIf { it.isAttached }?.boundsInWindow()
-                                ?: bounds
+                            val currentBounds = anchorHolder.boundsInWindow() ?: bounds
                             onAnchorBoundsChanged(currentBounds)
                             onOpenViewer(imageIndex, currentBounds, null, null)
                         }
@@ -10423,8 +10633,7 @@ private fun InlineVideoPlayer(
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var pressHoldProgress by remember(media.streamUrl) { mutableFloatStateOf(0f) }
-    var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
-    var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
+    val anchorHolder = remember(media.streamUrl) { LayoutAnchorHolder() }
     var lastTapUptimeMs by remember(media.streamUrl) { mutableStateOf(0L) }
     var isCardViewportVisible by remember(media.streamUrl) { mutableStateOf(true) }
     var isCardTopVisible by remember(media.streamUrl) { mutableStateOf(true) }
@@ -10447,7 +10656,7 @@ private fun InlineVideoPlayer(
     }
 
     fun openVideoPeek(pressWindowOffset: Offset) {
-        val bounds = anchorBounds ?: return
+        val bounds = anchorHolder.boundsInWindow() ?: return
         val wasPlayingBeforePeek = videoCoordinator.activeKey == playbackKey &&
             videoCoordinator.fullscreenKey != playbackKey
         actionOpen = true
@@ -10461,7 +10670,9 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
-                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
                 onCancel = {
                     videoCoordinator.cancelFullscreenHandoff(playbackKey)
                     resetPeekState()
@@ -10480,7 +10691,7 @@ private fun InlineVideoPlayer(
     }
 
     fun openInlineFloatingPlayback(pressWindowOffset: Offset, fromAutoScroll: Boolean = false) {
-        val bounds = anchorBounds ?: return
+        val bounds = anchorHolder.boundsInWindow() ?: return
         if (fromAutoScroll) {
             autoFloatReturnArmed = false
             isCardReadyForFloatReturn = false
@@ -10497,7 +10708,9 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
-                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
                 onCancel = {
                     val returningToInline = videoCoordinator.pendingPeekHandoffKey?.let { pending ->
                         videoCoordinator.matchesPlaybackKey(pending, playbackKey)
@@ -10554,7 +10767,7 @@ private fun InlineVideoPlayer(
         if (!inlinePlaying || !media.isStreamPlayable()) return@LaunchedEffect
         if (videoCoordinator.peekPlaybackKey == playbackKey) return@LaunchedEffect
         if (actionOpen || peekActive) return@LaunchedEffect
-        val bounds = anchorBounds ?: return@LaunchedEffect
+        val bounds = anchorHolder.boundsInWindow() ?: return@LaunchedEffect
         val center = Offset(
             bounds.left + bounds.width / 2f,
             bounds.top + bounds.height / 2f,
@@ -10579,7 +10792,7 @@ private fun InlineVideoPlayer(
     }
 
     fun openInlineFullscreenTransition(pressWindowOffset: Offset) {
-        val bounds = anchorBounds
+        val bounds = anchorHolder.boundsInWindow()
         if (bounds == null || !media.isStreamPlayable()) {
             videoCoordinator.activeKey = null
             onFullscreenRequest()
@@ -10597,7 +10810,9 @@ private fun InlineVideoPlayer(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
-                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
                 expandFromAnchor = true,
                 onCancel = {
                     videoCoordinator.cancelFullscreenHandoff(playbackKey)
@@ -10634,8 +10849,7 @@ private fun InlineVideoPlayer(
                 )
                 .zIndex(if (actionOpen || peekActive) 10f else 0f)
                 .onGloballyPositioned { coordinates ->
-                    anchorCoordinates = coordinates
-                    anchorBounds = coordinates.boundsInWindow()
+                    anchorHolder.coordinates = coordinates
                     if (autoFloatingOnScrollAway || isAutoScrollFloating) {
                         val bounds = coordinates.boundsInWindow()
                         val visibleTop = max(bounds.top, 0f)
@@ -10643,11 +10857,18 @@ private fun InlineVideoPlayer(
                         val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
                         val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
                         val nowVisible = fraction >= CardAutoFloatHideVisibleFraction
-                        isCardViewportVisible = nowVisible
-                        isCardTopVisible = bounds.top >= 0f
-                        isCardReadyForFloatReturn =
-                            isCardTopVisible && fraction >= CardAutoFloatReturnVisibleFraction
-                        if (isAutoScrollFloating && !isCardReadyForFloatReturn) {
+                        val topVisible = bounds.top >= 0f
+                        val readyForReturn = topVisible && fraction >= CardAutoFloatReturnVisibleFraction
+                        if (isCardViewportVisible != nowVisible) {
+                            isCardViewportVisible = nowVisible
+                        }
+                        if (isCardTopVisible != topVisible) {
+                            isCardTopVisible = topVisible
+                        }
+                        if (isCardReadyForFloatReturn != readyForReturn) {
+                            isCardReadyForFloatReturn = readyForReturn
+                        }
+                        if (isAutoScrollFloating && !readyForReturn) {
                             autoFloatReturnArmed = true
                         }
                     }
@@ -10661,7 +10882,7 @@ private fun InlineVideoPlayer(
                 .background(Color.Black)
                 .pointerInput(media.streamUrl, media.type) {
                 awaitEachGesture {
-                    val bounds = anchorBounds ?: return@awaitEachGesture
+                    val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
@@ -10736,14 +10957,14 @@ private fun InlineVideoPlayer(
                     }
                 },
                 onFullscreen = {
-                    val bounds = anchorBounds
+                    val bounds = anchorHolder.boundsInWindow()
                     val center = bounds?.let {
                         Offset(it.left + it.width / 2f, it.top + it.height / 2f)
                     } ?: Offset.Zero
                     openInlineFullscreenTransition(center)
                 },
                 onEnterFloatingPlayback = {
-                    val bounds = anchorBounds
+                    val bounds = anchorHolder.boundsInWindow()
                     val center = bounds?.let {
                         Offset(it.left + it.width / 2f, it.top + it.height / 2f)
                     } ?: Offset.Zero
@@ -12581,6 +12802,7 @@ private fun DetailScreen(
                 listState.firstVisibleItemScrollOffset > 64
         }
     }
+    val listFlingBehavior = rememberWeiboListFlingBehavior()
 
     Box(Modifier.fillMaxSize()) {
     AppPullToRefreshBox(
@@ -12602,6 +12824,7 @@ private fun DetailScreen(
                     .weight(1f)
                     .fillMaxWidth(),
                 contentPadding = PaddingValues(bottom = 24.dp),
+                flingBehavior = listFlingBehavior,
             ) {
                 item(key = "detail-feed") {
                     Box(Modifier.padding(top = 8.dp)) {
@@ -12680,7 +12903,11 @@ private fun DetailScreen(
                     }
                 }
 
-                itemsIndexed(sectionItems, key = { _, entry -> entry.id }) { index, entry ->
+                itemsIndexed(
+                    sectionItems,
+                    key = { _, entry -> entry.id },
+                    contentType = { _, _ -> "comment_row" },
+                ) { index, entry ->
                     CommentRow(
                         comment = entry,
                         onUserClick = onUserClick,
@@ -15687,6 +15914,7 @@ private fun SearchScreen(
         0.dp
     }
     val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap + suggestionPanelInset
+    val listFlingBehavior = rememberWeiboListFlingBehavior()
 
     SideEffect {
         searchBarOverlay.queryInput = searchDraft
@@ -15797,6 +16025,7 @@ private fun SearchScreen(
                             end = if (activeQuery == null) 16.dp else 0.dp,
                             bottom = listBottomInset,
                         ),
+                        flingBehavior = listFlingBehavior,
                     ) {
                 if (activeQuery == null) {
                     if (searchHistory.isNotEmpty()) {
@@ -15884,7 +16113,11 @@ private fun SearchScreen(
                             }
                         }
                         else -> {
-                            itemsIndexed(hotSearchItems, key = { _, item -> item.word }) { index, item ->
+                            itemsIndexed(
+                                hotSearchItems,
+                                key = { _, item -> item.word },
+                                contentType = { _, _ -> "hot_search" },
+                            ) { index, item ->
                                 HotSearchRow(
                                     rank = index + 1,
                                     item = item,
@@ -15944,7 +16177,11 @@ private fun SearchScreen(
                             }
                         }
                         activeSearchMode == SearchMode.User -> {
-                            items(userResultItems, key = { it.id.ifBlank { it.screenName } }) { user ->
+                            items(
+                                userResultItems,
+                                key = { it.id.ifBlank { it.screenName } },
+                                contentType = { "search_user" },
+                            ) { user ->
                                 RelationUserRow(
                                     user = user,
                                     showFollowButton = !mineProfileId.isNullOrBlank() && user.id != mineProfileId,
@@ -15960,7 +16197,7 @@ private fun SearchScreen(
                             }
                         }
                         else -> {
-                            items(resultItems, key = { it.id }) { item ->
+                            items(resultItems, key = { it.id }, contentType = { "feed_card" }) { item ->
                                 val resolved = resolveFeedItem(item)
                                 FeedCard(
                                     item = resolved,
@@ -16070,6 +16307,7 @@ private fun MobileWeiboWebScreen(
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             setLayerType(View.LAYER_TYPE_NONE, null)
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
             settings.apply {
@@ -16542,20 +16780,8 @@ private fun MineScreen(
             }
         }
     }
-    val animatedCollapseAnim = remember { Animatable(0f) }
-    var collapseAnimationReady by remember { mutableStateOf(false) }
-    LaunchedEffect(collapseProgress) {
-        if (!collapseAnimationReady) {
-            animatedCollapseAnim.snapTo(collapseProgress)
-            collapseAnimationReady = true
-        } else {
-            animatedCollapseAnim.animateTo(
-                collapseProgress,
-                animationSpec = tween(durationMillis = 220),
-            )
-        }
-    }
-    val animatedCollapse = animatedCollapseAnim.value
+    // 直接跟随列表滚动偏移，避免 LaunchedEffect + Animatable 在滑动时每帧重启动画
+    val animatedCollapse = collapseProgress
     val compactBarHeight = (topInset + compactBarContentHeight) * animatedCollapse
     val profileHeaderSlotHeight = when {
         profileHeaderHeight > 0.dp ->
@@ -16738,6 +16964,7 @@ private fun MineScreen(
                         }
                     }
 
+                    val listFlingBehavior = rememberWeiboListFlingBehavior()
                     HorizontalPager(
                         state = pagerState,
                         userScrollEnabled = !blockMinePagerScroll,
@@ -16753,6 +16980,7 @@ private fun MineScreen(
                                 state = postsListState,
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(bottom = 96.dp),
+                                flingBehavior = listFlingBehavior,
                             ) {
                                 if (posts.isEmpty()) {
                                     item {
@@ -16762,7 +16990,7 @@ private fun MineScreen(
                                         )
                                     }
                                 } else {
-                                    items(posts, key = { it.id }) { post ->
+                                    items(posts, key = { it.id }, contentType = { "feed_card" }) { post ->
                                         FeedCard(
                                             item = post,
                                             onClick = { onItemClick(post) },
@@ -16810,6 +17038,7 @@ private fun MineScreen(
                                     state = albumListState,
                                     modifier = Modifier.fillMaxSize(),
                                     contentPadding = PaddingValues(bottom = 96.dp),
+                                    flingBehavior = listFlingBehavior,
                                 ) {
                                     if (albumRows.isEmpty()) {
                                         item(key = "album-empty") {
@@ -19035,10 +19264,12 @@ private fun FollowListTabPage(
         onRefresh = ::refreshList,
         modifier = Modifier.fillMaxSize(),
     ) {
+        val listFlingBehavior = rememberWeiboListFlingBehavior()
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 24.dp),
+            flingBehavior = listFlingBehavior,
         ) {
             when {
                 loading && users.isEmpty() -> {
@@ -19070,7 +19301,7 @@ private fun FollowListTabPage(
                     }
                 }
                 else -> {
-                    items(users, key = { it.id }) { user ->
+                    items(users, key = { it.id }, contentType = { "relation_user" }) { user ->
                         RelationUserRow(
                             user = user,
                             showFollowButton = !mineProfileId.isNullOrBlank() && user.id != mineProfileId,
@@ -19811,8 +20042,7 @@ private fun AlbumVideoTile(
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
     var pressHoldProgress by remember(media.streamUrl) { mutableFloatStateOf(0f) }
-    var anchorBounds by remember(media.streamUrl) { mutableStateOf<Rect?>(null) }
-    var anchorCoordinates by remember(media.streamUrl) { mutableStateOf<LayoutCoordinates?>(null) }
+    val anchorHolder = remember(media.streamUrl) { LayoutAnchorHolder() }
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
     fun resetPeekState() {
@@ -19823,7 +20053,7 @@ private fun AlbumVideoTile(
     }
 
     fun openVideoPeek(pressWindowOffset: Offset) {
-        val bounds = anchorBounds ?: return
+        val bounds = anchorHolder.boundsInWindow() ?: return
         actionOpen = true
         peekActive = true
         pressHoldProgress = 0f
@@ -19835,7 +20065,9 @@ private fun AlbumVideoTile(
                 anchorBounds = bounds,
                 pressOffset = pressWindowOffset,
                 playbackOwnerId = playbackOwnerId,
-                resolveAnchorBounds = { resolveVideoAnchorBounds(anchorCoordinates, anchorBounds) },
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
                 onCancel = { resetPeekState() },
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
@@ -19850,8 +20082,7 @@ private fun AlbumVideoTile(
             .size(size)
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
-                anchorCoordinates = coordinates
-                anchorBounds = coordinates.boundsInWindow()
+                anchorHolder.coordinates = coordinates
             }
             .graphicsLayer {
                 scaleX = holdScale
@@ -19861,7 +20092,7 @@ private fun AlbumVideoTile(
             .clip(RoundedCornerShape(8.dp))
             .pointerInput(media.streamUrl) {
                 awaitEachGesture {
-                    val bounds = anchorBounds ?: return@awaitEachGesture
+                    val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var pressResult = MediaLongPressResult.Tap
                     pressResult = awaitMediaLongPress(
@@ -20223,6 +20454,7 @@ private fun AccountLoginWebView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             setBackgroundColor(android.graphics.Color.WHITE)
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -20382,6 +20614,7 @@ private fun ArticleReaderOverlay(
                                 modifier = Modifier.fillMaxSize(),
                                 factory = { context ->
                                     WebView(context).apply {
+                                        importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                         settings.javaScriptEnabled = false
                                         settings.domStorageEnabled = false
                                         settings.loadsImagesAutomatically = true
@@ -20406,6 +20639,7 @@ private fun ArticleReaderOverlay(
                             modifier = Modifier.fillMaxSize(),
                             factory = { context ->
                                 WebView(context).apply {
+                                    importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                     settings.javaScriptEnabled = true
                                     settings.domStorageEnabled = true
                                     settings.loadsImagesAutomatically = true
@@ -20570,12 +20804,14 @@ private fun AlbumGridRemoteImage(
         val loaded = if (previewUrl != null) {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    loadRemoteBitmap(
-                        url = previewUrl,
-                        maxDecodeDim = maxDecodeDim,
-                        connectTimeoutMs = 5000,
-                        readTimeoutMs = 5000,
-                    )
+                    FeedImageLoadSemaphore.withPermit {
+                        loadRemoteBitmap(
+                            url = previewUrl,
+                            maxDecodeDim = maxDecodeDim,
+                            connectTimeoutMs = 5000,
+                            readTimeoutMs = 5000,
+                        )
+                    }
                 }
             }.getOrNull()
         } else {
@@ -20627,7 +20863,7 @@ private fun RemoteImage(
     cacheLookupUrls: List<String> = emptyList(),
     maxDecodeDim: Int = 480,
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
-    limitConcurrency: Boolean = false,
+    limitConcurrency: Boolean = true,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -20731,14 +20967,16 @@ private fun AnimatedRemoteImage(
     modifier: Modifier = Modifier,
     contentScale: ContentScale = ContentScale.Crop,
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
-    limitConcurrency: Boolean = false,
+    limitConcurrency: Boolean = true,
 ) {
     var drawable by remember(url) { mutableStateOf<Drawable?>(null) }
     var failed by remember(url) { mutableStateOf(false) }
+    var failureText by remember(url) { mutableStateOf("\u56FE\u7247\u4E0D\u53EF\u7528") }
 
     LaunchedEffect(url) {
         drawable = null
         failed = false
+        failureText = "\u56FE\u7247\u4E0D\u53EF\u7528"
         val target = url?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
         runCatching {
             withContext(Dispatchers.IO) {
@@ -20751,7 +20989,14 @@ private fun AnimatedRemoteImage(
                 }
             }
         }.onSuccess { drawable = it }
-            .onFailure { failed = true }
+            .onFailure { error ->
+                failureText = if (error.message.orEmpty().contains("exceeds")) {
+                    "GIF\u8FC7\u5927"
+                } else {
+                    "GIF\u52A0\u8F7D\u5931\u8D25"
+                }
+                failed = true
+            }
     }
 
     Box(
@@ -20781,7 +21026,7 @@ private fun AnimatedRemoteImage(
             )
         } else if (failed) {
             Text(
-                text = "\u56FE\u7247\u4E0D\u53EF\u7528",
+                text = failureText,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -21074,15 +21319,49 @@ private fun fetchRemoteBytes(
         RemoteBytesCache.put(url, bytes)
         return bytes
     }
-    val bytes = URL(url).openConnection().apply {
-        (this as HttpURLConnection).connectTimeout = connectTimeoutMs
-        readTimeout = readTimeoutMs
-        setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
-        setRequestProperty("Referer", "https://weibo.com/")
-    }.inputStream.use { readRemoteBytesLimited(it, maxReadBytes) }
+    val request = weiboImageRequest(url)
+    val call = WeiboImageHttpClient.newCall(request).apply {
+        timeout().timeout((connectTimeoutMs + readTimeoutMs).toLong(), TimeUnit.MILLISECONDS)
+    }
+    val bytes = call.execute().use { response ->
+        if (!response.isSuccessful) {
+            response.body?.byteStream()?.use { readRemoteBytesLimited(it, 64 * 1024) }
+            throw java.io.IOException("Image request failed with HTTP ${response.code}")
+        }
+        val body = response.body ?: throw java.io.IOException("Image response has no body")
+        body.byteStream().use { readRemoteBytesLimited(it, maxReadBytes) }
+    }
     RemoteBytesCache.put(url, bytes)
     RemoteDiskBytesCache.put(url, bytes)
     return bytes
+}
+
+private val WeiboImageHttpClient: OkHttpClient by lazy {
+    val dispatcher = Dispatcher().apply {
+        maxRequests = 12
+        maxRequestsPerHost = 4
+    }
+    OkHttpClient.Builder()
+        .dispatcher(dispatcher)
+        .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build()
+}
+
+private fun weiboImageRequest(url: String): Request {
+    val builder = Request.Builder()
+        .url(url)
+        .header("Accept", ImageAcceptHeader)
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .header("User-Agent", DESKTOP_CHROME_USER_AGENT)
+        .header("Referer", "https://weibo.com/")
+    CookieManager.getInstance().getCookie("https://weibo.com/")
+        ?.takeIf { it.isNotBlank() }
+        ?.let { builder.header("Cookie", it) }
+    return builder.build()
 }
 
 private fun loadRemoteAnimatedDrawable(url: String): Drawable {
