@@ -2012,6 +2012,180 @@ private class FeedListScrollCoordinator {
 
 private val LocalFeedListScrollCoordinator = staticCompositionLocalOf { FeedListScrollCoordinator() }
 
+private val LocalFeedBodyTextStyle = staticCompositionLocalOf { TextStyle.Default }
+
+private const val EmoticonBitmapMaxDecodeDim = 96
+private const val FeedEmoticonTextCacheMaxEntries = 600
+
+private data class FeedEmoticonTextCacheKey(
+    val text: String,
+    val leadingAuthorName: String?,
+    val trailingLabel: String?,
+    val inlineImageTokens: List<String>,
+    val urlEntityTokens: List<String>,
+    val emoticonTokens: List<String>,
+    val linkScopeKey: String?,
+    val linkFlags: Int,
+    val fontSizeBits: ULong,
+    val lineHeightBits: ULong,
+    val primaryColorValue: ULong,
+)
+
+private object FeedEmoticonTextCache {
+    private val cache = object : LinkedHashMap<FeedEmoticonTextCacheKey, AnnotatedString>(
+        FeedEmoticonTextCacheMaxEntries,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<FeedEmoticonTextCacheKey, AnnotatedString>?): Boolean =
+            size > FeedEmoticonTextCacheMaxEntries
+    }
+
+    @Synchronized
+    fun get(key: FeedEmoticonTextCacheKey): AnnotatedString? = cache[key]
+
+    @Synchronized
+    fun put(key: FeedEmoticonTextCacheKey, value: AnnotatedString) {
+        cache[key] = value
+    }
+
+    fun clear() {
+        synchronized(this) { cache.clear() }
+    }
+}
+
+private object FeedEmoticonLinkDispatcher {
+    var onUserClick: ((String) -> Unit)? = null
+    var onTopicClick: ((String) -> Unit)? = null
+    var onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null
+
+    private val trailingClicks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
+    private val leadingAuthorClicks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
+    private val inlineImagesByToken = java.util.concurrent.ConcurrentHashMap<String, List<FeedImage>>()
+    private val urlEntitiesByToken = java.util.concurrent.ConcurrentHashMap<String, FeedUrlEntity>()
+
+    private val inlineImageCallbacks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
+
+    private fun scopedKey(scopeKey: String, token: String): String = "$scopeKey|$token"
+
+    fun registerTrailing(scopeKey: String, action: () -> Unit) {
+        trailingClicks[scopeKey] = action
+    }
+
+    fun unregisterTrailing(scopeKey: String) {
+        trailingClicks.remove(scopeKey)
+    }
+
+    fun trailingClick(scopeKey: String) {
+        trailingClicks[scopeKey]?.invoke()
+    }
+
+    fun registerLeadingAuthor(authorName: String, action: () -> Unit) {
+        leadingAuthorClicks[authorName] = action
+    }
+
+    fun unregisterLeadingAuthor(authorName: String) {
+        leadingAuthorClicks.remove(authorName)
+    }
+
+    fun leadingAuthorClick(authorName: String) {
+        leadingAuthorClicks[authorName]?.invoke()
+    }
+
+    fun hasLeadingAuthorClick(authorName: String): Boolean =
+        leadingAuthorClicks.containsKey(authorName)
+
+    fun hasTrailingClick(scopeKey: String): Boolean =
+        trailingClicks.containsKey(scopeKey)
+
+    fun hasInlineImageClick(scopeKey: String, token: String): Boolean =
+        inlineImageCallbacks.containsKey(scopedKey(scopeKey, token))
+
+    fun hasUrlEntityClick(scopeKey: String, token: String): Boolean =
+        urlEntitiesByToken.containsKey(scopedKey(scopeKey, token))
+
+    fun unregisterScope(scopeKey: String) {
+        trailingClicks.remove(scopeKey)
+        val prefix = "$scopeKey|"
+        inlineImagesByToken.keys.removeAll { it.startsWith(prefix) }
+        inlineImageCallbacks.keys.removeAll { it.startsWith(prefix) }
+        urlEntitiesByToken.keys.removeAll { it.startsWith(prefix) }
+    }
+
+    fun registerInlineImage(
+        scopeKey: String,
+        token: String,
+        images: List<FeedImage>,
+        action: () -> Unit,
+    ) {
+        val key = scopedKey(scopeKey, token)
+        inlineImagesByToken[key] = images
+        inlineImageCallbacks[key] = action
+    }
+
+    fun inlineImageClick(scopeKey: String, token: String) {
+        inlineImageCallbacks[scopedKey(scopeKey, token)]?.invoke()
+    }
+
+    fun registerUrlEntities(scopeKey: String, entities: Map<String, FeedUrlEntity>) {
+        entities.forEach { (token, entity) ->
+            urlEntitiesByToken[scopedKey(scopeKey, token)] = entity
+        }
+    }
+
+    fun urlEntityClick(scopeKey: String, token: String) {
+        urlEntitiesByToken[scopedKey(scopeKey, token)]?.let { entity ->
+            onUrlEntityClick?.invoke(entity)
+        }
+    }
+}
+
+private fun feedEmoticonGlobalLinkFlags(): Int {
+    var flags = 0
+    if (FeedEmoticonLinkDispatcher.onUserClick != null) flags = flags or 1
+    if (FeedEmoticonLinkDispatcher.onTopicClick != null) flags = flags or 2
+    if (FeedEmoticonLinkDispatcher.onUrlEntityClick != null) flags = flags or 4
+    return flags
+}
+
+private fun buildFeedEmoticonTextCacheKey(
+    text: String,
+    leadingAuthorName: String?,
+    trailingLabel: String?,
+    inlineImageLinks: Map<String, List<FeedImage>>,
+    urlEntities: Map<String, FeedUrlEntity>,
+    emoticonTokens: List<String>,
+    linkScopeKey: String?,
+    hasTrailingLink: Boolean,
+    hasLeadingLink: Boolean,
+    hasScopedInlineImageLinks: Boolean,
+    hasScopedUrlLinks: Boolean,
+    style: TextStyle,
+    primaryColor: Color,
+): FeedEmoticonTextCacheKey {
+    var linkFlags = feedEmoticonGlobalLinkFlags()
+    if (hasTrailingLink) linkFlags = linkFlags or 8
+    if (hasLeadingLink) linkFlags = linkFlags or 16
+    if (hasScopedInlineImageLinks) linkFlags = linkFlags or 32
+    if (hasScopedUrlLinks) linkFlags = linkFlags or 64
+    return FeedEmoticonTextCacheKey(
+        text = text,
+        leadingAuthorName = leadingAuthorName,
+        trailingLabel = trailingLabel,
+        inlineImageTokens = inlineImageLinks.keys.sorted(),
+        urlEntityTokens = urlEntities.keys.sorted(),
+        emoticonTokens = emoticonTokens,
+        linkScopeKey = linkScopeKey,
+        linkFlags = linkFlags,
+        fontSizeBits = textUnitCacheBits(style.fontSize),
+        lineHeightBits = textUnitCacheBits(style.lineHeight),
+        primaryColorValue = primaryColor.value.toULong(),
+    )
+}
+
+private fun textUnitCacheBits(unit: TextUnit): ULong =
+    if (unit == TextUnit.Unspecified) 0uL else unit.value.toRawBits().toULong()
+
 private fun cancelFeedListScrollOnTap(
     coordinator: FeedListScrollCoordinator,
     scope: CoroutineScope,
@@ -2258,7 +2432,7 @@ private fun rememberFeedEmoticonInlineContent(
 ): Map<String, InlineTextContent> {
     val primaryColor = MaterialTheme.colorScheme.primary
     val body = metrics.body
-    return remember(emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, body, primaryColor) {
+    return remember(emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, primaryColor) {
         buildMap {
             emoticonMap.forEach { (phrase, url) ->
                 put(phrase, emojiInlineContent(url = url, size = metrics.emojiSize))
@@ -2286,7 +2460,7 @@ private fun rememberMissingEmoticonInlineContent(
 ): Map<String, InlineTextContent> {
     val primaryColor = MaterialTheme.colorScheme.primary
     val body = metrics.body
-    return remember(tokens, emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, body, primaryColor) {
+    return remember(tokens, emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, primaryColor) {
         if (tokens.isEmpty()) {
             emptyMap()
         } else {
@@ -4881,16 +5055,23 @@ fun WeiboApp() {
         var lastScrollTotal =
             state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
         try {
-            snapshotFlow {
-                state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset to
-                    state.isScrollInProgress
-            }.collect { (scrollTotal, scrolling) ->
-                feedListScrollCoordinator.isListScrolling = scrolling
-                if (scrollTotal > lastScrollTotal + BottomBarCollapseScrollDelta) {
-                    bottomBarExpanded = false
-                    bottomBarAwaitingOutsideDismiss = false
+            coroutineScope {
+                launch {
+                    snapshotFlow { state.isScrollInProgress }
+                        .distinctUntilChanged()
+                        .collect { scrolling ->
+                            feedListScrollCoordinator.isListScrolling = scrolling
+                        }
                 }
-                lastScrollTotal = scrollTotal
+                snapshotFlow {
+                    state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
+                }.collect { scrollTotal ->
+                    if (scrollTotal > lastScrollTotal + BottomBarCollapseScrollDelta) {
+                        bottomBarExpanded = false
+                        bottomBarAwaitingOutsideDismiss = false
+                    }
+                    lastScrollTotal = scrollTotal
+                }
             }
         } finally {
             feedListScrollCoordinator.stopScrollAction = null
@@ -5057,6 +5238,37 @@ fun WeiboApp() {
         val imageSaveHintController = remember { ImageSaveHintController() }
         val feedTypographyMetrics = rememberFeedTypographyMetrics(feedFontSize, feedLineSpacing)
         val feedEmoticonInlineContent = rememberFeedEmoticonInlineContent(emoticonMap, feedTypographyMetrics)
+        LaunchedEffect(feedFontSize, feedLineSpacing) {
+            FeedEmoticonTextCache.clear()
+        }
+        LaunchedEffect(emoticonMap) {
+            val urls = emoticonMap.values.distinct()
+            if (urls.isEmpty()) return@LaunchedEffect
+            withContext(Dispatchers.IO) {
+                urls.take(300).forEach { url ->
+                    if (FeedBitmapCache.get(url) != null) return@forEach
+                    decodeCachedRemoteBitmap(url, EmoticonBitmapMaxDecodeDim) ?: run {
+                        runCatching {
+                            val bytes = FeedImageLoadSemaphore.withPermit {
+                                fetchRemoteBytes(
+                                    url = url,
+                                    connectTimeoutMs = 5000,
+                                    readTimeoutMs = 5000,
+                                    maxReadBytes = 2 * 1024 * 1024,
+                                )
+                            }
+                            decodeBitmapFromBytes(bytes, EmoticonBitmapMaxDecodeDim)?.also { bitmap ->
+                                FeedBitmapCache.put(url, bitmap)
+                            }
+                        }.getOrNull()
+                    }
+                }
+            }
+        }
+        val topicClickHandler = LocalTopicClickHandler.current
+        SideEffect {
+            FeedEmoticonLinkDispatcher.onTopicClick = topicClickHandler
+        }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
             LocalLiquidMenuBackdrop provides bottomBarBackdrop,
@@ -5067,6 +5279,7 @@ fun WeiboApp() {
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
+            LocalFeedBodyTextStyle provides feedTypographyMetrics.body,
             LocalFeedTypographyMetrics provides feedTypographyMetrics,
             LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
@@ -6323,7 +6536,11 @@ private fun FollowFeedScreen(
     feedUiOnTop: Boolean = true,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val listFlingBehavior = rememberWeiboListFlingBehavior()
+
+    SideEffect {
+        FeedEmoticonLinkDispatcher.onUserClick = onUserClick
+        FeedEmoticonLinkDispatcher.onUrlEntityClick = onUrlEntityClick
+    }
 
     if (!cacheLoaded) {
         Box(
@@ -6352,7 +6569,6 @@ private fun FollowFeedScreen(
             state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
-            flingBehavior = listFlingBehavior,
         ) {
             if (items.isEmpty() && !isLoading) {
                 item {
@@ -6548,11 +6764,15 @@ private fun buildStatusTokenRegex(
 }
 
 @Composable
+private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
+
+@Composable
 private fun EmoticonText(
     text: String,
     emoticonMap: Map<String, String>,
     style: TextStyle,
     modifier: Modifier = Modifier,
+    contentKey: String = text,
     onUserClick: ((String) -> Unit)? = null,
     leadingAuthorName: String? = null,
     onLeadingAuthorClick: (() -> Unit)? = null,
@@ -6582,11 +6802,62 @@ private fun EmoticonText(
     }
 
     val primaryColor = MaterialTheme.colorScheme.primary
-    val onTopicClick = LocalTopicClickHandler.current
     val sharedInlineContent = LocalFeedEmoticonInlineContent.current
     val feedTypographyMetrics = LocalFeedTypographyMetrics.current
+    val linkScopeKey = remember(contentKey, leadingAuthorName, trailingLabel) {
+        buildString {
+            append(contentKey)
+            leadingAuthorName?.let { append("|la:$it") }
+            trailingLabel?.let { append("|tr:$it") }
+        }
+    }
+    val trailingClickState = rememberUpdatedState(onTrailingClick)
+    val leadingAuthorClickState = rememberUpdatedState(onLeadingAuthorClick)
+    val inlineImageClickState = rememberUpdatedState(onInlineImageClick)
+    SideEffect {
+        if (trailingClickState.value != null) {
+            FeedEmoticonLinkDispatcher.registerTrailing(linkScopeKey) {
+                trailingClickState.value?.invoke()
+            }
+        } else {
+            FeedEmoticonLinkDispatcher.unregisterTrailing(linkScopeKey)
+        }
+        leadingAuthorName?.let { authorName ->
+            if (leadingAuthorClickState.value != null) {
+                FeedEmoticonLinkDispatcher.registerLeadingAuthor(authorName) {
+                    leadingAuthorClickState.value?.invoke()
+                }
+            } else {
+                FeedEmoticonLinkDispatcher.unregisterLeadingAuthor(authorName)
+            }
+        }
+        inlineImageLinks.forEach { (token, images) ->
+            if (inlineImageClickState.value != null) {
+                FeedEmoticonLinkDispatcher.registerInlineImage(linkScopeKey, token, images) {
+                    inlineImageClickState.value?.invoke(images)
+                }
+            }
+        }
+        if (urlEntities.isNotEmpty()) {
+            FeedEmoticonLinkDispatcher.registerUrlEntities(linkScopeKey, urlEntities)
+        }
+    }
+    DisposableEffect(linkScopeKey) {
+        onDispose {
+            FeedEmoticonLinkDispatcher.unregisterScope(linkScopeKey)
+            leadingAuthorName?.let { FeedEmoticonLinkDispatcher.unregisterLeadingAuthor(it) }
+        }
+    }
     val tokenRegex = remember(inlineImageLinks, urlEntities) {
         buildStatusTokenRegex(inlineImageLinks, urlEntities)
+    }
+    val emoticonTokensInText: List<String> = remember(text, emoticonMap, tokenRegex) {
+        tokenRegex.findAll(text)
+            .map { it.value }
+            .filter { emoticonMap.containsKey(it) }
+            .distinct()
+            .sorted()
+            .toList()
     }
     val missingEmoticonTokens = remember(text, emoticonMap, sharedInlineContent, tokenRegex) {
         tokenRegex.findAll(text)
@@ -6603,32 +6874,43 @@ private fun EmoticonText(
     val inlineContent = remember(sharedInlineContent, missingInlineContent) {
         if (missingInlineContent.isEmpty()) sharedInlineContent else sharedInlineContent + missingInlineContent
     }
-    val currentOnUserClick = rememberUpdatedState(onUserClick)
-    val currentOnLeadingAuthorClick = rememberUpdatedState(onLeadingAuthorClick)
-    val currentOnTrailingClick = rememberUpdatedState(onTrailingClick)
-    val currentOnInlineImageClick = rememberUpdatedState(onInlineImageClick)
-    val currentOnUrlEntityClick = rememberUpdatedState(onUrlEntityClick)
-    val currentOnTopicClick = rememberUpdatedState(onTopicClick)
+    val hasTrailingLink = trailingLabel != null && onTrailingClick != null
+    val hasLeadingLink = leadingAuthorName != null && onLeadingAuthorClick != null
+    val hasScopedInlineImageLinks = inlineImageLinks.isNotEmpty() && onInlineImageClick != null
+    val hasScopedUrlLinks = urlEntities.isNotEmpty() && onUrlEntityClick != null
     val annotatedString = remember(
         text,
         leadingAuthorName,
         trailingLabel,
         inlineImageLinks,
         urlEntities,
-        emoticonMap,
-        onUserClick != null,
-        onLeadingAuthorClick != null,
-        onTrailingClick != null,
-        onInlineImageClick != null,
-        onUrlEntityClick != null,
-        onTopicClick != null,
+        emoticonTokensInText,
+        linkScopeKey,
+        hasTrailingLink,
+        hasLeadingLink,
+        hasScopedInlineImageLinks,
+        hasScopedUrlLinks,
         tokenRegex,
-        inlineContent,
         primaryColor,
         style.fontSize,
         style.lineHeight,
     ) {
-        buildEmoticonAnnotatedString(
+        val cacheKey = buildFeedEmoticonTextCacheKey(
+            text = text,
+            leadingAuthorName = leadingAuthorName,
+            trailingLabel = trailingLabel,
+            inlineImageLinks = inlineImageLinks,
+            urlEntities = urlEntities,
+            emoticonTokens = emoticonTokensInText,
+            linkScopeKey = linkScopeKey,
+            hasTrailingLink = hasTrailingLink,
+            hasLeadingLink = hasLeadingLink,
+            hasScopedInlineImageLinks = hasScopedInlineImageLinks,
+            hasScopedUrlLinks = hasScopedUrlLinks,
+            style = style,
+            primaryColor = primaryColor,
+        )
+        FeedEmoticonTextCache.get(cacheKey) ?: buildEmoticonAnnotatedString(
             text = text,
             emoticonMap = emoticonMap,
             inlineImageLinks = inlineImageLinks,
@@ -6636,40 +6918,14 @@ private fun EmoticonText(
             tokenRegex = tokenRegex,
             primaryColor = primaryColor,
             leadingAuthorName = leadingAuthorName,
-            onLeadingAuthorClick = if (onLeadingAuthorClick != null) {
-                { currentOnLeadingAuthorClick.value?.invoke() }
-            } else {
-                null
-            },
             trailingLabel = trailingLabel,
-            onTrailingClick = if (onTrailingClick != null) {
-                { currentOnTrailingClick.value?.invoke() }
-            } else {
-                null
-            },
-            onUserClick = if (onUserClick != null) {
-                { screenName -> currentOnUserClick.value?.invoke(screenName) }
-            } else {
-                null
-            },
-            onInlineImageClick = if (onInlineImageClick != null) {
-                { images -> currentOnInlineImageClick.value?.invoke(images) }
-            } else {
-                null
-            },
-            onUrlEntityClick = if (onUrlEntityClick != null) {
-                { entity -> currentOnUrlEntityClick.value?.invoke(entity) }
-            } else {
-                null
-            },
-            onTopicClick = if (onTopicClick != null) {
-                { topic -> currentOnTopicClick.value?.invoke(topic) }
-            } else {
-                null
-            },
+            linkScopeKey = linkScopeKey,
+            hasLeadingLink = hasLeadingLink,
+            hasTrailingLink = hasTrailingLink,
+            hasScopedInlineImageLinks = hasScopedInlineImageLinks,
+            hasScopedUrlLinks = hasScopedUrlLinks,
             style = style,
-            inlineContent = inlineContent,
-        )
+        ).also { FeedEmoticonTextCache.put(cacheKey, it) }
     }
 
     Text(
@@ -6690,15 +6946,13 @@ private fun buildEmoticonAnnotatedString(
     tokenRegex: Regex,
     primaryColor: Color,
     leadingAuthorName: String?,
-    onLeadingAuthorClick: (() -> Unit)?,
     trailingLabel: String?,
-    onTrailingClick: (() -> Unit)?,
-    onUserClick: ((String) -> Unit)?,
-    onInlineImageClick: ((List<FeedImage>) -> Unit)?,
-    onUrlEntityClick: ((FeedUrlEntity) -> Unit)?,
-    onTopicClick: ((String) -> Unit)?,
+    linkScopeKey: String?,
+    hasLeadingLink: Boolean,
+    hasTrailingLink: Boolean,
+    hasScopedInlineImageLinks: Boolean,
+    hasScopedUrlLinks: Boolean,
     style: TextStyle,
-    inlineContent: Map<String, InlineTextContent>,
 ): AnnotatedString = buildAnnotatedString {
         leadingAuthorName?.let { authorName ->
             val authorLabel = "@$authorName\uFF1A"
@@ -6707,11 +6961,11 @@ private fun buildEmoticonAnnotatedString(
                 fontWeight = FontWeight.Medium,
                 textDecoration = TextDecoration.None,
             )
-            if (onLeadingAuthorClick != null) {
+            if (hasLeadingLink) {
                 withLink(
                     LinkAnnotation.Clickable(
                         tag = "quoted-author:$authorName",
-                        linkInteractionListener = { onLeadingAuthorClick() },
+                        linkInteractionListener = { FeedEmoticonLinkDispatcher.leadingAuthorClick(authorName) },
                     ),
                 ) {
                     withStyle(authorStyle) {
@@ -6731,7 +6985,9 @@ private fun buildEmoticonAnnotatedString(
             }
             val token = match.value
             when {
-                inlineImageLinks.containsKey(token) && onInlineImageClick != null -> {
+                inlineImageLinks.containsKey(token) &&
+                    linkScopeKey != null &&
+                    hasScopedInlineImageLinks -> {
                     val linkStyle = SpanStyle(
                         color = primaryColor,
                         fontWeight = FontWeight.Medium,
@@ -6740,7 +6996,9 @@ private fun buildEmoticonAnnotatedString(
                     withLink(
                         LinkAnnotation.Clickable(
                             tag = "view-image:$token",
-                            linkInteractionListener = { onInlineImageClick(inlineImageLinks[token].orEmpty()) },
+                            linkInteractionListener = {
+                                FeedEmoticonLinkDispatcher.inlineImageClick(linkScopeKey, token)
+                            },
                         ),
                     ) {
                         withStyle(linkStyle) {
@@ -6753,7 +7011,9 @@ private fun buildEmoticonAnnotatedString(
                         append("\u67E5\u770B\u56FE\u7247")
                     }
                 }
-                urlEntities.containsKey(token) && onUrlEntityClick != null -> {
+                urlEntities.containsKey(token) &&
+                    linkScopeKey != null &&
+                    hasScopedUrlLinks -> {
                     val entity = urlEntities.getValue(token)
                     val linkStyle = SpanStyle(
                         color = primaryColor,
@@ -6763,7 +7023,9 @@ private fun buildEmoticonAnnotatedString(
                     withLink(
                         LinkAnnotation.Clickable(
                             tag = "url-entity:${entity.shortUrl}",
-                            linkInteractionListener = { onUrlEntityClick(entity) },
+                            linkInteractionListener = {
+                                FeedEmoticonLinkDispatcher.urlEntityClick(linkScopeKey, token)
+                            },
                         ),
                     ) {
                         withStyle(linkStyle) {
@@ -6777,16 +7039,18 @@ private fun buildEmoticonAnnotatedString(
                         append(entity.title)
                     }
                 }
-                emoticonMap.containsKey(token) && inlineContent.containsKey(token) -> {
+                emoticonMap.containsKey(token) -> {
                     appendInlineContent(token, token)
                 }
                 token.startsWith("@") -> {
                     val screenName = token.removePrefix("@")
-                    if (onUserClick != null) {
+                    if (FeedEmoticonLinkDispatcher.onUserClick != null) {
                         withLink(
                             LinkAnnotation.Clickable(
                                 tag = "mention:$screenName",
-                                linkInteractionListener = { onUserClick(screenName) },
+                                linkInteractionListener = {
+                                    FeedEmoticonLinkDispatcher.onUserClick?.invoke(screenName)
+                                },
                             ),
                         ) {
                             withStyle(
@@ -6807,11 +7071,13 @@ private fun buildEmoticonAnnotatedString(
                 }
                 token.startsWith("#") && token.endsWith("#") -> {
                     val topic = token.removePrefix("#").removeSuffix("#")
-                    if (onTopicClick != null) {
+                    if (FeedEmoticonLinkDispatcher.onTopicClick != null) {
                         withLink(
                             LinkAnnotation.Clickable(
                                 tag = "topic:$topic",
-                                linkInteractionListener = { onTopicClick(topic) },
+                                linkInteractionListener = {
+                                    FeedEmoticonLinkDispatcher.onTopicClick?.invoke(topic)
+                                },
                             ),
                         ) {
                             withStyle(
@@ -6840,15 +7106,15 @@ private fun buildEmoticonAnnotatedString(
         trailingLabel?.let { label ->
             append('\u00A0')
             val trailingStyle = SpanStyle(
-                color = if (onTrailingClick != null) primaryColor else primaryColor.copy(alpha = 0.6f),
+                color = if (linkScopeKey != null) primaryColor else primaryColor.copy(alpha = 0.6f),
                 fontSize = style.fontSize,
                 textDecoration = TextDecoration.None,
             )
-            if (onTrailingClick != null) {
+            if (linkScopeKey != null && hasTrailingLink) {
                 withLink(
                     LinkAnnotation.Clickable(
-                        tag = "read-full-text",
-                        linkInteractionListener = { onTrailingClick() },
+                        tag = "read-full-text:$linkScopeKey",
+                        linkInteractionListener = { FeedEmoticonLinkDispatcher.trailingClick(linkScopeKey) },
                     ),
                 ) {
                     withStyle(trailingStyle) {
@@ -6876,21 +7142,36 @@ private fun tokenWidthEm(token: String): Float =
 
 @Composable
 private fun EmojiImage(url: String) {
-    var bitmap by remember(url) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var bitmap by remember(url) {
+        mutableStateOf(FeedBitmapCache.get(url)?.takeIfDrawable())
+    }
     LaunchedEffect(url) {
+        if (bitmap != null) return@LaunchedEffect
+        FeedBitmapCache.get(url)?.takeIfDrawable()?.let {
+            bitmap = it
+            return@LaunchedEffect
+        }
         runCatching {
             withContext(Dispatchers.IO) {
-                val bytes = FeedImageLoadSemaphore.withPermit {
-                    fetchRemoteBytes(
-                        url = url,
-                        connectTimeoutMs = 5000,
-                        readTimeoutMs = 5000,
-                        maxReadBytes = 2 * 1024 * 1024,
-                    )
+                decodeCachedRemoteBitmap(url, EmoticonBitmapMaxDecodeDim) ?: run {
+                    val bytes = FeedImageLoadSemaphore.withPermit {
+                        fetchRemoteBytes(
+                            url = url,
+                            connectTimeoutMs = 5000,
+                            readTimeoutMs = 5000,
+                            maxReadBytes = 2 * 1024 * 1024,
+                        )
+                    }
+                    decodeBitmapFromBytes(bytes, EmoticonBitmapMaxDecodeDim)?.also { decoded ->
+                        FeedBitmapCache.put(url, decoded)
+                    }
                 }
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             }
-        }.onSuccess { bitmap = it }
+        }.onSuccess { decoded ->
+            if (decoded != null) {
+                bitmap = decoded
+            }
+        }
     }
     val image = bitmap
     if (image != null) {
@@ -6902,9 +7183,6 @@ private fun EmojiImage(url: String) {
         )
     }
 }
-
-@Composable
-private fun feedBodyTextStyle(): TextStyle = LocalFeedTypographyMetrics.current.body
 
 @Composable
 private fun FeedCard(
@@ -7094,6 +7372,7 @@ private fun StatusTextSection(
     EmoticonText(
         modifier = Modifier.fillMaxWidth(),
         text = item.text,
+        contentKey = item.statusId.ifBlank { item.id },
         emoticonMap = emoticonMap,
         style = style,
         onUserClick = onUserClick,
