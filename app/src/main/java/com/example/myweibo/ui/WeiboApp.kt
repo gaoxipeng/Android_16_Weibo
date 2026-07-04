@@ -248,6 +248,7 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -349,7 +350,6 @@ import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
-import com.example.myweibo.ui.theme.fixedSp
 import com.example.myweibo.ui.liquidglass.LocalHazeState
 import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
 import com.example.myweibo.ui.liquidglass.SurfaceLiquidCapsule
@@ -2137,30 +2137,164 @@ private class ImagePeekController {
 private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
 private val LocalFeedThumbnailQuality = staticCompositionLocalOf { FeedThumbnailQuality.Medium }
-private val LocalFeedBodyTextStyle = staticCompositionLocalOf {
+private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
+private val LocalFeedEmoticonInlineContent = staticCompositionLocalOf { emptyMap<String, InlineTextContent>() }
+
+private data class FeedTypographyMetrics(
+    val body: TextStyle,
+    val emojiSize: TextUnit,
+    val placeholderLineHeight: TextUnit,
+)
+
+private val LocalFeedTypographyMetrics = staticCompositionLocalOf {
     val size = 15.sp
-    TextStyle(
-        fontSize = size,
-        lineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
-        platformStyle = PlatformTextStyle(includeFontPadding = false),
+    FeedTypographyMetrics(
+        body = TextStyle(
+            fontSize = size,
+            lineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
+            platformStyle = PlatformTextStyle(includeFontPadding = false),
+        ),
+        emojiSize = size * 1.4f,
+        placeholderLineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
     )
 }
-private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
 
 @Composable
-private fun rememberFeedBodyTextStyle(
+private fun rememberFeedTypographyMetrics(
     fontSize: FeedFontSize,
     lineSpacing: FeedLineSpacing,
-): TextStyle {
+): FeedTypographyMetrics {
     val bodyMedium = MaterialTheme.typography.bodyMedium
-    val size = fixedSp(fontSize.sizeSp)
-    return remember(fontSize, lineSpacing, size, bodyMedium) {
-        bodyMedium.copy(
+    val fontScale = LocalDensity.current.fontScale
+    return remember(fontSize, lineSpacing, fontScale, bodyMedium) {
+        val size = (fontSize.sizeSp / fontScale).sp
+        val body = bodyMedium.copy(
             fontSize = size,
             lineHeight = size * lineSpacing.lineHeightMultiplier,
             platformStyle = PlatformTextStyle(includeFontPadding = false),
         )
+        val placeholderLineHeight = body.lineHeight.takeIf { it != TextUnit.Unspecified }
+            ?: body.fontSize * 1.5f
+        FeedTypographyMetrics(
+            body = body,
+            emojiSize = body.fontSize * 1.4f,
+            placeholderLineHeight = placeholderLineHeight,
+        )
     }
+}
+
+private fun emojiInlineContent(
+    url: String,
+    size: TextUnit,
+): InlineTextContent =
+    InlineTextContent(
+        Placeholder(
+            width = size,
+            height = size,
+            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+        ),
+    ) {
+        EmojiImage(url = url)
+    }
+
+private fun mentionInlineContent(
+    token: String,
+    body: TextStyle,
+    lineHeight: TextUnit,
+    color: Color,
+): InlineTextContent {
+    val estWidth = body.fontSize * (tokenWidthEm(token) + 0.16f)
+    return InlineTextContent(
+        Placeholder(
+            width = estWidth,
+            height = lineHeight,
+            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+        ),
+    ) {
+        Text(
+            text = token,
+            color = color,
+            fontWeight = FontWeight.Medium,
+            style = body,
+            softWrap = false,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun rememberFeedEmoticonInlineContent(
+    emoticonMap: Map<String, String>,
+    metrics: FeedTypographyMetrics,
+): Map<String, InlineTextContent> {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val body = metrics.body
+    return remember(emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, body, primaryColor) {
+        buildMap {
+            emoticonMap.forEach { (phrase, url) ->
+                put(phrase, emojiInlineContent(url = url, size = metrics.emojiSize))
+            }
+            emoticonMap.keys.filter { it.startsWith("@") }.forEach { token ->
+                put(
+                    token,
+                    mentionInlineContent(
+                        token = token,
+                        body = body,
+                        lineHeight = metrics.placeholderLineHeight,
+                        color = primaryColor,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun rememberMissingEmoticonInlineContent(
+    tokens: List<String>,
+    emoticonMap: Map<String, String>,
+    metrics: FeedTypographyMetrics,
+): Map<String, InlineTextContent> {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val body = metrics.body
+    return remember(tokens, emoticonMap, metrics.emojiSize, metrics.placeholderLineHeight, body, primaryColor) {
+        if (tokens.isEmpty()) {
+            emptyMap()
+        } else {
+            buildMap {
+                tokens.forEach { token ->
+                    val url = emoticonMap[token] ?: return@forEach
+                    put(
+                        token,
+                        if (token.startsWith("@")) {
+                            mentionInlineContent(
+                                token = token,
+                                body = body,
+                                lineHeight = metrics.placeholderLineHeight,
+                                color = primaryColor,
+                            )
+                        } else {
+                            emojiInlineContent(url = url, size = metrics.emojiSize)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun textNeedsRichRendering(
+    text: String,
+    leadingAuthorName: String?,
+    trailingLabel: String?,
+    inlineImageLinks: Map<String, List<FeedImage>>,
+    urlEntities: Map<String, FeedUrlEntity>,
+): Boolean {
+    if (leadingAuthorName != null || trailingLabel != null) return true
+    if (text.isEmpty()) return false
+    if (text.indexOf('@') >= 0 || text.indexOf('#') >= 0 || text.indexOf('[') >= 0) return true
+    return inlineImageLinks.keys.any(text::contains) ||
+        urlEntities.keys.any(text::contains)
 }
 
 private class FeedImageUpgradeNotifier {
@@ -4898,7 +5032,8 @@ fun WeiboApp() {
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
         val imageSaveHintController = remember { ImageSaveHintController() }
-        val feedBodyTextStyleValue = rememberFeedBodyTextStyle(feedFontSize, feedLineSpacing)
+        val feedTypographyMetrics = rememberFeedTypographyMetrics(feedFontSize, feedLineSpacing)
+        val feedEmoticonInlineContent = rememberFeedEmoticonInlineContent(emoticonMap, feedTypographyMetrics)
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
             LocalLiquidMenuBackdrop provides bottomBarBackdrop,
@@ -4908,7 +5043,8 @@ fun WeiboApp() {
             LocalImageSaveHint provides imageSaveHintController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
-            LocalFeedBodyTextStyle provides feedBodyTextStyleValue,
+            LocalFeedTypographyMetrics provides feedTypographyMetrics,
+            LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
             Box(Modifier.fillMaxSize()) {
@@ -5350,7 +5486,9 @@ fun WeiboApp() {
                                     feedFontSize = size
                                     typographySettingsStore.writeFontSize(size)
                                 },
-                                feedPreviewItem = items.firstOrNull()?.let(::resolveFeedItem),
+                                feedPreviewItemProvider = {
+                                    items.firstOrNull()?.let(::resolveFeedItem)
+                                },
                                 selectedThemeColor = selectedThemeColor,
                                 onThemeColorChange = { color ->
                                     selectedThemeColor = color
@@ -6408,54 +6546,136 @@ private fun EmoticonText(
         return
     }
 
+    if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, inlineImageLinks, urlEntities)) {
+        Text(
+            text = text,
+            style = style,
+            modifier = modifier,
+            maxLines = maxLines,
+            overflow = overflow,
+        )
+        return
+    }
+
     val primaryColor = MaterialTheme.colorScheme.primary
-    val fontSize = style.fontSize
-    val lineHeight = style.lineHeight
-    val emojiSize = fontSize.times(1.4f)
-    val lineH = lineHeight.takeIf { it != TextUnit.Unspecified } ?: fontSize * 1.5f
+    val onTopicClick = LocalTopicClickHandler.current
+    val sharedInlineContent = LocalFeedEmoticonInlineContent.current
+    val feedTypographyMetrics = LocalFeedTypographyMetrics.current
     val tokenRegex = remember(inlineImageLinks, urlEntities) {
         buildStatusTokenRegex(inlineImageLinks, urlEntities)
     }
-    val inlineContent = remember(emoticonMap, emojiSize, lineH, fontSize, lineHeight, primaryColor) {
-        buildMap {
-            emoticonMap.forEach { (phrase, url) ->
-                put(
-                    phrase,
-                    InlineTextContent(
-                        Placeholder(
-                            width = emojiSize,
-                            height = emojiSize,
-                            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
-                        ),
-                    ) { EmojiImage(url = url) },
-                )
-            }
-            emoticonMap.keys.filter { it.startsWith("@") }.forEach { token ->
-                val estWidth = style.fontSize * (tokenWidthEm(token) + 0.16f)
-                put(
-                    token,
-                    InlineTextContent(
-                        Placeholder(
-                            width = estWidth,
-                            height = lineH,
-                            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
-                        ),
-                    ) {
-                        Text(
-                            text = token,
-                            color = primaryColor,
-                            fontWeight = FontWeight.Medium,
-                            style = style,
-                            softWrap = false,
-                            maxLines = 1,
-                        )
-                    },
-                )
-            }
-        }
+    val missingEmoticonTokens = remember(text, emoticonMap, sharedInlineContent, tokenRegex) {
+        tokenRegex.findAll(text)
+            .map { it.value }
+            .filter { token -> emoticonMap.containsKey(token) && !sharedInlineContent.containsKey(token) }
+            .distinct()
+            .toList()
+    }
+    val missingInlineContent = rememberMissingEmoticonInlineContent(
+        tokens = missingEmoticonTokens,
+        emoticonMap = emoticonMap,
+        metrics = feedTypographyMetrics,
+    )
+    val inlineContent = remember(sharedInlineContent, missingInlineContent) {
+        if (missingInlineContent.isEmpty()) sharedInlineContent else sharedInlineContent + missingInlineContent
+    }
+    val currentOnUserClick = rememberUpdatedState(onUserClick)
+    val currentOnLeadingAuthorClick = rememberUpdatedState(onLeadingAuthorClick)
+    val currentOnTrailingClick = rememberUpdatedState(onTrailingClick)
+    val currentOnInlineImageClick = rememberUpdatedState(onInlineImageClick)
+    val currentOnUrlEntityClick = rememberUpdatedState(onUrlEntityClick)
+    val currentOnTopicClick = rememberUpdatedState(onTopicClick)
+    val annotatedString = remember(
+        text,
+        leadingAuthorName,
+        trailingLabel,
+        inlineImageLinks,
+        urlEntities,
+        emoticonMap,
+        onUserClick != null,
+        onLeadingAuthorClick != null,
+        onTrailingClick != null,
+        onInlineImageClick != null,
+        onUrlEntityClick != null,
+        onTopicClick != null,
+        tokenRegex,
+        inlineContent,
+        primaryColor,
+        style.fontSize,
+        style.lineHeight,
+    ) {
+        buildEmoticonAnnotatedString(
+            text = text,
+            emoticonMap = emoticonMap,
+            inlineImageLinks = inlineImageLinks,
+            urlEntities = urlEntities,
+            tokenRegex = tokenRegex,
+            primaryColor = primaryColor,
+            leadingAuthorName = leadingAuthorName,
+            onLeadingAuthorClick = if (onLeadingAuthorClick != null) {
+                { currentOnLeadingAuthorClick.value?.invoke() }
+            } else {
+                null
+            },
+            trailingLabel = trailingLabel,
+            onTrailingClick = if (onTrailingClick != null) {
+                { currentOnTrailingClick.value?.invoke() }
+            } else {
+                null
+            },
+            onUserClick = if (onUserClick != null) {
+                { screenName -> currentOnUserClick.value?.invoke(screenName) }
+            } else {
+                null
+            },
+            onInlineImageClick = if (onInlineImageClick != null) {
+                { images -> currentOnInlineImageClick.value?.invoke(images) }
+            } else {
+                null
+            },
+            onUrlEntityClick = if (onUrlEntityClick != null) {
+                { entity -> currentOnUrlEntityClick.value?.invoke(entity) }
+            } else {
+                null
+            },
+            onTopicClick = if (onTopicClick != null) {
+                { topic -> currentOnTopicClick.value?.invoke(topic) }
+            } else {
+                null
+            },
+            style = style,
+            inlineContent = inlineContent,
+        )
     }
 
-    val annotatedString = buildAnnotatedString {
+    Text(
+        text = annotatedString,
+        inlineContent = inlineContent,
+        style = style,
+        modifier = modifier,
+        maxLines = maxLines,
+        overflow = overflow,
+    )
+}
+
+private fun buildEmoticonAnnotatedString(
+    text: String,
+    emoticonMap: Map<String, String>,
+    inlineImageLinks: Map<String, List<FeedImage>>,
+    urlEntities: Map<String, FeedUrlEntity>,
+    tokenRegex: Regex,
+    primaryColor: Color,
+    leadingAuthorName: String?,
+    onLeadingAuthorClick: (() -> Unit)?,
+    trailingLabel: String?,
+    onTrailingClick: (() -> Unit)?,
+    onUserClick: ((String) -> Unit)?,
+    onInlineImageClick: ((List<FeedImage>) -> Unit)?,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)?,
+    onTopicClick: ((String) -> Unit)?,
+    style: TextStyle,
+    inlineContent: Map<String, InlineTextContent>,
+): AnnotatedString = buildAnnotatedString {
         leadingAuthorName?.let { authorName ->
             val authorLabel = "@$authorName\uFF1A"
             val authorStyle = SpanStyle(
@@ -6563,7 +6783,6 @@ private fun EmoticonText(
                 }
                 token.startsWith("#") && token.endsWith("#") -> {
                     val topic = token.removePrefix("#").removeSuffix("#")
-                    val onTopicClick = LocalTopicClickHandler.current
                     if (onTopicClick != null) {
                         withLink(
                             LinkAnnotation.Clickable(
@@ -6620,16 +6839,6 @@ private fun EmoticonText(
         }
     }
 
-    Text(
-        text = annotatedString,
-        inlineContent = inlineContent,
-        style = style,
-        modifier = modifier,
-        maxLines = maxLines,
-        overflow = overflow,
-    )
-}
-
 private fun tokenWidthEm(token: String): Float =
     token.sumOf { char ->
         when {
@@ -6671,7 +6880,7 @@ private fun EmojiImage(url: String) {
 }
 
 @Composable
-private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
+private fun feedBodyTextStyle(): TextStyle = LocalFeedTypographyMetrics.current.body
 
 @Composable
 private fun FeedCard(
@@ -16600,7 +16809,7 @@ private fun MineScreen(
     onFeedLineSpacingChange: (FeedLineSpacing) -> Unit = {},
     feedFontSize: FeedFontSize = FeedFontSize.Medium,
     onFeedFontSizeChange: (FeedFontSize) -> Unit = {},
-    feedPreviewItem: FeedItem? = null,
+    feedPreviewItemProvider: () -> FeedItem? = { null },
     selectedThemeColor: MorandiThemeColor = MorandiThemeColors.first(),
     onThemeColorChange: (MorandiThemeColor) -> Unit = {},
     showFollowActions: Boolean = false,
@@ -16718,7 +16927,7 @@ private fun MineScreen(
                 onFeedLineSpacingChange = onFeedLineSpacingChange,
                 feedFontSize = feedFontSize,
                 onFeedFontSizeChange = onFeedFontSizeChange,
-                feedPreviewItem = feedPreviewItem,
+                feedPreviewItem = feedPreviewItemProvider(),
                 selectedThemeColor = selectedThemeColor,
                 onThemeColorChange = onThemeColorChange,
                 onBack = {
@@ -17902,6 +18111,7 @@ private fun SettingsTypographyCard(
     val subtitle = "行距 ${lineSpacing.label} · 字号 ${fontSize.label}"
     val selectedTint = MaterialTheme.colorScheme.primary
     val unselectedTint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    val previewTextStyle = rememberFeedTypographyMetrics(fontSize, lineSpacing).body
 
     SettingsPlainCard {
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -18008,13 +18218,10 @@ private fun SettingsTypographyCard(
                             ),
                         ) {
                             if (previewItem != null) {
-                                FeedCard(
+                                SettingsTypographyPreview(
                                     item = previewItem,
                                     emoticonMap = emoticonMap,
-                                    onClick = {},
-                                    onMediaClick = { _, _ -> },
-                                    menuBackEnabled = false,
-                                    showAuthorRow = true,
+                                    textStyle = previewTextStyle,
                                 )
                             } else {
                                 Box(
@@ -18035,6 +18242,61 @@ private fun SettingsTypographyCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SettingsTypographyPreview(
+    item: FeedItem,
+    emoticonMap: Map<String, String>,
+    textStyle: TextStyle,
+) {
+    val resolvedEmoticonMap = remember(emoticonMap, item.emoticons) {
+        resolveEmoticonMap(emoticonMap, item.emoticons)
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RemoteImage(
+                url = item.authorAvatarUrl,
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop,
+            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = item.authorName.ifBlank { "Weibo user" },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                item.createdAt?.takeIf { it.isNotBlank() }?.let { createdAt ->
+                    Text(
+                        text = formatWeiboTime(createdAt),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        EmoticonText(
+            text = item.text,
+            emoticonMap = resolvedEmoticonMap,
+            style = textStyle,
+            maxLines = 4,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
