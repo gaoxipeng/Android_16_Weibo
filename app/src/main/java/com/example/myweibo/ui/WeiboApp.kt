@@ -17311,8 +17311,20 @@ private fun MineScreen(
             }
         }
     }
-    // 直接跟随列表滚动偏移，避免 LaunchedEffect + Animatable 在滑动时每帧重启动画
-    val animatedCollapse = collapseProgress
+    val animatedCollapseAnim = remember { Animatable(0f) }
+    var collapseAnimationReady by remember { mutableStateOf(false) }
+    LaunchedEffect(collapseProgress) {
+        if (!collapseAnimationReady) {
+            animatedCollapseAnim.snapTo(collapseProgress)
+            collapseAnimationReady = true
+        } else {
+            animatedCollapseAnim.animateTo(
+                collapseProgress,
+                animationSpec = tween(durationMillis = 220),
+            )
+        }
+    }
+    val animatedCollapse = animatedCollapseAnim.value
     val compactBarHeight = (topInset + compactBarContentHeight) * animatedCollapse
     val profileHeaderSlotHeight = when {
         profileHeaderHeight > 0.dp ->
@@ -17822,6 +17834,7 @@ private val appHelpSections = listOf(
         title = "开始使用",
         items = listOf(
             "本应用通过微博网页登录态读取数据，首次使用请到「我的 → 设置 → 账号管理」完成登录。",
+            "首次登录成功后会自动返回首页并同步数据，无需手动点击「回到微博首页」。",
             "登录后可浏览首页信息流、搜索、个人主页，以及原生写微博、查看消息等功能。",
             "若首页为空，请确认已登录，并在首页下拉刷新或再次点击底部「首页」同步内容。",
         ),
@@ -17846,6 +17859,7 @@ private val appHelpSections = listOf(
         title = "首页信息流",
         items = listOf(
             "在首页下拉可刷新关注流；滚动到底部会自动加载更多。",
+            "列表使用系统默认滑动手感；惯性滚动中点击图片或视频，会先停止滚动，避免误触打开媒体。",
             "点击微博卡片进入详情；点击头像或 @昵称 进入用户主页。",
             "点击评论图标进入详情评论区；点击转发图标进入详情转发区。",
             "长按评论图标可快速打开评论输入框；长按「赞」可快速点赞或取消赞。",
@@ -17922,6 +17936,7 @@ private val appHelpSections = listOf(
             "公开范围支持：公开、好友圈、粉丝、仅自己可见；点「公开 ▼」在上方弹出选项。",
             "支持文字、@ 提及、表情与相册图片，最多可选 18 张；@ 候选与评论弹窗规则一致。",
             "离开发微博页再回来，已输入的文字、图片与可见范围会保留；发布成功或切换账号后清空。",
+            "未登录时进入「消息」会提示先登录；登录成功后会自动加载消息页，无需手动刷新。",
             "「消息」使用移动版微博网页（m.weibo.cn/message），登录态与首页共用。",
         ),
     ),
@@ -17935,7 +17950,8 @@ private val appHelpSections = listOf(
             "访问他人主页时，可关注/取关；互相关注时按钮显示「互相关注」。",
             "用户主页微博列表中的视频，支持与首页相同的长按预览、浮窗与全屏操作。",
             "在用户主页点击微博中的 #话题#，会进入该话题搜索；返回一次回到该用户主页。",
-            "列表滚动到顶部附近时，顶部资料区会随滚动逐渐收起。",
+            "列表上滑时，顶部封面与资料区会平滑收起；封面支持多图轮播，点击可全屏查看。",
+            "顶部为视频封面时，上滑收起速度与图片封面一致，不会出现突然滑过远的情况。",
         ),
     ),
     HelpSection(
