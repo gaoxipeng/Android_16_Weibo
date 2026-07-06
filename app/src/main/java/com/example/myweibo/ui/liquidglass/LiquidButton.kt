@@ -59,6 +59,7 @@ import kotlin.math.tanh
 internal val LiquidGlassBlurRadius = 4.dp
 internal val LiquidMenuGlassBlurRadius = 24.dp
 internal val LiquidMenuGlassIdleBlurRadius = 48.dp
+internal val BottomBarTabIndicatorLensRefraction = 12.dp
 internal val LiquidMenuBorderWidth = 0.5.dp
 
 internal fun liquidMenuBorderColor(isLightTheme: Boolean): Color =

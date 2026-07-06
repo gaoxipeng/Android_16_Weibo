@@ -364,11 +364,12 @@ fun LiquidBottomTabs(
                         backdrop = backdrop,
                         shape = { RoundedCornerShape(percent = 50) },
                         effects = {
+                            val progress = animatedPressProgress
                             vibrancy()
-                            blur(LiquidGlassBlurRadius.toPx())
+                            blur(LiquidMenuGlassBlurRadius.toPx())
                             lens(
-                                24.dp.toPx() * animatedPressProgress,
-                                24.dp.toPx() * animatedPressProgress,
+                                BottomBarTabIndicatorLensRefraction.toPx() * progress.coerceAtLeast(0.01f),
+                                LiquidMenuGlassBlurRadius.toPx() * progress.coerceAtLeast(0.01f),
                             )
                         },
                         highlight = {
@@ -422,12 +423,13 @@ fun LiquidBottomTabs(
                         scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
                     },
                     onDrawSurface = {
+                        val progress = animatedPressProgress
                         drawRect(
                             if (isLightTheme) Color.Black.copy(alpha = 0.1f)
                             else Color.White.copy(alpha = 0.1f),
-                            alpha = 1f - animatedPressProgress,
+                            alpha = 1f - progress,
                         )
-                        drawRect(Color.Black.copy(alpha = 0.03f * animatedPressProgress))
+                        drawRect(Color.Black.copy(alpha = 0.03f * progress))
                     },
                 )
                 .height(56.dp)
