@@ -345,8 +345,8 @@ fun TransparentLiquidCapsule(
                 shape = { shape },
                 effects = {
                     vibrancy()
-                    blur(LiquidGlassBlurRadius.toPx())
                     lens(12f.dp.toPx(), 24f.dp.toPx())
+                    blur(LiquidGlassBlurRadius.toPx(), TileMode.Decal)
                 },
                 highlight = null,
                 shadow = null,

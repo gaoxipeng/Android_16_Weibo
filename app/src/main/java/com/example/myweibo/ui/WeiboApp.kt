@@ -445,6 +445,7 @@ private fun feedRefreshHintMessage(
 
 private const val ListScrollToTopDurationMillis = 320
 private const val BottomBarCollapseScrollDelta = 12
+private const val ListLoadMoreItemsFromBottom = 3
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
     try {
@@ -974,6 +975,10 @@ private val SettingsBottomBarInset = 96.dp
 private val LiquidBottomBarReserve = 100.dp
 private val LiquidBottomBarContentGap = 8.dp
 private val SearchBarBottomGap = 20.dp
+private val SearchBarCompanionGap = 8.dp
+// 与 WeiboLiquidBottomBar 一致：64dp 栏高 + 24dp 底边距
+private val SearchBottomBarClearance = 64.dp + 24.dp
+private val SearchSuggestionPanelMaxHeight = 176.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
@@ -2227,7 +2232,7 @@ private class SearchBarOverlayController {
     var suggestionsLoading by mutableStateOf(false)
     var onSuggestionClick: (String, SearchMode) -> Unit = { _, _ -> }
     var onSuggestionUserClick: (SearchUserItem) -> Unit = {}
-    var bottomPadding by mutableStateOf(96.dp)
+    var bottomPadding by mutableStateOf(SearchBottomBarClearance + SearchBarBottomGap)
 }
 
 private enum class ImagePeekDismissReason {
@@ -5028,9 +5033,19 @@ fun WeiboApp() {
 
     val bottomBarListState: LazyListState? = when {
         selectedItem != null -> null
-        visitedUserId != null -> null
+        visitedUserId != null -> {
+            if (visitedMinePagerPage == MineContentTab.Posts.ordinal) {
+                visitedPostsListState
+            } else {
+                visitedAlbumListState
+            }
+        }
         selectedTab == MainTab.Mine -> {
-            if (minePagerPage == 0) minePostsListState else mineAlbumListState
+            if (minePagerPage == MineContentTab.Posts.ordinal) {
+                minePostsListState
+            } else {
+                mineAlbumListState
+            }
         }
         selectedTab == MainTab.Feed -> feedListState
         else -> null
@@ -5897,12 +5912,17 @@ fun WeiboApp() {
             }
 
             if (searchBarOverlay.active) {
-                val suggestionReserve = if (searchBarOverlay.suggestionsVisible) 176.dp else 0.dp
+                val suggestionReserve = if (searchBarOverlay.suggestionsVisible) {
+                    SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
+                } else {
+                    0.dp
+                }
+                val searchFieldHeight = 44.dp
                 Box(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
-                        .height(searchBarOverlay.bottomPadding + 52.dp + suggestionReserve)
+                        .height(searchBarOverlay.bottomPadding + searchFieldHeight + suggestionReserve)
                         .zIndex(84f),
                 )
                 Column(
@@ -5924,7 +5944,7 @@ fun WeiboApp() {
                         onUserClick = searchBarOverlay.onSuggestionUserClick,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 8.dp),
+                            .padding(bottom = SearchBarCompanionGap),
                     )
                     SearchCapsuleField(
                         value = searchBarOverlay.queryInput,
@@ -6537,7 +6557,7 @@ private fun FollowFeedScreen(
                 val layoutInfo = listState.layoutInfo
                 val totalItems = layoutInfo.totalItemsCount
                 val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                totalItems > 0 && lastVisibleItem >= totalItems - 3
+                totalItems > 0 && lastVisibleItem >= totalItems - ListLoadMoreItemsFromBottom
             }
                 .distinctUntilChanged()
                 .filter { it }
@@ -11661,6 +11681,11 @@ private fun WeiboVideoSurface(
                     .fillMaxSize()
                     .layerBackdrop(videoControlBackdrop),
             ) {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(Color.Black),
+                )
                 RemoteImage(
                     url = media.coverUrl,
                     modifier = Modifier.fillMaxSize(),
@@ -12450,8 +12475,17 @@ private fun WeiboVideoSurface(
         Box(
             Modifier
                 .fillMaxSize()
-                .layerBackdrop(videoControlBackdrop)
-                .then(
+                .layerBackdrop(videoControlBackdrop),
+        ) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(Color.Black),
+            )
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .then(
                     if (controlsEnabled && !hideProgressControls) {
                         Modifier.pointerInput(
                             durationState,
@@ -12629,6 +12663,7 @@ private fun WeiboVideoSurface(
                 }
             },
             )
+        }
         }
         }
 
@@ -16397,14 +16432,14 @@ private fun SearchScreen(
     }
     var searchHeaderHeight by remember { mutableStateOf(0.dp) }
     val density = LocalDensity.current
-    val bottomNavSpace = 96.dp
     val searchBarGap = SearchBarBottomGap
-    val searchBarBottom = bottomNavSpace + searchBarGap
+    val searchCompanionGap = SearchBarCompanionGap
     val searchFieldHeight = 44.dp
+    val searchBarBottom = SearchBottomBarClearance + searchBarGap
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
     val imeInsetForLayout = maxOf(imeBottom, imeTargetBottom)
-    val searchFieldBottomTarget = maxOf(searchBarBottom, imeInsetForLayout + searchBarGap)
+    val searchFieldBottomTarget = maxOf(searchBarBottom, imeInsetForLayout + searchCompanionGap)
     val searchFieldBottom by animateDpAsState(
         targetValue = searchFieldBottomTarget,
         animationSpec = tween(
@@ -16418,11 +16453,11 @@ private fun SearchScreen(
         searchDraftText.trim().isNotBlank() &&
         activeQuery != searchDraftText.trim()
     ) {
-        176.dp
+        SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
     } else {
         0.dp
     }
-    val listBottomInset = searchFieldBottom + searchFieldHeight + searchBarGap + suggestionPanelInset
+    val listBottomInset = searchFieldBottom + searchFieldHeight + searchCompanionGap + suggestionPanelInset
 
     SideEffect {
         searchBarOverlay.queryInput = searchDraft
@@ -17266,7 +17301,8 @@ private fun MineScreen(
         snapshotFlow {
             val layoutInfo = postsListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            layoutInfo.totalItemsCount > 0 && lastVisibleIndex >= layoutInfo.totalItemsCount - 2
+            layoutInfo.totalItemsCount > 0 &&
+                lastVisibleIndex >= layoutInfo.totalItemsCount - ListLoadMoreItemsFromBottom
         }
             .distinctUntilChanged()
             .filter { it }
@@ -17276,7 +17312,10 @@ private fun MineScreen(
     // Infinite scroll for Album
     LaunchedEffect(albumListState) {
         snapshotFlow {
-            albumListState.layoutInfo.totalItemsCount > 0 && !albumListState.canScrollForward
+            val layoutInfo = albumListState.layoutInfo
+            val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            layoutInfo.totalItemsCount > 0 &&
+                lastVisibleIndex >= layoutInfo.totalItemsCount - ListLoadMoreItemsFromBottom
         }
             .distinctUntilChanged()
             .filter { it }
