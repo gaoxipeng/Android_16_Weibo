@@ -17,5 +17,6 @@ val TabMutedDark = Color(0xFF98989D)
 
 val AppBackgroundLight = Color(0xFFF6F6F7)
 val AppSurfaceLight = Color.White
+val AppBackgroundDark = Color(0xFF121212)
 
 val StatusQuotedBackground = AppSurfaceLight

@@ -10,19 +10,24 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalContext
 
 private val DarkColorScheme = darkColorScheme(
     primary = WeiboBlue80,
     secondary = WeiboTeal80,
     tertiary = WeiboCoral80,
-    background = Color(0xFF121212),
+    background = AppBackgroundDark,
     surface = Color(0xFF1E1E1E),
     surfaceContainerLowest = Color(0xFF0F0F0F),
     surfaceContainerLow = Color(0xFF1A1A1A),
     surfaceContainer = Color(0xFF232323),
     surfaceContainerHigh = Color(0xFF2C2C2C),
     surfaceContainerHighest = Color(0xFF363636),
+    onSurface = Color(0xFFEAEAEA),
+    onSurfaceVariant = TabMutedDark,
+    outline = Color(0x66FFFFFF),
+    outlineVariant = Color(0xFF3A3A3C),
     surfaceTint = Color.Transparent,
 )
 
@@ -37,8 +42,16 @@ private val LightColorScheme = lightColorScheme(
     surfaceContainer = Color(0xFFF0F0F0),
     surfaceContainerHigh = Color(0xFFEBEBEB),
     surfaceContainerHighest = Color(0xFFE6E6E6),
+    onSurface = Color(0xFF1A1A1A),
+    onSurfaceVariant = Color(0xFF999999),
+    outline = Color(0x80999999),
+    outlineVariant = Color(0xFFE8E8E8),
     surfaceTint = Color.Transparent,
 )
+
+@Composable
+fun isAppLightTheme(): Boolean =
+    MaterialTheme.colorScheme.background.luminance() > 0.5f
 
 @Composable
 fun MyWeiboTheme(

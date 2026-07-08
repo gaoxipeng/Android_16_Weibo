@@ -352,7 +352,7 @@ import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.ui.theme.MyWeiboTheme
-import com.example.myweibo.ui.theme.StatusQuotedBackground
+import com.example.myweibo.ui.theme.isAppLightTheme
 import com.example.myweibo.ui.theme.WeiboTopicBlue
 import com.example.myweibo.ui.liquidglass.LocalHazeState
 import com.example.myweibo.ui.liquidglass.LocalLiquidMenuBackdrop
@@ -6465,7 +6465,7 @@ private fun FeedRefreshCapsuleHint(
     val textColor = when (tone) {
         CapsuleHintTone.Success -> HintCapsuleSuccessText
         CapsuleHintTone.Progress -> HintCapsuleProgressText
-        CapsuleHintTone.Neutral -> HintCapsuleText
+        CapsuleHintTone.Neutral -> hintCapsuleTextColor()
     }
     OpaqueHintCapsule(modifier = modifier, tone = tone) {
         Column(
@@ -6563,7 +6563,7 @@ private fun ExitConfirmCapsule(
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = HintCapsuleText,
+                color = hintCapsuleTextColor(),
             )
         }
     }
@@ -6610,7 +6610,7 @@ private fun AppPullToRefreshBox(
                 modifier = Modifier.align(Alignment.TopCenter),
                 isRefreshing = isRefreshing,
                 state = state,
-                containerColor = HintCapsuleWhite,
+                containerColor = MaterialTheme.colorScheme.surface,
                 color = FeedRefreshIndicatorColor,
             )
         },
@@ -8204,7 +8204,6 @@ private fun FeedImageCell(
 private val ActionMenuMaxWidth = 220.dp
 private val ActionMenuCornerRadius = 22.dp
 private val ActionMenuBlurRadius = 16.dp
-private val ActionMenuSurfaceColor = Color(0x8AF0F0F0)
 private val ActionMenuCardInset = 5.dp
 private val ActionMenuItemGap = 3.dp
 private val ActionMenuCapsuleHeight = 38.dp
@@ -8264,7 +8263,7 @@ private fun ImageActionFrostedCard(
         backdrop = backdrop ?: LocalLiquidMenuBackdrop.current,
         cornerRadius = ActionMenuCornerRadius,
         blurRadius = ActionMenuBlurRadius,
-        surfaceColor = ActionMenuSurfaceColor,
+        surfaceColor = actionMenuSurfaceColor(),
         contentPadding = PaddingValues(ActionMenuCardInset),
         content = {
             Column(
@@ -9534,11 +9533,7 @@ private fun ImageActionRow(
             style = actionMenuTextStyle(selected = selected),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            color = when {
-                !enabled -> Color(0x661C1C1E)
-                selected -> MaterialTheme.colorScheme.primary
-                else -> Color(0xFF1C1C1E)
-            },
+            color = actionMenuItemTextColor(enabled = enabled, selected = selected),
         )
     }
 }
@@ -13705,7 +13700,7 @@ private fun CommentComposerDialog(
     val focusManager = LocalFocusManager.current
     val canSubmit = (text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
     val sendColor = Color(0xFFFFB36B)
-    val cardColor = Color(0xFFFFFBFF)
+    val cardColor = if (isLightAppearance()) Color(0xFFFFFBFF) else MaterialTheme.colorScheme.surface
     val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.72f)
     val inputTextStyle = MaterialTheme.typography.bodyMedium.copy(
         color = MaterialTheme.colorScheme.onSurface,
@@ -14096,8 +14091,42 @@ private const val ComposeWeiboMaxTextLength = 2000
 private const val ComposeWeiboMaxPhotos = 18
 
 @Composable
-private fun isLightAppearance(): Boolean =
-    MaterialTheme.colorScheme.background.luminance() > 0.5f
+private fun isLightAppearance(): Boolean = isAppLightTheme()
+
+@Composable
+private fun hintCapsuleBorderColor(): Color =
+    if (isLightAppearance()) HintCapsuleBorderColor else MaterialTheme.colorScheme.outline
+
+@Composable
+private fun hintCapsuleTextColor(): Color =
+    if (isLightAppearance()) HintCapsuleText else MaterialTheme.colorScheme.onSurface
+
+@Composable
+private fun actionMenuSurfaceColor(): Color =
+    if (isLightAppearance()) {
+        Color(0x8AF0F0F0)
+    } else {
+        MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.54f)
+    }
+
+@Composable
+private fun actionMenuItemTextColor(enabled: Boolean, selected: Boolean): Color = when {
+    !enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+    selected -> MaterialTheme.colorScheme.primary
+    else -> MaterialTheme.colorScheme.onSurface
+}
+
+@Composable
+private fun visibilityMenuSubtitleColor(): Color =
+    if (isLightAppearance()) {
+        VisibilityMenuSubtitleColor
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+@Composable
+private fun hintCapsulePlaceholderColor(): Color =
+    if (isLightAppearance()) HintCapsulePlaceholder else MaterialTheme.colorScheme.onSurfaceVariant
 
 @Composable
 private fun searchHistoryChipBackground(): Color =
@@ -14669,9 +14698,10 @@ private fun VisibilityMenuRow(
     onClick: () -> Unit,
 ) {
     val titleStyle = actionMenuTextStyle(selected = selected)
-    val titleColor = when {
-        selected -> MaterialTheme.colorScheme.primary
-        else -> Color(0xFF1C1C1E)
+    val titleColor = if (selected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.onSurface
     }
     Box(
         modifier = Modifier
@@ -14695,7 +14725,7 @@ private fun VisibilityMenuRow(
                     text = subtitle,
                     fontSize = 11.sp,
                     lineHeight = 13.sp,
-                    color = VisibilityMenuSubtitleColor,
+                    color = visibilityMenuSubtitleColor(),
                     maxLines = 2,
                     overflow = TextOverflow.Clip,
                 )
@@ -14884,8 +14914,8 @@ private fun LikeToggleCapsule(
         modifier = Modifier
             .height(28.dp)
             .clip(RoundedCornerShape(14.dp))
-            .border(1.dp, HintCapsuleBorderColor, RoundedCornerShape(14.dp))
-            .background(Color.White)
+            .border(1.dp, hintCapsuleBorderColor(), RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.surface)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() },
@@ -14970,7 +15000,7 @@ private fun LikeUsersOverlay(
                         modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
-                        color = HintCapsuleText,
+                        color = hintCapsuleTextColor(),
                     )
                 }
             }
@@ -15025,9 +15055,9 @@ private fun LikeUsersOverlay(
                     onClick = {},
                 ),
             shape = cardShape,
-            color = Color.White,
+            color = MaterialTheme.colorScheme.surface,
             shadowElevation = 6.dp,
-            border = BorderStroke(1.dp, HintCapsuleBorderColor),
+            border = BorderStroke(1.dp, hintCapsuleBorderColor()),
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -15732,11 +15762,11 @@ private fun SearchCapsuleField(
 ) {
     val focusRequester = remember { FocusRequester() }
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
-        color = HintCapsuleText,
+        color = MaterialTheme.colorScheme.onSurface,
         fontSize = 15.sp,
         lineHeight = 20.sp,
     )
-    val placeholderStyle = fieldTextStyle.copy(color = HintCapsulePlaceholder)
+    val placeholderStyle = fieldTextStyle.copy(color = hintCapsulePlaceholderColor())
     SurfaceLiquidCapsule(
         modifier = modifier,
         pill = true,
@@ -20430,8 +20460,12 @@ private fun ProfileFollowCapsuleButton(
         onClick = onClick,
         enabled = !loading,
         shape = RoundedCornerShape(999.dp),
-        color = if (following) Color.White else WeiboFollowOrange,
-        border = if (following) BorderStroke(1.dp, Color(0xFFE0E0E0)) else null,
+        color = if (following) MaterialTheme.colorScheme.surface else WeiboFollowOrange,
+        border = if (following) {
+            BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+        } else {
+            null
+        },
     ) {
         Box(
             modifier = Modifier.padding(
@@ -20453,7 +20487,11 @@ private fun ProfileFollowCapsuleButton(
                     fontSize = if (mutual) 12.sp else MaterialTheme.typography.labelMedium.fontSize,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
-                    color = if (following) Color(0xFF636363) else Color.White,
+                    color = if (following) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        Color.White
+                    },
                 )
             }
         }
@@ -21127,7 +21165,7 @@ private fun MineStatsRow(profile: UserProfile?) {
     ElevatedCard(
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
+            containerColor = MaterialTheme.colorScheme.surface,
         ),
     ) {
         Row(
