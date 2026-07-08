@@ -71,6 +71,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.gestures.AnchoredDraggableDefaults
 import androidx.compose.foundation.gestures.AnchoredDraggableState
@@ -133,6 +134,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -204,6 +207,7 @@ import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.asImageBitmap
@@ -328,6 +332,7 @@ import com.example.myweibo.data.TypographySettingsStore
 import com.example.myweibo.data.MinePostsCache
 import com.example.myweibo.data.NativeUiMessage
 import com.example.myweibo.data.StoredWeiboAccount
+import com.example.myweibo.data.AppearanceMode
 import com.example.myweibo.data.ThemeSettingsStore
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
@@ -346,6 +351,7 @@ import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
+import com.example.myweibo.ui.theme.MyWeiboTheme
 import com.example.myweibo.ui.theme.StatusQuotedBackground
 import com.example.myweibo.ui.theme.WeiboTopicBlue
 import com.example.myweibo.ui.liquidglass.LocalHazeState
@@ -1626,6 +1632,39 @@ private data class NavRestoreState(
     val mediaPreview: MediaPreviewRequest? = null,
 )
 
+private sealed interface NavOverlayKind {
+    data class Detail(val itemId: String) : NavOverlayKind
+    data class VisitedProfile(val uid: String) : NavOverlayKind
+    data class FollowList(val uid: String) : NavOverlayKind
+    data object AlbumViewer : NavOverlayKind
+    data object MediaPreview : NavOverlayKind
+    data object Article : NavOverlayKind
+    data object TabSwitch : NavOverlayKind
+}
+
+private enum class OverlayTop {
+    None,
+    Detail,
+    VisitedProfile,
+    FollowList,
+    AlbumViewer,
+    MediaPreview,
+    Article,
+}
+
+private fun overlayTopKind(stack: List<NavOverlayKind>): OverlayTop = when (stack.lastOrNull()) {
+    is NavOverlayKind.Detail -> OverlayTop.Detail
+    is NavOverlayKind.VisitedProfile -> OverlayTop.VisitedProfile
+    is NavOverlayKind.FollowList -> OverlayTop.FollowList
+    NavOverlayKind.AlbumViewer -> OverlayTop.AlbumViewer
+    NavOverlayKind.MediaPreview -> OverlayTop.MediaPreview
+    NavOverlayKind.Article -> OverlayTop.Article
+    NavOverlayKind.TabSwitch, null -> OverlayTop.None
+}
+
+private fun overlayZIndex(top: OverlayTop, layer: OverlayTop, baseZ: Float): Float =
+    if (top == layer) 590f else baseZ
+
 private data class MediaPreviewRequest(
     val media: FeedMedia,
     val playbackOwnerId: String,
@@ -2852,6 +2891,7 @@ fun WeiboApp() {
     }
 
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
+    var navOverlayStack by remember { mutableStateOf<List<NavOverlayKind>>(emptyList()) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
     var detailScrollRestoreToken by remember { mutableIntStateOf(0) }
@@ -2885,6 +2925,9 @@ fun WeiboApp() {
     var feedFontSize by remember { mutableStateOf(typographySettingsStore.readFontSize()) }
     var selectedThemeColor by remember {
         mutableStateOf(morandiThemeColorFromStorage(themeSettingsStore.readThemeColor()))
+    }
+    var appearanceMode by remember {
+        mutableStateOf(themeSettingsStore.readAppearanceMode())
     }
     var mediaPreview by remember { mutableStateOf<MediaPreviewRequest?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
@@ -3454,26 +3497,34 @@ fun WeiboApp() {
             scrollLazyListState(followListFansListState, state.followListFansScroll)
         }
 
-        if (state.detail != null) {
+        if (state.albumViewerState != null) {
+            if (state.detail != null) {
+                restoreDetailSnapshot(state.detail)
+            } else {
+                selectedItem = null
+                comments = emptyList()
+                commentsCursor = null
+                commentsHasMore = true
+            }
+            albumViewerState = state.albumViewerState
+            restoreProfilePagerFromViewer(state.albumViewerState)
+            restoreAlbumScrollFromViewer(state.albumViewerState)
+        } else if (state.detail != null) {
             restoreDetailSnapshot(state.detail)
         } else {
             selectedItem = null
             comments = emptyList()
             commentsCursor = null
             commentsHasMore = true
-            if (state.albumViewerState != null) {
-                albumViewerState = state.albumViewerState
-                restoreProfilePagerFromViewer(state.albumViewerState)
-                restoreAlbumScrollFromViewer(state.albumViewerState)
-            }
         }
 
         articleOverlay = state.articleOverlay
         mediaPreview = state.mediaPreview
     }
 
-    fun pushNavigation(navigate: () -> Unit) {
+    fun pushNavigation(kind: NavOverlayKind, navigate: () -> Unit) {
         navStack = navStack + captureNavRestoreState()
+        navOverlayStack = navOverlayStack + kind
         navigate()
     }
 
@@ -3481,6 +3532,7 @@ fun WeiboApp() {
         if (navStack.isEmpty()) return false
         val previous = navStack.last()
         navStack = navStack.dropLast(1)
+        navOverlayStack = navOverlayStack.dropLast(1)
         applyNavRestoreState(previous)
         return true
     }
@@ -3502,6 +3554,7 @@ fun WeiboApp() {
         followListOverlay = null
         if (navStack.isNotEmpty()) {
             navStack = navStack.dropLast(1)
+            navOverlayStack = navOverlayStack.dropLast(1)
         }
     }
 
@@ -3512,7 +3565,7 @@ fun WeiboApp() {
         description: String?,
         tab: FriendListTab,
     ) {
-        pushNavigation {
+        pushNavigation(NavOverlayKind.FollowList(uid)) {
             val instanceKey = navStack.size
             followListOverlay = FollowListOverlayState(
                 uid = uid,
@@ -3531,7 +3584,7 @@ fun WeiboApp() {
             return
         }
         videoPlaybackCoordinator.claimFullscreenPlayback(nextKey)
-        pushNavigation { mediaPreview = MediaPreviewRequest(media, playbackOwnerId) }
+        pushNavigation(NavOverlayKind.MediaPreview) { mediaPreview = MediaPreviewRequest(media, playbackOwnerId) }
     }
 
     fun openFloatingPlaybackFromFullscreen(media: FeedMedia, playbackOwnerId: String) {
@@ -3573,10 +3626,17 @@ fun WeiboApp() {
     }
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
-        albumViewerState = viewer
+        pushNavigation(NavOverlayKind.AlbumViewer) {
+            albumViewerState = viewer
+        }
     }
 
     fun dismissAlbumViewer() {
+        if (albumViewerState == null) return
+        if (navOverlayStack.lastOrNull() == NavOverlayKind.AlbumViewer) {
+            popNavigation()
+            return
+        }
         val viewer = albumViewerState ?: return
         albumViewerState = null
         restoreProfilePagerFromViewer(viewer)
@@ -3597,7 +3657,7 @@ fun WeiboApp() {
             bottomBarExpanded = true
             return
         }
-        pushNavigation {
+        pushNavigation(NavOverlayKind.TabSwitch) {
             selectedItem = null
             comments = emptyList()
             commentsCursor = null
@@ -3624,7 +3684,7 @@ fun WeiboApp() {
         }
         if (isCurrentUser) return
 
-        pushNavigation {
+        pushNavigation(NavOverlayKind.VisitedProfile(value)) {
             if (selectedItem == null) {
                 comments = emptyList()
                 commentsCursor = null
@@ -3654,7 +3714,8 @@ fun WeiboApp() {
             closeFollowList()
             return
         }
-        pushNavigation {
+        pushNavigation(NavOverlayKind.VisitedProfile(value)) {
+            followListOverlay = null
             if (selectedItem == null) {
                 comments = emptyList()
                 commentsCursor = null
@@ -4619,7 +4680,7 @@ fun WeiboApp() {
             resolveFeedItem(item),
             hostItem?.let(::resolveFeedItem),
         )
-        pushNavigation {
+        pushNavigation(NavOverlayKind.Detail(resolveFeedItem(item).id)) {
             openDetailPrepared(
                 item = item,
                 initialSection = DetailContentSection.Comments,
@@ -4631,7 +4692,7 @@ fun WeiboApp() {
     fun openUrlEntity(entity: FeedUrlEntity) {
         val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
         if (articleId != null) {
-            pushNavigation { loadArticleIntoOverlay(entity) }
+            pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
             return
         }
         val statusCandidates = WeiboLinkResolver.statusIdCandidates(entity.url, entity.shortUrl)
@@ -4643,17 +4704,17 @@ fun WeiboApp() {
                 if (item != null) {
                     openDetailInternal(item)
                 } else {
-                    pushNavigation { loadArticleIntoOverlay(entity) }
+                    pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
                 }
             }
             return
         }
-        pushNavigation { loadArticleIntoOverlay(entity) }
+        pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
     }
 
     fun openDetailToSection(item: FeedItem, section: DetailContentSection) {
         prepareInlineVideoHandoffForDetail(resolveFeedItem(item))
-        pushNavigation {
+        pushNavigation(NavOverlayKind.Detail(resolveFeedItem(item).id)) {
             openDetailPrepared(
                 item = item,
                 initialSection = section,
@@ -4674,9 +4735,9 @@ fun WeiboApp() {
         val resolved = resolveFeedItem(item)
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
-        pushNavigation {
+        pushNavigation(NavOverlayKind.Detail(resolved.id)) {
             restoreProfilePagerFromViewer(viewer)
-            albumViewerState = viewer
+            albumViewerState = null
             activeDetailInstanceKey = navStack.size
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
@@ -5221,6 +5282,14 @@ fun WeiboApp() {
         }
     }
 
+    val systemInDarkTheme = isSystemInDarkTheme()
+    val darkTheme = when (appearanceMode) {
+        AppearanceMode.Light -> false
+        AppearanceMode.Dark -> true
+        AppearanceMode.System -> systemInDarkTheme
+    }
+
+    MyWeiboTheme(darkTheme = darkTheme) {
     val themedColorScheme = MaterialTheme.colorScheme.copy(
         primary = selectedThemeColor.primary,
         primaryContainer = selectedThemeColor.primaryContainer,
@@ -5298,6 +5367,28 @@ fun WeiboApp() {
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
             Box(Modifier.fillMaxSize()) {
+            val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
+            val overlayTop = overlayTopKind(navOverlayStack)
+            val detailLayerActive = navOverlayStack.any { it is NavOverlayKind.Detail } && detailOverlayItem != null
+            val detailOverlayVisible = overlayTop == OverlayTop.Detail && detailLayerActive
+            val profileLayerActive = navOverlayStack.any { it is NavOverlayKind.VisitedProfile } && visitedUserId != null
+            val visitedProfileVisible = overlayTop == OverlayTop.VisitedProfile && profileLayerActive
+            val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
+                when {
+                    visitedUserId != null -> visitedUserId == overlay.uid
+                    else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
+                }
+            } ?: false
+            val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
+                followListOverlay != null &&
+                followListBelongsToCurrentContext
+            val followListUiOnTop = overlayTop == OverlayTop.FollowList && followListLayerActive
+            val albumLayerActive = navOverlayStack.any { it == NavOverlayKind.AlbumViewer } && albumViewerState != null
+            val albumViewerVisible = overlayTop == OverlayTop.AlbumViewer && albumLayerActive
+            val mediaLayerActive = navOverlayStack.any { it == NavOverlayKind.MediaPreview } && mediaPreview != null
+            val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
+            val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
+            val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
             Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
             Box(Modifier.fillMaxSize().padding(innerPadding)) {
             val mainContentClear = visitedUserId == null && selectedItem == null
@@ -5404,7 +5495,6 @@ fun WeiboApp() {
                         .matchParentSize()
                         .background(MaterialTheme.colorScheme.background),
                 )
-            val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
                 detailOverlayItem == null
@@ -5430,22 +5520,6 @@ fun WeiboApp() {
                     articleOverlay != null ||
                     mediaPreview != null ||
                     albumViewerState != null)
-            val visitedProfileVisible = visitedUserId != null &&
-                detailOverlayItem == null &&
-                albumViewerState == null
-            val visitedProfileCoveredByOverlay = detailOverlayItem != null || albumViewerState != null
-            val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
-                when {
-                    visitedUserId != null -> visitedUserId == overlay.uid
-                    else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
-                }
-            } ?: false
-            val followListUiOnTop = followListOverlay != null &&
-                selectedItem == null &&
-                articleOverlay == null &&
-                mediaPreview == null &&
-                albumViewerState == null &&
-                followListBelongsToCurrentContext
             Box(Modifier.fillMaxSize()) {
                 if (feedLayerVisible) {
                     Box(
@@ -5487,10 +5561,10 @@ fun WeiboApp() {
                 }
 
                 NavAnimatedOverlay(
-                    target = followListOverlay,
+                    target = followListOverlay.takeIf { followListLayerActive },
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(if (followListUiOnTop) 550f else 400f),
+                        .zIndex(overlayZIndex(overlayTop, OverlayTop.FollowList, 550f)),
                 ) { overlay ->
                     Box(
                         Modifier
@@ -5563,7 +5637,7 @@ fun WeiboApp() {
                     }
                 }
 
-                val visitedProfileNavTarget = visitedUserId
+                val visitedProfileNavTarget = visitedUserId.takeIf { profileLayerActive }
                 if (visitedProfileNavTarget != null) {
                     LaunchedEffect(visitedProfileLoadGeneration) {
                         if (visitedListScrollResetGeneration == visitedProfileLoadGeneration) return@LaunchedEffect
@@ -5576,14 +5650,16 @@ fun WeiboApp() {
                 }
                 NavAnimatedOverlay(
                     target = visitedProfileNavTarget,
-                    modifier = Modifier.fillMaxSize().zIndex(540f),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(overlayZIndex(overlayTop, OverlayTop.VisitedProfile, 540f)),
                 ) { uid ->
                     key(uid) {
                         Box(
                             Modifier
                                 .fillMaxSize()
                                 .graphicsLayer {
-                                    alpha = if (visitedProfileCoveredByOverlay) 0f else 1f
+                                    alpha = if (visitedProfileVisible) 1f else 0f
                                 }
                                 .blockHiddenTouches(visitedProfileVisible),
                         ) {
@@ -5761,6 +5837,11 @@ fun WeiboApp() {
                                     selectedThemeColor = color
                                     themeSettingsStore.writeThemeColor(color.storageValue)
                                 },
+                                appearanceMode = appearanceMode,
+                                onAppearanceModeChange = { mode ->
+                                    appearanceMode = mode
+                                    themeSettingsStore.writeAppearanceMode(mode)
+                                },
                             )
                             }
                         }
@@ -5770,10 +5851,12 @@ fun WeiboApp() {
                 }
 
                 NavAnimatedOverlay(
-                    target = detailOverlayItem,
+                    target = detailOverlayItem.takeIf { detailLayerActive },
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(570f),
+                        .zIndex(overlayZIndex(overlayTop, OverlayTop.Detail, 570f))
+                        .graphicsLayer { alpha = if (detailOverlayVisible) 1f else 0f }
+                        .blockHiddenTouches(detailOverlayVisible),
                 ) { detailItem ->
                     key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
@@ -5807,7 +5890,10 @@ fun WeiboApp() {
                             }
                             detailScrollPending = null
                         }
-                        BackHandler(onBack = { closeDetail() })
+                        BackHandler(
+                            enabled = detailOverlayVisible,
+                            onBack = { closeDetail() },
+                        )
                         Surface(
                             modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background,
@@ -6153,19 +6239,32 @@ fun WeiboApp() {
                 )
             }
             }
-            if (mediaPreview != null) {
+            val overlayTop = overlayTopKind(navOverlayStack)
+            val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
+            val detailLayerActive = navOverlayStack.any { it is NavOverlayKind.Detail } && detailOverlayItem != null
+            val albumLayerActive = navOverlayStack.any { it == NavOverlayKind.AlbumViewer } && albumViewerState != null
+            val albumViewerVisible = overlayTop == OverlayTop.AlbumViewer && albumLayerActive
+            val mediaLayerActive = navOverlayStack.any { it == NavOverlayKind.MediaPreview } && mediaPreview != null
+            val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
+            val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
+            val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
+            if (mediaLayerActive) {
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .zIndex(498f)
+                        .zIndex(overlayZIndex(overlayTop, OverlayTop.MediaPreview, 498f))
+                        .graphicsLayer { alpha = if (mediaPreviewVisible) 1f else 0f }
+                        .blockHiddenTouches(mediaPreviewVisible)
                         .background(Color.Black),
                 )
             }
             NavAnimatedOverlay(
-                target = mediaPreview,
+                target = mediaPreview.takeIf { mediaLayerActive },
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(500f)
+                    .zIndex(overlayZIndex(overlayTop, OverlayTop.MediaPreview, 500f))
+                    .graphicsLayer { alpha = if (mediaPreviewVisible) 1f else 0f }
+                    .blockHiddenTouches(mediaPreviewVisible)
                     .background(Color.Black),
                 enter = EnterTransition.None,
                 exit = ExitTransition.None,
@@ -6206,13 +6305,20 @@ fun WeiboApp() {
                     onEnterFullscreenHandoffComplete = { request.onEnterFullscreenHandoffComplete() },
                 )
             }
-            albumViewerState?.takeIf { selectedItem == null }?.let { viewer ->
+            if (albumLayerActive) {
+                albumViewerState?.let { viewer ->
                 val relatedPosts = when {
                     visitedUserId != null -> visitedPosts
                     selectedTab == MainTab.Mine -> minePosts
                     else -> emptyList()
                 }
-                Box(Modifier.fillMaxSize().zIndex(500f)) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(overlayZIndex(overlayTop, OverlayTop.AlbumViewer, 560f))
+                        .graphicsLayer { alpha = if (albumViewerVisible) 1f else 0f }
+                        .blockHiddenTouches(albumViewerVisible),
+                ) {
                     FullscreenImageViewer(
                         images = viewer.images,
                         initialIndex = viewer.initialIndex,
@@ -6236,10 +6342,15 @@ fun WeiboApp() {
                         },
                     )
                 }
+                }
             }
             NavAnimatedOverlay(
-                target = articleOverlay,
-                modifier = Modifier.fillMaxSize().zIndex(600f),
+                target = articleOverlay.takeIf { articleLayerActive },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(overlayZIndex(overlayTop, OverlayTop.Article, 600f))
+                    .graphicsLayer { alpha = if (articleOverlayVisible) 1f else 0f }
+                    .blockHiddenTouches(articleOverlayVisible),
             ) { overlay ->
                 ArticleReaderOverlay(
                     state = overlay,
@@ -6261,6 +6372,7 @@ fun WeiboApp() {
                 )
             }
         }
+    }
     }
     }
     }
@@ -13982,7 +14094,34 @@ private fun CommentComposerDialog(
 
 private const val ComposeWeiboMaxTextLength = 2000
 private const val ComposeWeiboMaxPhotos = 18
-private val ComposeWeiboToolbarMutedColor = Color(0xFF999999)
+
+@Composable
+private fun isLightAppearance(): Boolean =
+    MaterialTheme.colorScheme.background.luminance() > 0.5f
+
+@Composable
+private fun searchHistoryChipBackground(): Color =
+    if (isLightAppearance()) {
+        Color(0xFFECECEC)
+    } else {
+        MaterialTheme.colorScheme.surfaceContainerHigh
+    }
+
+@Composable
+private fun searchHistoryDeleteBadgeBackground(): Color =
+    if (isLightAppearance()) {
+        Color(0xFF999999)
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+    }
+
+@Composable
+private fun composeWeiboToolbarMutedColor(): Color =
+    if (isLightAppearance()) {
+        Color(0xFF999999)
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -14139,10 +14278,12 @@ private fun ComposeWeiboScreen(
             .onSuccess { keyboard?.show() }
     }
 
+    val toolbarMutedColor = composeWeiboToolbarMutedColor()
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.White)
+            .background(MaterialTheme.colorScheme.surface)
             .consumeTouchEvents()
             .statusBarsPadding()
             .navigationBarsPadding()
@@ -14362,14 +14503,14 @@ private fun ComposeWeiboScreen(
                     fontSize = 20.sp,
                     lineHeight = 20.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = ComposeWeiboToolbarMutedColor,
+                    color = toolbarMutedColor,
                 )
                 Spacer(Modifier.width(14.dp))
                 CommentComposerTextButton(
                     text = "@",
                     onClick = { insertMention() },
                     contentDescription = "@",
-                    color = ComposeWeiboToolbarMutedColor,
+                    color = toolbarMutedColor,
                 )
                 Spacer(Modifier.width(6.dp))
                 CommentComposerIconButton(
@@ -14379,14 +14520,14 @@ private fun ComposeWeiboScreen(
                         photoPickerLauncher.launch("image/*")
                     },
                     contentDescription = "照片",
-                    tint = ComposeWeiboToolbarMutedColor,
+                    tint = toolbarMutedColor,
                 )
                 Spacer(Modifier.width(6.dp))
                 CommentComposerIconButton(
                     iconRes = R.drawable.ic_comment_emoji,
                     onClick = { openEmoticons() },
                     contentDescription = "表情",
-                    tint = ComposeWeiboToolbarMutedColor,
+                    tint = toolbarMutedColor,
                 )
             }
 
@@ -15789,7 +15930,6 @@ private fun SearchSuggestionUserRow(
     }
 }
 
-private val SearchHistoryChipBackground = Color(0xFFECECEC)
 private val SearchHistoryChipRadius = 8.dp
 private val SearchHistoryChipMaxWidth = 168.dp
 private val SearchHistoryTitleToChipsGap = 2.dp
@@ -15924,11 +16064,13 @@ private fun SearchHistoryChip(
     onDelete: () -> Unit,
 ) {
     val chipShape = RoundedCornerShape(SearchHistoryChipRadius)
+    val chipBackground = searchHistoryChipBackground()
+    val deleteBadgeBackground = searchHistoryDeleteBadgeBackground()
     Box(
         modifier = Modifier
             .widthIn(max = SearchHistoryChipMaxWidth)
             .clip(chipShape)
-            .background(SearchHistoryChipBackground)
+            .background(chipBackground)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -15956,7 +16098,7 @@ private fun SearchHistoryChip(
                     .padding(top = 4.dp, end = 4.dp)
                     .size(16.dp)
                     .clip(CircleShape)
-                    .background(Color(0xFF999999))
+                    .background(deleteBadgeBackground)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -15966,7 +16108,7 @@ private fun SearchHistoryChip(
             ) {
                 Text(
                     text = "×",
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.surface,
                     fontSize = 12.sp,
                     lineHeight = 12.sp,
                     textAlign = TextAlign.Center,
@@ -17150,6 +17292,8 @@ private fun MineScreen(
     feedPreviewItemProvider: () -> FeedItem? = { null },
     selectedThemeColor: MorandiThemeColor = MorandiThemeColors.first(),
     onThemeColorChange: (MorandiThemeColor) -> Unit = {},
+    appearanceMode: AppearanceMode = AppearanceMode.System,
+    onAppearanceModeChange: (AppearanceMode) -> Unit = {},
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
@@ -17275,6 +17419,8 @@ private fun MineScreen(
                 feedPreviewItem = feedPreviewItemProvider(),
                 selectedThemeColor = selectedThemeColor,
                 onThemeColorChange = onThemeColorChange,
+                appearanceMode = appearanceMode,
+                onAppearanceModeChange = onAppearanceModeChange,
                 onBack = {
                     showAccountManagement = false
                     showSettings = false
@@ -17399,7 +17545,7 @@ private fun MineScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(topInset + compactBarContentHeight)
-                                .background(Color.White)
+                                .background(MaterialTheme.colorScheme.surface)
                                 .padding(
                                     top = topInset,
                                     start = 16.dp,
@@ -17443,17 +17589,6 @@ private fun MineScreen(
                                     loading = followLoading,
                                     onClick = onFollowClick,
                                 )
-                            } else if (enableSettings) {
-                                IconButton(
-                                    onClick = { showSettings = true },
-                                    modifier = Modifier.size(40.dp),
-                                ) {
-                                    Icon(
-                                        painter = painterResource(R.drawable.ic_settings),
-                                        contentDescription = "\u8BBE\u7F6E",
-                                        tint = MaterialTheme.colorScheme.onSurface,
-                                    )
-                                }
                             }
                         }
                     }
@@ -17491,11 +17626,7 @@ private fun MineScreen(
                             profile = profile,
                             hasLoginCookie = hasLoginCookie,
                             loadError = loadError,
-                            onOpenSettings = if (enableSettings) {
-                                { showSettings = true }
-                            } else {
-                                null
-                            },
+                            onOpenSettings = null,
                             onAvatarClick = openAvatarViewer,
                             showFollowActions = showFollowActions,
                             followLoading = followLoading,
@@ -17564,10 +17695,14 @@ private fun MineScreen(
                             ) {
                                 if (posts.isEmpty()) {
                                     item {
-                                        EmptyState(
-                                            title = if (hasLoginCookie) "\u6682\u672A\u8BFB\u5230\u4E3B\u9875\u5FAE\u535A" else "\u672A\u767B\u5F55",
-                                            body = if (hasLoginCookie) "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u4E2A\u4EBA\u4E3B\u9875\u91CD\u65B0\u8BFB\u53D6\u3002" else "\u8BF7\u5728\u5C01\u9762\u53F3\u4E0A\u89D2\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\u3002",
-                                        )
+                                        if (hasLoginCookie && isLoading) {
+                                            MineLoadingMoreIndicator()
+                                        } else if (!hasLoginCookie) {
+                                            EmptyState(
+                                                title = "\u672A\u767B\u5F55",
+                                                body = "\u8BF7\u5728\u5C01\u9762\u53F3\u4E0A\u89D2\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\u3002",
+                                            )
+                                        }
                                     }
                                 } else {
                                     items(posts, key = { it.id }, contentType = { "feed_card" }) { post ->
@@ -17686,6 +17821,23 @@ private fun MineScreen(
         }
     }
 
+    if (enableSettings) {
+        IconButton(
+            onClick = { showSettings = true },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 32.dp, end = 10.dp)
+                .size(40.dp)
+                .zIndex(4f),
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Settings,
+                contentDescription = "\u8BBE\u7F6E",
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+
     if (avatarViewerOpen && avatarImage != null) {
         FullscreenImageViewer(
             images = listOf(avatarImage),
@@ -17756,6 +17908,8 @@ private fun SettingsScreen(
     feedPreviewItem: FeedItem?,
     selectedThemeColor: MorandiThemeColor,
     onThemeColorChange: (MorandiThemeColor) -> Unit,
+    appearanceMode: AppearanceMode,
+    onAppearanceModeChange: (AppearanceMode) -> Unit,
     onBack: () -> Unit,
     onSwitchAccount: (String) -> Unit,
     onDeleteAccount: (String) -> Unit,
@@ -17767,6 +17921,7 @@ private fun SettingsScreen(
     var imageExpanded by remember { mutableStateOf(false) }
     var typographyExpanded by remember { mutableStateOf(false) }
     var themeExpanded by remember { mutableStateOf(false) }
+    var appearanceExpanded by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val versionName = remember {
@@ -17836,6 +17991,14 @@ private fun SettingsScreen(
                         onFontSizeChange = onFeedFontSizeChange,
                         previewItem = feedPreviewItem,
                         emoticonMap = emoticonMap,
+                    )
+                }
+                item {
+                    SettingsAppearanceCard(
+                        expanded = appearanceExpanded,
+                        onExpandedChange = { appearanceExpanded = it },
+                        mode = appearanceMode,
+                        onModeChange = onAppearanceModeChange,
                     )
                 }
                 item {
@@ -18001,6 +18164,7 @@ private val appHelpSections = listOf(
             "浏览信息流时，正文里出现的表情也会自动收录到本地，同步时不会删除这些表情。",
             "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
             "行距与字号：五档行距、五档字号，作用于首页微博正文、引用区与评论区。",
+            "深色模式：可在浅色、深色与跟随系统之间切换。",
             "主题颜色：更换应用强调色，影响底部导航、按钮与高亮文字等界面元素。",
             "后台播放声音：关闭后，应用切到后台时会暂停视频；浮窗播放时切换页面不会暂停。",
         ),
@@ -18020,7 +18184,7 @@ private fun SettingsPlainCard(
             .clip(shape)
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
         shape = shape,
-        color = Color.White,
+        color = MaterialTheme.colorScheme.surface,
         shadowElevation = 0.dp,
         tonalElevation = 0.dp,
         content = content,
@@ -18165,9 +18329,9 @@ private fun SettingsAccountRow(
     val deleteActionWidthPx = remember(density) { with(density) { deleteActionWidth.toPx() } }
     val rowShape = RoundedCornerShape(8.dp)
     val rowBackground = if (isActive) {
-        lerp(Color.White, MaterialTheme.colorScheme.primaryContainer, 0.35f)
+        lerp(MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.primaryContainer, 0.35f)
     } else {
-        Color.White
+        MaterialTheme.colorScheme.surface
     }
     val dragState = remember(account.id, deleteActionWidthPx) {
         AnchoredDraggableState(
@@ -18721,6 +18885,101 @@ private fun SettingsThemeColorGrid(
 }
 
 @Composable
+private fun SettingsAppearanceCard(
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    mode: AppearanceMode,
+    onModeChange: (AppearanceMode) -> Unit,
+) {
+    SettingsPlainCard {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "深色模式",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Text(
+                                text = mode.label,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    Text(
+                        text = mode.description,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    AppearanceMode.entries.forEach { option ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onModeChange(option) }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            RadioButton(
+                                selected = mode == option,
+                                onClick = { onModeChange(option) },
+                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = option.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (mode == option) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                                Text(
+                                    text = option.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingsThemeColorCard(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
@@ -18890,7 +19149,7 @@ private fun SettingsAccountCard(
 ) {
     val activeAccount = accounts.firstOrNull { it.id == activeAccountId }
     val subtitle = when {
-        activeAccount != null -> "${activeAccount.screenName}（UID ${activeAccount.id}）"
+        activeAccount != null -> activeAccount.screenName.ifBlank { "微博用户" }
         accounts.isNotEmpty() -> "已保存 ${accounts.size} 个账号，点击展开切换"
         hasLoginCookie -> "已登录，点击展开管理账号"
         else -> "登录微博以读取主页、信息流与评论"
@@ -19181,7 +19440,7 @@ private fun SettingsActionCard(
             .clickable(enabled = enabled, onClick = onClick),
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.elevatedCardColors(
-            containerColor = Color.White,
+            containerColor = MaterialTheme.colorScheme.surface,
         ),
     ) {
         Row(
@@ -19330,7 +19589,7 @@ private fun ProfileCoverBanner(
                     .size(40.dp),
             ) {
                 Icon(
-                    painter = painterResource(R.drawable.ic_settings),
+                    imageVector = Icons.Rounded.Settings,
                     contentDescription = "\u8BBE\u7F6E",
                     tint = MaterialTheme.colorScheme.onSurface,
                 )
@@ -19700,7 +19959,7 @@ private fun FollowFansListScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color.White)
+                    .background(MaterialTheme.colorScheme.surface)
                     .padding(
                         top = topInset + 12.dp,
                         bottom = 12.dp,
@@ -22160,6 +22419,7 @@ private fun videoControlFixedSp(size: Int): TextUnit {
 private fun videoControlTextStyle(sizeSp: Int): TextStyle = TextStyle(
     fontSize = videoControlFixedSp(sizeSp),
     lineHeight = videoControlFixedSp(sizeSp),
+    fontWeight = FontWeight.Bold,
     platformStyle = PlatformTextStyle(includeFontPadding = false),
 )
 

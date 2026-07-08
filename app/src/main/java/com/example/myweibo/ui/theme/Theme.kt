@@ -15,7 +15,15 @@ import androidx.compose.ui.platform.LocalContext
 private val DarkColorScheme = darkColorScheme(
     primary = WeiboBlue80,
     secondary = WeiboTeal80,
-    tertiary = WeiboCoral80
+    tertiary = WeiboCoral80,
+    background = Color(0xFF121212),
+    surface = Color(0xFF1E1E1E),
+    surfaceContainerLowest = Color(0xFF0F0F0F),
+    surfaceContainerLow = Color(0xFF1A1A1A),
+    surfaceContainer = Color(0xFF232323),
+    surfaceContainerHigh = Color(0xFF2C2C2C),
+    surfaceContainerHighest = Color(0xFF363636),
+    surfaceTint = Color.Transparent,
 )
 
 private val LightColorScheme = lightColorScheme(

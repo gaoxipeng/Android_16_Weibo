@@ -5,7 +5,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import com.example.myweibo.ui.WeiboApp
-import com.example.myweibo.ui.theme.MyWeiboTheme
 import java.net.CookieHandler
 import java.net.CookieManager
 import java.net.URI
@@ -44,9 +43,7 @@ class MainActivity : ComponentActivity() {
 
         enableEdgeToEdge()
         setContent {
-            MyWeiboTheme {
-                WeiboApp()
-            }
+            WeiboApp()
         }
     }
 }
