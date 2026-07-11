@@ -22445,7 +22445,7 @@ private fun formatVideoTime(ms: Long): String {
 }
 
 private fun speedLabel(speed: Float): String =
-    if (speed == speed.toInt().toFloat()) "${speed.toInt()}x" else "${speed}x"
+    if (speed == speed.toInt().toFloat()) "${speed.toInt()}×" else "${speed}×"
 
 @Composable
 private fun videoControlFixedSp(size: Int): TextUnit {
