@@ -76,7 +76,9 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.gestures.AnchoredDraggableDefaults
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
+import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.foundation.gestures.animateTo
 import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -123,6 +125,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.lazy.layout.LazyLayoutCacheWindow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -910,6 +913,7 @@ private fun LazyListState.scrollDistanceToTop(): Int {
 private suspend fun LazyListState.animateScrollToTopFixed(
     durationMillis: Int = ListScrollToTopDurationMillis,
 ) {
+    if (layoutInfo.totalItemsCount == 0) return
     if (firstVisibleItemIndex == 0 && firstVisibleItemScrollOffset == 0) return
 
     val scrollDistance = scrollDistanceToTop()
@@ -989,6 +993,42 @@ private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
+private const val WeiboListFlingFriction = 0.45f
+private const val WeiboListFlingStopVelocity = 0.75f
+
+/**
+ * A slightly shorter, more controlled decay than Compose's platform default. It preserves the
+ * release velocity, but removes the long low-speed tail that makes content feel as if it is
+ * drifting after the finger has stopped.
+ */
+@Composable
+private fun rememberWeiboListFlingBehavior(): FlingBehavior {
+    val decay = remember {
+        exponentialDecay<Float>(
+            frictionMultiplier = WeiboListFlingFriction,
+            absVelocityThreshold = WeiboListFlingStopVelocity,
+        )
+    }
+    return remember(decay) {
+        object : FlingBehavior {
+            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
+                if (abs(initialVelocity) < WeiboListFlingStopVelocity) return initialVelocity
+                var lastValue = 0f
+                val animation = AnimationState(
+                    initialValue = 0f,
+                    initialVelocity = initialVelocity,
+                )
+                animation.animateDecay(decay) {
+                    val delta = value - lastValue
+                    val consumed = scrollBy(delta)
+                    lastValue = value
+                    if (abs(delta - consumed) > 0.5f) cancelAnimation()
+                }
+                return animation.velocity
+            }
+        }
+    }
+}
 
 private class LayoutAnchorHolder {
     var coordinates: LayoutCoordinates? = null
@@ -2820,7 +2860,7 @@ private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun WeiboApp() {
     val context = LocalContext.current
@@ -2846,6 +2886,10 @@ fun WeiboApp() {
     val snackbarHostState = remember { SnackbarHostState() }
     val initialFollowingScroll = remember { timelineCacheStore.readFollowingScroll() }
     val feedListState = rememberLazyListState(
+        cacheWindow = LazyLayoutCacheWindow(
+            ahead = 640.dp,
+            behind = 160.dp,
+        ),
         initialFirstVisibleItemIndex = initialFollowingScroll.first,
         initialFirstVisibleItemScrollOffset = initialFollowingScroll.second,
     )
@@ -3859,7 +3903,9 @@ fun WeiboApp() {
             isLoading = true
             feedLoadingMore = false
             hasLoginCookie = session.hasLoginCookie()
-            feedListState.animateScrollToTopFixed()
+            if (feedListState.layoutInfo.totalItemsCount > 0) {
+                feedListState.animateScrollToTopFixed()
+            }
             runCatchingPreservingCancellation {
                 val raw = session.loadTimelineRaw(requestedKind)
                 if (requestedKind == TimelineKind.Following) {
@@ -3901,7 +3947,9 @@ fun WeiboApp() {
             if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
                 isLoading = false
                 timelineRefreshJob = null
-                feedListState.animateScrollToTopFixed()
+                if (feedListState.layoutInfo.totalItemsCount > 0) {
+                    feedListState.animateScrollToTopFixed()
+                }
             }
         }
     }
@@ -5800,10 +5848,12 @@ fun WeiboApp() {
                                 onPrepareAddAccount = { session.prepareAddAccount() },
                                 onPersistLoginSession = { persistLoginSession(makeActive = true) },
                                 onReturnToFeed = {
+                                    selectedTab = MainTab.Feed
                                     scope.launch {
-                                        persistLoginSession()
+                                        session.resumeAfterAccountLogin()
+                                        persistLoginSession(makeActive = true)
+                                        reloadStoredAccounts()
                                         session.openWeiboHome()
-                                        selectedTab = MainTab.Feed
                                         refreshTimeline()
                                     }
                                 },
@@ -5987,14 +6037,7 @@ fun WeiboApp() {
                 }
             }
 
-            if (
-                selectedTab != MainTab.Mine &&
-                selectedTab != MainTab.Messages &&
-                selectedTab != MainTab.Compose &&
-                selectedItem == null
-            ) {
-                HiddenSessionWebView(session)
-            }
+            HiddenSessionWebView(session)
             }
 
             if (searchBarOverlay.active) {
@@ -6678,11 +6721,23 @@ private fun FollowFeedScreen(
 
         LazyColumn(
             state = listState,
+            flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
-            if (items.isEmpty() && !isLoading) {
-                item {
+            if (isLoading && items.isEmpty()) {
+                item(key = "feed-loading") {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 48.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                }
+            } else if (items.isEmpty()) {
+                item(key = "feed-empty") {
                     EmptyState(
                         title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
                         body = if (hasLoginCookie) {
@@ -6702,7 +6757,7 @@ private fun FollowFeedScreen(
                 }
             }
 
-            items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
+            items(items, key = { it.id }, contentType = { it.feedCardContentType() }) { item ->
                 val resolved = resolveFeedItem(item)
                 FeedCard(
                     item = resolved,
@@ -6744,6 +6799,18 @@ private fun FollowFeedScreen(
     )
 }
 
+/** Groups reusable lazy-list slots by card structure to reduce composition work during flings. */
+private fun FeedItem.feedCardContentType(): Int {
+    val mediaBucket = when {
+        medias.isNotEmpty() -> 10
+        images.isEmpty() -> 0
+        images.size == 1 -> 1
+        images.size <= 4 -> 2
+        else -> 3
+    }
+    return mediaBucket + if (retweetedStatus != null) 20 else 0
+}
+
 @Composable
 private fun FeedScreen(
     session: WeiboWebSession,
@@ -6758,6 +6825,7 @@ private fun FeedScreen(
     onMediaClick: (FeedMedia, String) -> Unit,
 ) {
     LazyColumn(
+        flingBehavior = rememberWeiboListFlingBehavior(),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 24.dp),
     ) {
@@ -6782,7 +6850,7 @@ private fun FeedScreen(
             }
         }
 
-        items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
+        items(items, key = { it.id }, contentType = { it.feedCardContentType() }) { item ->
             FeedCard(
                 item = item,
                 onClick = { onItemClick(item) },
@@ -17410,15 +17478,15 @@ private fun MineScreen(
                     session = session,
                     autoReturnToFeedOnLogin = storedAccounts.isEmpty(),
                     onLoginSuccess = {
-                        val isFirstLogin = storedAccounts.isEmpty()
                         coroutineScope.launch {
-                            onPersistLoginSession()
-                            onSyncEmoticons()
-                        }
-                        if (isFirstLogin) {
-                            showAccountManagement = false
-                            showSettings = false
+                            delay(150)
+                            val isFirstLogin = storedAccounts.isEmpty()
+                            if (isFirstLogin) {
+                                showAccountManagement = false
+                                showSettings = false
+                            }
                             onReturnToFeed()
+                            onSyncEmoticons()
                         }
                     },
                     onReturnToFeed = {
@@ -21389,7 +21457,7 @@ private fun AccountLoginWebView(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     val webView = remember(reloadKey) {
-        WebView(context).apply {
+        WebView(context.applicationContext).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -21411,14 +21479,14 @@ private fun AccountLoginWebView(
                 userAgentString = loginUserAgent
             }
             webViewClient = object : WebViewClient() {
-                private fun notifyLoginSuccessIfNeeded() {
+                private fun notifyLoginSuccessIfNeeded(host: WebView?) {
                     if (session.hasLoginCookie() && loginSuccessNotified.compareAndSet(false, true)) {
-                        onLoginSuccessState.value()
+                        (host ?: this@apply).post { onLoginSuccessState.value() }
                     }
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    notifyLoginSuccessIfNeeded()
+                    notifyLoginSuccessIfNeeded(view)
                 }
 
                 override fun onReceivedError(
@@ -21442,7 +21510,9 @@ private fun AccountLoginWebView(
             webView.onPause()
             webView.stopLoading()
             webView.webViewClient = WebViewClient()
-            webView.destroy()
+            webView.post {
+                runCatching { webView.destroy() }
+            }
         }
     }
 
@@ -21832,15 +21902,6 @@ private fun RemoteImage(
     }
     var failed by remember(loadKey) { mutableStateOf(false) }
 
-    SideEffect {
-        FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let { cached ->
-            if (bitmap !== cached) {
-                bitmap = cached
-                failed = false
-            }
-        }
-    }
-
     LaunchedEffect(loadKey, upgradeRevision) {
         FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let {
             bitmap = it
@@ -21877,8 +21938,6 @@ private fun RemoteImage(
             failed = candidates.isNotEmpty()
         }
     }
-
-    val imageBitmap = remember(bitmap) { bitmap?.takeIfDrawable()?.asImageBitmap() }
 
     Box(
         modifier = modifier.background(placeholderBackground),

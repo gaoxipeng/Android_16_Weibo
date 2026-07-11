@@ -1644,6 +1644,12 @@ class WeiboWebSession(context: Context) {
         clearAllCookies()
     }
 
+    suspend fun resumeAfterAccountLogin() {
+        withContext(Dispatchers.Main) {
+            webView.onResume()
+        }
+    }
+
     fun captureCookieSnapshot(): Map<String, String> {
         CookieManager.getInstance().flush()
         return COOKIE_ORIGINS.mapNotNull { origin ->
