@@ -1137,9 +1137,20 @@ private fun navStackExitTransition() =
 private fun <T> NavAnimatedOverlay(
     target: T?,
     modifier: Modifier = Modifier,
+    stackTop: Boolean = false,
+    layerBaseZIndex: Float = 0f,
+    animationKey: Any? = null,
+    visible: Boolean? = null,
+    stackAnimated: Boolean = true,
+    navKind: NavOverlayKind? = null,
+    pendingEnterKind: NavOverlayKind? = null,
+    pendingExitKind: NavOverlayKind? = null,
+    onClearPendingEnter: () -> Unit = {},
+    onClearPendingExit: () -> Unit = {},
     enter: EnterTransition = navStackEnterTransition(),
     exit: ExitTransition = navStackExitTransition(),
     exitHoldMillis: Long = NavTransitionDurationMs.toLong(),
+    onHidden: () -> Unit = {},
     content: @Composable (T) -> Unit,
 ) {
     val navTransitions = LocalNavTransitionCoordinator.current
@@ -1147,15 +1158,45 @@ private fun <T> NavAnimatedOverlay(
     if (target != null) {
         displayed = target
     }
-    val visible = target != null
+    val overlayVisible = visible ?: (target != null)
+    // 栈内仍挂载（target != null）但被上层盖住时，保持组合树不销毁，避免 LazyList 滚动位置丢失。
+    val avVisible = target != null || overlayVisible
+    val transitionIdentity = animationKey ?: target
+    val enteredKeys = remember { mutableStateMapOf<Any, Boolean>() }
+    val shouldAnimateEnter = stackAnimated &&
+        overlayVisible &&
+        transitionIdentity != null &&
+        enteredKeys[transitionIdentity] != true &&
+        (navKind == null || pendingEnterKind == null || navOverlayKindsMatch(pendingEnterKind, navKind))
+    val shouldAnimateExit = stackAnimated &&
+        !overlayVisible &&
+        target == null &&
+        (navKind == null || navOverlayKindsMatch(pendingExitKind, navKind))
+    val effectiveEnter = if (shouldAnimateEnter) enter else EnterTransition.None
+    val effectiveExit = if (shouldAnimateExit) exit else ExitTransition.None
+    val effectiveExitHoldMillis = if (shouldAnimateExit) exitHoldMillis else 0L
     var skipAnimationToken by remember { mutableIntStateOf(0) }
-    val transitionState = remember(skipAnimationToken) {
-        MutableTransitionState(visible).apply { targetState = visible }
+    val transitionState = remember(skipAnimationToken, transitionIdentity) {
+        MutableTransitionState(false).apply { targetState = avVisible }
     }
     SideEffect {
-        transitionState.targetState = visible
+        transitionState.targetState = avVisible
+    }
+    LaunchedEffect(overlayVisible, transitionIdentity, pendingEnterKind) {
+        if (overlayVisible && transitionIdentity != null) {
+            enteredKeys[transitionIdentity] = true
+            if (navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
+                onClearPendingEnter()
+            }
+        }
     }
     val isAnimating = !transitionState.isIdle
+    val isExiting = isAnimating && !transitionState.targetState
+    val zIndex = when {
+        isExiting -> NavOverlayExitZIndex
+        stackTop -> NavOverlayTopZIndex
+        else -> layerBaseZIndex
+    }
 
     DisposableEffect(Unit) {
         val unregister = navTransitions.registerSkipHandler { skipAnimationToken++ }
@@ -1172,21 +1213,25 @@ private fun <T> NavAnimatedOverlay(
 
     AnimatedVisibility(
         visibleState = transitionState,
-        modifier = modifier,
-        enter = enter,
-        exit = exit,
+        modifier = modifier.zIndex(zIndex),
+        enter = effectiveEnter,
+        exit = effectiveExit,
         label = "nav-stack-overlay",
     ) {
         displayed?.let { item -> content(item) }
     }
-    if (!visible && displayed != null) {
-        LaunchedEffect(displayed, transitionState.isIdle) {
+    if (!avVisible && displayed != null) {
+        LaunchedEffect(displayed, transitionState.isIdle, target) {
             if (!transitionState.isIdle || transitionState.targetState) return@LaunchedEffect
-            if (exitHoldMillis > 0L) {
-                delay(exitHoldMillis)
+            if (effectiveExitHoldMillis > 0L) {
+                delay(effectiveExitHoldMillis)
             }
-            if (!transitionState.targetState && transitionState.isIdle) {
+            if (!transitionState.targetState && transitionState.isIdle && target == null) {
                 displayed = null
+                if (navKind != null && navOverlayKindsMatch(pendingExitKind, navKind)) {
+                    onClearPendingExit()
+                }
+                onHidden()
             }
         }
     }
@@ -1701,8 +1746,18 @@ private fun overlayTopKind(stack: List<NavOverlayKind>): OverlayTop = when (stac
     NavOverlayKind.TabSwitch, null -> OverlayTop.None
 }
 
-private fun overlayZIndex(top: OverlayTop, layer: OverlayTop, baseZ: Float): Float =
-    if (top == layer) 590f else baseZ
+private fun navOverlayKindsMatch(a: NavOverlayKind?, b: NavOverlayKind?): Boolean {
+    if (a == null || b == null) return false
+    return when {
+        a is NavOverlayKind.Detail && b is NavOverlayKind.Detail -> true
+        a is NavOverlayKind.VisitedProfile && b is NavOverlayKind.VisitedProfile -> true
+        a is NavOverlayKind.FollowList && b is NavOverlayKind.FollowList -> true
+        else -> a == b
+    }
+}
+
+private const val NavOverlayTopZIndex = 590f
+private const val NavOverlayExitZIndex = 595f
 
 private data class MediaPreviewRequest(
     val media: FeedMedia,
@@ -2931,10 +2986,17 @@ fun WeiboApp() {
 
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
     var navOverlayStack by remember { mutableStateOf<List<NavOverlayKind>>(emptyList()) }
+    var navEnterPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
+    var navExitPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
+    var pendingDeferredNavRestore by remember { mutableStateOf<NavRestoreState?>(null) }
+    var deferredNavRestoreGeneration by remember { mutableIntStateOf(0) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
     var detailScrollRestoreToken by remember { mutableIntStateOf(0) }
     var activeDetailInstanceKey by remember { mutableIntStateOf(0) }
+    var albumOverlayInstanceKey by remember { mutableIntStateOf(0) }
+    var mediaOverlayInstanceKey by remember { mutableIntStateOf(0) }
+    var articleOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
@@ -3512,9 +3574,7 @@ fun WeiboApp() {
         mediaPreview = mediaPreview,
     )
 
-    fun applyNavRestoreState(state: NavRestoreState) {
-        selectedTab = state.selectedTab
-        minePagerPage = state.minePagerPage
+    fun applyDeferredNavRestore(state: NavRestoreState) {
         mediaPreview = null
         articleOverlay = null
         albumViewerState = null
@@ -3530,7 +3590,6 @@ fun WeiboApp() {
         scrollLazyListState(mineAlbumListState, state.mineAlbumScroll)
         scrollLazyListState(searchListState, state.searchScroll)
 
-        followListOverlay = state.followListOverlay
         if (state.followListOverlay != null) {
             scrollLazyListState(followListFollowingListState, state.followListFollowingScroll)
             scrollLazyListState(followListFansListState, state.followListFansScroll)
@@ -3561,14 +3620,54 @@ fun WeiboApp() {
         mediaPreview = state.mediaPreview
     }
 
+    fun flushDeferredNavRestore() {
+        val state = pendingDeferredNavRestore ?: return
+        pendingDeferredNavRestore = null
+        applyDeferredNavRestore(state)
+    }
+
+    fun scheduleDeferredNavRestore(state: NavRestoreState) {
+        pendingDeferredNavRestore = state
+        val generation = deferredNavRestoreGeneration + 1
+        deferredNavRestoreGeneration = generation
+        scope.launch {
+            delay(NavTransitionDurationMs.toLong() + 32L)
+            if (deferredNavRestoreGeneration == generation && pendingDeferredNavRestore === state) {
+                flushDeferredNavRestore()
+            }
+        }
+    }
+
+    fun clearNavExitPendingKind() {
+        navExitPendingKind = null
+        flushDeferredNavRestore()
+    }
+
+    fun applyNavRestoreState(state: NavRestoreState) {
+        selectedTab = state.selectedTab
+        minePagerPage = state.minePagerPage
+        followListOverlay = state.followListOverlay
+
+        if (navExitPendingKind != null) {
+            scheduleDeferredNavRestore(state)
+        } else {
+            pendingDeferredNavRestore = null
+            applyDeferredNavRestore(state)
+        }
+    }
+
     fun pushNavigation(kind: NavOverlayKind, navigate: () -> Unit) {
         navStack = navStack + captureNavRestoreState()
         navOverlayStack = navOverlayStack + kind
+        navEnterPendingKind = kind
+        navExitPendingKind = null
         navigate()
     }
 
     fun popNavigation(): Boolean {
         if (navStack.isEmpty()) return false
+        navExitPendingKind = navOverlayStack.lastOrNull()
+        navEnterPendingKind = null
         val previous = navStack.last()
         navStack = navStack.dropLast(1)
         navOverlayStack = navOverlayStack.dropLast(1)
@@ -3591,6 +3690,7 @@ fun WeiboApp() {
     fun dismissFollowListForTabSwitch() {
         if (followListOverlay == null) return
         followListOverlay = null
+        navExitPendingKind = null
         if (navStack.isNotEmpty()) {
             navStack = navStack.dropLast(1)
             navOverlayStack = navOverlayStack.dropLast(1)
@@ -3623,7 +3723,10 @@ fun WeiboApp() {
             return
         }
         videoPlaybackCoordinator.claimFullscreenPlayback(nextKey)
-        pushNavigation(NavOverlayKind.MediaPreview) { mediaPreview = MediaPreviewRequest(media, playbackOwnerId) }
+        pushNavigation(NavOverlayKind.MediaPreview) {
+            mediaOverlayInstanceKey = navStack.size
+            mediaPreview = MediaPreviewRequest(media, playbackOwnerId)
+        }
     }
 
     fun openFloatingPlaybackFromFullscreen(media: FeedMedia, playbackOwnerId: String) {
@@ -3666,6 +3769,7 @@ fun WeiboApp() {
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
         pushNavigation(NavOverlayKind.AlbumViewer) {
+            albumOverlayInstanceKey = navStack.size
             albumViewerState = viewer
         }
     }
@@ -3754,7 +3858,6 @@ fun WeiboApp() {
             return
         }
         pushNavigation(NavOverlayKind.VisitedProfile(value)) {
-            followListOverlay = null
             if (selectedItem == null) {
                 comments = emptyList()
                 commentsCursor = null
@@ -4735,7 +4838,10 @@ fun WeiboApp() {
     fun openUrlEntity(entity: FeedUrlEntity) {
         val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
         if (articleId != null) {
-            pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
+            pushNavigation(NavOverlayKind.Article) {
+                articleOverlayInstanceKey = navStack.size
+                loadArticleIntoOverlay(entity)
+            }
             return
         }
         val statusCandidates = WeiboLinkResolver.statusIdCandidates(entity.url, entity.shortUrl)
@@ -4747,7 +4853,10 @@ fun WeiboApp() {
                 if (item != null) {
                     openDetailInternal(item)
                 } else {
-                    pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
+                    pushNavigation(NavOverlayKind.Article) {
+                articleOverlayInstanceKey = navStack.size
+                loadArticleIntoOverlay(entity)
+            }
                 }
             }
             return
@@ -5156,8 +5265,10 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(selectedTab, visitedUserId) {
-        if (selectedTab != MainTab.Messages && selectedTab != MainTab.Compose) {
-            bottomBarExpanded = true
+        when (selectedTab) {
+            MainTab.Compose -> bottomBarExpanded = true
+            MainTab.Messages -> Unit
+            else -> bottomBarExpanded = true
         }
         bottomBarAwaitingOutsideDismiss = false
     }
@@ -5414,18 +5525,14 @@ fun WeiboApp() {
             val overlayTop = overlayTopKind(navOverlayStack)
             val detailLayerActive = navOverlayStack.any { it is NavOverlayKind.Detail } && detailOverlayItem != null
             val detailOverlayVisible = overlayTop == OverlayTop.Detail && detailLayerActive
+            val detailNavKind = detailOverlayItem?.id?.let { NavOverlayKind.Detail(itemId = it) }
             val profileLayerActive = navOverlayStack.any { it is NavOverlayKind.VisitedProfile } && visitedUserId != null
             val visitedProfileVisible = overlayTop == OverlayTop.VisitedProfile && profileLayerActive
-            val followListBelongsToCurrentContext = followListOverlay?.let { overlay ->
-                when {
-                    visitedUserId != null -> visitedUserId == overlay.uid
-                    else -> selectedTab == MainTab.Mine && overlay.uid == mineProfile?.id
-                }
-            } ?: false
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
-                followListOverlay != null &&
-                followListBelongsToCurrentContext
+                followListOverlay != null
             val followListUiOnTop = overlayTop == OverlayTop.FollowList && followListLayerActive
+            val followListNavKind = followListOverlay?.uid?.let { NavOverlayKind.FollowList(it) }
+            val followListExiting = navOverlayKindsMatch(navExitPendingKind, followListNavKind)
             val albumLayerActive = navOverlayStack.any { it == NavOverlayKind.AlbumViewer } && albumViewerState != null
             val albumViewerVisible = overlayTop == OverlayTop.AlbumViewer && albumLayerActive
             val mediaLayerActive = navOverlayStack.any { it == NavOverlayKind.MediaPreview } && mediaPreview != null
@@ -5548,7 +5655,7 @@ fun WeiboApp() {
             val keepFeedBackdropAlive = webTabVisible && cacheLoaded
             val feedLayerVisible = (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) ||
                 keepFeedBackdropAlive
-            val feedVisibleAlpha = if (feedUiOnTop) 1f else 0f
+            val feedVisibleAlpha = 1f
             val searchUiOnTop = selectedTab == MainTab.Search &&
                 visitedUserId == null &&
                 detailOverlayItem == null &&
@@ -5607,14 +5714,17 @@ fun WeiboApp() {
                     target = followListOverlay.takeIf { followListLayerActive },
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(overlayZIndex(overlayTop, OverlayTop.FollowList, 550f)),
+                        .blockHiddenTouches(followListUiOnTop || followListExiting),
+                    stackTop = followListUiOnTop,
+                    layerBaseZIndex = 550f,
+                    visible = followListUiOnTop,
+                    animationKey = followListOverlay?.instanceKey,
+                    navKind = followListNavKind,
+                    pendingEnterKind = navEnterPendingKind,
+                    pendingExitKind = navExitPendingKind,
+                    onClearPendingEnter = { navEnterPendingKind = null },
+                    onClearPendingExit = ::clearNavExitPendingKind,
                 ) { overlay ->
-                    Box(
-                        Modifier
-                            .fillMaxSize()
-                            .graphicsLayer { alpha = if (followListUiOnTop) 1f else 0f }
-                            .blockHiddenTouches(followListUiOnTop),
-                    ) {
                         key(overlay.uid, overlay.instanceKey) {
                             FollowFansListScreen(
                                 session = session,
@@ -5632,16 +5742,16 @@ fun WeiboApp() {
                                 mineProfileId = mineProfile?.id,
                             )
                         }
-                    }
                 }
 
-                if (selectedTab == MainTab.Search && (searchUiOnTop || keepSearchAlive)) {
-                    Box(
-                        Modifier
-                            .fillMaxSize()
-                            .graphicsLayer { alpha = if (searchUiOnTop) 1f else 0f },
-                    ) {
-                        SearchScreen(
+                NavAnimatedOverlay(
+                    target = MainTab.Search.takeIf { selectedTab == MainTab.Search && (searchUiOnTop || keepSearchAlive) },
+                    modifier = Modifier.fillMaxSize(),
+                    stackTop = searchUiOnTop,
+                    visible = searchUiOnTop,
+                    stackAnimated = false,
+                ) {
+                    SearchScreen(
                             session = session,
                             searchBarOverlay = searchBarOverlay,
                             searchHistoryStore = searchHistoryStore,
@@ -5677,11 +5787,10 @@ fun WeiboApp() {
                                 searchSettingsStore.writeWeiboSort(sort.storageValue())
                             },
                         )
-                    }
                 }
 
                 val visitedProfileNavTarget = visitedUserId.takeIf { profileLayerActive }
-                if (visitedProfileNavTarget != null) {
+                if (visitedProfileNavTarget != null && visitedProfileVisible) {
                     LaunchedEffect(visitedProfileLoadGeneration) {
                         if (visitedListScrollResetGeneration == visitedProfileLoadGeneration) return@LaunchedEffect
                         visitedListScrollResetGeneration = visitedProfileLoadGeneration
@@ -5695,17 +5804,19 @@ fun WeiboApp() {
                     target = visitedProfileNavTarget,
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(overlayZIndex(overlayTop, OverlayTop.VisitedProfile, 540f)),
+                        .blockHiddenTouches(visitedProfileVisible),
+                    stackTop = visitedProfileVisible,
+                    layerBaseZIndex = 540f,
+                    visible = visitedProfileVisible,
+                    animationKey = visitedProfileLoadGeneration,
+                    navKind = visitedProfileNavTarget?.let { NavOverlayKind.VisitedProfile(it) },
+                    pendingEnterKind = navEnterPendingKind,
+                    pendingExitKind = navExitPendingKind,
+                    onClearPendingEnter = { navEnterPendingKind = null },
+                    onClearPendingExit = ::clearNavExitPendingKind,
                 ) { uid ->
                     key(uid) {
-                        Box(
-                            Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    alpha = if (visitedProfileVisible) 1f else 0f
-                                }
-                                .blockHiddenTouches(visitedProfileVisible),
-                        ) {
+                        Box(Modifier.fillMaxSize()) {
                             BackHandler(
                                 enabled = visitedProfileVisible,
                                 onBack = ::closeVisitedProfile,
@@ -5773,25 +5884,21 @@ fun WeiboApp() {
                     }
                 }
 
-                if (visitedUserId == null) {
-                    when (selectedTab) {
-                        MainTab.Search -> Unit
-                        MainTab.Messages, MainTab.Compose -> Unit
-
-                        MainTab.Mine -> {
-                            val mineCoveredByOverlay = selectedItem != null || albumViewerState != null
-                            LaunchedEffect(mineProfile) {
-                                if (mineProfile == null && !mineProfileLoading) {
-                                    refreshMineProfile()
-                                }
-                            }
-                            Box(
-                                Modifier
-                                    .fillMaxSize()
-                                    .graphicsLayer { alpha = if (mineCoveredByOverlay) 0f else 1f }
-                                    .blockHiddenTouches(!mineCoveredByOverlay),
-                            ) {
-                            MineScreen(
+                NavAnimatedOverlay(
+                    target = MainTab.Mine.takeIf {
+                        visitedUserId == null && selectedTab == MainTab.Mine
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                    stackTop = selectedTab == MainTab.Mine && visitedUserId == null,
+                    visible = selectedTab == MainTab.Mine && visitedUserId == null,
+                    stackAnimated = false,
+                ) {
+                    LaunchedEffect(mineProfile, mineProfileLoading) {
+                        if (mineProfile == null && !mineProfileLoading) {
+                            refreshMineProfile()
+                        }
+                    }
+                    MineScreen(
                                 session = session,
                                 profile = mineProfile,
                                 profileHeaderHeight = profileHeaderHeights["mine-self"] ?: 0.dp,
@@ -5888,20 +5995,22 @@ fun WeiboApp() {
                                     themeSettingsStore.writeAppearanceMode(mode)
                                 },
                             )
-                            }
-                        }
-
-                        MainTab.Feed -> Unit
-                    }
                 }
 
                 NavAnimatedOverlay(
                     target = detailOverlayItem.takeIf { detailLayerActive },
                     modifier = Modifier
                         .fillMaxSize()
-                        .zIndex(overlayZIndex(overlayTop, OverlayTop.Detail, 570f))
-                        .graphicsLayer { alpha = if (detailOverlayVisible) 1f else 0f }
                         .blockHiddenTouches(detailOverlayVisible),
+                    stackTop = detailOverlayVisible,
+                    layerBaseZIndex = 570f,
+                    visible = detailOverlayVisible,
+                    animationKey = activeDetailInstanceKey,
+                    navKind = detailNavKind,
+                    pendingEnterKind = navEnterPendingKind,
+                    pendingExitKind = navExitPendingKind,
+                    onClearPendingEnter = { navEnterPendingKind = null },
+                    onClearPendingExit = ::clearNavExitPendingKind,
                 ) { detailItem ->
                     key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
@@ -6157,7 +6266,6 @@ fun WeiboApp() {
                     listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
                 }
                 val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
-                if (selectedTab != MainTab.Compose) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
@@ -6244,7 +6352,6 @@ fun WeiboApp() {
                         .align(Alignment.BottomStart)
                         .zIndex(91f),
                 )
-                }
             }
 
             ExitConfirmCapsule(
@@ -6286,27 +6393,21 @@ fun WeiboApp() {
             val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
-            if (mediaLayerActive) {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .zIndex(overlayZIndex(overlayTop, OverlayTop.MediaPreview, 498f))
-                        .graphicsLayer { alpha = if (mediaPreviewVisible) 1f else 0f }
-                        .blockHiddenTouches(mediaPreviewVisible)
-                        .background(Color.Black),
-                )
-            }
             NavAnimatedOverlay(
                 target = mediaPreview.takeIf { mediaLayerActive },
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(overlayZIndex(overlayTop, OverlayTop.MediaPreview, 500f))
-                    .graphicsLayer { alpha = if (mediaPreviewVisible) 1f else 0f }
                     .blockHiddenTouches(mediaPreviewVisible)
                     .background(Color.Black),
-                enter = EnterTransition.None,
-                exit = ExitTransition.None,
-                exitHoldMillis = 0L,
+                stackTop = mediaPreviewVisible,
+                layerBaseZIndex = 500f,
+                visible = mediaPreviewVisible,
+                animationKey = mediaOverlayInstanceKey,
+                navKind = NavOverlayKind.MediaPreview,
+                pendingEnterKind = navEnterPendingKind,
+                pendingExitKind = navExitPendingKind,
+                onClearPendingEnter = { navEnterPendingKind = null },
+                onClearPendingExit = ::clearNavExitPendingKind,
             ) { request ->
                 FullscreenMediaPreview(
                     media = request.media,
@@ -6343,52 +6444,63 @@ fun WeiboApp() {
                     onEnterFullscreenHandoffComplete = { request.onEnterFullscreenHandoffComplete() },
                 )
             }
-            if (albumLayerActive) {
-                albumViewerState?.let { viewer ->
+            NavAnimatedOverlay(
+                target = albumViewerState.takeIf { albumLayerActive },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .blockHiddenTouches(albumViewerVisible),
+                stackTop = albumViewerVisible,
+                layerBaseZIndex = 560f,
+                visible = albumViewerVisible,
+                animationKey = albumOverlayInstanceKey,
+                navKind = NavOverlayKind.AlbumViewer,
+                pendingEnterKind = navEnterPendingKind,
+                pendingExitKind = navExitPendingKind,
+                onClearPendingEnter = { navEnterPendingKind = null },
+                onClearPendingExit = ::clearNavExitPendingKind,
+            ) { viewer ->
                 val relatedPosts = when {
                     visitedUserId != null -> visitedPosts
                     selectedTab == MainTab.Mine -> minePosts
                     else -> emptyList()
                 }
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .zIndex(overlayZIndex(overlayTop, OverlayTop.AlbumViewer, 560f))
-                        .graphicsLayer { alpha = if (albumViewerVisible) 1f else 0f }
-                        .blockHiddenTouches(albumViewerVisible),
-                ) {
-                    FullscreenImageViewer(
-                        images = viewer.images,
-                        initialIndex = viewer.initialIndex,
-                        onDismiss = { dismissAlbumViewer() },
-                        session = session,
-                        relatedPosts = relatedPosts,
-                        emoticonMap = emoticonMap,
-                        statusCache = viewer.statusCache,
-                        onOpenStatus = { item, index, cache ->
-                            openDetailFromAlbumViewer(
-                                item,
-                                AlbumViewerState(
-                                    images = viewer.images,
-                                    initialIndex = index,
-                                    statusCache = cache,
-                                    profilePagerPage = viewer.profilePagerPage,
-                                    albumScrollIndex = viewer.albumScrollIndex,
-                                    albumScrollOffset = viewer.albumScrollOffset,
-                                ),
-                            )
-                        },
-                    )
-                }
-                }
+                FullscreenImageViewer(
+                    images = viewer.images,
+                    initialIndex = viewer.initialIndex,
+                    onDismiss = { dismissAlbumViewer() },
+                    session = session,
+                    relatedPosts = relatedPosts,
+                    emoticonMap = emoticonMap,
+                    statusCache = viewer.statusCache,
+                    onOpenStatus = { item, index, cache ->
+                        openDetailFromAlbumViewer(
+                            item,
+                            AlbumViewerState(
+                                images = viewer.images,
+                                initialIndex = index,
+                                statusCache = cache,
+                                profilePagerPage = viewer.profilePagerPage,
+                                albumScrollIndex = viewer.albumScrollIndex,
+                                albumScrollOffset = viewer.albumScrollOffset,
+                            ),
+                        )
+                    },
+                )
             }
             NavAnimatedOverlay(
                 target = articleOverlay.takeIf { articleLayerActive },
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(overlayZIndex(overlayTop, OverlayTop.Article, 600f))
-                    .graphicsLayer { alpha = if (articleOverlayVisible) 1f else 0f }
                     .blockHiddenTouches(articleOverlayVisible),
+                stackTop = articleOverlayVisible,
+                layerBaseZIndex = 600f,
+                visible = articleOverlayVisible,
+                animationKey = articleOverlayInstanceKey,
+                navKind = NavOverlayKind.Article,
+                pendingEnterKind = navEnterPendingKind,
+                pendingExitKind = navExitPendingKind,
+                onClearPendingEnter = { navEnterPendingKind = null },
+                onClearPendingExit = ::clearNavExitPendingKind,
             ) { overlay ->
                 ArticleReaderOverlay(
                     state = overlay,
@@ -14370,6 +14482,20 @@ private fun ComposeWeiboScreen(
     }
 
     val toolbarMutedColor = composeWeiboToolbarMutedColor()
+    val bottomBarGap = LiquidBottomBarContentGap
+    val bottomBarReserve = LiquidBottomBarReserve + bottomBarGap
+    val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
+    val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
+    val imeInsetForLayout = maxOf(imeBottom, imeTargetBottom)
+    val bottomBarClearanceTarget = maxOf(bottomBarReserve, imeInsetForLayout + bottomBarGap)
+    val bottomBarClearance by animateDpAsState(
+        targetValue = bottomBarClearanceTarget,
+        animationSpec = tween(
+            durationMillis = SearchImeFollowDurationMillis,
+            easing = FastOutSlowInEasing,
+        ),
+        label = "compose-weibo-bottom-clearance",
+    )
 
     Box(
         modifier = Modifier
@@ -14377,8 +14503,7 @@ private fun ComposeWeiboScreen(
             .background(MaterialTheme.colorScheme.surface)
             .consumeTouchEvents()
             .statusBarsPadding()
-            .navigationBarsPadding()
-            .imePadding(),
+            .padding(bottom = bottomBarClearance),
     ) {
         Column(Modifier.fillMaxSize()) {
             Row(
@@ -17390,6 +17515,7 @@ private fun MineScreen(
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
     onOpenFollowList: ((String, String, String?, String?, FriendListTab) -> Unit)? = null,
+    showPullRefreshIndicator: Boolean = true,
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
@@ -17613,6 +17739,7 @@ private fun MineScreen(
     val videoPeekController = LocalVideoPeekController.current
     val blockMinePagerScroll = videoPeekController.activeRequest != null &&
         videoPeekController.pendingDismiss == null
+    val isPullRefreshing = showPullRefreshIndicator && isLoading && posts.isNotEmpty()
 
     Box(Modifier.fillMaxSize()) {
     Column(
@@ -17621,7 +17748,7 @@ private fun MineScreen(
             .background(MaterialTheme.colorScheme.background),
     ) {
         AppPullToRefreshBox(
-            isRefreshing = isLoading,
+            isRefreshing = isPullRefreshing,
             onRefresh = onRefresh,
             modifier = Modifier.fillMaxWidth().weight(1f),
         ) {
@@ -17813,7 +17940,7 @@ private fun MineScreen(
                                             onUrlEntityClick = onUrlEntityClick,
                                         )
                                     }
-                                    if (postsLoadingMore) {
+                                    if (postsLoadingMore || (isLoading && !showPullRefreshIndicator)) {
                                         item { MineLoadingMoreIndicator() }
                                     }
                                     if (!postsHasMore && posts.isNotEmpty()) {
@@ -19993,6 +20120,7 @@ private fun VisitedUserProfileContent(
         onUrlEntityClick = onUrlEntityClick,
         onOpenFollowList = onOpenFollowList,
         enableSettings = false,
+        showPullRefreshIndicator = false,
         showFollowActions = showFollowActions,
         followLoading = followLoading,
         onFollowClick = onFollowClick,
