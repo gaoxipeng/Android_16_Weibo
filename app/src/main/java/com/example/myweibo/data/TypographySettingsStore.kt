@@ -16,7 +16,7 @@ enum class FeedLineSpacing(
 
     companion object {
         fun fromStorage(value: String?): FeedLineSpacing =
-            entries.firstOrNull { it.storageValue == value } ?: Compact
+            entries.firstOrNull { it.storageValue == value } ?: Normal
     }
 }
 

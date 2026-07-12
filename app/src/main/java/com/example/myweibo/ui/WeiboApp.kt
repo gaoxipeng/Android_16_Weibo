@@ -348,6 +348,7 @@ import com.example.myweibo.data.WeiboArticle
 import com.example.myweibo.data.WeiboLinkResolver
 import com.example.myweibo.data.resolveArticleId
 import com.example.myweibo.data.formatWeiboTime
+import com.example.myweibo.data.parseWeiboCreatedAtMillis
 import com.example.myweibo.data.collectEmoticons
 import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
@@ -1125,13 +1126,13 @@ private fun navStackEnterTransition() =
     slideInHorizontally(
         animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
         initialOffsetX = { fullWidth -> fullWidth },
-    ) + fadeIn(tween(NavTransitionDurationMs))
+    )
 
 private fun navStackExitTransition() =
     slideOutHorizontally(
         animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
         targetOffsetX = { fullWidth -> fullWidth },
-    ) + fadeOut(tween(NavTransitionDurationMs))
+    )
 
 @Composable
 private fun <T> NavAnimatedOverlay(
@@ -1163,7 +1164,7 @@ private fun <T> NavAnimatedOverlay(
     val avVisible = target != null || overlayVisible
     val transitionIdentity = animationKey ?: target
     val enteredKeys = remember { mutableStateMapOf<Any, Boolean>() }
-    val shouldAnimateEnter = stackAnimated &&
+    val wantsEnterAnimation = stackAnimated &&
         overlayVisible &&
         transitionIdentity != null &&
         enteredKeys[transitionIdentity] != true &&
@@ -1172,22 +1173,38 @@ private fun <T> NavAnimatedOverlay(
         !overlayVisible &&
         target == null &&
         (navKind == null || navOverlayKindsMatch(pendingExitKind, navKind))
-    val effectiveEnter = if (shouldAnimateEnter) enter else EnterTransition.None
-    val effectiveExit = if (shouldAnimateExit) exit else ExitTransition.None
-    val effectiveExitHoldMillis = if (shouldAnimateExit) exitHoldMillis else 0L
     var skipAnimationToken by remember { mutableIntStateOf(0) }
+    // 进入/退出动画在 identity 或 pendingExit 生命周期内锁定，避免中途 effectiveEnter/Exit 变 None 导致动画被掐断。
+    val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
+        if (wantsEnterAnimation) enter else EnterTransition.None
+    }
+    val effectiveExit = remember(transitionIdentity, skipAnimationToken, pendingExitKind) {
+        if (shouldAnimateExit) exit else ExitTransition.None
+    }
+    val effectiveExitHoldMillis = if (shouldAnimateExit) exitHoldMillis else 0L
     val transitionState = remember(skipAnimationToken, transitionIdentity) {
-        MutableTransitionState(false).apply { targetState = avVisible }
+        MutableTransitionState(false)
     }
     SideEffect {
         transitionState.targetState = avVisible
     }
-    LaunchedEffect(overlayVisible, transitionIdentity, pendingEnterKind) {
-        if (overlayVisible && transitionIdentity != null) {
-            enteredKeys[transitionIdentity] = true
-            if (navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
-                onClearPendingEnter()
-            }
+    LaunchedEffect(avVisible, transitionIdentity) {
+        if (!avVisible && transitionIdentity != null) {
+            enteredKeys.remove(transitionIdentity)
+        }
+    }
+    LaunchedEffect(
+        transitionState.isIdle,
+        transitionState.currentState,
+        overlayVisible,
+        transitionIdentity,
+        pendingEnterKind,
+    ) {
+        if (!overlayVisible || transitionIdentity == null) return@LaunchedEffect
+        if (!transitionState.isIdle || !transitionState.currentState) return@LaunchedEffect
+        enteredKeys[transitionIdentity] = true
+        if (navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
+            onClearPendingEnter()
         }
     }
     val isAnimating = !transitionState.isIdle
@@ -2489,11 +2506,11 @@ private val LocalFeedTypographyMetrics = staticCompositionLocalOf {
     FeedTypographyMetrics(
         body = TextStyle(
             fontSize = size,
-            lineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
+            lineHeight = size * FeedLineSpacing.Normal.lineHeightMultiplier,
             platformStyle = PlatformTextStyle(includeFontPadding = false),
         ),
         emojiSize = size * 1.4f,
-        placeholderLineHeight = size * FeedLineSpacing.Compact.lineHeightMultiplier,
+        placeholderLineHeight = size * FeedLineSpacing.Normal.lineHeightMultiplier,
     )
 }
 
@@ -3098,6 +3115,7 @@ fun WeiboApp() {
     var pendingOpenAccountLogin by remember { mutableStateOf(false) }
     var articleOverlay by remember { mutableStateOf<ArticleOverlayState?>(null) }
     var followListOverlay by remember { mutableStateOf<FollowListOverlayState?>(null) }
+    var followListOverlayInstanceKey by remember { mutableIntStateOf(0) }
     val followListTabCaches = remember { mutableStateMapOf<String, FollowListTabCache>() }
 
     fun scrollLazyListState(listState: LazyListState, scroll: ScrollRestore) {
@@ -3618,6 +3636,7 @@ fun WeiboApp() {
 
         articleOverlay = state.articleOverlay
         mediaPreview = state.mediaPreview
+        followListOverlay = state.followListOverlay
     }
 
     fun flushDeferredNavRestore() {
@@ -3646,12 +3665,12 @@ fun WeiboApp() {
     fun applyNavRestoreState(state: NavRestoreState) {
         selectedTab = state.selectedTab
         minePagerPage = state.minePagerPage
-        followListOverlay = state.followListOverlay
 
         if (navExitPendingKind != null) {
             scheduleDeferredNavRestore(state)
         } else {
             pendingDeferredNavRestore = null
+            followListOverlay = state.followListOverlay
             applyDeferredNavRestore(state)
         }
     }
@@ -3705,14 +3724,14 @@ fun WeiboApp() {
         tab: FriendListTab,
     ) {
         pushNavigation(NavOverlayKind.FollowList(uid)) {
-            val instanceKey = navStack.size
+            followListOverlayInstanceKey += 1
             followListOverlay = FollowListOverlayState(
                 uid = uid,
                 screenName = screenName,
                 avatarUrl = avatarUrl,
                 description = description,
                 tab = tab,
-                instanceKey = instanceKey,
+                instanceKey = followListOverlayInstanceKey,
             )
         }
     }
@@ -4801,7 +4820,7 @@ fun WeiboApp() {
         val resolved = resolveFeedItem(item)
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
-        activeDetailInstanceKey = navStack.size
+        activeDetailInstanceKey += 1
         val scroll = if (scrollToContentSection) {
             ScrollRestore(index = DETAIL_SECTION_HEADER_INDEX)
         } else {
@@ -4890,7 +4909,7 @@ fun WeiboApp() {
         pushNavigation(NavOverlayKind.Detail(resolved.id)) {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = null
-            activeDetailInstanceKey = navStack.size
+            activeDetailInstanceKey += 1
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
@@ -5051,7 +5070,7 @@ fun WeiboApp() {
                             comments = if (append) {
                                 mergeCommentItems(comment.comments, page.items)
                             } else {
-                                page.items
+                                sortNestedCommentsByTime(page.items)
                             },
                             moreInfoText = null,
                             nestedNextCursor = page.nextCursor,
@@ -5265,10 +5284,8 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(selectedTab, visitedUserId) {
-        when (selectedTab) {
-            MainTab.Compose -> bottomBarExpanded = true
-            MainTab.Messages -> Unit
-            else -> bottomBarExpanded = true
+        if (selectedTab != MainTab.Messages && selectedTab != MainTab.Compose) {
+            bottomBarExpanded = true
         }
         bottomBarAwaitingOutsideDismiss = false
     }
@@ -5645,6 +5662,13 @@ fun WeiboApp() {
                         .matchParentSize()
                         .background(MaterialTheme.colorScheme.background),
                 )
+                if (webTabVisible && cacheLoaded) {
+                    Box(
+                        Modifier
+                            .matchParentSize()
+                            .background(Color.White),
+                    )
+                }
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
                 detailOverlayItem == null
@@ -5652,10 +5676,8 @@ fun WeiboApp() {
                 (visitedUserId != null && detailOverlayItem == null) ||
                 detailOverlayItem != null
             )
-            val keepFeedBackdropAlive = webTabVisible && cacheLoaded
-            val feedLayerVisible = (selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)) ||
-                keepFeedBackdropAlive
-            val feedVisibleAlpha = 1f
+            val feedLayerVisible = selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)
+            val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
             val searchUiOnTop = selectedTab == MainTab.Search &&
                 visitedUserId == null &&
                 detailOverlayItem == null &&
@@ -5666,6 +5688,20 @@ fun WeiboApp() {
             val keepSearchAlive = selectedTab == MainTab.Search &&
                 (visitedUserId != null ||
                     detailOverlayItem != null ||
+                    followListOverlay != null ||
+                    articleOverlay != null ||
+                    mediaPreview != null ||
+                    albumViewerState != null)
+            val mineUiOnTop = selectedTab == MainTab.Mine &&
+                visitedUserId == null &&
+                detailOverlayItem == null &&
+                followListOverlay == null &&
+                articleOverlay == null &&
+                mediaPreview == null &&
+                albumViewerState == null
+            val keepMineAlive = selectedTab == MainTab.Mine &&
+                visitedUserId == null &&
+                (detailOverlayItem != null ||
                     followListOverlay != null ||
                     articleOverlay != null ||
                     mediaPreview != null ||
@@ -5886,11 +5922,13 @@ fun WeiboApp() {
 
                 NavAnimatedOverlay(
                     target = MainTab.Mine.takeIf {
-                        visitedUserId == null && selectedTab == MainTab.Mine
+                        visitedUserId == null && selectedTab == MainTab.Mine && (mineUiOnTop || keepMineAlive)
                     },
-                    modifier = Modifier.fillMaxSize(),
-                    stackTop = selectedTab == MainTab.Mine && visitedUserId == null,
-                    visible = selectedTab == MainTab.Mine && visitedUserId == null,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blockHiddenTouches(mineUiOnTop),
+                    stackTop = mineUiOnTop,
+                    visible = mineUiOnTop,
                     stackAnimated = false,
                 ) {
                     LaunchedEffect(mineProfile, mineProfileLoading) {
@@ -6234,6 +6272,9 @@ fun WeiboApp() {
                 }
             }
 
+            val detailExiting = navExitPendingKind is NavOverlayKind.Detail
+            val bottomBarVisible = visitedUserId == null &&
+                (selectedItem == null || detailExiting)
             if (selectedItem == null && visitedUserId == null) {
                 if (timelineMenuExpanded) {
                     Box(
@@ -6262,10 +6303,12 @@ fun WeiboApp() {
                             ),
                     )
                 }
-                val timelineMenuLabels = remember {
-                    listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
-                }
-                val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
+            }
+            val timelineMenuLabels = remember {
+                listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
+            }
+            val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
+            if (bottomBarVisible) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     expanded = bottomBarExpanded,
@@ -13823,8 +13866,16 @@ private fun mergeCommentItems(
 ): List<CommentItem> {
     if (appended.isEmpty()) return existing
     val seen = existing.map { it.id }.toMutableSet()
-    return existing + appended.filter { it.id !in seen }
+    return sortNestedCommentsByTime(existing + appended.filter { it.id !in seen })
 }
+
+private fun sortNestedCommentsByTime(comments: List<CommentItem>): List<CommentItem> =
+    comments
+        .sortedBy { parseWeiboCreatedAtMillis(it.createdAt) ?: Long.MAX_VALUE }
+        .map { comment ->
+            if (comment.comments.isEmpty()) comment
+            else comment.copy(comments = sortNestedCommentsByTime(comment.comments))
+        }
 
 private fun updateCommentTree(
     comments: List<CommentItem>,
@@ -15754,7 +15805,7 @@ private fun CommentRow(
                 )
             }
         }
-        comment.comments.forEach { nested ->
+        sortNestedCommentsByTime(comment.comments).forEach { nested ->
             CommentRow(
                 comment = nested,
                 depth = depth + 1,

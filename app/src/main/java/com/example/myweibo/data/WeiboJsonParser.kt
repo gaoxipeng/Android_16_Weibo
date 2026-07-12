@@ -460,7 +460,7 @@ object WeiboJsonParser {
                     )
                 )
             }
-        }
+        }.sortedBy { parseWeiboCreatedAtMillis(it.createdAt) ?: Long.MAX_VALUE }
     }
 
     fun hasLongTextPayload(data: JSONObject): Boolean =
