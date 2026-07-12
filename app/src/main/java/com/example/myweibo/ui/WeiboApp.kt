@@ -125,7 +125,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.gestures.animateScrollBy
-import androidx.compose.foundation.lazy.layout.LazyLayoutCacheWindow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -2886,10 +2885,6 @@ fun WeiboApp() {
     val snackbarHostState = remember { SnackbarHostState() }
     val initialFollowingScroll = remember { timelineCacheStore.readFollowingScroll() }
     val feedListState = rememberLazyListState(
-        cacheWindow = LazyLayoutCacheWindow(
-            ahead = 640.dp,
-            behind = 160.dp,
-        ),
         initialFirstVisibleItemIndex = initialFollowingScroll.first,
         initialFirstVisibleItemScrollOffset = initialFollowingScroll.second,
     )
@@ -6721,7 +6716,6 @@ private fun FollowFeedScreen(
 
         LazyColumn(
             state = listState,
-            flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
@@ -6757,7 +6751,7 @@ private fun FollowFeedScreen(
                 }
             }
 
-            items(items, key = { it.id }, contentType = { it.feedCardContentType() }) { item ->
+            items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
                 val resolved = resolveFeedItem(item)
                 FeedCard(
                     item = resolved,
@@ -21902,6 +21896,15 @@ private fun RemoteImage(
     }
     var failed by remember(loadKey) { mutableStateOf(false) }
 
+    SideEffect {
+        FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let { cached ->
+            if (bitmap !== cached) {
+                bitmap = cached
+                failed = false
+            }
+        }
+    }
+
     LaunchedEffect(loadKey, upgradeRevision) {
         FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let {
             bitmap = it
@@ -22105,6 +22108,11 @@ private class BitmapByteCache(private val maxBytes: Int) {
         }
         entries[key] = bitmap
         currentBytes += bitmap.allocationByteCount
+        while (currentBytes > maxBytes && entries.isNotEmpty()) {
+            val eldest = entries.entries.firstOrNull() ?: break
+            entries.remove(eldest.key)
+            currentBytes = (currentBytes - eldest.value.allocationByteCount).coerceAtLeast(0)
+        }
     }
 
     @Synchronized
