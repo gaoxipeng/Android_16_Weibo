@@ -3911,32 +3911,20 @@ fun WeiboApp() {
     }
 
     fun prepareInlineVideoHandoffForDetail(item: FeedItem, hostItem: FeedItem? = null) {
+        if (videoPlaybackCoordinator.peekPlaybackKey != null) return
+        val activeKey = videoPlaybackCoordinator.activeKey ?: return
         val candidateKeys = buildSet {
             addAll(feedItemInlinePlaybackKeys(item))
             hostItem?.let { addAll(feedItemInlinePlaybackKeys(it)) }
         }
-        val activeKey = videoPlaybackCoordinator.activeKey
-        if (activeKey != null) {
-            val shouldHandoff = candidateKeys.any { candidate ->
-                videoPlaybackCoordinator.matchesPlaybackKey(activeKey, candidate)
-            }
-            if (shouldHandoff) {
-                videoPlaybackCoordinator.beginDetailHandoff(activeKey)
-            } else {
-                videoPlaybackCoordinator.pauseInlineOnly()
-                videoPlaybackCoordinator.activeKey = null
-            }
-            return
+        val shouldHandoff = candidateKeys.any { candidate ->
+            videoPlaybackCoordinator.matchesPlaybackKey(activeKey, candidate)
         }
-        val peekKey = videoPlaybackCoordinator.peekPlaybackKey ?: return
-        val peekMatchesTarget = candidateKeys.any { candidate ->
-            videoPlaybackCoordinator.matchesPlaybackKey(peekKey, candidate)
-        }
-        if (!peekMatchesTarget) {
-            videoPlaybackCoordinator.pausePeek()
-            if (videoPeekController.activeRequest != null) {
-                videoPeekController.cancel()
-            }
+        if (shouldHandoff) {
+            videoPlaybackCoordinator.beginDetailHandoff(activeKey)
+        } else {
+            videoPlaybackCoordinator.pauseInlineOnly()
+            videoPlaybackCoordinator.activeKey = null
         }
     }
 
