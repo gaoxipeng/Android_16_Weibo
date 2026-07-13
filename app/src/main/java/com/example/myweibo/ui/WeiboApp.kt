@@ -1245,13 +1245,11 @@ private fun <T> NavAnimatedOverlay(
             if (effectiveExitHoldMillis > 0L) {
                 delay(effectiveExitHoldMillis)
             }
-            if (!transitionState.targetState && transitionState.isIdle && target == null) {
-                displayed = null
-                if (navKind != null && navOverlayKindsMatch(pendingExitKind, navKind)) {
-                    onClearPendingExit()
-                }
-                onHidden()
+            displayed = null
+            if (navKind != null && navOverlayKindsMatch(pendingExitKind, navKind)) {
+                onClearPendingExit()
             }
+            onHidden()
         }
     }
 }
