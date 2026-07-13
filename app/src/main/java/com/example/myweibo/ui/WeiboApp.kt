@@ -137,6 +137,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -193,6 +194,7 @@ import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
@@ -2168,11 +2170,13 @@ private val LocalFeedBodyTextStyle = staticCompositionLocalOf { TextStyle.Defaul
 
 private const val EmoticonBitmapMaxDecodeDim = 96
 private const val FeedEmoticonTextCacheMaxEntries = 600
+private const val UrlLinkIconInlineContentKey = "url-link-icon"
 
 private data class FeedEmoticonTextCacheKey(
     val text: String,
     val leadingAuthorName: String?,
     val trailingLabel: String?,
+    val trailingLocation: String?,
     val inlineImageTokens: List<String>,
     val urlEntityTokens: List<String>,
     val emoticonTokens: List<String>,
@@ -2304,6 +2308,7 @@ private fun buildFeedEmoticonTextCacheKey(
     text: String,
     leadingAuthorName: String?,
     trailingLabel: String?,
+    trailingLocation: String?,
     inlineImageLinks: Map<String, List<FeedImage>>,
     urlEntities: Map<String, FeedUrlEntity>,
     emoticonTokens: List<String>,
@@ -2324,6 +2329,7 @@ private fun buildFeedEmoticonTextCacheKey(
         text = text,
         leadingAuthorName = leadingAuthorName,
         trailingLabel = trailingLabel,
+        trailingLocation = trailingLocation,
         inlineImageTokens = inlineImageLinks.keys.sorted(),
         urlEntityTokens = urlEntities.keys.sorted(),
         emoticonTokens = emoticonTokens,
@@ -2544,12 +2550,34 @@ private fun emojiInlineContent(
 ): InlineTextContent =
     InlineTextContent(
         Placeholder(
-            width = size,
+            width = size * 0.85f,
             height = size,
             placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
         ),
     ) {
         EmojiImage(url = url)
+    }
+
+private fun urlLinkIconInlineContent(
+    size: TextUnit,
+    color: Color,
+): InlineTextContent =
+    InlineTextContent(
+        Placeholder(
+            width = size,
+            height = size,
+            placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+        ),
+    ) {
+        Icon(
+            imageVector = Icons.Outlined.Link,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(1.dp)
+                .rotate(135f),
+        )
     }
 
 private fun mentionInlineContent(
@@ -2642,10 +2670,11 @@ private fun textNeedsRichRendering(
     text: String,
     leadingAuthorName: String?,
     trailingLabel: String?,
+    trailingLocation: String?,
     inlineImageLinks: Map<String, List<FeedImage>>,
     urlEntities: Map<String, FeedUrlEntity>,
 ): Boolean {
-    if (leadingAuthorName != null || trailingLabel != null) return true
+    if (leadingAuthorName != null || trailingLabel != null || trailingLocation != null) return true
     if (text.isEmpty()) return false
     if (text.indexOf('@') >= 0 || text.indexOf('#') >= 0 || text.indexOf('[') >= 0) return true
     return inlineImageLinks.keys.any(text::contains) ||
@@ -4585,7 +4614,7 @@ fun WeiboApp() {
     }
 
     fun loadLongText(item: FeedItem) {
-        if (!item.isLongText || item.statusId in longTextLoadingIds) return
+        if (!item.requiresLongTextFetch || item.statusId in longTextLoadingIds) return
         scope.launch {
             longTextLoadingIds = longTextLoadingIds + item.statusId
             runCatching { session.expandLongText(item) }
@@ -4833,10 +4862,10 @@ fun WeiboApp() {
         detailScrollPending = resolved.id to scroll
         selectedItem = resolved
         resetDetailContentState(initialSection)
-        if (resolved.isLongText) {
+        if (resolved.requiresLongTextFetch) {
             loadLongText(resolved)
         }
-        resolved.retweetedStatus?.takeIf { it.isLongText }?.let { loadLongText(it) }
+        resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let { loadLongText(it) }
         when (initialSection) {
             DetailContentSection.Comments -> reloadComments()
             DetailContentSection.Reposts -> reloadReposts()
@@ -4917,10 +4946,10 @@ fun WeiboApp() {
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
             resetDetailContentState()
-            if (resolved.isLongText) {
+            if (resolved.requiresLongTextFetch) {
                 loadLongText(resolved)
             }
-            resolved.retweetedStatus?.takeIf { it.isLongText }?.let { loadLongText(it) }
+            resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let { loadLongText(it) }
             reloadComments()
         }
     }
@@ -7109,6 +7138,7 @@ private fun EmoticonText(
     leadingAuthorName: String? = null,
     onLeadingAuthorClick: (() -> Unit)? = null,
     trailingLabel: String? = null,
+    trailingLocation: String? = null,
     onTrailingClick: (() -> Unit)? = null,
     inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
     onInlineImageClick: ((List<FeedImage>) -> Unit)? = null,
@@ -7122,7 +7152,7 @@ private fun EmoticonText(
         return
     }
 
-    if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, inlineImageLinks, urlEntities)) {
+    if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, trailingLocation, inlineImageLinks, urlEntities)) {
         Text(
             text = text,
             style = style,
@@ -7136,11 +7166,12 @@ private fun EmoticonText(
     val primaryColor = MaterialTheme.colorScheme.primary
     val sharedInlineContent = LocalFeedEmoticonInlineContent.current
     val feedTypographyMetrics = LocalFeedTypographyMetrics.current
-    val linkScopeKey = remember(contentKey, leadingAuthorName, trailingLabel) {
+    val linkScopeKey = remember(contentKey, leadingAuthorName, trailingLabel, trailingLocation) {
         buildString {
             append(contentKey)
             leadingAuthorName?.let { append("|la:$it") }
             trailingLabel?.let { append("|tr:$it") }
+            trailingLocation?.let { append("|loc:$it") }
         }
     }
     val trailingClickState = rememberUpdatedState(onTrailingClick)
@@ -7203,8 +7234,13 @@ private fun EmoticonText(
         emoticonMap = emoticonMap,
         metrics = feedTypographyMetrics,
     )
-    val inlineContent = remember(sharedInlineContent, missingInlineContent) {
-        if (missingInlineContent.isEmpty()) sharedInlineContent else sharedInlineContent + missingInlineContent
+    val inlineContent = remember(sharedInlineContent, missingInlineContent, style.fontSize, primaryColor) {
+        val withEmoticons = if (missingInlineContent.isEmpty()) {
+            sharedInlineContent
+        } else {
+            sharedInlineContent + missingInlineContent
+        }
+        withEmoticons + (UrlLinkIconInlineContentKey to urlLinkIconInlineContent(style.fontSize, primaryColor))
     }
     val hasTrailingLink = trailingLabel != null && onTrailingClick != null
     val hasLeadingLink = leadingAuthorName != null && onLeadingAuthorClick != null
@@ -7214,6 +7250,7 @@ private fun EmoticonText(
         text,
         leadingAuthorName,
         trailingLabel,
+        trailingLocation,
         inlineImageLinks,
         urlEntities,
         emoticonTokensInText,
@@ -7231,6 +7268,7 @@ private fun EmoticonText(
             text = text,
             leadingAuthorName = leadingAuthorName,
             trailingLabel = trailingLabel,
+            trailingLocation = trailingLocation,
             inlineImageLinks = inlineImageLinks,
             urlEntities = urlEntities,
             emoticonTokens = emoticonTokensInText,
@@ -7251,6 +7289,7 @@ private fun EmoticonText(
             primaryColor = primaryColor,
             leadingAuthorName = leadingAuthorName,
             trailingLabel = trailingLabel,
+            trailingLocation = trailingLocation,
             linkScopeKey = linkScopeKey,
             hasLeadingLink = hasLeadingLink,
             hasTrailingLink = hasTrailingLink,
@@ -7279,6 +7318,7 @@ private fun buildEmoticonAnnotatedString(
     primaryColor: Color,
     leadingAuthorName: String?,
     trailingLabel: String?,
+    trailingLocation: String?,
     linkScopeKey: String?,
     hasLeadingLink: Boolean,
     hasTrailingLink: Boolean,
@@ -7361,6 +7401,7 @@ private fun buildEmoticonAnnotatedString(
                         ),
                     ) {
                         withStyle(linkStyle) {
+                            appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                             append(entity.title)
                         }
                     }
@@ -7368,6 +7409,7 @@ private fun buildEmoticonAnnotatedString(
                 urlEntities.containsKey(token) -> {
                     val entity = urlEntities.getValue(token)
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
+                        appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                         append(entity.title)
                     }
                 }
@@ -7434,6 +7476,21 @@ private fun buildEmoticonAnnotatedString(
         }
         if (last < text.length) {
             append(text.substring(last))
+        }
+        trailingLocation?.takeIf { it.isNotBlank() }?.let { location ->
+            append('\u2009')
+            withStyle(SpanStyle(color = primaryColor)) {
+                withStyle(
+                    SpanStyle(
+                        fontSize = style.fontSize * 1.15f,
+                        fontWeight = FontWeight.Bold,
+                    ),
+                ) {
+                    append("\u2316")
+                }
+                append('\u2009')
+                append(location.trim())
+            }
         }
         trailingLabel?.let { label ->
             append('\u00A0')
@@ -7715,6 +7772,7 @@ private fun StatusTextSection(
         } else {
             null
         },
+        trailingLocation = item.locationName,
         onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
             { onLoadLongText(item) }
         } else {

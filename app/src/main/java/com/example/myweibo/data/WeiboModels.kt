@@ -14,8 +14,12 @@ data class FeedItem(
     val createdAt: String?,
     val source: String?,
     val ipLocation: String?,
+    /** 微博发布时附带的 POI 地点，不同于用户 IP 属地。 */
+    val locationName: String? = null,
     val text: String,
     val isLongText: Boolean = false,
+    /** 仅用于详情页自动尝试全文接口；不决定是否展示「阅读全文」。 */
+    val requiresLongTextFetch: Boolean = false,
     val emoticons: Map<String, String> = emptyMap(),
     val repostsCount: String,
     val commentsCount: String,

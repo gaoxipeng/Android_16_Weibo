@@ -503,6 +503,12 @@ object WeiboJsonParser {
         if (text.isBlank()) {
             text = sourceForParse.trim()
         }
+        // `isLongText` 偶尔只代表微博客户端会追加「大家都在搜」「超话」等
+        // 导流模块。它们不是博主正文；若长文接口没有带来实际的新正文，直接收起
+        // 「阅读全文」，也不要把这些模块混入微博内容。
+        if (isClientSupplementOnlyLongText(item.text, text)) {
+            return item.copy(isLongText = false, requiresLongTextFetch = false)
+        }
         val emoticonSources = buildList {
             contentHtml.takeIf { it.isNotBlank() }?.let(::add)
             contentRaw.takeIf { it.isNotBlank() }?.let(::add)
@@ -516,6 +522,7 @@ object WeiboJsonParser {
             if (!hasMoreImages) return item
             return item.copy(
                 isLongText = false,
+                requiresLongTextFetch = false,
                 emoticons = mergedEmoticons,
                 images = mergedImages,
                 inlineImageLinks = mergedInlineImageLinks,
@@ -524,6 +531,7 @@ object WeiboJsonParser {
         }
         return item.copy(
             isLongText = false,
+            requiresLongTextFetch = false,
             text = text,
             emoticons = mergedEmoticons,
             images = mergedImages,
@@ -1091,7 +1099,11 @@ object WeiboJsonParser {
             ?: htmlText
         val isLongTextPreview = status.isLongTextPreview()
         val displayText = if (isLongTextPreview) stripLongTextPreviewLabel(rawText) else rawText
-        val isLongText = status.shouldShowLongTextExpand(rawText, displayText)
+        val isLongText = status.shouldShowLongTextExpand(
+            rawText = rawText,
+            displayText = displayText,
+            hasAttachedVideo = medias.isNotEmpty() || status.hasVideoOrLivePageInfo(),
+        )
         val inlineImageLinks = parseInlineImageLinks(status, displayText)
         val urlEntities = parseUrlEntities(status, displayText, inlineImageLinks.keys)
 
@@ -1123,8 +1135,11 @@ object WeiboJsonParser {
             createdAt = status.optNullableString("created_at"),
             source = plainText(status.optNullableString("source") ?: ""),
             ipLocation = parseIpLocation(status),
+            locationName = parseStatusLocation(status),
             text = parseStatusText(status, displayText, images, resolvedMedias, inlineImageLinks, urlEntities),
             isLongText = isLongText,
+            requiresLongTextFetch = status.hasLongTextFlag() ||
+                hasTextTruncationSignals(rawText, displayText),
             emoticons = extractEmoticonsFromHtml(htmlText),
             repostsCount = formatCount(status.opt("reposts_count")),
             commentsCount = formatCount(status.opt("comments_count")),
@@ -1661,6 +1676,34 @@ object WeiboJsonParser {
             ?.trim()
     }
 
+    private fun parseStatusLocation(status: JSONObject): String? {
+        val annotations = status.optJSONArray("annotations")
+        for (index in 0 until (annotations?.length() ?: 0)) {
+            val annotation = annotations?.optJSONObject(index) ?: continue
+            val place = annotation.optJSONObject("place") ?: annotation.optJSONObject("poi")
+            val title = place?.optNullableString("title")
+                ?: place?.optNullableString("name")
+                ?: annotation.optNullableString("title")
+            if (!title.isNullOrBlank()) return plainText(title)
+        }
+
+        val urls = status.optJSONArray("url_struct")
+        for (index in 0 until (urls?.length() ?: 0)) {
+            val entry = urls?.optJSONObject(index) ?: continue
+            val type = entry.optNullableString("object_type")?.lowercase().orEmpty()
+            if (type !in setOf("place", "poi", "location")) continue
+            val title = entry.optNullableString("url_title") ?: entry.optNullableString("title")
+            if (!title.isNullOrBlank()) return plainText(title)
+        }
+
+        val pageInfo = status.optJSONObject("page_info") ?: return null
+        val type = pageInfo.optNullableString("type")?.lowercase().orEmpty()
+        if (type !in setOf("place", "poi", "location")) return null
+        return pageInfo.optNullableString("page_title")
+            ?: pageInfo.optNullableString("title")
+            ?: pageInfo.optJSONObject("poi")?.optNullableString("title")
+    }
+
     private fun statusId(status: JSONObject): String =
         status.optNullableString("idstr")
             ?: status.optNullableString("mid")
@@ -1874,13 +1917,32 @@ object WeiboJsonParser {
     }
 
     private fun JSONObject.isLongTextPreview(): Boolean =
-        optBoolean("isLongText") && !(has("longText") && !isNull("longText"))
+        hasLongTextFlag() && !(has("longText") && !isNull("longText"))
 
-    private fun JSONObject.shouldShowLongTextExpand(rawText: String, displayText: String): Boolean {
+    private fun JSONObject.hasLongTextFlag(): Boolean =
+        optTruthy("isLongText") || optTruthy("is_long_text")
+
+    private fun JSONObject.shouldShowLongTextExpand(
+        rawText: String,
+        displayText: String,
+        hasAttachedVideo: Boolean,
+    ): Boolean {
         if (!isLongTextPreview()) return false
+        // `isLongText` 也会用于超话、热搜等客户端附加卡片。只有正文确实带有
+        // 截断迹象，或落在微博常见的预览长度时才展示「阅读全文」。部分接口会移除
+        // 预览末尾的“展开”标签，但仍保留约 140 字的截断正文。
+        val hasTextTruncation = hasTextTruncationSignals(rawText, displayText)
+        if (!hasTextTruncation && hasAttachedVideo && isShortMediaCaption(displayText)) return false
+        if (!hasTextTruncation && !isLikelyTruncatedLongTextPreview(displayText)
+        ) return false
         // 接口对「超过 9 张图」也会设 isLongText，但短配文已完整；仅在这种场景隐藏按钮。
         return !isLongTextExpandForExtraImagesOnly(rawText, displayText)
     }
+
+    private fun JSONObject.hasVideoOrLivePageInfo(): Boolean =
+        optJSONObject("page_info")
+            ?.optNullableString("type")
+            ?.lowercase() in setOf("video", "live")
 
     private fun JSONObject.isLongTextExpandForExtraImagesOnly(
         rawText: String,
@@ -1888,8 +1950,8 @@ object WeiboJsonParser {
     ): Boolean {
         if (resolvePicCount() <= 9) return false
         if (hasTextTruncationSignals(rawText, displayText)) return false
-        // 长文预览通常接近 140 字；明显更短的配文视为已完整。
-        return plainText(displayText).length < 100
+        // 超过九图时接口也会设置 isLongText；没有正文截断证据即表示配文已完整。
+        return true
     }
 
     private fun JSONObject.resolvePicCount(): Int {
@@ -1904,6 +1966,40 @@ object WeiboJsonParser {
         val plain = plainText(displayText).trimEnd()
         return plain.endsWith("...") || plain.endsWith("…") || plain.endsWith("⋯")
     }
+
+    private fun isLikelyTruncatedLongTextPreview(text: String): Boolean {
+        val length = plainText(text).replace(Regex("""\s+"""), "").length
+        return length in 120..170
+    }
+
+    private fun isShortMediaCaption(text: String): Boolean =
+        plainText(text).replace(Regex("""\s+"""), "").length < 120
+
+    private fun isClientSupplementOnlyLongText(preview: String, expanded: String): Boolean {
+        val normalizedPreview = normalizeLongTextForComparison(preview)
+        val normalizedExpanded = normalizeLongTextForComparison(expanded)
+        if (normalizedExpanded.isBlank() || normalizedExpanded == normalizedPreview) return true
+        if (!normalizedExpanded.startsWith(normalizedPreview)) return false
+        val appended = normalizedExpanded.removePrefix(normalizedPreview)
+        return appended.isNotBlank() &&
+            CLIENT_SUPPLEMENT_MARKERS.any { appended.contains(it) } &&
+            CLIENT_SUPPLEMENT_MARKERS.fold(appended) { remaining, marker ->
+                remaining.replace(marker, "")
+            }.trim().isBlank()
+    }
+
+    private fun normalizeLongTextForComparison(text: String): String =
+        plainText(stripLongTextPreviewLabel(text))
+            .replace(Regex("""\s+"""), "")
+            .trim()
+
+    private val CLIENT_SUPPLEMENT_MARKERS = listOf(
+        "大家都在搜",
+        "微博热搜",
+        "超话社区",
+        "微博超话",
+        "超话",
+    )
 
     private fun containsLongTextExpandMarker(text: String): Boolean =
         LONG_TEXT_EXPAND_MARKER.containsMatchIn(text)

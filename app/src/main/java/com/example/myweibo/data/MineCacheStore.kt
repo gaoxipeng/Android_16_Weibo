@@ -133,8 +133,10 @@ class MineCacheStore(context: Context) {
             .put("created_at", createdAt)
             .put("source", source)
             .put("ip_location", ipLocation)
+            .put("location_name", locationName)
             .put("text", text)
             .put("is_long_text", isLongText)
+            .put("requires_long_text_fetch", requiresLongTextFetch)
             .put("emoticons", JSONObject(emoticons))
             .put("reposts_count", repostsCount)
             .put("comments_count", commentsCount)
@@ -166,8 +168,10 @@ class MineCacheStore(context: Context) {
             createdAt = optNullableString("created_at"),
             source = optNullableString("source"),
             ipLocation = optNullableString("ip_location"),
+            locationName = optNullableString("location_name"),
             text = optString("text"),
             isLongText = optBoolean("is_long_text"),
+            requiresLongTextFetch = optBoolean("requires_long_text_fetch"),
             emoticons = optJSONObject("emoticons").toStringMap(),
             repostsCount = optString("reposts_count", "0"),
             commentsCount = optString("comments_count", "0"),

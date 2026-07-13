@@ -97,8 +97,12 @@ app/src/main/java/com/example/myweibo/
 
 ## 20260713 更新摘要
 
-- 版本号改为日期格式 `20260713`（versionCode 14）
+- 版本号改为日期格式 `20260713`（versionCode 17）
 - 设置页「关于」同步显示新版本号
+- 修复误显示「阅读全文」：忽略超话、大家都在搜等官方附加模块触发的 `isLongText`
+- 区分「阅读全文」按钮与详情页静默全文拉取（`requiresLongTextFetch`）
+- 展示微博发布 POI 地点（与 IP 属地分开）
+- 播放视频时进入其他微博详情会暂停；浮窗预览时进入其他详情继续播放
 
 ## v1.6 更新摘要
 - 重构导航为统一 overlay 栈：跳转 push、返回 pop，栈顶可见可交互，下层 keepAlive 隐藏
