@@ -2,7 +2,6 @@ package com.example.myweibo.data
 
 object WeiboEndpoints {
     const val CONFIG = "/ajax/config"
-    const val FOR_YOU = "/ajax/feed/unreadfriendstimeline"
     const val FOLLOWING = "/ajax/feed/friendstimeline"
     const val GROUP_TIMELINE = "/ajax/feed/groupstimeline"
     const val STATUS_COMMENTS = "/ajax/statuses/buildComments"
@@ -26,7 +25,6 @@ object WeiboEndpoints {
 
     fun timelinePath(kind: TimelineKind): String =
         when (kind) {
-            TimelineKind.ForYou -> FOR_YOU
             TimelineKind.Following -> FOLLOWING
             TimelineKind.FriendsCircle -> GROUP_TIMELINE
         }

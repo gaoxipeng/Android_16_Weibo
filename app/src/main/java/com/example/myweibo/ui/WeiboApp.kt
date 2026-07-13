@@ -971,8 +971,6 @@ private fun commentFailureMessage(error: Throwable): String {
     }
 }
 
-private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float =
-    start + (stop - start) * fraction
 
 private val HintCapsuleWhite = Color.White
 private val HintCapsuleText = Color(0xFF1F1F1F)
@@ -6904,6 +6902,7 @@ private fun FollowFeedScreen(
 
         LazyColumn(
             state = listState,
+            flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
@@ -6979,130 +6978,6 @@ private fun FollowFeedScreen(
         modifier = Modifier.fillMaxSize(),
         content = feedContent,
     )
-}
-
-/** Groups reusable lazy-list slots by card structure to reduce composition work during flings. */
-private fun FeedItem.feedCardContentType(): Int {
-    val mediaBucket = when {
-        medias.isNotEmpty() -> 10
-        images.isEmpty() -> 0
-        images.size == 1 -> 1
-        images.size <= 4 -> 2
-        else -> 3
-    }
-    return mediaBucket + if (retweetedStatus != null) 20 else 0
-}
-
-@Composable
-private fun FeedScreen(
-    session: WeiboWebSession,
-    kind: TimelineKind,
-    items: List<FeedItem>,
-    isLoading: Boolean,
-    message: NativeUiMessage?,
-    onKindChange: (TimelineKind) -> Unit,
-    onRefresh: () -> Unit,
-    onLoadMore: () -> Unit,
-    onItemClick: (FeedItem) -> Unit,
-    onMediaClick: (FeedMedia, String) -> Unit,
-) {
-    LazyColumn(
-        flingBehavior = rememberWeiboListFlingBehavior(),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(bottom = 24.dp),
-    ) {
-        item {
-            FeedHeader(
-                kind = kind,
-                isLoading = isLoading,
-                message = message,
-                onKindChange = onKindChange,
-                onRefresh = onRefresh,
-            )
-        }
-
-        if (items.isEmpty() && !isLoading) {
-            item {
-                EmptyState(
-                    title = "等待微博数据",
-                    body = "\u5148\u5230\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u5B8C\u6210\u767B\u5F55\uFF0C\u518D\u56DE\u5230\u9996\u9875\u5237\u65B0\u3002\u6570\u636E\u6E90\u4F7F\u7528 weibo.com/ajax/*\uFF0C\u548C example \u7684\u6D4F\u89C8\u5668\u6269\u5C55\u8DEF\u7EBF\u4E00\u81F4\u3002",
-                    actionLabel = "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
-                    onAction = { session.openLogin() },
-                )
-            }
-        }
-
-        items(items, key = { it.id }, contentType = { it.feedCardContentType() }) { item ->
-            FeedCard(
-                item = item,
-                onClick = { onItemClick(item) },
-                onMediaClick = onMediaClick,
-                emoticonMap = mapOf(),
-            )
-        }
-
-        item {
-            Box(
-                modifier = Modifier.fillMaxWidth().padding(20.dp),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (isLoading) {
-                    CircularProgressIndicator()
-                } else if (items.isNotEmpty()) {
-                    Button(onClick = onLoadMore) { Text("加载更多") }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun FeedHeader(
-    kind: TimelineKind,
-    isLoading: Boolean,
-    message: NativeUiMessage?,
-    onKindChange: (TimelineKind) -> Unit,
-    onRefresh: () -> Unit,
-) {
-    Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text(
-            text = "重新排版微博",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            text = "\u4F7F\u7528\u5FAE\u535A\u7F51\u9875\u767B\u5F55\u6001\u8BFB\u53D6\u63A5\u53E3\uFF0C\u539F\u751F Material 3 \u5448\u73B0\u4FE1\u606F\u6D41\u3001\u5A92\u4F53\u548C\u8BC4\u8BBA\u3002",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            TimelineKind.entries.forEach { option ->
-                FilterChip(
-                    selected = kind == option,
-                    onClick = { onKindChange(option) },
-                    label = { Text(option.label) },
-                )
-            }
-        }
-        if (message != null) {
-            Surface(
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                shape = RoundedCornerShape(8.dp),
-            ) {
-                Column(Modifier.padding(12.dp)) {
-                    Text(message.title, fontWeight = FontWeight.SemiBold)
-                    Text(message.detail, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-        if (!isLoading) {
-            TextButton(onClick = onRefresh) { Text("\u4ECE\u5FAE\u535A\u540C\u6B65\u6700\u65B0\u5185\u5BB9") }
-        }
-    }
 }
 
 private fun resolveEmoticonMap(
@@ -8166,17 +8041,6 @@ private fun singleImageFeedLayout(
         aspectRatio = aspectRatio,
         widthFraction = widthFraction,
     )
-}
-
-private fun singleImageDisplayAspectRatio(
-    width: Int,
-    height: Int,
-    maxHeightToWidth: Float = SingleImageMaxHeightToWidth,
-): Float {
-    if (width <= 0 || height <= 0) return 1f
-    val naturalAspect = width.toFloat() / height
-    val minAspectFromHeightCap = 1f / maxHeightToWidth
-    return naturalAspect.coerceIn(minAspectFromHeightCap, 3f)
 }
 
 private fun feedVideoFeedLayout(
@@ -13751,6 +13615,7 @@ private fun DetailScreen(
             )
             LazyColumn(
                 state = listState,
+                flingBehavior = rememberWeiboListFlingBehavior(),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth(),
@@ -15104,11 +14969,6 @@ private fun calculateVisibilityMenuOffsetPx(
     return ActionMenuPlacement(IntOffset(x.roundToInt(), y.roundToInt()), belowAnchor)
 }
 
-private fun actionMenuHeightForRowCount(rowCount: Int): Dp {
-    val gaps = (rowCount - 1).coerceAtLeast(0)
-    return ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * rowCount + ActionMenuItemGap * gaps
-}
-
 private fun FeedItem.hasNoLikes(): Boolean {
     val value = likesCount.trim()
     return value == "0" || value == "--" || value.equals("null", ignoreCase = true) || value.isEmpty()
@@ -15484,6 +15344,7 @@ private fun MentionSuggestionPanel(
 
     if (vertical) {
         LazyColumn(
+            flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = panelModifier.heightIn(max = 196.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
@@ -17030,6 +16891,7 @@ private fun SearchScreen(
                 Box(Modifier.fillMaxSize()) {
                     LazyColumn(
                         state = listState,
+                        flingBehavior = rememberWeiboListFlingBehavior(),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             top = when {
@@ -17527,40 +17389,6 @@ private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
 }
 
 @Composable
-private fun PlaceholderScreen(
-    title: String,
-    body: String,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            text = body,
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceContainerHighest,
-            shape = RoundedCornerShape(8.dp),
-        ) {
-            Text(
-                text = "\u8FD9\u662F\u9996\u7248\u5360\u4F4D\u9875\uFF0C\u5DF2\u7ECF\u63A5\u5165\u5E95\u90E8\u5BFC\u822A\u548C\u8FD4\u56DE\u6808\u3002",
-                modifier = Modifier.padding(14.dp),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
-    }
-}
-
-@Composable
 private fun MineScreen(
     session: WeiboWebSession,
     profile: UserProfile?,
@@ -18022,6 +17850,7 @@ private fun MineScreen(
                         MineContentTab.Posts -> {
                             LazyColumn(
                                 state = postsListState,
+                                flingBehavior = rememberWeiboListFlingBehavior(),
                                 modifier = Modifier.fillMaxSize(),
                                 contentPadding = PaddingValues(bottom = 96.dp),
                             ) {
@@ -18083,6 +17912,7 @@ private fun MineScreen(
                             Box(modifier = Modifier.fillMaxSize()) {
                                 LazyColumn(
                                     state = albumListState,
+                                    flingBehavior = rememberWeiboListFlingBehavior(),
                                     modifier = Modifier.fillMaxSize(),
                                     contentPadding = PaddingValues(bottom = 96.dp),
                                 ) {
@@ -18275,6 +18105,7 @@ private fun SettingsScreen(
             SettingsHelpContent()
         } else {
             LazyColumn(
+                flingBehavior = rememberWeiboListFlingBehavior(),
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
                     start = 16.dp,
@@ -18586,6 +18417,7 @@ private fun SettingsAboutCard(versionName: String) {
 @Composable
 private fun SettingsHelpContent() {
     LazyColumn(
+        flingBehavior = rememberWeiboListFlingBehavior(),
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             start = 16.dp,
@@ -19756,88 +19588,6 @@ private fun SettingsEmoticonTile(
 }
 
 @Composable
-private fun SettingsActionCard(
-    title: String,
-    subtitle: String,
-    status: String,
-    actionLabel: String,
-    loading: Boolean = false,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    ElevatedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled, onClick = onClick),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
-        ),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(5.dp),
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Surface(
-                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Text(
-                            text = status,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            maxLines = 1,
-                        )
-                    }
-                }
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (loading) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(22.dp),
-                    strokeWidth = 2.dp,
-                )
-            } else {
-                Text(
-                    text = actionLabel,
-                    style = MaterialTheme.typography.labelLarge,
-                    color = if (enabled) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun ProfileCoverBanner(
     coverUrls: List<String>,
     modifier: Modifier = Modifier,
@@ -20494,6 +20244,7 @@ private fun FollowListTabPage(
     ) {
         LazyColumn(
             state = listState,
+            flingBehavior = rememberWeiboListFlingBehavior(),
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(bottom = 24.dp),
         ) {
@@ -21464,119 +21215,6 @@ private fun albumDateLabel(createdAt: String?): Pair<String, String> {
 }
 
 @Composable
-private fun MineStatsRow(profile: UserProfile?) {
-    ElevatedCard(
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.elevatedCardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
-        ),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-        ) {
-            MineStatItem(value = profile?.followersCount ?: "--", label = "\u7C89\u4E1D")
-            MineStatItem(value = profile?.followingCount ?: "--", label = "\u5173\u6CE8")
-            MineStatItem(value = profile?.statusesCount ?: "--", label = "\u5FAE\u535A")
-            MineStatItem(value = profile?.photosCount ?: "--", label = "\u76F8\u518C")
-        }
-    }
-}
-
-@Composable
-private fun MineStatItem(value: String, label: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            text = value,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-@Composable
-private fun MineShortcutGrid() {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = "\u5185\u5BB9",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            MineShortcut("\u5168\u90E8\u5FAE\u535A", "\u65F6\u95F4\u7EBF")
-            MineShortcut("\u76F8\u518C", "\u56FE\u7247\u4E0E LivePhoto")
-            MineShortcut("\u89C6\u9891", "\u5FAE\u535A\u89C6\u9891")
-            MineShortcut("\u8D5E\u8FC7", "\u559C\u6B22\u5185\u5BB9")
-            MineShortcut("\u6536\u85CF", "\u7A0D\u540E\u9605\u8BFB")
-            MineShortcut("\u8BC4\u8BBA", "\u4E92\u52A8\u8BB0\u5F55")
-        }
-    }
-}
-
-@Composable
-private fun MineShortcut(title: String, subtitle: String) {
-    Surface(
-        modifier = Modifier.width(156.dp),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-    ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                subtitle,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-    }
-}
-
-@Composable
-private fun MineInfoPanel(profile: UserProfile?, hasLoginCookie: Boolean) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-    ) {
-        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("\u8D26\u6237\u4FE1\u606F", fontWeight = FontWeight.SemiBold)
-            MineInfoLine("\u767B\u5F55\u72B6\u6001", if (hasLoginCookie) "\u5DF2\u767B\u5F55" else "\u672A\u767B\u5F55")
-            MineInfoLine("\u5730\u533A", profile?.location?.takeIf { it.isNotBlank() } ?: "--")
-        }
-    }
-}
-
-@Composable
-private fun MineInfoLine(label: String, value: String) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = label,
-            modifier = Modifier.width(82.dp),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            text = value,
-            modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodySmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-}
-
-@Composable
 private fun AccountLoginPanel(
     session: WeiboWebSession,
     autoReturnToFeedOnLogin: Boolean = false,
@@ -21622,39 +21260,6 @@ private fun AccountLoginPanel(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
-        )
-    }
-}
-
-@Composable
-private fun AccountScreen(session: WeiboWebSession) {
-    var loginReloadKey by remember { mutableIntStateOf(0) }
-
-    Column(Modifier.fillMaxSize()) {
-        Surface(
-            color = MaterialTheme.colorScheme.secondaryContainer,
-            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-        ) {
-            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("微博网页会话", fontWeight = FontWeight.SemiBold)
-                Text(
-                    "\u8FD9\u91CC\u4F7F\u7528\u684C\u9762 Chrome \u6807\u8BC6\u6253\u5F00 passport.weibo.cn\u3002\u767B\u5F55\u6210\u529F\u540E\u56DE\u5230\u5FAE\u535A\u9996\u9875\uFF0C\u518D\u5230\u9996\u9875\u5237\u65B0\u3002",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(onClick = { session.openWeiboHome() }) {
-                        Text("\u5B8C\u6210\u767B\u5F55\uFF0C\u56DE\u5230\u5FAE\u535A\u9996\u9875")
-                    }
-                    TextButton(onClick = { loginReloadKey += 1 }) {
-                        Text("\u91CD\u65B0\u6253\u5F00")
-                    }
-                }
-            }
-        }
-        AccountLoginWebView(
-            session = session,
-            reloadKey = loginReloadKey,
-            modifier = Modifier.fillMaxWidth().weight(1f),
         )
     }
 }

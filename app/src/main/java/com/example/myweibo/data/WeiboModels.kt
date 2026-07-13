@@ -279,7 +279,6 @@ data class UserProfile(
 }
 
 enum class TimelineKind(val label: String) {
-    ForYou("\u63A8\u8350"),
     Following("\u6700\u65B0\u5FAE\u535A"),
     FriendsCircle("\u597D\u53CB\u5708"),
 }

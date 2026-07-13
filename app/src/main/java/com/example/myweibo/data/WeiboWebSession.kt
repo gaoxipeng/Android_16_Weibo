@@ -354,10 +354,6 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
         val params = when (kind) {
-            TimelineKind.ForYou -> linkedMapOf(
-                if (cursor == null) "since_id" to "0" else "max_id" to cursor,
-            )
-
             TimelineKind.Following -> linkedMapOf(
                 "list_id" to "110001768015440",
                 "refresh" to "4",
