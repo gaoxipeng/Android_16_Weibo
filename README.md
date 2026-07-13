@@ -4,8 +4,13 @@
 
 基于 Jetpack Compose 的第三方微博客户端，通过 WebView 登录态 + 微博 PC 端 `ajax` 接口读取数据，原生渲染信息流、详情、搜索与个人主页。
 
-## 技术栈
+**当前版本：20260713**（需 Android 16+）
 
+## 下载
+
+[GitHub Releases](https://github.com/gaoxipeng/Android_16_Weibo/releases/latest) 下载 `app-release.apk` 安装即可。
+
+## 技术栈
 - **UI**：Jetpack Compose + Material 3
 - **网络**：隐藏 WebView 维持 Cookie，`HttpURLConnection` 调用 `weibo.com/ajax/*`
 - **媒体**：Coil 风格自研 `RemoteImage`、Media3 ExoPlayer（HLS/DASH）
@@ -88,9 +93,14 @@ app/src/main/java/com/example/myweibo/
 - **搜索联想**：输入关键词时，搜索框上方会显示毛玻璃联想词面板
 - **浮窗**：右上角可全屏；竖屏全屏时可切换横屏/竖屏；底部胶囊进度条可拖动，倍速显示为 `1×`，控件约 2 秒后自动隐藏；上下滑优先关闭
 - **底部栏**：上滑列表时自动收起到小胶囊，单击展开，长按拖动快速切 Tab；文字大小不受系统字体缩放影响
+- **图片清晰度**：设置中省流 / 标准 / 高清三档，影响信息流缩略图规格与解码尺寸；全屏看图仍会尽量加载高清图
+
+## 20260713 更新摘要
+
+- 版本号改为日期格式 `20260713`（versionCode 14）
+- 设置页「关于」同步显示新版本号
 
 ## v1.6 更新摘要
-
 - 重构导航为统一 overlay 栈：跳转 push、返回 pop，栈顶可见可交互，下层 keepAlive 隐藏
 - 设置新增浅色 / 深色 / 跟随系统三档外观模式，默认主题色改为钴蓝
 - 深色模式适配用户主页、搜索历史、发微博、设置页、粉丝关注列表等界面
