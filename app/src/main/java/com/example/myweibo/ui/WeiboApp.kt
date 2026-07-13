@@ -3911,17 +3911,32 @@ fun WeiboApp() {
     }
 
     fun prepareInlineVideoHandoffForDetail(item: FeedItem, hostItem: FeedItem? = null) {
-        if (videoPlaybackCoordinator.peekPlaybackKey != null) return
-        val activeKey = videoPlaybackCoordinator.activeKey ?: return
         val candidateKeys = buildSet {
             addAll(feedItemInlinePlaybackKeys(item))
             hostItem?.let { addAll(feedItemInlinePlaybackKeys(it)) }
         }
-        val shouldHandoff = candidateKeys.any { candidate ->
-            videoPlaybackCoordinator.matchesPlaybackKey(activeKey, candidate)
+        val activeKey = videoPlaybackCoordinator.activeKey
+        if (activeKey != null) {
+            val shouldHandoff = candidateKeys.any { candidate ->
+                videoPlaybackCoordinator.matchesPlaybackKey(activeKey, candidate)
+            }
+            if (shouldHandoff) {
+                videoPlaybackCoordinator.beginDetailHandoff(activeKey)
+            } else {
+                videoPlaybackCoordinator.pauseInlineOnly()
+                videoPlaybackCoordinator.activeKey = null
+            }
+            return
         }
-        if (shouldHandoff) {
-            videoPlaybackCoordinator.beginDetailHandoff(activeKey)
+        val peekKey = videoPlaybackCoordinator.peekPlaybackKey ?: return
+        val peekMatchesTarget = candidateKeys.any { candidate ->
+            videoPlaybackCoordinator.matchesPlaybackKey(peekKey, candidate)
+        }
+        if (!peekMatchesTarget) {
+            videoPlaybackCoordinator.pausePeek()
+            if (videoPeekController.activeRequest != null) {
+                videoPeekController.cancel()
+            }
         }
     }
 
@@ -5378,7 +5393,6 @@ fun WeiboApp() {
             videoPeekController.isFloating &&
             !videoPeekController.isFullscreenMode &&
             videoPeekController.pendingDismiss == null
-        val detailVideoHandoffKey = videoPlaybackCoordinator.pendingPeekHandoffKey
         val profileInlinePlaybackActive = visitedUserId != null &&
             selectedItem == null &&
             albumViewerState == null &&
@@ -5406,7 +5420,11 @@ fun WeiboApp() {
                     videoPlaybackCoordinator.activeKey = null
                 }
                 selectedItem != null -> {
-                    val preserveKey = detailVideoHandoffKey ?: videoPlaybackCoordinator.activeKey
+                    val preserveKey = if (videoPlaybackCoordinator.detailHandoffActive) {
+                        videoPlaybackCoordinator.pendingPeekHandoffKey
+                    } else {
+                        null
+                    }
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
                     videoPlaybackCoordinator.activeKey = preserveKey
                 }
