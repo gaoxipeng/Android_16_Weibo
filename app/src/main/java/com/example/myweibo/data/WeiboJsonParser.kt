@@ -2340,11 +2340,16 @@ object WeiboJsonParser {
         // 截断迹象，或落在微博常见的预览长度时才展示「阅读全文」。部分接口会移除
         // 预览末尾的“展开”标签，但仍保留约 140 字的截断正文。
         val hasTextTruncation = hasTextTruncationSignals(rawText, displayText)
-        if (!hasTextTruncation && hasAttachedVideo && isShortMediaCaption(displayText)) return false
-        if (!hasTextTruncation && !isLikelyTruncatedLongTextPreview(displayText)
-        ) return false
-        // 接口对「超过 9 张图」也会设 isLongText，但短配文已完整；仅在这种场景隐藏按钮。
-        return !isLongTextExpandForExtraImagesOnly(rawText, displayText)
+        if (hasTextTruncation) return true
+        // 超过 9 张图且无截断、无视频混排时，接口也可能设 isLongText，配文其实已完整。
+        if (isLongTextExpandForExtraImagesOnly(rawText, displayText)) return false
+        // 视频/直播 + 短配文无截断：常见「大家都在搜」误标。
+        // 长文 + 图/视频混排的配文不短，此时 isLongText 应信任。
+        if (hasAttachedVideo) {
+            return !isShortMediaCaption(displayText)
+        }
+        // 无媒体时：仅在常见截断长度区间展示，避免超话等附加模块误标。
+        return isLikelyTruncatedLongTextPreview(displayText)
     }
 
     private fun JSONObject.hasVideoOrLivePageInfo(): Boolean {
@@ -2362,6 +2367,10 @@ object WeiboJsonParser {
     ): Boolean {
         if (resolvePicCount() <= 9) return false
         if (hasTextTruncationSignals(rawText, displayText)) return false
+        // 图文混排多个视频时 pic_num 会虚高；不能按「纯九图以上」误藏阅读全文。
+        if (hasVideoOrLivePageInfo() || hasMixMediaVideo(this) || optJSONObject("mix_media_info") != null) {
+            return false
+        }
         // 超过九图时接口也会设置 isLongText；没有正文截断证据即表示配文已完整。
         return true
     }

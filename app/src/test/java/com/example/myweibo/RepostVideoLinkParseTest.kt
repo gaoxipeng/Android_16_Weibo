@@ -191,6 +191,92 @@ class RepostVideoLinkParseTest {
         assertEquals(1, countOccurrences(item.text, token))
     }
 
+    @Test
+    fun longTextWithMixMediaShowsReadFullButton() {
+        val preview = "甲".repeat(200)
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "5720474518001",
+                  "mblogid": "R8mcLDMhx",
+                  "isLongText": true,
+                  "created_at": "Tue Jul 14 08:00:00 +0800 2026",
+                  "text_raw": "$preview",
+                  "text": "$preview",
+                  "pic_num": 12,
+                  "pic_ids": [],
+                  "reposts_count": 1,
+                  "comments_count": 1,
+                  "attitudes_count": 1,
+                  "user": { "idstr": "5720474518", "screen_name": "测试用户" },
+                  "mix_media_info": {
+                    "items": [
+                      {
+                        "type": "video",
+                        "data": {
+                          "media_info": {
+                            "mp4_hd_url": "https://example.com/v1.mp4",
+                            "duration": 12
+                          }
+                        }
+                      },
+                      {
+                        "type": "video",
+                        "data": {
+                          "media_info": {
+                            "mp4_hd_url": "https://example.com/v2.mp4",
+                            "duration": 20
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
+    @Test
+    fun shortVideoCaptionDoesNotShowReadFullButton() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "9001",
+                  "mblogid": "shortVid",
+                  "isLongText": true,
+                  "created_at": "Tue Jul 14 08:00:00 +0800 2026",
+                  "text_raw": "今日播报",
+                  "text": "今日播报",
+                  "reposts_count": 1,
+                  "comments_count": 1,
+                  "attitudes_count": 1,
+                  "user": { "idstr": "1", "screen_name": "媒体" },
+                  "page_info": {
+                    "type": "video",
+                    "object_type": "video",
+                    "page_title": "媒体的微博视频",
+                    "media_info": {
+                      "mp4_hd_url": "https://example.com/a.mp4",
+                      "duration": 60
+                    }
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertFalse(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0
