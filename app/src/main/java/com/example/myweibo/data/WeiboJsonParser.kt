@@ -343,14 +343,19 @@ object WeiboJsonParser {
     }
 
     /** 已有内嵌视频/直播卡片时，正文不应再把对应媒体短链渲染成普通链接。 */
+    private fun isVideoProgressTimestampTitle(title: String): Boolean =
+        title.trim().matches(Regex("""^\d{1,2}:\d{2}(?::\d{2})?$"""))
+
     private fun isAttachedMediaUrlStructEntity(entity: JSONObject): Boolean {
+        val title = entity.optNullableString("url_title")
+            ?: entity.optNullableString("title")
+            ?: ""
+        // 「10:29」这类进度锚点也常带 object_type=video / video.weibo.com，但不能当附属卡片剥掉。
+        if (isVideoProgressTimestampTitle(title)) return false
         val objectType = entity.optNullableString("object_type")?.lowercase().orEmpty()
         if (objectType in setOf("video", "live", "story", "movie", "audio", "gif")) {
             return true
         }
-        val title = entity.optNullableString("url_title")
-            ?: entity.optNullableString("title")
-            ?: ""
         if (title.contains("微博视频") ||
             title.contains("微博直播") ||
             title.contains("微博故事") ||
@@ -375,6 +380,7 @@ object WeiboJsonParser {
     }
 
     private fun isAttachedMediaFeedUrlEntity(entity: FeedUrlEntity): Boolean {
+        if (isVideoProgressTimestampTitle(entity.title)) return false
         val title = entity.title
         if (title.contains("微博视频") ||
             title.contains("微博直播") ||
@@ -505,6 +511,12 @@ object WeiboJsonParser {
             if (picIds != null && picIds.length() > 0 && entity.optJSONObject("pic_infos") != null) {
                 continue
             }
+            val title = entity.optNullableString("url_title")
+                ?: entity.optNullableString("title")
+                ?: ""
+            if (isVideoProgressTimestampTitle(title)) continue
+            // 仅剥附属视频卡片类链接；进度锚点等已由 exclude / 上文跳过。
+            if (!isAttachedMediaUrlStructEntity(entity)) continue
             for (key in listOf("short_url", "long_url", "ori_url", "h5_target_url")) {
                 entity.optNullableString(key)
                     ?.takeIf { it.isNotBlank() && it !in excludeShortUrls && sourceText.contains(it) }
@@ -598,8 +610,10 @@ object WeiboJsonParser {
             ?: contentHtml
         if (!hasLongTextPayload(data)) return item
 
-        val sourceForParse = stripLongTextPreviewLabel(
-            contentRaw.takeIf { it.isNotBlank() } ?: contentHtml,
+        val sourceForParse = buildStatusDisplayText(
+            rawText = contentRaw.takeIf { it.isNotBlank() } ?: contentHtml,
+            htmlText = contentHtml,
+            isLongTextPreview = false,
         )
         val inlineImageLinks = parseInlineImageLinks(data, sourceForParse)
         val suppressAttachedMediaLinks = item.medias.isNotEmpty() ||
@@ -1231,7 +1245,11 @@ object WeiboJsonParser {
             ?: status.optNullableString("raw_text")
             ?: htmlText
         val isLongTextPreview = status.isLongTextPreview()
-        val displayText = if (isLongTextPreview) stripLongTextPreviewLabel(rawText) else rawText
+        val displayText = buildStatusDisplayText(
+            rawText = rawText,
+            htmlText = htmlText,
+            isLongTextPreview = isLongTextPreview,
+        )
 
         val retweeted = retweetedJson?.let { json ->
             val normalized = normalizeRetweetedStatus(status, json)
@@ -2462,12 +2480,88 @@ object WeiboJsonParser {
     private fun plainText(value: String): String =
         value
             .replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
+            // 表情在 HTML 里是 <img alt="[微笑]">；剥标签前先还原成 [微笑]，否则首页正文会丢表情。
+            .replace(HTML_EMOTICON_IMG_PATTERN) { match ->
+                match.groupValues[2]
+            }
             .replace(Regex("<[^>]+>"), "")
             .replace("&nbsp;", " ")
             .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .trim()
+
+    private val HTML_EMOTICON_IMG_PATTERN = Regex(
+        """<img\b[^>]*\balt\s*=\s*(["'])(\[[^\[\]]+\])\1[^>]*/?>""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * 用 HTML 正文里的锚点位置还原短链，避免 text_raw 把「▷10:29」等时间戳挤到段落末尾，
+     * 同时仍保留 t.cn 以便 url_struct 渲染成可点链接。
+     */
+    private fun buildStatusDisplayText(
+        rawText: String,
+        htmlText: String,
+        isLongTextPreview: Boolean,
+    ): String {
+        val preferredRaw = if (isLongTextPreview) stripLongTextPreviewLabel(rawText) else rawText
+        val fromHtml = plainText(expandHtmlAnchorsToShortUrls(htmlText))
+            .let { if (isLongTextPreview) stripLongTextPreviewLabel(it) else it }
+            .trim()
+        if (fromHtml.isBlank()) return preferredRaw
+        val htmlLinkCount = countTcShortLinks(fromHtml)
+        val rawLinkCount = countTcShortLinks(preferredRaw)
+        // HTML 若丢掉了 text_raw 里的短链（投票/网页链接常见无 data-url），必须回退，
+        // 否则「微博投票」会从可点链接变成纯文字甚至被后续剥链弄没。
+        return when {
+            rawLinkCount > htmlLinkCount -> preferredRaw
+            htmlLinkCount > 0 -> fromHtml
+            fromHtml.length >= preferredRaw.length * 0.6f -> fromHtml
+            else -> preferredRaw
+        }
+    }
+
+    private fun countTcShortLinks(text: String): Int =
+        Regex("""https?://t\.cn/\S+""").findAll(text).count()
+
+    private fun expandHtmlAnchorsToShortUrls(html: String): String {
+        if (html.isBlank() || !html.contains("<a", ignoreCase = true)) return html
+        return html.replace(
+            Regex(
+                """<a\b([^>]*)>(.*?)</a>""",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+            ),
+        ) { match ->
+            val attrs = match.groupValues[1]
+            val inner = match.groupValues[2]
+            val dataUrl = Regex(
+                """\bdata-url\s*=\s*["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE,
+            ).find(attrs)?.groupValues?.getOrNull(1)?.trim()
+            val href = Regex(
+                """\bhref\s*=\s*["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE,
+            ).find(attrs)?.groupValues?.getOrNull(1)?.trim()
+            val candidate = sequenceOf(dataUrl, href)
+                .firstOrNull { !it.isNullOrBlank() }
+                ?.let(::normalizeUrl)
+            when {
+                !candidate.isNullOrBlank() && looksLikeExpandableStatusLink(candidate) -> {
+                    " $candidate "
+                }
+                // 投票/网页等锚点若只有长链、无 data-url，保留文案，短链交给 text_raw 回退逻辑。
+                else -> inner
+            }
+        }
+    }
+
+    private fun looksLikeExpandableStatusLink(url: String): Boolean {
+        val lower = url.lowercase()
+        // 仅还原 t.cn 短链，保留话题/昵称等锚点可见文案（#话题#、@用户）。
+        // 若连 weibo.com 一起替换，首页会露出 s.weibo.com/weibo?q=%23... 这种脏链。
+        return lower.contains("t.cn/") || lower.startsWith("sinaweibo://")
+    }
 
     private fun normalizeUrl(url: String): String =
         when {

@@ -277,6 +277,153 @@ class RepostVideoLinkParseTest {
         assertTrue(item.requiresLongTextFetch)
     }
 
+    @Test
+    fun longTextMergeKeepsVideoProgressTimestamp() {
+        val seekUrl = "http://t.cn/seek1029"
+        val previewItem = com.example.myweibo.data.FeedItem(
+            id = "2955878834",
+            statusId = "R8yArhqxy",
+            authorId = "2955878834",
+            authorName = "影石刘靖康",
+            authorAvatarUrl = null,
+            createdAt = null,
+            source = null,
+            ipLocation = null,
+            text = "视频里的 $seekUrl @影石Insta360",
+            isLongText = true,
+            requiresLongTextFetch = true,
+            repostsCount = "0",
+            commentsCount = "0",
+            likesCount = "0",
+            images = emptyList(),
+            medias = listOf(
+                com.example.myweibo.data.FeedMedia(
+                    type = com.example.myweibo.data.MediaType.Video,
+                    title = "影石刘靖康的微博视频",
+                    coverUrl = null,
+                    streamUrl = "https://example.com/v.mp4",
+                ),
+            ),
+            urlEntities = listOf(
+                com.example.myweibo.data.FeedUrlEntity(
+                    shortUrl = seekUrl,
+                    title = "10:29",
+                    url = "https://video.weibo.com/show?fid=1034:1&t=629",
+                ),
+            ),
+        )
+        val longTextPayload = JSONObject(
+            """
+            {
+              "longTextContent": "视频里的<a data-url=\"$seekUrl\" href=\"https://video.weibo.com/show?fid=1034:1&t=629\">▷10:29</a> @影石Insta360 完整正文",
+              "longTextContent_raw": "视频里的完整正文被挤到后面 $seekUrl",
+              "url_struct": [
+                {
+                  "short_url": "$seekUrl",
+                  "url_title": "10:29",
+                  "url_type": 39,
+                  "object_type": "video",
+                  "h5_target_url": "https://video.weibo.com/show?fid=1034:1&t=629"
+                }
+              ]
+            }
+            """.trimIndent(),
+        )
+
+        val merged = WeiboJsonParser.mergeLongTextIntoFeedItem(previewItem, longTextPayload)
+        val seekLinks = merged.urlEntities.filter { it.title == "10:29" }
+        assertEquals(1, seekLinks.size)
+        assertTrue(merged.text.contains(seekUrl))
+        assertTrue(merged.text.indexOf(seekUrl) < merged.text.indexOf("@影石Insta360"))
+    }
+
+    @Test
+    fun htmlDisplayKeepsTopicAnchorText() {
+        val topic = "#杭州工之报一个不人知用享刺温人#"
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "topic1",
+                  "mblogid": "topicBlog",
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "【$topic】正文",
+                  "text": "【<a href=\"https://s.weibo.com/weibo?q=%23hangzhou%23\" data-hide=\"\">$topic</a>】正文",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "三联生活周刊" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.text.contains(topic))
+        assertFalse(item.text.contains("s.weibo.com/weibo"))
+        assertFalse(item.text.contains("%23"))
+    }
+
+    @Test
+    fun htmlDisplayKeepsEmoticonPhrases() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "emo1",
+                  "mblogid": "emoBlog",
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "你好[微笑]",
+                  "text": "你好<img alt=\"[微笑]\" src=\"https://face.t.sinajs.cn/t4/appstyle/expression/ext/normal/e3/2018new_weixiao_org.png\" style=\"width:1em; height:1em;\" />世界",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.text.contains("[微笑]"))
+        assertTrue(item.emoticons.containsKey("[微笑]"))
+    }
+
+    @Test
+    fun prefersRawWhenHtmlDropsVoteShortLink() {
+        val voteUrl = "http://t.cn/voteLink"
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "vote1",
+                  "mblogid": "voteBlog",
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "来投票 $voteUrl",
+                  "text": "来投票 <a href=\"https://vote.weibo.com/h5/index/index?vote_id=1\">微博投票</a>",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试" },
+                  "url_struct": [
+                    {
+                      "short_url": "$voteUrl",
+                      "url_title": "微博投票",
+                      "url_type": 39,
+                      "object_type": "webpage",
+                      "h5_target_url": "https://vote.weibo.com/h5/index/index?vote_id=1"
+                    }
+                  ]
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.text.contains(voteUrl))
+        assertTrue(item.urlEntities.any { it.title == "微博投票" && it.shortUrl == voteUrl })
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0
