@@ -2445,8 +2445,8 @@ object WeiboJsonParser {
 
     private val LONG_TEXT_EXPAND_MARKER = Regex(
         """<span\b[^>]*\bclass=(["'])[^"']*\bexpand\b[^"']*\1|""" +
-            """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?全文|""" +
-            """(?<=\S)(?:\.{3}|…|⋯)?\s*全文\s*</""",
+            """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?(?:全文|展开)|""" +
+            """(?<=\S)(?:\.{3}|…|⋯)?\s*(?:全文|展开)\s*</""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -2461,20 +2461,21 @@ object WeiboJsonParser {
             )
             .replace(
                 Regex(
-                    """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?全文\s*(?:</a>)?(?=\s*//[@＠])""",
+                    """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?(?:全文|展开)\s*(?:</a>)?(?=\s*//[@＠])""",
                     RegexOption.IGNORE_CASE,
                 ),
                 "",
             )
-            .replace(Regex("""(?:\.{3}|…|⋯)?\s*全文(?=\s*//[@＠])"""), "")
+            .replace(Regex("""(?:\.{3}|…|⋯)?\s*(?:全文|展开)(?=\s*//[@＠])"""), "")
+            // 客户端已有「阅读全文」按钮，正文末尾的 “…全文 / …展开”整段去掉（含省略号）。
             .replace(
                 Regex(
-                    """((?:\.{3}|…|⋯)\s*)(?:<a\b[^>]*>\s*)?全文\s*(?:</a>)?\s*$""",
+                    """(?:\.{3}|…|⋯)\s*(?:<a\b[^>]*>\s*)?(?:全文|展开)\s*(?:</a>)?\s*$""",
                     RegexOption.IGNORE_CASE,
                 ),
-                "$1",
+                "",
             )
-            .replace(Regex("""(?<=\S)(?:\.{3}|…|⋯)?\s*全文\s*$"""), "")
+            .replace(Regex("""(?<=\S)\s*(?:全文|展开)\s*$"""), "")
             .trimEnd()
 
     private fun plainText(value: String): String =
@@ -2512,10 +2513,14 @@ object WeiboJsonParser {
         if (fromHtml.isBlank()) return preferredRaw
         val htmlLinkCount = countTcShortLinks(fromHtml)
         val rawLinkCount = countTcShortLinks(preferredRaw)
+        val htmlTopicCount = countTopicMarkers(fromHtml)
+        val rawTopicCount = countTopicMarkers(preferredRaw)
         // HTML 若丢掉了 text_raw 里的短链（投票/网页链接常见无 data-url），必须回退，
         // 否则「微博投票」会从可点链接变成纯文字甚至被后续剥链弄没。
+        // 同样：超话锚点常无 data-url，HTML 只剩「话题名」时要回退保留 #话题[超话]#。
         return when {
             rawLinkCount > htmlLinkCount -> preferredRaw
+            rawTopicCount > htmlTopicCount -> preferredRaw
             htmlLinkCount > 0 -> fromHtml
             fromHtml.length >= preferredRaw.length * 0.6f -> fromHtml
             else -> preferredRaw
@@ -2524,6 +2529,13 @@ object WeiboJsonParser {
 
     private fun countTcShortLinks(text: String): Int =
         Regex("""https?://t\.cn/\S+""").findAll(text).count()
+
+    private fun countTopicMarkers(text: String): Int {
+        if (text.isBlank()) return 0
+        val hashTopics = Regex("""#[^#\n]+#""").findAll(text).count()
+        val chaohua = Regex("""\[[\s\u200b]*超话[\s\u200b]*\]""").findAll(text).count()
+        return hashTopics + chaohua
+    }
 
     private fun expandHtmlAnchorsToShortUrls(html: String): String {
         if (html.isBlank() || !html.contains("<a", ignoreCase = true)) return html

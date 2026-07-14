@@ -424,6 +424,70 @@ class RepostVideoLinkParseTest {
         assertTrue(item.urlEntities.any { it.title == "微博投票" && it.shortUrl == voteUrl })
     }
 
+    @Test
+    fun prefersRawWhenHtmlDropsChaohuaTopic() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "chao1",
+                  "mblogid": "R8tYvdCoc",
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "周末出片 #摄影[超话]# 多图",
+                  "text": "周末出片 <a href=\"https://weibo.com/p/100808abcdef\">摄影</a> 多图 http://t.cn/pic1",
+                  "pic_num": 6,
+                  "pic_ids": ["a","b","c","d","e","f"],
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "5720474518", "screen_name": "测试" },
+                  "url_struct": [
+                    {
+                      "short_url": "http://t.cn/pic1",
+                      "url_title": "查看图片",
+                      "url_type": 39,
+                      "pic_ids": ["a"],
+                      "pic_infos": { "a": { "largest": { "url": "https://example.com/a.jpg" } } }
+                    }
+                  ]
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.text.contains("#摄影[超话]#"))
+    }
+
+    @Test
+    fun stripsTrailingExpandMarkerFromLongTextPreview() {
+        val preview = "而长时间佩戴更是极易 ...展开"
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "expand1",
+                  "mblogid": "expandBlog",
+                  "isLongText": true,
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "$preview",
+                  "text": "$preview",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "我爱音频网" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.isLongText)
+        assertFalse(item.text.contains("展开"))
+        assertFalse(item.text.trimEnd().endsWith("..."))
+        assertTrue(item.text.contains("极易"))
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0

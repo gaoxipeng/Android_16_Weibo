@@ -7008,7 +7008,7 @@ private fun buildStatusTokenRegex(
     val urlPattern = (inlineImageLinks.keys + urlEntities.keys)
         .sortedByDescending { it.length }
         .joinToString("|") { Regex.escape(it) }
-    val base = """\[[^\[\]]+\]|@[\p{L}\p{N}_\-.·\u00B7\u30FB]+|#[^#\n]+#"""
+    val base = """#[^#\n]+#|@[\p{L}\p{N}_\-.·\u00B7\u30FB]+|\[[^\[\]]+\]"""
     val pattern = if (urlPattern.isNotEmpty()) "$base|$urlPattern" else base
     return Regex(pattern)
 }
