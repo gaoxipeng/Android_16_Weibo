@@ -134,6 +134,7 @@ class MineCacheStore(context: Context) {
             .put("source", source)
             .put("ip_location", ipLocation)
             .put("location_name", locationName)
+            .put("location_url", locationUrl)
             .put("text", text)
             .put("is_long_text", isLongText)
             .put("requires_long_text_fetch", requiresLongTextFetch)
@@ -169,6 +170,7 @@ class MineCacheStore(context: Context) {
             source = optNullableString("source"),
             ipLocation = optNullableString("ip_location"),
             locationName = optNullableString("location_name"),
+            locationUrl = optNullableString("location_url"),
             text = optString("text"),
             isLongText = optBoolean("is_long_text"),
             requiresLongTextFetch = optBoolean("requires_long_text_fetch"),

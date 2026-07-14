@@ -273,6 +273,7 @@ object WeiboJsonParser {
         medias: List<FeedMedia> = emptyList(),
         inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
         urlEntities: List<FeedUrlEntity> = emptyList(),
+        forceStripMediaUrlTokens: Boolean = false,
     ): String {
         val preservedUrls = inlineImageLinks.keys + urlEntities.map { it.shortUrl }.toSet()
         var text = plainText(sourceRaw)
@@ -280,12 +281,13 @@ object WeiboJsonParser {
         val imageTokens = imageUrlTokensFromUrlStruct(urlStruct, sourceRaw)
             .filter { it !in preservedUrls }
         text = stripEntityTokens(text, imageTokens)
-        if (medias.isNotEmpty()) {
+        val shouldStripMediaTokens = medias.isNotEmpty() || forceStripMediaUrlTokens
+        if (shouldStripMediaTokens) {
             val mediaTokens = mediaUrlTokensFromUrlStruct(urlStruct, sourceRaw, preservedUrls) +
                 mediaPageInfoTokens(status, sourceRaw)
             text = stripEntityTokens(text, mediaTokens)
         }
-        if ((images.isNotEmpty() || medias.isNotEmpty()) && inlineImageLinks.isEmpty() && urlEntities.isEmpty()) {
+        if ((images.isNotEmpty() || shouldStripMediaTokens) && inlineImageLinks.isEmpty() && urlEntities.isEmpty()) {
             text = stripOrphanMediaLinks(text)
         } else if (urlEntities.isNotEmpty() || inlineImageLinks.isNotEmpty()) {
             text = stripOrphanMediaLinksExcept(text, preservedUrls)
@@ -297,6 +299,7 @@ object WeiboJsonParser {
         status: JSONObject,
         sourceText: String,
         inlineImageUrls: Set<String> = emptySet(),
+        suppressAttachedMediaLinks: Boolean = false,
     ): List<FeedUrlEntity> {
         val urlStruct = status.optJSONArray("url_struct") ?: return emptyList()
         return buildList {
@@ -306,6 +309,9 @@ object WeiboJsonParser {
                 if (shortUrl in inlineImageUrls || !sourceText.contains(shortUrl)) continue
                 val picIds = entity.optJSONArray("pic_ids")
                 if (picIds != null && picIds.length() > 0 && entity.optJSONObject("pic_infos") != null) {
+                    continue
+                }
+                if (suppressAttachedMediaLinks && isAttachedMediaUrlStructEntity(entity)) {
                     continue
                 }
                 if (!entity.has("url_type") || entity.isNull("url_type")) continue
@@ -323,7 +329,122 @@ object WeiboJsonParser {
                     ),
                 )
             }
+        }.distinctBy { it.shortUrl }
+            .let(::dedupeAttachedMediaUrlEntities)
+    }
+
+    /** 同一「xxx的微博视频」常对应多条不同短链，正文只保留一条。 */
+    private fun dedupeAttachedMediaUrlEntities(entities: List<FeedUrlEntity>): List<FeedUrlEntity> {
+        val seenVideoTitles = mutableSetOf<String>()
+        return entities.filter { entity ->
+            if (!isAttachedMediaFeedUrlEntity(entity)) return@filter true
+            seenVideoTitles.add(entity.title.trim())
         }
+    }
+
+    /** 已有内嵌视频/直播卡片时，正文不应再把对应媒体短链渲染成普通链接。 */
+    private fun isAttachedMediaUrlStructEntity(entity: JSONObject): Boolean {
+        val objectType = entity.optNullableString("object_type")?.lowercase().orEmpty()
+        if (objectType in setOf("video", "live", "story", "movie", "audio", "gif")) {
+            return true
+        }
+        val title = entity.optNullableString("url_title")
+            ?: entity.optNullableString("title")
+            ?: ""
+        if (title.contains("微博视频") ||
+            title.contains("微博直播") ||
+            title.contains("微博故事") ||
+            title.contains("的视频")
+        ) {
+            return true
+        }
+        val candidateUrls = listOfNotNull(
+            entity.optNullableString("h5_target_url"),
+            entity.optNullableString("long_url"),
+            entity.optNullableString("ori_url"),
+            entity.optNullableString("short_url"),
+        )
+        return candidateUrls.any { url ->
+            val lower = url.lowercase()
+            lower.contains("video.weibo.com") ||
+                lower.contains("weibo.com/tv") ||
+                lower.contains("media.weibo.cn") ||
+                lower.contains("/tv/show/") ||
+                lower.contains("livestream")
+        }
+    }
+
+    private fun isAttachedMediaFeedUrlEntity(entity: FeedUrlEntity): Boolean {
+        val title = entity.title
+        if (title.contains("微博视频") ||
+            title.contains("微博直播") ||
+            title.contains("微博故事") ||
+            title.contains("的视频")
+        ) {
+            return true
+        }
+        val lower = "${entity.url} ${entity.shortUrl}".lowercase()
+        return lower.contains("video.weibo.com") ||
+            lower.contains("weibo.com/tv") ||
+            lower.contains("media.weibo.cn") ||
+            lower.contains("/tv/show/") ||
+            lower.contains("livestream")
+    }
+
+    /** 转发外层剥链：收集原博/本层视频短链与标题，避免 //@ 末尾残留「xxx的微博视频」。 */
+    private fun collectWeiboHostedVideoLinkTokens(status: JSONObject?): List<String> {
+        if (status == null) return emptyList()
+        val tokens = linkedSetOf<String>()
+        val urlStruct = status.optJSONArray("url_struct")
+        for (index in 0 until (urlStruct?.length() ?: 0)) {
+            val entity = urlStruct?.optJSONObject(index) ?: continue
+            if (!isAttachedMediaUrlStructEntity(entity)) continue
+            listOfNotNull(
+                entity.optNullableString("short_url"),
+                entity.optNullableString("long_url"),
+                entity.optNullableString("ori_url"),
+                entity.optNullableString("h5_target_url"),
+                entity.optNullableString("url_title"),
+                entity.optNullableString("title"),
+            ).forEach { token ->
+                if (token.isNotBlank()) tokens.add(token)
+            }
+        }
+        status.optJSONObject("page_info")?.let { pageInfo ->
+            val type = pageInfo.optNullableString("type")?.lowercase().orEmpty()
+            val objectType = pageInfo.optNullableString("object_type")?.lowercase().orEmpty()
+            val title = pageInfo.optNullableString("page_title")
+                ?: pageInfo.optNullableString("title")
+                ?: ""
+            val looksVideo = type in setOf("video", "live", "story") ||
+                objectType in setOf("video", "live", "story") ||
+                title.contains("微博视频") ||
+                title.contains("微博直播") ||
+                title.contains("微博故事")
+            if (looksVideo) {
+                listOfNotNull(
+                    pageInfo.optNullableString("page_url"),
+                    pageInfo.optNullableString("url_ori"),
+                    pageInfo.optJSONObject("media_info")?.optNullableString("h5_url"),
+                    title.takeIf { it.isNotBlank() },
+                ).forEach { token ->
+                    if (token.isNotBlank()) tokens.add(token)
+                }
+            }
+        }
+        return tokens.toList()
+    }
+
+    private fun stripWeiboHostedVideoTitles(text: String): String {
+        if (text.isBlank()) return text
+        return text
+            .replace(Regex("""L?\S{1,40}的微博视频"""), "")
+            .replace(Regex("""L?\S{1,40}的微博直播"""), "")
+            .replace(Regex("""L?\S{1,40}的微博故事"""), "")
+            .replace(Regex("[ \\t]{2,}"), " ")
+            .replace(Regex("[ \\t]+\\n"), "\n")
+            .replace(Regex("\\n[ \\t]+"), "\n")
+            .trim()
     }
 
     private fun stripOrphanMediaLinksExcept(text: String, preserveUrls: Set<String>): String {
@@ -481,19 +602,31 @@ object WeiboJsonParser {
             contentRaw.takeIf { it.isNotBlank() } ?: contentHtml,
         )
         val inlineImageLinks = parseInlineImageLinks(data, sourceForParse)
-        val urlEntities = parseUrlEntities(data, sourceForParse, inlineImageLinks.keys)
+        val suppressAttachedMediaLinks = item.medias.isNotEmpty() ||
+            item.retweetedStatus?.medias?.isNotEmpty() == true
+        val urlEntities = parseUrlEntities(
+            status = data,
+            sourceText = sourceForParse,
+            inlineImageUrls = inlineImageLinks.keys,
+            suppressAttachedMediaLinks = suppressAttachedMediaLinks,
+        )
         val additionalImages = parseImages(data, inlineImageLinks.keys).map {
             it.copy(createdAt = it.createdAt ?: item.createdAt)
         }
         val mergedImages = (item.images + additionalImages).distinctBy { it.largeUrl }
         val mergedInlineImageLinks = item.inlineImageLinks + inlineImageLinks
-        val mergedUrlEntities = (item.urlEntities + urlEntities).distinctBy { it.shortUrl }
+        val existingUrlEntities = if (suppressAttachedMediaLinks) {
+            item.urlEntities.filterNot(::isAttachedMediaFeedUrlEntity)
+        } else {
+            item.urlEntities
+        }
+        val mergedUrlEntities = (existingUrlEntities + urlEntities).distinctBy { it.shortUrl }
         // 长文合并只依据接口返回的正文与媒体，不复用卡片上的 video 等媒体字段，避免转发场景误删正文。
         var text = parseStatusText(
             data,
             sourceForParse,
             mergedImages,
-            medias = emptyList(),
+            medias = if (suppressAttachedMediaLinks) item.medias else emptyList(),
             mergedInlineImageLinks,
             mergedUrlEntities,
         )
@@ -1099,21 +1232,7 @@ object WeiboJsonParser {
             ?: htmlText
         val isLongTextPreview = status.isLongTextPreview()
         val displayText = if (isLongTextPreview) stripLongTextPreviewLabel(rawText) else rawText
-        val isLongText = status.shouldShowLongTextExpand(
-            rawText = rawText,
-            displayText = displayText,
-            hasAttachedVideo = medias.isNotEmpty() || status.hasVideoOrLivePageInfo(),
-        )
-        val inlineImageLinks = parseInlineImageLinks(status, displayText)
-        val urlEntities = parseUrlEntities(status, displayText, inlineImageLinks.keys)
 
-        val images = if (mediaBelongsToRetweeted) {
-            emptyList()
-        } else {
-            parseImages(status, inlineImageLinks.keys).map {
-                it.copy(createdAt = it.createdAt ?: status.optNullableString("created_at"))
-            }
-        }
         val retweeted = retweetedJson?.let { json ->
             val normalized = normalizeRetweetedStatus(status, json)
             parseStatus(normalized, allowRetweeted = false)
@@ -1123,8 +1242,65 @@ object WeiboJsonParser {
             retweeted?.medias?.isNotEmpty() == true && medias.isNotEmpty() -> emptyList()
             else -> medias
         }
+        val retweetedHasVideo = mediaBelongsToRetweeted ||
+            retweeted?.medias?.isNotEmpty() == true ||
+            retweetedJson?.hasVideoOrLivePageInfo() == true ||
+            collectWeiboHostedVideoLinkTokens(retweetedJson).isNotEmpty()
+        val hasOwnVideo = resolvedMedias.isNotEmpty() || status.hasVideoOrLivePageInfo()
+        val hasAttachedVideo = hasOwnVideo || retweetedHasVideo
+        val isLongText = status.shouldShowLongTextExpand(
+            rawText = rawText,
+            displayText = displayText,
+            hasAttachedVideo = hasAttachedVideo,
+        )
+        val inlineImageLinks = parseInlineImageLinks(status, displayText)
+        val images = if (mediaBelongsToRetweeted) {
+            emptyList()
+        } else {
+            parseImages(status, inlineImageLinks.keys).map {
+                it.copy(createdAt = it.createdAt ?: status.optNullableString("created_at"))
+            }
+        }
+        // 转发外层：去掉「xxx的微博视频」，只留原博引用区（至多一条）。
+        // 独立视频帖：去掉短链，避免与视频卡片重复。
+        val stripVideoLinksFromOuter = allowRetweeted && retweeted != null
+        val suppressAttachedMediaLinks = when {
+            stripVideoLinksFromOuter -> true
+            allowRetweeted && hasOwnVideo -> true
+            else -> false
+        }
+        var urlEntities = parseUrlEntities(
+            status = status,
+            sourceText = displayText,
+            inlineImageUrls = inlineImageLinks.keys,
+            suppressAttachedMediaLinks = suppressAttachedMediaLinks,
+        )
+        if (stripVideoLinksFromOuter) {
+            urlEntities = urlEntities.filterNot(::isAttachedMediaFeedUrlEntity)
+        }
+        val textStripMedias = when {
+            resolvedMedias.isNotEmpty() -> resolvedMedias
+            stripVideoLinksFromOuter && retweeted?.medias?.isNotEmpty() == true -> retweeted.medias
+            else -> emptyList()
+        }
+        var text = parseStatusText(
+            status = status,
+            sourceRaw = displayText,
+            images = images,
+            medias = textStripMedias,
+            inlineImageLinks = inlineImageLinks,
+            urlEntities = urlEntities,
+            forceStripMediaUrlTokens = suppressAttachedMediaLinks,
+        )
+        if (stripVideoLinksFromOuter) {
+            val extraMediaTokens = collectWeiboHostedVideoLinkTokens(status) +
+                collectWeiboHostedVideoLinkTokens(retweetedJson)
+            text = stripEntityTokens(text, extraMediaTokens)
+            text = stripWeiboHostedVideoTitles(text)
+        }
 
         val (isEdited, editCount) = status.parseEditMetadata()
+        val statusLocation = parseStatusLocation(status)
         val item = FeedItem(
             id = id,
             statusId = status.optNullableString("mblogid") ?: id,
@@ -1135,8 +1311,9 @@ object WeiboJsonParser {
             createdAt = status.optNullableString("created_at"),
             source = plainText(status.optNullableString("source") ?: ""),
             ipLocation = parseIpLocation(status),
-            locationName = parseStatusLocation(status),
-            text = parseStatusText(status, displayText, images, resolvedMedias, inlineImageLinks, urlEntities),
+            locationName = statusLocation?.name,
+            locationUrl = statusLocation?.url,
+            text = text,
             isLongText = isLongText,
             requiresLongTextFetch = status.hasLongTextFlag() ||
                 hasTextTruncationSignals(rawText, displayText),
@@ -1155,8 +1332,106 @@ object WeiboJsonParser {
         )
         val embeddedLongText = status.optJSONObject("longText")
             ?.takeIf { hasLongTextPayload(it) }
-        return embeddedLongText?.let { mergeLongTextIntoFeedItem(item, it) } ?: item
+        val merged = embeddedLongText?.let { mergeLongTextIntoFeedItem(item, it) } ?: item
+        // 只在最外层做展示净化；嵌套原博若在此处按独立视频帖处理会误删「应保留的一条」链接。
+        return if (allowRetweeted) sanitizeRepostVideoLinks(merged) else merged
     }
+
+    /**
+     * 转发视频展示约定：
+     * - 外层 //@：去掉全部「xxx的微博视频」链接
+     * - 原博引用：同一标题只保留一条，并折叠正文里重复的 token
+     * - 独立视频帖：去掉正文链接，只留视频卡片
+     */
+    fun sanitizeRepostVideoLinks(item: FeedItem): FeedItem {
+        val cleanedRetweet = item.retweetedStatus?.let { retweeted ->
+            clearMisparsedVideoLocation(keepAtMostOneWeiboVideoLink(retweeted))
+        }
+        val base = if (cleanedRetweet != null) {
+            stripAllWeiboVideoLinks(item.copy(retweetedStatus = cleanedRetweet))
+        } else {
+            val hasOwnVideo = item.medias.any { media ->
+                media.type == MediaType.Video || media.type == MediaType.Live
+            }
+            if (hasOwnVideo) {
+                stripAllWeiboVideoLinks(item)
+            } else {
+                keepAtMostOneWeiboVideoLink(item)
+            }
+        }
+        return clearMisparsedVideoLocation(base)
+    }
+
+    private fun clearMisparsedVideoLocation(item: FeedItem): FeedItem {
+        val name = item.locationName ?: return item
+        if (!looksLikeNonPlaceLocationTitle(name)) return item
+        return item.copy(locationName = null, locationUrl = null)
+    }
+
+    private fun stripAllWeiboVideoLinks(item: FeedItem): FeedItem {
+        val removed = item.urlEntities.filter(::isAttachedMediaFeedUrlEntity)
+        if (removed.isEmpty() && !containsWeiboHostedVideoTitle(item.text)) {
+            return item
+        }
+        val kept = item.urlEntities.filterNot(::isAttachedMediaFeedUrlEntity)
+        var text = stripEntityTokens(
+            item.text,
+            removed.flatMap { entity ->
+                listOfNotNull(entity.shortUrl, entity.title, "L${entity.title}")
+            },
+        )
+        text = stripWeiboHostedVideoTitles(text)
+        return item.copy(text = text, urlEntities = kept)
+    }
+
+    private fun keepAtMostOneWeiboVideoLink(item: FeedItem): FeedItem {
+        val videoLinks = item.urlEntities.filter(::isAttachedMediaFeedUrlEntity)
+        val otherLinks = item.urlEntities.filterNot(::isAttachedMediaFeedUrlEntity)
+        if (videoLinks.isEmpty()) {
+            return item
+        }
+        val keep = videoLinks.first()
+        val dropped = videoLinks.drop(1)
+        var text = item.text
+        if (dropped.isNotEmpty()) {
+            text = stripEntityTokens(
+                text,
+                dropped.flatMap { entity ->
+                    listOfNotNull(entity.shortUrl, entity.title, "L${entity.title}")
+                },
+            )
+        }
+        text = collapseDuplicateToken(text, keep.shortUrl)
+        if (keep.title.isNotBlank() && keep.title != keep.shortUrl) {
+            text = collapseDuplicateToken(text, keep.title)
+            text = collapseDuplicateToken(text, "L${keep.title}")
+        }
+        return item.copy(
+            text = text,
+            urlEntities = otherLinks + keep,
+        )
+    }
+
+    private fun collapseDuplicateToken(text: String, token: String): String {
+        if (token.isBlank()) return text
+        val first = text.indexOf(token)
+        if (first < 0) return text
+        var result = text
+        var searchFrom = first + token.length
+        while (true) {
+            val next = result.indexOf(token, searchFrom)
+            if (next < 0) break
+            result = result.removeRange(next, next + token.length)
+        }
+        return result
+            .replace(Regex("[ \\t]{2,}"), " ")
+            .replace(Regex("[ \\t]+\\n"), "\n")
+            .replace(Regex("\\n[ \\t]+"), "\n")
+            .trim()
+    }
+
+    private fun containsWeiboHostedVideoTitle(text: String): Boolean =
+        Regex("""L?\S{1,40}的微博(?:视频|直播|故事)""").containsMatchIn(text)
 
     private fun unwrapStatusDetailPayload(root: JSONObject): JSONObject? {
         root.optJSONObject("data")?.let { data ->
@@ -1676,7 +1951,114 @@ object WeiboJsonParser {
             ?.trim()
     }
 
-    private fun parseStatusLocation(status: JSONObject): String? {
+    private data class ParsedStatusLocation(
+        val name: String,
+        val url: String?,
+    )
+
+    private fun pickLocationUrl(obj: JSONObject?): String? {
+        if (obj == null) return null
+        return sequenceOf(
+            obj.optNullableString("h5_target_url"),
+            obj.optNullableString("page_url"),
+            obj.optNullableString("long_url"),
+            obj.optNullableString("ori_url"),
+            obj.optNullableString("target_url"),
+            obj.optNullableString("url"),
+            obj.optNullableString("scheme"),
+            obj.optNullableString("short_url"),
+        ).firstOrNull { !it.isNullOrBlank() }
+    }
+
+    private fun pickPoiId(obj: JSONObject?): String? {
+        if (obj == null) return null
+        sequenceOf(
+            obj.optNullableString("poiid"),
+            obj.optNullableString("poi_id"),
+            obj.optNullableString("object_id"),
+            obj.optNullableString("page_id"),
+            obj.optNullableString("containerid"),
+        ).forEach { raw ->
+            val normalized = normalizePoiId(raw)
+            if (normalized != null) return normalized
+        }
+        return null
+    }
+
+    private fun normalizePoiId(raw: String?): String? {
+        var id = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        id = id.substringAfterLast(':').trim()
+        if (id.isBlank()) return null
+        // Weibo place page ids usually look like 100101 + poiid
+        if (id.startsWith("100101") && id.length > 6) return id
+        // 真实 POI 常见 B 开头十六进制；视频 object_id（纯数字等）不能当地点。
+        if (id.matches(Regex("""B[0-9A-F]{15,}""", RegexOption.IGNORE_CASE))) return id
+        return null
+    }
+
+    private fun buildWeiboPlacePageUrl(poiIdRaw: String?): String? {
+        val id = normalizePoiId(poiIdRaw) ?: return null
+        val pageId = if (id.startsWith("100101")) id else "100101$id"
+        return "https://weibo.com/p/$pageId"
+    }
+
+    private fun resolveStatusLocationUrl(
+        primary: JSONObject?,
+        vararg fallbacks: JSONObject?,
+    ): String? {
+        sequenceOf(primary, *fallbacks).forEach { obj ->
+            pickLocationUrl(obj)?.let { return it }
+        }
+        sequenceOf(primary, *fallbacks).forEach { obj ->
+            buildWeiboPlacePageUrl(pickPoiId(obj))?.let { return it }
+        }
+        return null
+    }
+
+    private fun isPlaceObjectType(type: String?): Boolean {
+        val normalized = type?.lowercase().orEmpty()
+        return normalized in setOf("place", "poi", "location", "checkin")
+    }
+
+    private fun looksLikeNonPlaceLocationTitle(name: String): Boolean {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return true
+        if (trimmed.contains("微博视频") ||
+            trimmed.contains("微博直播") ||
+            trimmed.contains("微博故事") ||
+            trimmed.contains("的视频")
+        ) {
+            return true
+        }
+        // 视频进度锚点（如 10:29）不是地点。
+        return trimmed.matches(Regex("""^\d{1,2}:\d{2}(?::\d{2})?$"""))
+    }
+
+    private fun parseStatusLocation(status: JSONObject): ParsedStatusLocation? {
+        val urls = status.optJSONArray("url_struct")
+        for (index in 0 until (urls?.length() ?: 0)) {
+            val entry = urls?.optJSONObject(index) ?: continue
+            if (isAttachedMediaUrlStructEntity(entry)) continue
+            val type = entry.optNullableString("object_type")
+            val hasPoi = pickPoiId(entry) != null ||
+                pickPoiId(entry.optJSONObject("object")) != null
+            if (!isPlaceObjectType(type) && !hasPoi) continue
+            val title = entry.optNullableString("url_title")
+                ?: entry.optNullableString("title")
+                ?: entry.optJSONObject("object")?.optNullableString("object_name")
+                ?: continue
+            val name = plainText(title).takeIf { it.isNotBlank() } ?: continue
+            if (looksLikeNonPlaceLocationTitle(name)) continue
+            return ParsedStatusLocation(
+                name = name,
+                url = resolveStatusLocationUrl(
+                    entry,
+                    entry.optJSONObject("object"),
+                    entry.optJSONObject("actionlog"),
+                ),
+            )
+        }
+
         val annotations = status.optJSONArray("annotations")
         for (index in 0 until (annotations?.length() ?: 0)) {
             val annotation = annotations?.optJSONObject(index) ?: continue
@@ -1684,24 +2066,40 @@ object WeiboJsonParser {
             val title = place?.optNullableString("title")
                 ?: place?.optNullableString("name")
                 ?: annotation.optNullableString("title")
-            if (!title.isNullOrBlank()) return plainText(title)
-        }
-
-        val urls = status.optJSONArray("url_struct")
-        for (index in 0 until (urls?.length() ?: 0)) {
-            val entry = urls?.optJSONObject(index) ?: continue
-            val type = entry.optNullableString("object_type")?.lowercase().orEmpty()
-            if (type !in setOf("place", "poi", "location")) continue
-            val title = entry.optNullableString("url_title") ?: entry.optNullableString("title")
-            if (!title.isNullOrBlank()) return plainText(title)
+            if (title.isNullOrBlank()) continue
+            val name = plainText(title).takeIf { it.isNotBlank() } ?: continue
+            if (looksLikeNonPlaceLocationTitle(name)) continue
+            return ParsedStatusLocation(
+                name = name,
+                url = resolveStatusLocationUrl(place, annotation),
+            )
         }
 
         val pageInfo = status.optJSONObject("page_info") ?: return null
-        val type = pageInfo.optNullableString("type")?.lowercase().orEmpty()
-        if (type !in setOf("place", "poi", "location")) return null
-        return pageInfo.optNullableString("page_title")
+        val type = pageInfo.optNullableString("type")
+            ?: pageInfo.optNullableString("object_type")
+        if (type?.lowercase() in setOf("video", "live", "story", "movie", "audio", "gif")) {
+            return null
+        }
+        val hasPoi = pickPoiId(pageInfo) != null ||
+            pickPoiId(pageInfo.optJSONObject("poi")) != null ||
+            pickPoiId(pageInfo.optJSONObject("object")) != null
+        if (!isPlaceObjectType(type) && !hasPoi) return null
+        val title = pageInfo.optNullableString("page_title")
             ?: pageInfo.optNullableString("title")
             ?: pageInfo.optJSONObject("poi")?.optNullableString("title")
+            ?: pageInfo.optJSONObject("object")?.optNullableString("object_name")
+            ?: return null
+        val name = plainText(title).takeIf { it.isNotBlank() } ?: return null
+        if (looksLikeNonPlaceLocationTitle(name)) return null
+        return ParsedStatusLocation(
+            name = name,
+            url = resolveStatusLocationUrl(
+                pageInfo,
+                pageInfo.optJSONObject("poi"),
+                pageInfo.optJSONObject("object"),
+            ),
+        )
     }
 
     private fun statusId(status: JSONObject): String =
@@ -1765,10 +2163,20 @@ object WeiboJsonParser {
 
         val retweetedText = retweetedTextForUrlMatch(retweeted)
         val inheritAll = inheritAllFromOuter && isJsonArrayEmpty(retweetedStruct)
+        val retweetedAlreadyHasVideoLink = (0 until mergedStruct.length()).any { index ->
+            mergedStruct.optJSONObject(index)?.let(::isAttachedMediaUrlStructEntity) == true
+        }
         for (index in 0 until outerStruct.length()) {
             val entity = outerStruct.optJSONObject(index) ?: continue
             val shortUrl = entity.optNullableString("short_url") ?: continue
             if (shortUrl in existingShortUrls) continue
+            // 外层 //@ 里的视频短链若并入原博，会与原博自身短链叠成两条「xxx的微博视频」。
+            if (!inheritAll &&
+                retweetedAlreadyHasVideoLink &&
+                isAttachedMediaUrlStructEntity(entity)
+            ) {
+                continue
+            }
             if (inheritAll || retweetedText.contains(shortUrl)) {
                 mergedStruct.put(entity)
                 existingShortUrls.add(shortUrl)
@@ -1939,10 +2347,14 @@ object WeiboJsonParser {
         return !isLongTextExpandForExtraImagesOnly(rawText, displayText)
     }
 
-    private fun JSONObject.hasVideoOrLivePageInfo(): Boolean =
-        optJSONObject("page_info")
-            ?.optNullableString("type")
-            ?.lowercase() in setOf("video", "live")
+    private fun JSONObject.hasVideoOrLivePageInfo(): Boolean {
+        val pageInfo = optJSONObject("page_info") ?: return false
+        val type = pageInfo.optNullableString("type")?.lowercase()
+            ?: pageInfo.optNullableString("object_type")?.lowercase()
+        if (type in setOf("video", "live")) return true
+        if (type in setOf("article", "webpage", "topic", "place", "poi")) return false
+        return pageInfo.optJSONObject("media_info") != null
+    }
 
     private fun JSONObject.isLongTextExpandForExtraImagesOnly(
         rawText: String,

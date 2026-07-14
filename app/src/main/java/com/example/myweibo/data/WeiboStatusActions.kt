@@ -43,6 +43,46 @@ object WeiboStatusActions {
         }
     }
 
+    /** 打开地点 / 外链：优先官方微博 App，否则系统浏览器。 */
+    fun openExternalUrl(context: Context, rawUrl: String, failureMessage: String = "无法打开链接") {
+        val url = rawUrl.trim().takeIf { it.isNotBlank() } ?: run {
+            Toast.makeText(context, failureMessage, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: run {
+            Toast.makeText(context, failureMessage, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val packageManager = context.packageManager
+        val candidates = buildList {
+            if (url.contains("weibo.com", ignoreCase = true) ||
+                url.contains("weibo.cn", ignoreCase = true) ||
+                url.startsWith("sinaweibo://", ignoreCase = true)
+            ) {
+                add(
+                    Intent(Intent.ACTION_VIEW, uri).apply {
+                        setPackage("com.sina.weibo")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    },
+                )
+            }
+            add(
+                Intent(Intent.ACTION_VIEW, uri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                },
+            )
+        }
+        val intent = candidates.firstOrNull { it.resolveActivity(packageManager) != null }
+        if (intent != null) {
+            runCatching { context.startActivity(intent) }
+                .onFailure {
+                    Toast.makeText(context, failureMessage, Toast.LENGTH_SHORT).show()
+                }
+        } else {
+            Toast.makeText(context, failureMessage, Toast.LENGTH_SHORT).show()
+        }
+    }
+
     fun shareLink(context: Context, item: FeedItem) {
         val url = weiboUrl(item)
         if (url == null) {

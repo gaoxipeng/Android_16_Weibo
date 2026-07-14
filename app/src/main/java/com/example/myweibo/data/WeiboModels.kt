@@ -16,6 +16,8 @@ data class FeedItem(
     val ipLocation: String?,
     /** 微博发布时附带的 POI 地点，不同于用户 IP 属地。 */
     val locationName: String? = null,
+    /** POI 地点对应的可打开链接（短链或 H5）。 */
+    val locationUrl: String? = null,
     val text: String,
     val isLongText: Boolean = false,
     /** 仅用于详情页自动尝试全文接口；不决定是否展示「阅读全文」。 */
