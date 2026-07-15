@@ -488,6 +488,96 @@ class RepostVideoLinkParseTest {
         assertTrue(item.text.contains("极易"))
     }
 
+    @Test
+    fun longTextWithMultipleImagesShowsReadFullButton() {
+        val preview = "甲".repeat(200)
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "multiPicLong1",
+                  "mblogid": "multiPicLong",
+                  "isLongText": true,
+                  "created_at": "Tue Jul 14 10:00:00 +0800 2026",
+                  "text_raw": "$preview",
+                  "text": "$preview",
+                  "pic_num": 6,
+                  "pic_ids": ["p1","p2","p3","p4","p5","p6"],
+                  "pic_infos": {
+                    "p1": { "largest": { "url": "https://example.com/1.jpg" } },
+                    "p2": { "largest": { "url": "https://example.com/2.jpg" } },
+                    "p3": { "largest": { "url": "https://example.com/3.jpg" } },
+                    "p4": { "largest": { "url": "https://example.com/4.jpg" } },
+                    "p5": { "largest": { "url": "https://example.com/5.jpg" } },
+                    "p6": { "largest": { "url": "https://example.com/6.jpg" } }
+                  },
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
+    @Test
+    fun manyImagesWithShortCaptionDoesNotShowReadFullButton() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "manyPicShort1",
+                  "mblogid": "manyPicShort",
+                  "isLongText": true,
+                  "created_at": "Tue Jul 14 10:00:00 +0800 2026",
+                  "text_raw": "九图配文",
+                  "text": "九图配文",
+                  "pic_num": 12,
+                  "pic_ids": ["a","b","c","d","e","f","g","h","i","j","k","l"],
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertFalse(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
+    @Test
+    fun plainTextDecodesQuoteEntities() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "quote1",
+                  "mblogid": "quoteBlog",
+                  "created_at": "Tue Jul 14 10:00:00 +0800 2026",
+                  "text_raw": "第一份通报：&quot;舆论场一定要弘扬就事论事&quot;",
+                  "text": "第一份通报：&quot;舆论场一定要弘扬就事论事&quot;",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertTrue(item.text.contains("\"舆论场一定要弘扬就事论事\""))
+        assertFalse(item.text.contains("&quot;"))
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0

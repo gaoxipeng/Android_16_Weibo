@@ -2359,15 +2359,18 @@ object WeiboJsonParser {
         // 预览末尾的“展开”标签，但仍保留约 140 字的截断正文。
         val hasTextTruncation = hasTextTruncationSignals(rawText, displayText)
         if (hasTextTruncation) return true
-        // 超过 9 张图且无截断、无视频混排时，接口也可能设 isLongText，配文其实已完整。
+        // 超过 9 张图且配文已完整（偏短）时，接口也可能误设 isLongText。
         if (isLongTextExpandForExtraImagesOnly(rawText, displayText)) return false
         // 视频/直播 + 短配文无截断：常见「大家都在搜」误标。
-        // 长文 + 图/视频混排的配文不短，此时 isLongText 应信任。
-        if (hasAttachedVideo) {
-            return !isShortMediaCaption(displayText)
+        if (hasAttachedVideo && isShortMediaCaption(displayText)) return false
+        val hasMultipleImages = resolvePicCount() >= 2
+        // 长文 + 多图/视频混排：配文不短时信任 isLongText。
+        if ((hasAttachedVideo || hasMultipleImages) && !isShortMediaCaption(displayText)) {
+            return true
         }
-        // 无媒体时：仅在常见截断长度区间展示，避免超话等附加模块误标。
-        return isLikelyTruncatedLongTextPreview(displayText)
+        // 无媒体时：常见截断长度，或明显偏长的预览（去掉「全文/展开」后仍 >170 字）。
+        return isLikelyTruncatedLongTextPreview(displayText) ||
+            isSubstantialLongTextPreview(displayText)
     }
 
     private fun JSONObject.hasVideoOrLivePageInfo(): Boolean {
@@ -2389,8 +2392,8 @@ object WeiboJsonParser {
         if (hasVideoOrLivePageInfo() || hasMixMediaVideo(this) || optJSONObject("mix_media_info") != null) {
             return false
         }
-        // 超过九图时接口也会设置 isLongText；没有正文截断证据即表示配文已完整。
-        return true
+        // 超过九图：仅当配文已完整（偏短）时才视为误标；长配文仍应显示「阅读全文」。
+        return isShortMediaCaption(displayText)
     }
 
     private fun JSONObject.resolvePicCount(): Int {
@@ -2409,6 +2412,12 @@ object WeiboJsonParser {
     private fun isLikelyTruncatedLongTextPreview(text: String): Boolean {
         val length = plainText(text).replace(Regex("""\s+"""), "").length
         return length in 120..170
+    }
+
+    /** 接口去掉「全文/展开」后，预览仍明显偏长，说明还有正文未展示。 */
+    private fun isSubstantialLongTextPreview(text: String): Boolean {
+        val length = plainText(text).replace(Regex("""\s+"""), "").length
+        return length > 170
     }
 
     private fun isShortMediaCaption(text: String): Boolean =
@@ -2487,9 +2496,7 @@ object WeiboJsonParser {
             }
             .replace(Regex("<[^>]+>"), "")
             .replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
+            .let(::htmlDecode)
             .trim()
 
     private val HTML_EMOTICON_IMG_PATTERN = Regex(
@@ -3197,7 +3204,9 @@ object WeiboJsonParser {
         value
             .replace("&amp;", "&")
             .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
             .replace("&#39;", "'")
+            .replace("&apos;", "'")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
 
