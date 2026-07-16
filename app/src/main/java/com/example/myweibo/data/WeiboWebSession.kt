@@ -238,7 +238,13 @@ class WeiboWebSession(context: Context) {
                 null
             }
             if (wallPage != null && wallPage.images.isNotEmpty()) {
-                return@withLock wallPage
+                return@withLock if (wallPage.nextCursor == null) {
+                    // Some accounts return exactly one 20-item image-wall page without a
+                    // continuation token even though the waterfall endpoint has more media.
+                    wallPage.copy(nextCursor = "waterfall:cursor:0")
+                } else {
+                    wallPage
+                }
             }
             return@withLock loadUserAlbumWaterfall(
                 uid = uid,
@@ -247,6 +253,26 @@ class WeiboWebSession(context: Context) {
             )
         }
         loadUserAlbumImageWall(uid, cursor, onPageLoaded)
+    }
+
+    suspend fun loadMoreUserAlbumImages(
+        uid: String,
+        cursor: String?,
+        existingLargeUrls: Set<String>,
+    ): AlbumPage {
+        var nextCursor = cursor
+        repeat(4) {
+            val page = loadUserAlbumImages(uid, nextCursor)
+            val newImages = page.images.filterNot { it.largeUrl in existingLargeUrls }
+            if (newImages.isNotEmpty() || page.nextCursor == null) {
+                return page.copy(images = newImages)
+            }
+            if (page.nextCursor == nextCursor) {
+                return AlbumPage(emptyList(), null)
+            }
+            nextCursor = page.nextCursor
+        }
+        return AlbumPage(emptyList(), nextCursor)
     }
 
     private suspend fun loadUserAlbumImageWall(
@@ -320,7 +346,9 @@ class WeiboWebSession(context: Context) {
         val images = wall.images.distinctByAlbumKey()
         onPageLoaded?.invoke(images)
 
-        val nextPageCursor = wall.nextCursor?.let { "waterfall:cursor:$it" }
+        val nextPageCursor = (wall.nextCursor ?: wall.nextSinceId)
+            ?.takeIf { it.isNotBlank() && it != "0" && it != "-1" }
+            ?.let { "waterfall:cursor:$it" }
 
         return AlbumPage(
             images = images,
@@ -610,6 +638,17 @@ class WeiboWebSession(context: Context) {
             referer = "https://m.weibo.cn/compose/",
         )
         assertMweiboMutationSuccess(raw, "微博发布失败")
+    }
+
+    suspend fun deleteStatus(statusId: String) {
+        val id = statusId.trim()
+        require(id.isNotBlank()) { "微博 ID 不能为空" }
+        val raw = postForm(
+            path = WeiboEndpoints.STATUS_DESTROY,
+            params = linkedMapOf("id" to id),
+            referer = "https://weibo.com/detail/$id",
+        )
+        WeiboJsonParser.assertMutationSuccess(raw, "删除微博失败")
     }
 
     private suspend fun loadMweiboXsrfToken(): String {

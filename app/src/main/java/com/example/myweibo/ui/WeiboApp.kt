@@ -225,6 +225,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
@@ -1863,7 +1866,7 @@ private class ImageSaveHintController {
 
     fun showBatchSaveProgress(progress: ImageSaveHelper.SaveAllProgress, itemLabel: String = "张") {
         val message = if (progress.total > 1) {
-            "正在保存第 ${progress.activeIndex}/${progress.total} $itemLabel"
+            "正在保存，已完成 ${progress.completed}/${progress.total} $itemLabel"
         } else {
             "正在保存"
         }
@@ -2026,9 +2029,9 @@ private class ImageSaveHintController {
             saved == total ->
                 showSuccess("已保存 ${saved} 张图片到相册")
             saved > 0 && usesMixedMedia ->
-                showSuccess("已保存 ${saved}/${total} 项")
+                showFailure("已保存 ${saved}/${total} 项；${errors.firstOrNull() ?: "部分保存失败"}")
             saved > 0 ->
-                showSuccess("已保存 ${saved}/${total} 张图片")
+                showFailure("已保存 ${saved}/${total} 张图片；${errors.firstOrNull() ?: "部分保存失败"}")
             else ->
                 showFailure(errors.firstOrNull()?.takeIf { it.isNotBlank() } ?: "保存失败")
         }
@@ -2189,6 +2192,11 @@ private data class FeedCardActionMenuRequest(
     val item: FeedItem,
     val anchorBoundsInRoot: Rect,
     val backHandlerEnabled: Boolean,
+)
+
+private data class DeleteStatusConfirmRequest(
+    val item: FeedItem,
+    val anchorBoundsInRoot: Rect,
 )
 
 private class FeedCardActionMenuController {
@@ -3189,6 +3197,8 @@ fun WeiboApp() {
     var longTextPreflightCheckedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     val longTextAutoLoadSemaphore = remember { Semaphore(3) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var pendingDeleteStatus by remember { mutableStateOf<DeleteStatusConfirmRequest?>(null) }
+    var deletingStatusId by remember { mutableStateOf<String?>(null) }
     var likeUsersOverlay by remember { mutableStateOf<LikeUsersOverlayState?>(null) }
     var likeUsers by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
     var likeUsersLoading by remember { mutableStateOf(false) }
@@ -3638,7 +3648,13 @@ fun WeiboApp() {
         scope.launch {
             visitedAlbumLoadingMore = true
             val cursor = visitedAlbumNextCursor
-            runCatching { session.loadUserAlbumImages(uid, cursor) }
+            runCatching {
+                session.loadMoreUserAlbumImages(
+                    uid = uid,
+                    cursor = cursor,
+                    existingLargeUrls = visitedAlbumImages.mapTo(mutableSetOf()) { it.largeUrl },
+                )
+            }
                 .onSuccess { page ->
                     val lookup = buildAlbumPostLookup(visitedPosts)
                     val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
@@ -4005,6 +4021,11 @@ fun WeiboApp() {
             return
         }
         pushNavigation(NavOverlayKind.VisitedProfile(value)) {
+            // The follow/fans list remains in the navigation snapshot and is restored on Back.
+            // It must not stay logically visible behind the visited profile: playback ownership
+            // treats a non-null follow overlay as the foreground and detaches the profile video
+            // surface immediately after playback starts, leaving audio with the cover on screen.
+            followListOverlay = null
             if (selectedItem == null) {
                 comments = emptyList()
                 commentsCursor = null
@@ -4482,7 +4503,13 @@ fun WeiboApp() {
         scope.launch {
             mineAlbumLoadingMore = true
             val cursor = mineAlbumNextCursor
-            runCatching { session.loadUserAlbumImages(uid, cursor) }
+            runCatching {
+                session.loadMoreUserAlbumImages(
+                    uid = uid,
+                    cursor = cursor,
+                    existingLargeUrls = mineAlbumImages.mapTo(mutableSetOf()) { it.largeUrl },
+                )
+            }
                 .onSuccess { page ->
                     val lookup = buildAlbumPostLookup(minePosts)
                     val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
@@ -4576,6 +4603,47 @@ fun WeiboApp() {
                 showMessage("\u70B9\u8D5E\u64CD\u4F5C\u5931\u8D25", likeFailureMessage(error))
             }
             likeLoadingIds = likeLoadingIds - likeId
+        }
+    }
+
+    fun deleteOwnStatus(item: FeedItem) {
+        val deleteId = item.id.trim().takeIf { it.isNotBlank() && it != "0" }
+            ?: item.statusId.trim().takeIf { it.isNotBlank() }
+            ?: return
+        if (deletingStatusId != null) return
+        deletingStatusId = deleteId
+        scope.launch {
+            runCatching { session.deleteStatus(deleteId) }
+                .onSuccess {
+                    val key = item.actionMenuKey()
+                    fun List<FeedItem>.withoutDeletedStatus(): List<FeedItem> =
+                        filterNot { it.actionMenuKey() == key }
+
+                    videoPlaybackCoordinator.pauseAll()
+                    items = items.withoutDeletedStatus()
+                    minePosts = minePosts.withoutDeletedStatus()
+                    visitedPosts = visitedPosts.withoutDeletedStatus()
+                    expandedFeedItems = expandedFeedItems.filterValues { it.actionMenuKey() != key }
+                    navStack = navStack.map { state ->
+                        state.copy(
+                            detail = state.detail?.takeUnless { it.item.actionMenuKey() == key },
+                            visitedProfile = state.visitedProfile?.copy(
+                                posts = state.visitedProfile.posts.withoutDeletedStatus(),
+                            ),
+                        )
+                    }
+                    if (selectedItem?.actionMenuKey() == key) {
+                        closeDetail()
+                    }
+                    operationCapsuleHint = "微博已删除"
+                }
+                .onFailure { error ->
+                    operationCapsuleHint = error.message
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { "删除失败：$it" }
+                        ?: "删除微博失败，请稍后重试"
+                }
+            deletingStatusId = null
         }
     }
 
@@ -6658,7 +6726,24 @@ fun WeiboApp() {
             FeedCardActionMenuOverlay(
                 controller = feedCardActionMenuController,
                 backdrop = bottomBarBackdrop,
+                currentUserId = mineProfile?.id ?: activeAccountId,
+                deletingStatusId = deletingStatusId,
+                onDelete = { item, anchor ->
+                    pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
+                },
             )
+            pendingDeleteStatus?.let { request ->
+                DeleteStatusConfirmOverlay(
+                    backdrop = bottomBarBackdrop,
+                    anchorBoundsInRoot = request.anchorBoundsInRoot,
+                    deleting = deletingStatusId != null,
+                    onConfirm = {
+                        pendingDeleteStatus = null
+                        deleteOwnStatus(request.item)
+                    },
+                    onDismiss = { pendingDeleteStatus = null },
+                )
+            }
             }
             }
             imagePeekController.activeRequest?.let { request ->
@@ -8109,6 +8194,9 @@ private fun FeedCardActionMenu(
 private fun FeedCardActionMenuOverlay(
     controller: FeedCardActionMenuController,
     backdrop: Backdrop,
+    currentUserId: String?,
+    deletingStatusId: String?,
+    onDelete: (FeedItem, Rect) -> Unit,
 ) {
     val activeRequest = controller.activeRequest
     var displayedRequest by remember { mutableStateOf<FeedCardActionMenuRequest?>(null) }
@@ -8141,8 +8229,15 @@ private fun FeedCardActionMenuOverlay(
         dismissMenu()
     }
 
-    val menuLabels = remember { listOf("\u8df3\u8f6c\u5230\u5fae\u535a", "\u5206\u4eab") }
-    val menuHeight = ActionMenuTwoRowHeight
+    val canDelete = !currentUserId.isNullOrBlank() && request.item.authorId == currentUserId
+    val menuLabels = remember(canDelete) {
+        buildList {
+            add("\u8df3\u8f6c\u5230\u5fae\u535a")
+            add("\u5206\u4eab")
+            if (canDelete) add("删除微博")
+        }
+    }
+    val menuHeight = if (canDelete) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
     val gapFromButton = 6.dp
     val screenMargin = 14.dp
     val anchor = request.anchorBoundsInRoot
@@ -8215,7 +8310,80 @@ private fun FeedCardActionMenuOverlay(
                         WeiboStatusActions.shareLink(context, request.item)
                     },
                 )
+                if (canDelete) {
+                    ImageActionRow(
+                        label = "删除微博",
+                        enabled = deletingStatusId == null,
+                        onClick = {
+                            dismissMenu()
+                            onDelete(request.item, request.anchorBoundsInRoot)
+                        },
+                    )
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun DeleteStatusConfirmOverlay(
+    backdrop: Backdrop,
+    anchorBoundsInRoot: Rect,
+    deleting: Boolean,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    BackHandler(enabled = !deleting, onBack = onDismiss)
+    val labels = remember { listOf("确认删除微博", "取消") }
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .zIndex(610f)
+            .clickable(
+                enabled = !deleting,
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onDismiss,
+            ),
+    ) {
+        val density = LocalDensity.current
+        val menuWidth = rememberActionMenuWidth(labels, maxWidth - 28.dp)
+        val menuWidthPx = with(density) { menuWidth.toPx() }
+        // Use the three-row owner-menu footprint for placement so this confirmation
+        // opens at exactly the same anchor position as the menu it replaces.
+        val menuHeightPx = with(density) { ActionMenuThreeRowHeight.toPx() }
+        val placement = calculateFeedCardActionMenuOffsetPx(
+            anchorBounds = anchorBoundsInRoot,
+            screenWidthPx = with(density) { maxWidth.toPx() },
+            screenHeightPx = with(density) { maxHeight.toPx() },
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
+            marginPx = with(density) { 14.dp.toPx() },
+            gapPx = with(density) { 6.dp.toPx() },
+        )
+        ImageActionFrostedCard(
+            modifier = Modifier
+                .offset { placement.offset }
+                .width(menuWidth)
+                .height(ActionMenuTwoRowHeight)
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = {},
+                ),
+            backdrop = backdrop,
+        ) {
+            ImageActionRow(
+                label = if (deleting) "正在删除…" else "确认删除微博",
+                enabled = !deleting,
+                textColor = MaterialTheme.colorScheme.error,
+                onClick = onConfirm,
+            )
+            ImageActionRow(
+                label = "取消",
+                enabled = !deleting,
+                onClick = onDismiss,
+            )
         }
     }
 }
@@ -10128,6 +10296,7 @@ private fun ImageActionRow(
     label: String,
     enabled: Boolean,
     selected: Boolean = false,
+    textColor: Color? = null,
     onClick: () -> Unit,
 ) {
     val capsuleShape = RoundedCornerShape(percent = 50)
@@ -10145,7 +10314,8 @@ private fun ImageActionRow(
             style = actionMenuTextStyle(selected = selected),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            color = actionMenuItemTextColor(enabled = enabled, selected = selected),
+            color = textColor?.copy(alpha = if (enabled) 1f else 0.45f)
+                ?: actionMenuItemTextColor(enabled = enabled, selected = selected),
         )
     }
 }
@@ -18283,11 +18453,13 @@ private fun MineScreen(
         snapshotFlow {
             val layoutInfo = postsListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            layoutInfo.totalItemsCount > 0 &&
-                lastVisibleIndex >= layoutInfo.totalItemsCount - ListLoadMoreItemsFromBottom
+            layoutInfo.totalItemsCount to lastVisibleIndex
         }
             .distinctUntilChanged()
-            .filter { it }
+            .filter { (totalItems, lastVisibleIndex) ->
+                totalItems > 0 &&
+                    lastVisibleIndex >= totalItems - ListLoadMoreItemsFromBottom
+            }
             .collect { onLoadMorePosts() }
     }
 
@@ -18296,11 +18468,13 @@ private fun MineScreen(
         snapshotFlow {
             val layoutInfo = albumListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            layoutInfo.totalItemsCount > 0 &&
-                lastVisibleIndex >= layoutInfo.totalItemsCount - ListLoadMoreItemsFromBottom
+            layoutInfo.totalItemsCount to lastVisibleIndex
         }
             .distinctUntilChanged()
-            .filter { it }
+            .filter { (totalItems, lastVisibleIndex) ->
+                totalItems > 0 &&
+                    lastVisibleIndex >= totalItems - ListLoadMoreItemsFromBottom
+            }
             .collect { onLoadMoreAlbum() }
     }
 
@@ -18317,35 +18491,53 @@ private fun MineScreen(
     }
 
     val density = LocalDensity.current
-    val collapseThresholdPx = remember(density) { with(density) { 72.dp.roundToPx() } }
     val compactBarContentHeight = 48.dp
+    val collapseThresholdPx = remember(density, profileHeaderHeight) {
+        with(density) {
+            profileHeaderHeight
+                .takeIf { it > 0.dp }
+                ?.roundToPx()
+                ?.coerceAtLeast(72.dp.roundToPx())
+                ?: 72.dp.roundToPx()
+        }
+    }
     val activeListState = when (pagerState.currentPage) {
         MineContentTab.Posts.ordinal -> postsListState
         else -> albumListState
     }
-    val collapseProgress by remember(activeListState, collapseThresholdPx) {
-        derivedStateOf {
-            when {
-                activeListState.firstVisibleItemIndex > 0 -> 1f
-                else -> (activeListState.firstVisibleItemScrollOffset.toFloat() / collapseThresholdPx)
-                    .coerceIn(0f, 1f)
+    var headerCollapseOffsetPx by remember(profile?.id, collapseThresholdPx) {
+        mutableFloatStateOf(
+            if (activeListState.firstVisibleItemIndex > 0) collapseThresholdPx.toFloat() else 0f,
+        )
+    }
+    val profileCollapseConnection = remember(
+        activeListState,
+        collapseThresholdPx,
+        posts.isNotEmpty(),
+        albumImages.isNotEmpty(),
+    ) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val deltaY = available.y
+                if (deltaY < 0f && headerCollapseOffsetPx < collapseThresholdPx) {
+                    val consumed = (-deltaY)
+                        .coerceAtMost(collapseThresholdPx - headerCollapseOffsetPx)
+                    headerCollapseOffsetPx += consumed
+                    return Offset(0f, -consumed)
+                }
+                val listAtTop = activeListState.firstVisibleItemIndex == 0 &&
+                    activeListState.firstVisibleItemScrollOffset == 0
+                if (deltaY > 0f && listAtTop && headerCollapseOffsetPx > 0f) {
+                    val consumed = deltaY.coerceAtMost(headerCollapseOffsetPx)
+                    headerCollapseOffsetPx -= consumed
+                    return Offset(0f, consumed)
+                }
+                return Offset.Zero
             }
+
         }
     }
-    val animatedCollapseAnim = remember { Animatable(0f) }
-    var collapseAnimationReady by remember { mutableStateOf(false) }
-    LaunchedEffect(collapseProgress) {
-        if (!collapseAnimationReady) {
-            animatedCollapseAnim.snapTo(collapseProgress)
-            collapseAnimationReady = true
-        } else {
-            animatedCollapseAnim.animateTo(
-                collapseProgress,
-                animationSpec = tween(durationMillis = 220),
-            )
-        }
-    }
-    val animatedCollapse = animatedCollapseAnim.value
+    val animatedCollapse = (headerCollapseOffsetPx / collapseThresholdPx.toFloat()).coerceIn(0f, 1f)
     val compactBarHeight = (topInset + compactBarContentHeight) * animatedCollapse
     val profileHeaderSlotHeight = when {
         profileHeaderHeight > 0.dp ->
@@ -18525,6 +18717,11 @@ private fun MineScreen(
                     ) { page ->
                     when (MineContentTab.entries[page]) {
                         MineContentTab.Posts -> {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .nestedScroll(profileCollapseConnection),
+                            ) {
                             LazyColumn(
                                 state = postsListState,
                                 flingBehavior = rememberWeiboListFlingBehavior(),
@@ -18575,6 +18772,7 @@ private fun MineScreen(
                                     }
                                 }
                             }
+                            }
                         }
 
                         MineContentTab.Album -> {
@@ -18586,7 +18784,11 @@ private fun MineScreen(
                                     resolveStickyAlbumMonthLabel(albumListState, albumRows)
                                 }
                             }
-                            Box(modifier = Modifier.fillMaxSize()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .nestedScroll(profileCollapseConnection),
+                            ) {
                                 LazyColumn(
                                     state = albumListState,
                                     flingBehavior = rememberWeiboListFlingBehavior(),
