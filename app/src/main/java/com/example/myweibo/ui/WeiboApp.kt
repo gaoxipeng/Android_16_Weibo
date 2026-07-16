@@ -4722,6 +4722,7 @@ fun WeiboApp() {
                                 ipLocation = item.ipLocation,
                                 locationName = item.locationName,
                                 locationUrl = item.locationUrl,
+                                isPinned = item.isPinned,
                             ),
                         )
                     } else {
@@ -4769,6 +4770,7 @@ fun WeiboApp() {
                             ipLocation = item.ipLocation,
                             locationName = item.locationName,
                             locationUrl = item.locationUrl,
+                            isPinned = item.isPinned,
                         ),
                     )
                 }
@@ -8180,15 +8182,38 @@ private fun AuthorRow(
         )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
-            Text(
-                text = item.authorName,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.clickable(
-                    enabled = onUserClick != null && userTarget.isNotBlank(),
-                    onClick = { onUserClick?.invoke(userTarget) },
-                ),
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = item.authorName,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .clickable(
+                            enabled = onUserClick != null && userTarget.isNotBlank(),
+                            onClick = { onUserClick?.invoke(userTarget) },
+                        ),
+                )
+                if (item.isPinned) {
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "置顶",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.White,
+                        maxLines = 1,
+                        lineHeight = 12.sp,
+                        modifier = Modifier
+                            .background(
+                                color = Color(0xFFFF8200),
+                                shape = RoundedCornerShape(3.dp),
+                            )
+                            .padding(horizontal = 3.dp, vertical = 0.dp),
+                    )
+                }
+            }
             if (metadataText.isNotBlank()) {
                 Text(
                     text = metadataText,

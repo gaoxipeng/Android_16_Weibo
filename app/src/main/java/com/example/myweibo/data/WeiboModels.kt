@@ -37,6 +37,8 @@ data class FeedItem(
     /** 微博 web 接口常见字段：edit_count / edit_at / edited / is_edit */
     val isEdited: Boolean = false,
     val editCount: Int = 0,
+    /** 个人主页置顶微博（接口 isTop / title.text=置顶）。 */
+    val isPinned: Boolean = false,
 ) {
     val media: FeedMedia?
         get() = medias.firstOrNull()

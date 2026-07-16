@@ -145,6 +145,7 @@ class MineCacheStore(context: Context) {
             .put("liked", liked)
             .put("is_edited", isEdited)
             .put("edit_count", editCount)
+            .put("is_pinned", isPinned)
             .put("images", images.toFeedImagesJsonArray())
             .put("medias", medias.toFeedMediasJsonArray())
             .put("media", media?.toJson())
@@ -181,6 +182,7 @@ class MineCacheStore(context: Context) {
             liked = optBoolean("liked"),
             isEdited = optBoolean("is_edited"),
             editCount = optInt("edit_count"),
+            isPinned = optBoolean("is_pinned"),
             images = optJSONArray("images").toFeedImages(),
             medias = optJSONArray("medias").toFeedMedias()
                 .ifEmpty { optJSONObject("media")?.toFeedMedia()?.let(::listOf).orEmpty() },

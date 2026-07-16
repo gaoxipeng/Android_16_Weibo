@@ -671,6 +671,44 @@ class RepostVideoLinkParseTest {
         assertEquals(item.text, merged.text)
     }
 
+    @Test
+    fun pinnedStatusIsParsedFromIsTopAndTitle() {
+        val raw = """
+            {
+              "statuses": [
+                {
+                  "idstr": "pin1",
+                  "mblogid": "pinnedBlog",
+                  "isTop": 1,
+                  "title": { "text": "置顶" },
+                  "created_at": "Tue Jul 14 10:00:00 +0800 2026",
+                  "text_raw": "置顶内容",
+                  "text": "置顶内容",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试用户" }
+                },
+                {
+                  "idstr": "normal1",
+                  "mblogid": "normalBlog",
+                  "created_at": "Tue Jul 14 09:00:00 +0800 2026",
+                  "text_raw": "普通微博",
+                  "text": "普通微博",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "1", "screen_name": "测试用户" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val items = WeiboJsonParser.parseTimeline(raw).items
+        assertTrue(items[0].isPinned)
+        assertFalse(items[1].isPinned)
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0

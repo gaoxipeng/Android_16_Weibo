@@ -1358,6 +1358,7 @@ object WeiboJsonParser {
             retweetedStatus = retweeted,
             isEdited = isEdited,
             editCount = editCount,
+            isPinned = status.isPinnedStatus(),
         )
         val embeddedLongText = status.optJSONObject("longText")
             ?.takeIf { hasLongTextPayload(it) }
@@ -2263,6 +2264,18 @@ object WeiboJsonParser {
         val typeName = optNullableString("mblogtypename").orEmpty()
         val title = optNullableString("title").orEmpty()
         return typeName.contains("广告") || title.contains("广告")
+    }
+
+    /** 个人主页置顶：isTop / is_top，或 title.text / mblogtypename 含「置顶」。 */
+    private fun JSONObject.isPinnedStatus(): Boolean {
+        if (optTruthy("isTop") || optTruthy("is_top")) return true
+        val titleText = when (val title = opt("title")) {
+            is JSONObject -> title.optNullableString("text").orEmpty()
+            else -> optNullableString("title").orEmpty()
+        }
+        if (titleText.contains("置顶")) return true
+        val typeName = optNullableString("mblogtypename").orEmpty()
+        return typeName.contains("置顶")
     }
 
     private fun JSONObject.optNullableString(name: String): String? {
