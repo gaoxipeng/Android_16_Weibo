@@ -185,6 +185,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -2051,6 +2052,7 @@ private data class VideoPeekRequest(
     val expandFromAnchor: Boolean = false,
     val fromFullscreen: Boolean = false,
     val dockImmediately: Boolean = false,
+    val inlineHosted: Boolean = false,
     val onCancel: () -> Unit,
     val onRelease: () -> Unit,
     val onPlaybackEnded: () -> Unit,
@@ -2063,6 +2065,7 @@ private class VideoPeekController {
     var pendingDismiss by mutableStateOf<VideoPeekDismissReason?>(null)
     var isFloating by mutableStateOf(false)
     var isFullscreenMode by mutableStateOf(false)
+    var isInlineAnchored by mutableStateOf(false)
     /** 自动滚回卡片等场景跳过浮窗回缩动画，避免黑块下落。 */
     var snapDismiss by mutableStateOf(false)
         private set
@@ -2082,6 +2085,7 @@ private class VideoPeekController {
         snapDismiss = false
         isFloating = false
         isFullscreenMode = false
+        isInlineAnchored = false
         fingerDragOffset = Offset.Zero
         activeRequest = request
     }
@@ -2091,8 +2095,33 @@ private class VideoPeekController {
         snapDismiss = false
         isFloating = true
         isFullscreenMode = false
+        isInlineAnchored = false
         fingerDragOffset = Offset.Zero
         activeRequest = request
+    }
+
+    fun openInline(request: VideoPeekRequest) {
+        pendingDismiss = null
+        snapDismiss = false
+        isFloating = false
+        isFullscreenMode = false
+        isInlineAnchored = true
+        fingerDragOffset = Offset.Zero
+        activeRequest = request
+    }
+
+    fun enterFloatingFromInline() {
+        if (activeRequest != null && pendingDismiss == null && isInlineAnchored) {
+            isInlineAnchored = false
+            isFloating = true
+        }
+    }
+
+    fun returnToInlineAnchor() {
+        if (activeRequest != null && pendingDismiss == null && isFloating) {
+            isFloating = false
+            isInlineAnchored = true
+        }
     }
 
     fun cancel(snap: Boolean = false) {
@@ -2135,6 +2164,7 @@ private class VideoPeekController {
         snapDismiss = false
         isFloating = false
         isFullscreenMode = false
+        isInlineAnchored = false
         fingerDragOffset = Offset.Zero
         when (reason) {
             VideoPeekDismissReason.Cancel -> request?.onCancel?.invoke()
@@ -2150,6 +2180,7 @@ private class VideoPeekController {
         pendingDismiss = null
         isFloating = false
         isFullscreenMode = true
+        isInlineAnchored = false
         activeRequest?.onEnterFullscreenHandoffComplete?.invoke()
     }
 }
@@ -4000,18 +4031,24 @@ fun WeiboApp() {
                 videoPlaybackCoordinator.peekPlaybackKey.orEmpty(),
             )
         // 详情内联播放、自动滚动浮窗：返回首页时必须停掉，否则会出现只闻其声、点首页才恢复画面。
-        // 仅保留用户从全屏主动浮窗的播放。
+        // Any user-created floating playback is global and must survive entering/leaving
+        // detail. Only the detail page's automatic scroll float belongs to that page.
         val keepUserFloating = floatingActive &&
-            !autoScrollFloating &&
-            videoPeekController.activeRequest?.fromFullscreen == true
+            !autoScrollFloating
+        val detailCardHostActive = videoPeekController.activeRequest?.inlineHosted == true &&
+            videoPeekController.isInlineAnchored &&
+            videoPeekController.pendingDismiss == null
         if (!keepUserFloating) {
-            if (floatingActive) {
+            if (floatingActive || detailCardHostActive) {
                 videoPlaybackCoordinator.peekPlaybackKey?.let { key ->
                     videoPlaybackCoordinator.clearAutoScrollFloating(key)
                     videoPlaybackCoordinator.cancelPeekHandoff(key)
                     videoPlaybackCoordinator.clearInlineHandoffResume(key)
                 }
-                videoPeekController.cancel()
+                // Mark dismissal before navigation moves the anchor off screen. Otherwise
+                // the viewport observer can interpret the exit animation as an upward scroll
+                // and promote the detail card playback into a floating window.
+                videoPeekController.cancel(snap = detailCardHostActive)
             }
             videoPlaybackCoordinator.activeKey?.let { key ->
                 videoPlaybackCoordinator.cancelPeekHandoff(key)
@@ -5579,10 +5616,18 @@ fun WeiboApp() {
             albumViewerState == null
         if (!homeFeedOnTop) {
             when {
-                mediaPreview != null || keepFloatingPeekPlayback -> {
-                    // 浮窗已接管：切勿 pauseInlineOnly。内联 pause handler 可能仍挂着同一
-                    // ExoPlayer，会把浮窗刚恢复的播放再次 pause → 黑屏无声。
+                mediaPreview != null -> {
                     videoPlaybackCoordinator.activeKey = null
+                }
+                keepFloatingPeekPlayback -> {
+                    // 浮窗已接管：切勿 pauseInlineOnly。内联 pause handler 可能仍挂着同一
+                    // ExoPlayer。However, when the user explicitly starts another card,
+                    // requestInlinePlayback has already paused the peek and assigned a new
+                    // activeKey. Preserve that key so the new card keeps its visible Surface.
+                    // Clearing it here leaves an audible orphan and repeated taps create more.
+                    if (videoPlaybackCoordinator.activeKey != null) {
+                        videoPlaybackCoordinator.pausePeek()
+                    }
                 }
                 selectedItem != null -> {
                     // 详情页冷启动点播会写入 activeKey；本 effect 以 activeKey 为 key，
@@ -6240,6 +6285,22 @@ fun WeiboApp() {
                 ) { detailItem ->
                     key(detailItem.id, activeDetailInstanceKey) {
                         val detailListState = rememberLazyListState()
+                        val detailScrollCoordinator = remember { FeedListScrollCoordinator() }
+                        LaunchedEffect(detailListState, detailScrollCoordinator) {
+                            detailScrollCoordinator.stopScrollAction = {
+                                detailListState.stopScroll(MutatePriority.UserInput)
+                            }
+                            try {
+                                snapshotFlow { detailListState.isScrollInProgress }
+                                    .distinctUntilChanged()
+                                    .collect { scrolling ->
+                                        detailScrollCoordinator.isListScrolling = scrolling
+                                    }
+                            } finally {
+                                detailScrollCoordinator.stopScrollAction = null
+                                detailScrollCoordinator.isListScrolling = false
+                            }
+                        }
                         LaunchedEffect(detailListState) {
                             snapshotFlow {
                                 ScrollRestore(
@@ -6278,7 +6339,10 @@ fun WeiboApp() {
                             modifier = Modifier.fillMaxSize(),
                             color = MaterialTheme.colorScheme.background,
                         ) {
-                            CompositionLocalProvider(LocalDetailInlineVideoPlayback provides true) {
+                            CompositionLocalProvider(
+                                LocalDetailInlineVideoPlayback provides true,
+                                LocalFeedListScrollCoordinator provides detailScrollCoordinator,
+                            ) {
                             DetailScreen(
                                 item = detailItem,
                                 contentSection = detailContentSection,
@@ -6656,6 +6720,7 @@ fun WeiboApp() {
                             // 须高于详情层（约 590），否则详情内滚动浮窗会被挡住 → 只听声音看不见画面
                             videoPeekController.isFullscreenMode -> 600f
                             videoPeekController.isFloating -> 605f
+                            videoPeekController.isInlineAnchored -> 601f
                             else -> 565f
                         },
                     ),
@@ -6667,7 +6732,9 @@ fun WeiboApp() {
                     expandFromAnchor = request.expandFromAnchor,
                     fromFullscreen = request.fromFullscreen,
                     dockImmediately = request.dockImmediately,
+                    inlineHosted = request.inlineHosted,
                     isFloating = videoPeekController.isFloating,
+                    isInlineAnchored = videoPeekController.isInlineAnchored,
                     isFullscreenMode = videoPeekController.isFullscreenMode,
                     dismissReason = videoPeekController.pendingDismiss,
                     onRequestCancel = { videoPeekController.cancel() },
@@ -9220,7 +9287,9 @@ private fun VideoPeekOverlay(
     expandFromAnchor: Boolean = false,
     fromFullscreen: Boolean = false,
     dockImmediately: Boolean = false,
+    inlineHosted: Boolean = false,
     isFloating: Boolean,
+    isInlineAnchored: Boolean,
     isFullscreenMode: Boolean,
     dismissReason: VideoPeekDismissReason?,
     onRequestCancel: () -> Unit,
@@ -9237,25 +9306,48 @@ private fun VideoPeekOverlay(
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val configuration = LocalConfiguration.current
     val screenHeight = configuration.screenHeightDp.dp
-    var aspectRatio by remember(media.streamUrl) { mutableStateOf(16f / 9f) }
-    val enterProgress = remember(fromFullscreen, dockImmediately) {
+    var aspectRatio by remember(
+        media.streamUrl,
+        media.coverWidth,
+        media.coverHeight,
+        media.videoOrientation,
+    ) {
+        val coverWidth = media.coverWidth ?: 0
+        val coverHeight = media.coverHeight ?: 0
+        mutableStateOf(
+            when {
+                coverWidth > 0 && coverHeight > 0 ->
+                    (coverWidth.toFloat() / coverHeight.toFloat()).coerceIn(0.25f, 4f)
+                media.videoOrientation.equals("vertical", ignoreCase = true) ||
+                    media.videoOrientation.equals("portrait", ignoreCase = true) -> 9f / 16f
+                else -> 16f / 9f
+            },
+        )
+    }
+    val enterProgress = remember(playbackKey, fromFullscreen, dockImmediately, isInlineAnchored) {
         Animatable(
             when {
+                isInlineAnchored -> 1f
                 fromFullscreen -> 0f
                 dockImmediately -> 1f
                 else -> 0f
             },
         )
     }
-    val dockProgress = remember(dockImmediately) {
+    val dockProgress = remember(playbackKey, dockImmediately) {
         Animatable(if (dockImmediately) 1f else 0f)
     }
-    val fullscreenExpandProgress = remember { Animatable(if (isFullscreenMode) 1f else 0f) }
+    val fullscreenExpandProgress = remember(playbackKey) {
+        Animatable(if (isFullscreenMode) 1f else 0f)
+    }
     var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
     var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
     var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
     var peekDismissUseTopExit by remember { mutableStateOf(false) }
     var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
+    var inlineAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
+    var hasEnteredFloating by remember { mutableStateOf(false) }
+    var animateHostedBounds by remember { mutableStateOf(false) }
     val peekDismissMorphProgress = remember { Animatable(1f) }
     val isDocked = isFloating || dockProgress.value > 0f || isFullscreenMode
 
@@ -9265,8 +9357,46 @@ private fun VideoPeekOverlay(
 
     ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
 
-    LaunchedEffect(expandFromAnchor, fromFullscreen, dockImmediately) {
+    LaunchedEffect(inlineHosted, isFullscreenMode, resolveAnchorBounds) {
+        // Keep the destination current even while the video is floating. Otherwise the
+        // return first shrinks toward the stale departure point and then jumps down to the
+        // card's new scroll position, which looks like two separate animations.
+        while (inlineHosted && !isFullscreenMode) {
+            inlineAnchorBounds = resolveAnchorBounds()
+            withFrameNanos { }
+        }
+    }
+
+    LaunchedEffect(isFloating, isInlineAnchored) {
         when {
+            isFloating -> {
+                hasEnteredFloating = true
+                animateHostedBounds = true
+            }
+            isInlineAnchored && hasEnteredFloating -> {
+                // Keep interpolation only for the return animation. Once settled, follow
+                // the scrolling card directly so the video never trails behind the list.
+                animateHostedBounds = true
+                delay(70)
+                animateHostedBounds = false
+            }
+            isInlineAnchored -> animateHostedBounds = false
+        }
+    }
+
+    LaunchedEffect(
+        playbackKey,
+        expandFromAnchor,
+        fromFullscreen,
+        dockImmediately,
+        isInlineAnchored,
+        isFloating,
+    ) {
+        // Floating owns a single direct transition below. Do not first animate to the
+        // centered preview position.
+        if (isFloating) return@LaunchedEffect
+        when {
+            isInlineAnchored -> enterProgress.snapTo(1f)
             expandFromAnchor || fromFullscreen -> enterProgress.snapTo(0f)
             dockImmediately -> enterProgress.snapTo(1f)
             else -> {
@@ -9279,7 +9409,14 @@ private fun VideoPeekOverlay(
         }
     }
 
-    LaunchedEffect(isFloating, dockImmediately, fromFullscreen, isFullscreenMode) {
+    LaunchedEffect(
+        playbackKey,
+        isFloating,
+        isInlineAnchored,
+        dockImmediately,
+        fromFullscreen,
+        isFullscreenMode,
+    ) {
         if (isFullscreenMode) {
             enterProgress.snapTo(1f)
             dockProgress.snapTo(1f)
@@ -9287,9 +9424,6 @@ private fun VideoPeekOverlay(
             return@LaunchedEffect
         }
         if (isFloating) {
-            if (enterProgress.value < 1f) {
-                enterProgress.animateTo(1f, MediaPeekEnterAnimationSpec)
-            }
             if (fullscreenExpandProgress.value > 0f) {
                 fullscreenExpandProgress.animateTo(
                     targetValue = 0f,
@@ -9299,14 +9433,27 @@ private fun VideoPeekOverlay(
                     ),
                 )
             }
-            if (dockImmediately) {
+            if (inlineHosted || dockImmediately) {
+                enterProgress.snapTo(1f)
                 dockProgress.snapTo(1f)
             } else {
-                dockProgress.animateTo(
-                    targetValue = 1f,
-                    animationSpec = MediaPeekDockAnimationSpec,
+                val directToFloatingSpec = tween<Float>(
+                    durationMillis = 220,
+                    easing = LinearEasing,
                 )
+                coroutineScope {
+                    launch {
+                        enterProgress.animateTo(1f, directToFloatingSpec)
+                    }
+                    launch {
+                        dockProgress.animateTo(1f, directToFloatingSpec)
+                    }
+                }
             }
+        } else if (isInlineAnchored) {
+            enterProgress.snapTo(1f)
+            dockProgress.snapTo(0f)
+            fullscreenExpandProgress.snapTo(0f)
         } else if (dismissReason == null) {
             dockProgress.snapTo(0f)
         }
@@ -9429,6 +9576,35 @@ private fun VideoPeekOverlay(
         val dockHeight = dockWidth / VideoPeekDockAspectRatio
         val dockLeft = 0.dp
         val dockTop = statusBarTop + 8.dp
+        val hostedTargetLeft = if (isFloating) {
+            dockLeft
+        } else {
+            with(density) { (inlineAnchorBounds.left - overlayWindowOrigin.x).toDp() }
+        }
+        val hostedTargetTop = if (isFloating) {
+            dockTop
+        } else {
+            with(density) { (inlineAnchorBounds.top - overlayWindowOrigin.y).toDp() }
+        }
+        val hostedTargetWidth = if (isFloating) {
+            dockWidth
+        } else {
+            with(density) { inlineAnchorBounds.width.toDp() }
+        }
+        val hostedTargetHeight = if (isFloating) {
+            dockHeight
+        } else {
+            with(density) { inlineAnchorBounds.height.toDp() }
+        }
+        val hostedBoundsAnimation = when {
+            isFloating -> tween<Dp>(50, easing = LinearEasing)
+            animateHostedBounds -> tween<Dp>(50, easing = LinearEasing)
+            else -> snap()
+        }
+        val hostedLeft by animateDpAsState(hostedTargetLeft, hostedBoundsAnimation, label = "videoHostLeft")
+        val hostedTop by animateDpAsState(hostedTargetTop, hostedBoundsAnimation, label = "videoHostTop")
+        val hostedWidth by animateDpAsState(hostedTargetWidth, hostedBoundsAnimation, label = "videoHostWidth")
+        val hostedHeight by animateDpAsState(hostedTargetHeight, hostedBoundsAnimation, label = "videoHostHeight")
 
         val holdLeftPx = with(density) { holdLeft.toPx() }
         val holdTopPx = with(density) { holdTop.toPx() }
@@ -9450,6 +9626,15 @@ private fun VideoPeekOverlay(
             fullscreenVideoWidthPx = maxWidthPx
             fullscreenVideoHeightPx = fullscreenVideoWidthPx / safeVideoAspect
         }
+        val fullscreenVideoLeft = with(density) {
+            ((maxWidthPx - fullscreenVideoWidthPx) / 2f).toDp()
+        }
+        val fullscreenVideoTop = with(density) {
+            ((maxHeightPx - fullscreenVideoHeightPx) / 2f).toDp()
+        }
+        val fullscreenVideoWidth = with(density) { fullscreenVideoWidthPx.toDp() }
+        val fullscreenVideoHeight = with(density) { fullscreenVideoHeightPx.toDp() }
+        val inlineFullscreenProgress = fullscreenExpandProgress.value.coerceIn(0f, 1f)
         val motion = computeMediaPeekGraphicsMotion(
             anchorBounds = anchorBounds,
             layoutOriginLeftPx = holdLeftPx,
@@ -9470,7 +9655,10 @@ private fun VideoPeekOverlay(
             dockWidthPx = dockWidthPx,
             dockHeightPx = dockHeightPx,
         )
-        val useDockedColumnLayout = isDocked && !expandingToFullscreen && !useFloatingDismissMorph
+        val useDockedColumnLayout = inlineHosted && isDocked &&
+            dockProgress.value >= 0.999f &&
+            !expandingToFullscreen &&
+            !useFloatingDismissMorph
         val peekDismissEnabled = isDocked && dismissReason == null && !useFloatingDismissMorph && !isFullscreenMode
 
         val videoCardModifier = Modifier
@@ -9497,6 +9685,33 @@ private fun VideoPeekOverlay(
                 },
             )
 
+        // Keep a portrait video's PlayerView measured at the final dock size throughout
+        // the transition. A layer transform is cheap and does not recreate its buffers.
+        val directFloatingCardModifier = run {
+            val progress = dockProgress.value.coerceIn(0f, 1f)
+            val source = anchorBounds.toOverlayLocal(overlayWindowOrigin)
+            val sourceCenterX = source.center.x
+            val sourceCenterY = source.center.y
+            val dockCenterX = dockLeftPx + dockWidthPx / 2f
+            val dockCenterY = dockTopPx + dockHeightPx / 2f
+            val startScaleX = source.width / dockWidthPx.coerceAtLeast(1f)
+            val startScaleY = source.height / dockHeightPx.coerceAtLeast(1f)
+            Modifier
+                .offset(x = dockLeft, y = dockTop)
+                .size(dockWidth, dockHeight)
+                .graphicsLayer {
+                    translationX = lerp(sourceCenterX - dockCenterX, 0f, progress)
+                    translationY = lerp(sourceCenterY - dockCenterY, 0f, progress)
+                    scaleX = lerp(startScaleX, 1f, progress)
+                    scaleY = lerp(startScaleY, 1f, progress)
+                    transformOrigin = TransformOrigin.Center
+                    shape = RoundedCornerShape(12.dp)
+                    clip = true
+                    shadowElevation = 8.dp.toPx() * progress
+                }
+                .background(Color.Black)
+        }
+
         @Composable
         fun VideoPeekCard(modifier: Modifier) {
             Box(modifier = modifier) {
@@ -9504,7 +9719,7 @@ private fun VideoPeekOverlay(
                     media = media,
                     playbackOwnerId = playbackOwnerId,
                     isFullscreen = isFullscreenMode,
-                    controlsEnabled = isDocked || isFullscreenMode,
+                    controlsEnabled = isInlineAnchored || isDocked || isFullscreenMode,
                     initialControlsVisible = false,
                     trackViewportPauseOverride = false,
                     isPeekPlayback = !isFullscreenMode,
@@ -9513,6 +9728,7 @@ private fun VideoPeekOverlay(
                     savePositionOnDispose = true,
                     playbackSpeedOverride = when {
                         isFullscreenMode -> null
+                        inlineHosted -> null
                         expandFromAnchor -> null
                         isDocked -> null
                         else -> VideoPeekFloatingPlaybackSpeed
@@ -9522,10 +9738,10 @@ private fun VideoPeekOverlay(
                         aspectRatio = width.toFloat() / height.toFloat()
                     },
                     onFullscreen = { videoPeekController.enterFullscreen() },
-                    onEnterFloatingPlayback = if (isFullscreenMode) {
-                        { videoPeekController.exitFullscreenToFloating() }
-                    } else {
-                        null
+                    onEnterFloatingPlayback = when {
+                        isFullscreenMode -> ({ videoPeekController.exitFullscreenToFloating() })
+                        isInlineAnchored -> ({ videoPeekController.enterFloatingFromInline() })
+                        else -> null
                     },
                     showFullscreenButton = false,
                     showPictureInPictureButton = false,
@@ -9584,7 +9800,7 @@ private fun VideoPeekOverlay(
                     .fillMaxSize()
                     .background(Color.Black),
             )
-        } else if (!isDocked) {
+        } else if (!isDocked && !isInlineAnchored) {
             val scrimAlpha = 0.42f * layoutProgress
             Box(
                 modifier = Modifier
@@ -9723,6 +9939,25 @@ private fun VideoPeekOverlay(
                         isFullscreenMode -> Modifier
                             .fillMaxSize()
                             .background(Color.Black)
+                        inlineHosted && !useFloatingDismissMorph -> Modifier
+                            .offset(
+                                x = lerpDp(hostedLeft, fullscreenVideoLeft, inlineFullscreenProgress),
+                                y = lerpDp(hostedTop, fullscreenVideoTop, inlineFullscreenProgress),
+                            )
+                            .size(
+                                width = lerpDp(hostedWidth, fullscreenVideoWidth, inlineFullscreenProgress),
+                                height = lerpDp(hostedHeight, fullscreenVideoHeight, inlineFullscreenProgress),
+                            )
+                            .graphicsLayer {
+                                shape = RoundedCornerShape(
+                                    lerpDp(if (isFloating) 12.dp else 8.dp, 0.dp, inlineFullscreenProgress),
+                                )
+                                clip = true
+                                shadowElevation =
+                                    (if (isFloating) 8.dp.toPx() else 0f) * (1f - inlineFullscreenProgress)
+                            }
+                            .background(Color.Black)
+                        isFloating && !useFloatingDismissMorph -> directFloatingCardModifier
                         useFloatingDismissMorph -> Modifier
                             .align(Alignment.Center)
                             .size(dockWidth, dockHeight)
@@ -11671,6 +11906,61 @@ private fun InlineVideoPlayer(
         videoPeekController.resetFingerDragOffset()
     }
 
+    fun openAnchoredInlinePlayback() {
+        val bounds = anchorHolder.boundsInWindow() ?: return
+        actionOpen = true
+        peekActive = true
+        // When detail inherited an already-playing instance from profile/feed, hand that
+        // exact instance to the persistent host before hiding the old inline surface.
+        if (inlinePlaying) {
+            videoCoordinator.beginPeekHandoff(playbackKey)
+            videoCoordinator.claimPeekPlaybackForScrollFloat(playbackKey)
+        } else {
+            videoCoordinator.claimPeekPlayback(playbackKey)
+        }
+        videoPeekController.openInline(
+            VideoPeekRequest(
+                media = media,
+                anchorBounds = bounds,
+                pressOffset = bounds.center,
+                playbackOwnerId = playbackOwnerId,
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
+                inlineHosted = true,
+                onCancel = {
+                    videoCoordinator.clearAutoScrollFloating(playbackKey)
+                    videoCoordinator.releasePeekPlayback(playbackKey)
+                    resetPeekState()
+                },
+                onRelease = {},
+                onPlaybackEnded = {
+                    videoCoordinator.clearAutoScrollFloating(playbackKey)
+                    resetPeekState()
+                },
+                onOpenFullscreenBehind = {},
+            ),
+        )
+    }
+
+    LaunchedEffect(
+        isDetailInlinePlayback,
+        inlinePlaying,
+        videoPeekController.activeRequest,
+        videoPeekController.isInlineAnchored,
+        playbackKey,
+    ) {
+        if (!isDetailInlinePlayback || !inlinePlaying) return@LaunchedEffect
+        val hostAlreadyOwnsThisVideo = videoPeekController.activeRequest?.let {
+            videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
+        } == true
+        if (hostAlreadyOwnsThisVideo) return@LaunchedEffect
+        // Profile/feed -> detail is the only remaining entry that can arrive with an old
+        // inline surface. Adopt it once here; all later card/float/fullscreen movement stays
+        // inside the same host and Surface.
+        openAnchoredInlinePlayback()
+    }
+
     fun openVideoPeek(pressWindowOffset: Offset) {
         val bounds = anchorHolder.boundsInWindow() ?: return
         val wasPlayingBeforePeek = videoCoordinator.activeKey == playbackKey &&
@@ -11765,8 +12055,12 @@ private fun InlineVideoPlayer(
         if (videoCoordinator.peekPlaybackKey != playbackKey || !videoPeekController.isFloating) return
         if (videoPeekController.pendingDismiss != null) return
         videoCoordinator.clearAutoScrollFloating(playbackKey)
-        videoCoordinator.beginPeekHandoff(playbackKey)
-        videoPeekController.cancel()
+        if (videoPeekController.activeRequest?.let {
+                videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
+            } == true
+        ) {
+            videoPeekController.returnToInlineAnchor()
+        }
     }
 
     LaunchedEffect(
@@ -11790,16 +12084,25 @@ private fun InlineVideoPlayer(
                 returnToInlineFromScrollFloating()
             }
         } else {
-            if (!inlinePlaying || !media.isStreamPlayable()) return@LaunchedEffect
-            if (videoCoordinator.peekPlaybackKey == playbackKey) return@LaunchedEffect
-            if (actionOpen || peekActive) return@LaunchedEffect
+            val anchoredHere = videoPeekController.isInlineAnchored &&
+                videoPeekController.activeRequest?.let {
+                    videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
+                } == true
+            if ((!inlinePlaying && !anchoredHere) || !media.isStreamPlayable()) return@LaunchedEffect
+            if (!anchoredHere && videoCoordinator.peekPlaybackKey == playbackKey) return@LaunchedEffect
+            if (!anchoredHere && (actionOpen || peekActive)) return@LaunchedEffect
             // 视频画面上边界接触头像/发布时间卡片底边的这一帧即开始交接。
             if (bounds.top > threshold) return@LaunchedEffect
             val center = Offset(
                 bounds.left + bounds.width / 2f,
                 bounds.top + bounds.height / 2f,
             )
-            openInlineFloatingPlayback(center, fromAutoScroll = true)
+            if (anchoredHere) {
+                videoCoordinator.markAutoScrollFloating(playbackKey)
+                videoPeekController.enterFloatingFromInline()
+            } else {
+                openInlineFloatingPlayback(center, fromAutoScroll = true)
+            }
         }
     }
 
@@ -11894,7 +12197,8 @@ private fun InlineVideoPlayer(
                             val tapUptime = down.uptimeMillis
                             val pressWindowOffset = down.position.toWindowPosition(bounds)
                             if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
-                                videoCoordinator.requestInlinePlayback(playbackKey)
+                                if (isDetailInlinePlayback) openAnchoredInlinePlayback()
+                                else videoCoordinator.requestInlinePlayback(playbackKey)
                                 return@awaitEachGesture
                             }
                             val isDoubleTap = lastTapUptimeMs > 0L &&
@@ -11903,7 +12207,8 @@ private fun InlineVideoPlayer(
                                 lastTapUptimeMs = 0L
                                 if (media.isStreamPlayable()) {
                                     if (!inlinePlaying) {
-                                        videoCoordinator.requestInlinePlayback(playbackKey)
+                                        if (isDetailInlinePlayback) openAnchoredInlinePlayback()
+                                        else videoCoordinator.requestInlinePlayback(playbackKey)
                                     }
                                 } else {
                                     onClick()
@@ -11991,7 +12296,8 @@ private fun InlineVideoPlayer(
                 TransparentLiquidIconButton(
                     onClick = {
                         if (media.isStreamPlayable()) {
-                            videoCoordinator.requestInlinePlayback(playbackKey)
+                            if (isDetailInlinePlayback) openAnchoredInlinePlayback()
+                            else videoCoordinator.requestInlinePlayback(playbackKey)
                         } else {
                             onClick()
                         }
@@ -12094,6 +12400,7 @@ private fun WeiboVideoSurface(
     val saveHint = LocalImageSaveHint.current
     val scope = rememberCoroutineScope()
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val videoPeekController = LocalVideoPeekController.current
     val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
     val isInlineFeedOrDetail = !isPeekPlayback && !isFullscreen && !seamlessOverlayPlayback
     val isLiveBroadcast = media.isLiveBroadcast()
@@ -12495,8 +12802,10 @@ private fun WeiboVideoSurface(
             if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
                 return@LaunchedEffect
             }
-            val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
-            while (android.os.SystemClock.uptimeMillis() < deadline) {
+            // A handoff target must adopt the source instance. Never create a fallback
+            // ExoPlayer here: that leaves two independent timelines alive and is the root
+            // cause of duplicate audio, frozen frames and playback continuing after exit.
+            while (true) {
                 videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
                     configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
                     deferredPlayer = handoff
@@ -12505,33 +12814,8 @@ private fun WeiboVideoSurface(
                         videoCoordinator.requestInlinePlayback(playbackKey)
                     }
                     return@LaunchedEffect
-                }
-                if (
-                    !videoCoordinator.isFullscreenHandoffPending(playbackKey) &&
-                    !videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
-                ) {
-                    break
                 }
                 delay(16)
-            }
-            if (videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
-                videoCoordinator.hasStashedHandoff(playbackKey)
-            ) {
-                videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-                    configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
-                    deferredPlayer = handoff
-                    handoffPlayerResolved = true
-                    if (!isPeekPlayback && !isFullscreen) {
-                        videoCoordinator.requestInlinePlayback(playbackKey)
-                    }
-                    return@LaunchedEffect
-                }
-            }
-            val resolved = resolveOverlayPlayer()
-            deferredPlayer = resolved
-            handoffPlayerResolved = true
-            if (!isPeekPlayback && !isFullscreen) {
-                videoCoordinator.requestInlinePlayback(playbackKey)
             }
         }
     }
@@ -12589,13 +12873,21 @@ private fun WeiboVideoSurface(
             player,
             playbackKey,
             videoCoordinator.pendingPeekHandoffKey,
+            videoCoordinator.pendingFullscreenHandoffKey,
             videoCoordinator.detailHandoffActive,
         ) {
             val target = player ?: return@LaunchedEffect
             if (stashedForHandoff) return@LaunchedEffect
-            if (!videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)) return@LaunchedEffect
+            val handingToOverlay = videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+                videoCoordinator.isFullscreenHandoffPending(playbackKey)
+            if (!handingToOverlay) return@LaunchedEffect
             // 首页进详情的交接不要从详情内联 stash。
-            if (isDetailInlinePlayback && videoCoordinator.detailHandoffActive) return@LaunchedEffect
+            if (
+                isDetailInlinePlayback &&
+                videoCoordinator.detailHandoffActive &&
+                videoPeekController.activeRequest?.inlineHosted != true &&
+                !videoCoordinator.isFullscreenHandoffPending(playbackKey)
+            ) return@LaunchedEffect
             val textureView = playerViewHolder.view?.videoSurfaceView as? android.view.TextureView
             textureView?.bitmap?.takeIf { it.width > 0 && it.height > 0 }?.let { bitmap ->
                 videoCoordinator.storeTransitionFrame(playbackKey, bitmap)
@@ -12730,7 +13022,8 @@ private fun WeiboVideoSurface(
     }
     var videoFrameReady by remember(player) {
         mutableStateOf(
-            player.playbackState == androidx.media3.common.Player.STATE_READY &&
+            isInlineFeedOrDetail &&
+                player.playbackState == androidx.media3.common.Player.STATE_READY &&
                 player.videoSize.width > 0 &&
                 (player.isPlaying || player.currentPosition > 0L),
         )
@@ -12813,6 +13106,9 @@ private fun WeiboVideoSurface(
         }
     }
 
+    val currentPeekMode = rememberUpdatedState(isPeekPlayback)
+    val currentFullscreenMode = rememberUpdatedState(isFullscreen)
+
     LaunchedEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
         when {
             isFullscreen -> videoCoordinator.claimFullscreenPlayback(playbackKey)
@@ -12865,10 +13161,20 @@ private fun WeiboVideoSurface(
         }
         player.addListener(listener)
         onDispose {
-            videoCoordinator.unregisterPeekPauseHandler(playbackKey)
-            videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen = false)
-            videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen = true)
-            videoCoordinator.releasePeekPlayback(playbackKey)
+            // Handler registration has its own mode-keyed DisposableEffect. Do not clear
+            // another surface's handler/ownership here: during card -> floating the old
+            // inline surface is disposed after the floating surface has already claimed it.
+            if (currentPeekMode.value) {
+                videoCoordinator.releasePeekPlayback(playbackKey)
+            }
+            if (
+                currentFullscreenMode.value &&
+                videoCoordinator.fullscreenKey?.let {
+                    videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                } == true
+            ) {
+                videoCoordinator.fullscreenKey = null
+            }
             if (effectiveSavePosition) {
                 if (videoCoordinator.isPeekRestartFromBeginning(playbackKey)) {
                     videoCoordinator.clearPosition(playbackKey)
@@ -12908,7 +13214,19 @@ private fun WeiboVideoSurface(
                 val adoptedByDetail = videoCoordinator.detailOverlayOpen &&
                     !isDetailInlinePlayback &&
                     videoCoordinator.isPlaybackKeyActive(playbackKey)
-                if (adoptedByDetail) {
+                val adoptedByOverlay = !isPeekPlayback &&
+                    (
+                        videoCoordinator.peekPlaybackKey?.let {
+                            videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                        } == true ||
+                            videoCoordinator.fullscreenKey?.let {
+                                videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                            } == true
+                        )
+                if (adoptedByDetail || adoptedByOverlay) {
+                    // The overlay may consume the handoff map before this old card reaches
+                    // onDispose. Ownership is authoritative: never release an instance that
+                    // has already been claimed by the visible floating/fullscreen surface.
                     playerViewHolder.view?.player = null
                 } else {
                     videoCoordinator.releaseSharedPlayer(playbackKey, player)
@@ -13403,6 +13721,7 @@ private fun WeiboVideoSurface(
                 onClick = {
                     showControls()
                     if (onEnterFloatingPlayback != null) {
+                        captureHandoffTransitionFrame()
                         onEnterFloatingPlayback()
                     } else {
                         enterPictureInPicture()
@@ -13742,7 +14061,7 @@ private fun VideoControlCapsuleProgressBackground(
     BoxWithConstraints(
         modifier = modifier.clip(VideoControlCapsuleShape),
     ) {
-        if (displayedProgress > 0f) {
+        if (displayedProgress > 0f && maxWidth >= VideoProgressLineWidth) {
             val lineOffset = (maxWidth * displayedProgress - VideoProgressLineWidth)
                 .coerceIn(0.dp, maxWidth - VideoProgressLineWidth)
             Box(
