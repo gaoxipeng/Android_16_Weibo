@@ -1261,14 +1261,6 @@ private fun <T> NavAnimatedOverlay(
 }
 
 private class VideoPlaybackCoordinator {
-    private fun trace(event: String, playbackKey: String, player: androidx.media3.exoplayer.ExoPlayer? = null) {
-        android.util.Log.d(
-            "VideoHandoff",
-            "$event key=$playbackKey player=${player?.let(System::identityHashCode)} " +
-                "active=$activeKey peek=$peekPlaybackKey pending=$pendingPeekHandoffKey " +
-                "playing=${player?.isPlaying} pwr=${player?.playWhenReady}",
-        )
-    }
     var activeKey by mutableStateOf<String?>(null)
     var fullscreenKey by mutableStateOf<String?>(null)
     val positions = mutableStateMapOf<String, Long>()
@@ -1281,13 +1273,10 @@ private class VideoPlaybackCoordinator {
     var autoScrollFloatingKey by mutableStateOf<String?>(null)
     private val sharedPlayersByMediaKey = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val handoffPlayers = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
-    private val handoffSourceViews = mutableMapOf<String, androidx.media3.ui.PlayerView>()
     private val surfaceBoundPlayers = java.util.Collections.newSetFromMap(
         java.util.IdentityHashMap<androidx.media3.exoplayer.ExoPlayer, Boolean>(),
     )
     private val transitionFrames = mutableMapOf<String, Bitmap>()
-    var transitionFrameVersion by mutableIntStateOf(0)
-        private set
     private val inlinePauseHandlers = mutableMapOf<String, () -> Unit>()
     private val fullscreenPauseHandlers = mutableMapOf<String, () -> Unit>()
     private val peekPauseHandlers = mutableMapOf<String, () -> Unit>()
@@ -1362,20 +1351,10 @@ private class VideoPlaybackCoordinator {
 
     fun storeTransitionFrame(playbackKey: String, bitmap: Bitmap) {
         transitionFrames.put(playbackKey, bitmap)?.takeIf { it !== bitmap }?.recycle()
-        transitionFrameVersion++
     }
 
-    fun peekTransitionFrame(playbackKey: String): Bitmap? = transitionFrames[playbackKey]
-
-    fun releaseTransitionFrame(playbackKey: String, expected: Bitmap? = null) {
-        val matchedKey = transitionFrames.keys.firstOrNull { matchesPlaybackKey(it, playbackKey) }
-            ?: return
-        val frame = transitionFrames[matchedKey] ?: return
-        if (expected != null && frame !== expected) return
-        transitionFrames.remove(matchedKey)
-        if (!frame.isRecycled) frame.recycle()
-        transitionFrameVersion++
-    }
+    fun consumeTransitionFrame(playbackKey: String): Bitmap? =
+        transitionFrames.remove(playbackKey)
 
     fun requestProactivePeekStash(playbackKey: String) {
         proactiveStashSignalKey = playbackKey
@@ -1395,16 +1374,6 @@ private class VideoPlaybackCoordinator {
         val mediaPart = mediaPartFromPlaybackKey(playbackKey)
         if (mediaPart.isBlank()) return false
         return findHandoffKeyByMediaPart(mediaPart, except = playbackKey) != null
-    }
-
-    fun hasHandoffSourceView(playbackKey: String): Boolean =
-        handoffSourceViews.keys.any { matchesPlaybackKey(it, playbackKey) }
-
-    fun consumeHandoffSourceView(playbackKey: String): androidx.media3.ui.PlayerView? {
-        handoffSourceViews.remove(playbackKey)?.let { return it }
-        val matched = handoffSourceViews.keys.firstOrNull { matchesPlaybackKey(it, playbackKey) }
-            ?: return null
-        return handoffSourceViews.remove(matched)
     }
 
     fun cancelFullscreenHandoff(playbackKey: String) {
@@ -1479,17 +1448,12 @@ private class VideoPlaybackCoordinator {
 
     fun adoptSharedPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
         consumeHandoffPlayer(playbackKey)?.let { player ->
-            trace("adopt-handoff", playbackKey, player)
             registerSharedPlayer(playbackKey, player)
             return player
         }
         val mediaPart = mediaPartFromPlaybackKey(playbackKey)
         if (mediaPart.isBlank()) return null
-        // Adoption transfers the output surface, not ownership of the playback engine.
-        // Keep the canonical instance discoverable while Compose source/target lifetimes
-        // overlap; removing it here lets a rapid recomposition create a second player.
-        val shared = sharedPlayersByMediaKey[mediaPart] ?: return null
-        trace("adopt-shared", playbackKey, shared)
+        val shared = sharedPlayersByMediaKey.remove(mediaPart) ?: return null
         // 从 shared 接管时也清掉 pending，避免 peek 一直认为尚在交接而卡住。
         if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
             pendingPeekHandoffKey = null
@@ -1547,11 +1511,13 @@ private class VideoPlaybackCoordinator {
         if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
             pendingPeekHandoffKey = null
         }
-        // Cancellation can race with the source-to-target surface switch. The source view
-        // and stashed player may already be the only visible/playing pair, so detaching or
-        // releasing either here produces audio-only playback. Leave them available for the
-        // winner (inline or peek) to adopt; normal disposal owns the eventual release.
-        clearProactiveStashRequest(playbackKey)
+        handoffPlayers.remove(playbackKey)?.release()
+        val mediaPart = mediaPartFromPlaybackKey(playbackKey)
+        if (mediaPart.isNotBlank()) {
+            findHandoffKeyByMediaPart(mediaPart, except = playbackKey)?.let { matched ->
+                handoffPlayers.remove(matched)?.release()
+            }
+        }
     }
 
     fun markPlayerSurfaceBound(player: androidx.media3.exoplayer.ExoPlayer) {
@@ -1588,22 +1554,6 @@ private class VideoPlaybackCoordinator {
         registerSharedPlayer(playbackKey, player)
     }
 
-    /**
-     * 卡片与浮窗之间的无缝交接：播放器和旧 PlayerView 一起保留，既不暂停也不清 Surface。
-     * 新 PlayerView 挂载后由 PlayerView.switchTargetView 原子切换输出目标。
-     */
-    fun stashSeamlessHandoffPlayer(
-        playbackKey: String,
-        player: androidx.media3.exoplayer.ExoPlayer,
-        sourceView: androidx.media3.ui.PlayerView,
-    ) {
-        trace("stash-seamless", playbackKey, player)
-        rememberPosition(playbackKey, player.currentPosition.coerceAtLeast(0L))
-        handoffPlayers[playbackKey] = player
-        handoffSourceViews[playbackKey] = sourceView
-        registerSharedPlayer(playbackKey, player)
-    }
-
     fun isAnotherInlinePlaybackActive(playbackKey: String): Boolean {
         val current = activeKey ?: return false
         return !matchesPlaybackKey(current, playbackKey)
@@ -1611,7 +1561,6 @@ private class VideoPlaybackCoordinator {
 
     fun consumeHandoffPlayer(playbackKey: String): androidx.media3.exoplayer.ExoPlayer? {
         handoffPlayers.remove(playbackKey)?.let { player ->
-            trace("consume-exact", playbackKey, player)
             clearHandoffFlagsForKey(playbackKey)
             clearProactiveStashRequest(playbackKey)
             return player
@@ -1620,7 +1569,6 @@ private class VideoPlaybackCoordinator {
         if (mediaPart.isBlank()) return null
         val matchedKey = findHandoffKeyByMediaPart(mediaPart, except = playbackKey) ?: return null
         val player = handoffPlayers.remove(matchedKey) ?: return null
-        trace("consume-alias", playbackKey, player)
         clearHandoffFlagsForKey(matchedKey)
         clearProactiveStashRequest(playbackKey)
         if (pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true) {
@@ -1695,14 +1643,6 @@ private class VideoPlaybackCoordinator {
         pausePeek(exceptKey = playbackKey)
         activeKey = null
         peekPlaybackKey = playbackKey
-        trace("claim-float", playbackKey)
-    }
-
-    /** 返回卡片时先让内联目标进入组合，但不暂停仍承担退出动画的浮窗播放器。 */
-    fun claimInlinePlaybackForScrollReturn(playbackKey: String) {
-        pauseInlineOnly(exceptKey = playbackKey)
-        activeKey = playbackKey
-        trace("claim-return", playbackKey)
     }
 
     fun releasePeekPlayback(playbackKey: String) {
@@ -9235,10 +9175,6 @@ private fun VideoPeekOverlay(
     var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
     val peekDismissMorphProgress = remember { Animatable(1f) }
     val isDocked = isFloating || dockProgress.value > 0f || isFullscreenMode
-    val dockTransitionRunning = isFloating &&
-        !isFullscreenMode &&
-        dismissReason == null &&
-        dockProgress.value < 0.999f
 
     fun requestDismiss() {
         onRequestCancel()
@@ -9246,14 +9182,10 @@ private fun VideoPeekOverlay(
 
     ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
 
-    LaunchedEffect(expandFromAnchor, fromFullscreen, dockImmediately, isFloating) {
+    LaunchedEffect(expandFromAnchor, fromFullscreen, dockImmediately) {
         when {
             expandFromAnchor || fromFullscreen -> enterProgress.snapTo(0f)
             dockImmediately -> enterProgress.snapTo(1f)
-            // Scroll-triggered floating goes straight from the inline video rect to the
-            // dock. Running the regular peek-enter animation first detours through the
-            // centered hold rect, which appears as a downward jump.
-            isFloating -> enterProgress.snapTo(0f)
             else -> {
                 enterProgress.snapTo(0f)
                 enterProgress.animateTo(
@@ -9272,6 +9204,9 @@ private fun VideoPeekOverlay(
             return@LaunchedEffect
         }
         if (isFloating) {
+            if (enterProgress.value < 1f) {
+                enterProgress.animateTo(1f, MediaPeekEnterAnimationSpec)
+            }
             if (fullscreenExpandProgress.value > 0f) {
                 fullscreenExpandProgress.animateTo(
                     targetValue = 0f,
@@ -9289,9 +9224,6 @@ private fun VideoPeekOverlay(
                     animationSpec = MediaPeekDockAnimationSpec,
                 )
             }
-            // At dockProgress == 1 the enter path no longer affects geometry. Settle the
-            // value only after the direct morph has completed so future modes start cleanly.
-            enterProgress.snapTo(1f)
         } else if (dismissReason == null) {
             dockProgress.snapTo(0f)
         }
@@ -9387,7 +9319,7 @@ private fun VideoPeekOverlay(
                 overlayWindowOrigin = Offset(windowBounds.left, windowBounds.top)
             }
             .then(
-            if (expandingToFullscreen || !isDocked || dockTransitionRunning) {
+            if (expandingToFullscreen || !isDocked) {
                 Modifier.fillMaxSize()
             } else {
                 Modifier.fillMaxWidth()
@@ -9435,12 +9367,8 @@ private fun VideoPeekOverlay(
             fullscreenVideoWidthPx = maxWidthPx
             fullscreenVideoHeightPx = fullscreenVideoWidthPx / safeVideoAspect
         }
-        // The media anchor is measured in window coordinates, while this motion layer is
-        // laid out in overlay-local coordinates. Keeping them mixed offsets the enter
-        // origin by the overlay's top inset and makes it look like the whole post is used.
-        val motionAnchorBounds = anchorBounds.toOverlayLocal(overlayWindowOrigin)
         val motion = computeMediaPeekGraphicsMotion(
-            anchorBounds = motionAnchorBounds,
+            anchorBounds = anchorBounds,
             layoutOriginLeftPx = holdLeftPx,
             layoutOriginTopPx = holdTopPx,
             layoutWidthPx = holdWidthPx,
@@ -9459,12 +9387,7 @@ private fun VideoPeekOverlay(
             dockWidthPx = dockWidthPx,
             dockHeightPx = dockHeightPx,
         )
-        // While docking, keep the card in the full-screen motion layer. Switching to the
-        // compact column before dockProgress finishes makes the video jump to its end rect.
-        val useDockedColumnLayout = isDocked &&
-            !dockTransitionRunning &&
-            !expandingToFullscreen &&
-            !useFloatingDismissMorph
+        val useDockedColumnLayout = isDocked && !expandingToFullscreen && !useFloatingDismissMorph
         val peekDismissEnabled = isDocked && dismissReason == null && !useFloatingDismissMorph && !isFullscreenMode
 
         val videoCardModifier = Modifier
@@ -9551,11 +9474,8 @@ private fun VideoPeekOverlay(
                 right = dockLeftPx + dockWidthPx,
                 bottom = dockTopPx + dockHeightPx,
             )
-            val morphTargetBounds = if (useFloatingDismissMorph) {
-                resolveAnchorBounds().toOverlayLocal(overlayWindowOrigin)
-            } else {
-                peekDismissTargetBounds ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
-            }
+            val morphTargetBounds = peekDismissTargetBounds
+                ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
             val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
             val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
             val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
@@ -9654,7 +9574,8 @@ private fun VideoPeekOverlay(
                 right = dockLeftPx + dockWidthPx,
                 bottom = dockTopPx + dockHeightPx,
             )
-            val morphTargetBounds = resolveAnchorBounds().toOverlayLocal(overlayWindowOrigin)
+            val morphTargetBounds = peekDismissTargetBounds
+                ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
             val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
             val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
             val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
@@ -11647,10 +11568,8 @@ private fun InlineVideoPlayer(
     val suppressPausedCover = actionOpen || peekActive || isAutoScrollFloating || inlineHandoffPending
     // 滚动进浮窗：claimPeek 后仍先保留内联 Surface，主动 stash 后再拆，避免交接竞态黑屏无声。
     val keepInlineSurfaceForPeekHandoff = (isAutoScrollFloating || peekActive) &&
-        (
-            (inlineHandoffPending && !videoCoordinator.hasStashedHandoff(playbackKey)) ||
-                videoCoordinator.hasHandoffSourceView(playbackKey)
-            )
+        inlineHandoffPending &&
+        !videoCoordinator.hasStashedHandoff(playbackKey)
     val showInlineVideoSurface = media.isStreamPlayable() &&
         (inlinePlaying || keepInlineSurfaceForPeekHandoff)
     val configuration = LocalConfiguration.current
@@ -11730,10 +11649,9 @@ private fun InlineVideoPlayer(
                 // 从当前画面连续缩放到停靠位；播放器实例在两个 Surface 之间交接。
                 dockImmediately = false,
                 onCancel = {
-                    val returningToInline = videoCoordinator.isPlaybackKeyActive(playbackKey) ||
-                        videoCoordinator.pendingPeekHandoffKey?.let { pending ->
-                            videoCoordinator.matchesPlaybackKey(pending, playbackKey)
-                        } == true
+                    val returningToInline = videoCoordinator.pendingPeekHandoffKey?.let { pending ->
+                        videoCoordinator.matchesPlaybackKey(pending, playbackKey)
+                    } == true
                     if (!returningToInline) {
                         videoCoordinator.clearAutoScrollFloating(playbackKey)
                         videoCoordinator.cancelPeekHandoff(playbackKey)
@@ -11743,7 +11661,7 @@ private fun InlineVideoPlayer(
                     if (returningToInline && media.isStreamPlayable()) {
                         videoCoordinator.clearAutoScrollFloating(playbackKey)
                         videoCoordinator.releasePeekPlayback(playbackKey)
-                        videoCoordinator.claimInlinePlaybackForScrollReturn(playbackKey)
+                        videoCoordinator.requestInlinePlayback(playbackKey)
                     }
                 },
                 onRelease = {},
@@ -11765,8 +11683,6 @@ private fun InlineVideoPlayer(
         if (videoPeekController.pendingDismiss != null) return
         videoCoordinator.clearAutoScrollFloating(playbackKey)
         videoCoordinator.beginPeekHandoff(playbackKey)
-        videoCoordinator.requestProactivePeekStash(playbackKey)
-        videoCoordinator.claimInlinePlaybackForScrollReturn(playbackKey)
         videoPeekController.cancel()
     }
 
@@ -12300,12 +12216,12 @@ private fun WeiboVideoSurface(
         }
         if (deferPlaybackUntilSurface) {
             resumeAfterSurfaceAttach = true
+            target.playWhenReady = false
+            target.pause()
+        } else {
+            target.playWhenReady = true
+            target.play()
         }
-        // An adopted player is already the single playback engine for this media. Surface
-        // attachment may lag composition by a frame, but pausing here turns a visual handoff
-        // into a real playback pause and that state can survive rapid scroll reversals.
-        target.playWhenReady = true
-        target.play()
     }
 
     fun createFreshPlayer(
@@ -12365,24 +12281,13 @@ private fun WeiboVideoSurface(
                 return@LaunchedEffect
             }
 
-            val yieldingToPeek = videoCoordinator.peekPlaybackKey?.let {
-                    videoCoordinator.matchesPlaybackKey(it, playbackKey)
-                } == true &&
-                !videoCoordinator.isPlaybackKeyActive(playbackKey)
-            if (yieldingToPeek) {
-                // 这是交接源，不是目标；禁止把刚 stash 的播放器从浮窗手里领回来。
-                inlineWaitingForHandoff = true
-                return@LaunchedEffect
-            }
-
             suspend fun claimSharedPlayer(): androidx.media3.exoplayer.ExoPlayer? =
                 videoCoordinator.adoptSharedPlayer(playbackKey)
 
             claimSharedPlayer()?.let { adopted ->
                 configureExistingPlayer(
                     adopted,
-                    deferPlaybackUntilSurface = isDetailInlinePlayback &&
-                        !videoCoordinator.hasHandoffSourceView(playbackKey),
+                    deferPlaybackUntilSurface = isDetailInlinePlayback,
                 )
                 inlinePlayer = adopted
                 inlineWaitingForHandoff = false
@@ -12404,8 +12309,7 @@ private fun WeiboVideoSurface(
                     claimSharedPlayer()?.let { adopted ->
                         configureExistingPlayer(
                             adopted,
-                            deferPlaybackUntilSurface = isDetailInlinePlayback &&
-                                !videoCoordinator.hasHandoffSourceView(playbackKey),
+                            deferPlaybackUntilSurface = isDetailInlinePlayback,
                         )
                         inlinePlayer = adopted
                         inlineWaitingForHandoff = false
@@ -12425,10 +12329,7 @@ private fun WeiboVideoSurface(
                 it.playbackState == androidx.media3.common.Player.STATE_IDLE &&
                     it.playerError != null
             }
-            // Re-check the process-wide media registry immediately before construction.
-            // A handoff may have registered the canonical player while this effect yielded.
             val resolved = cached
-                ?: videoCoordinator.adoptSharedPlayer(playbackKey)
                 ?: createFreshPlayer(deferPlaybackUntilSurface = deferUntilSurface)
                     .also { playerCache[videoUrl] = it }
             configureExistingPlayer(
@@ -12462,10 +12363,7 @@ private fun WeiboVideoSurface(
             videoCoordinator.adoptSharedPlayer(playbackKey)
         }
         adopted?.let { handoff ->
-            configureExistingPlayer(
-                handoff,
-                deferPlaybackUntilSurface = !videoCoordinator.hasHandoffSourceView(playbackKey),
-            )
+            configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
             return handoff
         }
         playerCache[videoUrl]?.let { cached ->
@@ -12514,51 +12412,10 @@ private fun WeiboVideoSurface(
             if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
                 return@LaunchedEffect
             }
-            if (awaitingPeekHandoffConsume) {
-                // 优先等待卡片连同旧 Surface 主动交出；部分 Compose 重组顺序下 source
-                // effect 可能不会再次执行，此时只领取 shared 中的同一实例，绝不新建播放器。
-                val seamlessDeadline = android.os.SystemClock.uptimeMillis() + 240L
-                while (android.os.SystemClock.uptimeMillis() < seamlessDeadline) {
-                    videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-                        configureExistingPlayer(
-                            handoff,
-                            deferPlaybackUntilSurface = !videoCoordinator.hasHandoffSourceView(playbackKey),
-                        )
-                        deferredPlayer = handoff
-                        handoffPlayerResolved = true
-                        return@LaunchedEffect
-                    }
-                    delay(8)
-                }
-                videoCoordinator.adoptSharedPlayer(playbackKey)?.let { shared ->
-                    configureExistingPlayer(shared, deferPlaybackUntilSurface = false)
-                    deferredPlayer = shared
-                    handoffPlayerResolved = true
-                    return@LaunchedEffect
-                }
-                // shared 注册也可能与当前帧错开；继续等待唯一实例，仍不创建 fallback player。
-                while (true) {
-                    val shared = videoCoordinator.consumeHandoffPlayer(playbackKey)
-                        ?: videoCoordinator.adoptSharedPlayer(playbackKey)
-                    if (shared != null) {
-                        configureExistingPlayer(
-                            shared,
-                            deferPlaybackUntilSurface = !videoCoordinator.hasHandoffSourceView(playbackKey),
-                        )
-                        deferredPlayer = shared
-                        handoffPlayerResolved = true
-                        return@LaunchedEffect
-                    }
-                    delay(8)
-                }
-            }
             val deadline = android.os.SystemClock.uptimeMillis() + 1_200L
             while (android.os.SystemClock.uptimeMillis() < deadline) {
                 videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-                    configureExistingPlayer(
-                        handoff,
-                        deferPlaybackUntilSurface = !videoCoordinator.hasHandoffSourceView(playbackKey),
-                    )
+                    configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
                     deferredPlayer = handoff
                     handoffPlayerResolved = true
                     if (!isPeekPlayback && !isFullscreen) {
@@ -12578,10 +12435,7 @@ private fun WeiboVideoSurface(
                 videoCoordinator.hasStashedHandoff(playbackKey)
             ) {
                 videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
-                    configureExistingPlayer(
-                        handoff,
-                        deferPlaybackUntilSurface = !videoCoordinator.hasHandoffSourceView(playbackKey),
-                    )
+                    configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
                     deferredPlayer = handoff
                     handoffPlayerResolved = true
                     if (!isPeekPlayback && !isFullscreen) {
@@ -12622,27 +12476,10 @@ private fun WeiboVideoSurface(
     }
     val playerViewHolder = remember { object { var view: androidx.media3.ui.PlayerView? = null } }
     var stashedForHandoff by remember(playbackKey, videoUrl) { mutableStateOf(false) }
-    var seamlessSourceStashed by remember(playbackKey, videoUrl) { mutableStateOf(false) }
-    val stashedForHandoffState = rememberUpdatedState(stashedForHandoff || seamlessSourceStashed)
+    val stashedForHandoffState = rememberUpdatedState(stashedForHandoff)
     var transitionFrame by remember(playbackKey) {
-        mutableStateOf(videoCoordinator.peekTransitionFrame(playbackKey))
+        mutableStateOf(videoCoordinator.consumeTransitionFrame(playbackKey))
     }
-    LaunchedEffect(playbackKey, videoCoordinator.transitionFrameVersion) {
-        if (transitionFrame == null) {
-            transitionFrame = videoCoordinator.peekTransitionFrame(playbackKey)
-        }
-    }
-    var videoFrameReady by remember(player) {
-        mutableStateOf(
-            player != null &&
-                !resumeAfterSurfaceAttach &&
-                !videoCoordinator.hasHandoffSourceView(playbackKey) &&
-                player.playbackState == androidx.media3.common.Player.STATE_READY &&
-                player.videoSize.width > 0 &&
-                (player.isPlaying || player.currentPosition > 0L),
-        )
-    }
-    var surfaceBindingGeneration by remember(player) { mutableIntStateOf(0) }
 
     if (!isInlineFeedOrDetail) {
         LaunchedEffect(
@@ -12654,23 +12491,14 @@ private fun WeiboVideoSurface(
             resumeAfterSurfaceAttach,
         ) {
             val target = player ?: return@LaunchedEffect
-            if (isFullscreen || stashedForHandoff || seamlessSourceStashed || resumeAfterSurfaceAttach) return@LaunchedEffect
+            if (isFullscreen || isPeekPlayback || stashedForHandoff || resumeAfterSurfaceAttach) {
+                return@LaunchedEffect
+            }
             if (!videoCoordinator.isProactiveStashRequested(playbackKey)) return@LaunchedEffect
             videoCoordinator.clearProactiveStashRequest(playbackKey)
-            val sourceView = playerViewHolder.view
-            val textureView = sourceView?.videoSurfaceView as? android.view.TextureView
-            textureView?.bitmap?.takeIf { it.width > 0 && it.height > 0 }?.let { bitmap ->
-                videoCoordinator.storeTransitionFrame(playbackKey, bitmap)
-            }
-            if (isPeekPlayback && sourceView != null && sourceView.player === target) {
-                // 保留浮窗 View 到卡片目标挂载并执行 switchTargetView，退出动画继续显示最后一帧。
-                videoCoordinator.stashSeamlessHandoffPlayer(playbackKey, target, sourceView)
-                seamlessSourceStashed = true
-            } else {
-                sourceView?.player = null
-                videoCoordinator.stashHandoffPlayer(playbackKey, target)
-                stashedForHandoff = true
-            }
+            playerViewHolder.view?.player = null
+            videoCoordinator.stashHandoffPlayer(playbackKey, target)
+            stashedForHandoff = true
         }
     } else {
         // 详情内联 → 浮窗：在 Surface 仍挂载时主动交出，避免 claimPeek 后立刻拆掉造成交接失败。
@@ -12690,49 +12518,22 @@ private fun WeiboVideoSurface(
                 videoCoordinator.storeTransitionFrame(playbackKey, bitmap)
             }
             videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen = false)
-            val sourceView = playerViewHolder.view
-            if (sourceView != null && sourceView.player === target) {
-                videoCoordinator.stashSeamlessHandoffPlayer(playbackKey, target, sourceView)
-            } else {
-                videoCoordinator.stashHandoffPlayer(playbackKey, target)
-            }
+            playerViewHolder.view?.player = null
+            videoCoordinator.markPlayerSurfaceUnbound(target)
+            videoCoordinator.stashHandoffPlayer(playbackKey, target)
             stashedForHandoff = true
         }
     }
 
     fun attachPlayerToView(view: androidx.media3.ui.PlayerView) {
         val target = player ?: return
-        android.util.Log.d(
-            "VideoHandoff",
-            "attach key=$playbackKey player=${System.identityHashCode(target)} " +
-                "peek=$isPeekPlayback fullscreen=$isFullscreen playing=${target.isPlaying} pwr=${target.playWhenReady}",
-        )
-        val viewChanged = playerViewHolder.view !== view
         playerViewHolder.view = view
-        val handoffSourceView = videoCoordinator.consumeHandoffSourceView(playbackKey)
-        if (handoffSourceView != null && handoffSourceView !== view) {
-            // ExoPlayer READY 不等于新 TextureView 已有画面；等待该 Surface 的首帧回调。
-            videoFrameReady = false
-            surfaceBindingGeneration++
-            androidx.media3.ui.PlayerView.switchTargetView(target, handoffSourceView, view)
-            videoCoordinator.markPlayerSurfaceUnbound(target)
-            videoCoordinator.markPlayerSurfaceBound(target)
-            resumeAfterSurfaceAttach = false
-            target.playWhenReady = true
-            target.play()
-            return
-        }
         val needsForceRebind = resumeAfterSurfaceAttach && view.player === target
         if (view.player !== target || needsForceRebind) {
-            videoFrameReady = false
-            surfaceBindingGeneration++
             if (needsForceRebind) {
                 view.player = null
             }
             view.player = target
-        } else if (viewChanged) {
-            videoFrameReady = false
-            surfaceBindingGeneration++
         }
         videoCoordinator.markPlayerSurfaceBound(target)
         val pendingDetailHandoffResume = isInlineFeedOrDetail &&
@@ -12793,24 +12594,6 @@ private fun WeiboVideoSurface(
         }
     }
 
-    LaunchedEffect(player, surfaceBindingGeneration) {
-        val targetPlayer = player ?: return@LaunchedEffect
-        val generation = surfaceBindingGeneration
-        if (generation == 0) return@LaunchedEffect
-        delay(180)
-        if (videoFrameReady || generation != surfaceBindingGeneration) return@LaunchedEffect
-        val targetView = playerViewHolder.view ?: return@LaunchedEffect
-        if (!targetView.isAttachedToWindow) return@LaunchedEffect
-        // Rapid direction reversals can leave Media3 attached to a superseded TextureView.
-        // Rebind only the latest generation; playback itself remains running throughout.
-        targetView.player = null
-        targetPlayer.clearVideoSurface()
-        targetView.player = targetPlayer
-        videoCoordinator.markPlayerSurfaceBound(targetPlayer)
-        targetPlayer.playWhenReady = true
-        targetPlayer.play()
-    }
-
     LaunchedEffect(
         player,
         isDetailInlinePlayback,
@@ -12840,9 +12623,7 @@ private fun WeiboVideoSurface(
                 awaitingPeekHandoffSource ||
                 awaitingPeekHandoffConsume ||
                 videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
-            // storeTransitionFrame 可能发生在当前组合之后；peek 可在 effect 消费前的
-            // 同一重组帧立刻显示截图，避免中间闪出封面。
-            val placeholderFrame = transitionFrame ?: videoCoordinator.peekTransitionFrame(playbackKey)
+            val placeholderFrame = transitionFrame
             if (placeholderFrame != null && !placeholderFrame.isRecycled) {
                 Image(
                     bitmap = placeholderFrame.asImageBitmap(),
@@ -12864,10 +12645,17 @@ private fun WeiboVideoSurface(
         }
         return
     }
+    var videoFrameReady by remember(player) {
+        mutableStateOf(
+            player.playbackState == androidx.media3.common.Player.STATE_READY &&
+                player.videoSize.width > 0 &&
+                (player.isPlaying || player.currentPosition > 0L),
+        )
+    }
     LaunchedEffect(videoFrameReady) {
         if (!videoFrameReady || transitionFrame == null) return@LaunchedEffect
         delay(140)
-        videoCoordinator.releaseTransitionFrame(playbackKey, transitionFrame)
+        transitionFrame?.recycle()
         transitionFrame = null
     }
 
@@ -13001,13 +12789,8 @@ private fun WeiboVideoSurface(
             if (handoffToFullscreen || handoffToPeek || handoffFromPeek || transferringToDetail) {
                 if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
                     captureHandoffTransitionFrame()
-                    val sourceView = playerViewHolder.view
-                    if (handoffFromPeek && sourceView != null && sourceView.player === player) {
-                        videoCoordinator.stashSeamlessHandoffPlayer(playbackKey, player, sourceView)
-                    } else {
-                        sourceView?.player = null
-                        videoCoordinator.stashHandoffPlayer(playbackKey, player)
-                    }
+                    playerViewHolder.view?.player = null
+                    videoCoordinator.stashHandoffPlayer(playbackKey, player)
                 }
             } else if (switchingToAnotherInline) {
                 if (!videoCoordinator.hasStashedHandoff(playbackKey)) {
@@ -13018,16 +12801,8 @@ private fun WeiboVideoSurface(
                 val adoptedByDetail = videoCoordinator.detailOverlayOpen &&
                     !isDetailInlinePlayback &&
                     videoCoordinator.isPlaybackKeyActive(playbackKey)
-                val ownedByPeek = videoCoordinator.peekPlaybackKey?.let {
-                    videoCoordinator.matchesPlaybackKey(it, playbackKey)
-                } == true
-                val ownedByInline = videoCoordinator.isPlaybackKeyActive(playbackKey)
-                if (adoptedByDetail || ownedByPeek || ownedByInline ||
-                    videoCoordinator.hasHandoffSourceView(playbackKey)
-                ) {
-                    // 交接源销毁不能释放已归浮窗所有的唯一播放器。
+                if (adoptedByDetail) {
                     playerViewHolder.view?.player = null
-                    videoCoordinator.registerSharedPlayer(playbackKey, player)
                 } else {
                     videoCoordinator.releaseSharedPlayer(playbackKey, player)
                     player.pause()
@@ -13410,10 +13185,7 @@ private fun WeiboVideoSurface(
                 !(seamlessOverlayPlayback && isFullscreen) &&
                 (
                     transitionFrame != null ||
-                        videoCoordinator.peekTransitionFrame(playbackKey) != null ||
                         (
-                            !isPeekPlayback &&
-                                !resumeAfterSurfaceAttach &&
                             !inlineWaitingForHandoff &&
                                 !awaitingPeekHandoffSource &&
                                 !awaitingPeekHandoffConsume &&
@@ -13425,7 +13197,7 @@ private fun WeiboVideoSurface(
             exit = fadeOut(tween(120)),
             modifier = Modifier.matchParentSize(),
         ) {
-            val frame = transitionFrame ?: videoCoordinator.peekTransitionFrame(playbackKey)
+            val frame = transitionFrame
             if (frame != null && !frame.isRecycled) {
                 Image(
                     bitmap = frame.asImageBitmap(),
