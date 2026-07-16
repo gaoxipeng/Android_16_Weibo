@@ -600,6 +600,14 @@ object WeiboJsonParser {
         listOf("longTextContent", "longTextContent_raw", "text", "text_raw", "raw_text")
             .any { data.optNullableString(it)?.isNotBlank() == true }
 
+    fun hasMeaningfulLongTextExpansion(preview: FeedItem, expanded: FeedItem): Boolean {
+        val hasNewImages = expanded.images.any { candidate ->
+            preview.images.none { it.largeUrl == candidate.largeUrl }
+        }
+        if (hasNewImages) return true
+        return !isClientSupplementOnlyLongText(preview.text, expanded.text)
+    }
+
     fun mergeLongTextIntoFeedItem(item: FeedItem, data: JSONObject): FeedItem {
         val contentHtml = data.optNullableString("longTextContent")
             ?: data.optNullableString("text")
@@ -1266,11 +1274,14 @@ object WeiboJsonParser {
             collectWeiboHostedVideoLinkTokens(retweetedJson).isNotEmpty()
         val hasOwnVideo = resolvedMedias.isNotEmpty() || status.hasVideoOrLivePageInfo()
         val hasAttachedVideo = hasOwnVideo || retweetedHasVideo
-        val isLongText = status.shouldShowLongTextExpand(
-            rawText = rawText,
-            displayText = displayText,
-            hasAttachedVideo = hasAttachedVideo,
-        )
+        // “阅读全文”入口已停用。旧的 shouldShowLongTextExpand(...) 规则保留在下方
+        // 作为历史实现，但不再参与 UI；长文只通过 requiresLongTextFetch 自动加载。
+        // val isLongText = status.shouldShowLongTextExpand(
+        //     rawText = rawText,
+        //     displayText = displayText,
+        //     hasAttachedVideo = hasAttachedVideo,
+        // )
+        val isLongText = false
         val inlineImageLinks = parseInlineImageLinks(status, displayText)
         val images = if (mediaBelongsToRetweeted) {
             emptyList()
@@ -2357,18 +2368,12 @@ object WeiboJsonParser {
         // `isLongText` 也会用于超话、热搜等客户端附加卡片。只有正文确实带有
         // 截断迹象，或落在微博常见的预览长度时才展示「阅读全文」。部分接口会移除
         // 预览末尾的“展开”标签，但仍保留约 140 字的截断正文。
-        val hasTextTruncation = hasTextTruncationSignals(rawText, displayText)
-        if (hasTextTruncation) return true
-        // 超过 9 张图且配文已完整（偏短）时，接口也可能误设 isLongText。
-        if (isLongTextExpandForExtraImagesOnly(rawText, displayText)) return false
-        // 视频/直播 + 短配文无截断：常见「大家都在搜」误标。
-        if (hasAttachedVideo && isShortMediaCaption(displayText)) return false
-        val hasMultipleImages = resolvePicCount() >= 2
-        // 长文 + 多图/视频混排：配文不短时信任 isLongText。
-        if ((hasAttachedVideo || hasMultipleImages) && !isShortMediaCaption(displayText)) {
-            return true
-        }
-        // 无媒体时：常见截断长度，或明显偏长的预览（去掉「全文/展开」后仍 >170 字）。
+        // Media is already rendered independently (all image thumbnails are visible), so
+        // image/video counts must never decide whether text is expandable. URL/super-topic
+        // rewriting can also change rawText without hiding a single character of正文.
+        if (hasExplicitTextTruncationSignal(rawText, displayText)) return true
+        // Without an explicit marker, trust only the visible text length together with the
+        // API long-text flag. Short captions remain complete regardless of attached media.
         return isLikelyTruncatedLongTextPreview(displayText) ||
             isSubstantialLongTextPreview(displayText)
     }
@@ -2404,7 +2409,14 @@ object WeiboJsonParser {
 
     private fun hasTextTruncationSignals(rawText: String, displayText: String): Boolean {
         if (containsLongTextExpandMarker(rawText)) return true
-        if (plainText(rawText) != plainText(displayText)) return true
+        val plain = plainText(displayText).trimEnd()
+        return plain.endsWith("...") || plain.endsWith("…") || plain.endsWith("⋯")
+    }
+
+    private fun hasExplicitTextTruncationSignal(rawText: String, displayText: String): Boolean {
+        if (containsLongTextExpandMarker(rawText) || containsLongTextExpandMarker(displayText)) {
+            return true
+        }
         val plain = plainText(displayText).trimEnd()
         return plain.endsWith("...") || plain.endsWith("…") || plain.endsWith("⋯")
     }
@@ -2429,11 +2441,23 @@ object WeiboJsonParser {
         if (normalizedExpanded.isBlank() || normalizedExpanded == normalizedPreview) return true
         if (!normalizedExpanded.startsWith(normalizedPreview)) return false
         val appended = normalizedExpanded.removePrefix(normalizedPreview)
-        return appended.isNotBlank() &&
-            CLIENT_SUPPLEMENT_MARKERS.any { appended.contains(it) } &&
-            CLIENT_SUPPLEMENT_MARKERS.fold(appended) { remaining, marker ->
-                remaining.replace(marker, "")
-            }.trim().isBlank()
+        if (appended.isBlank()) return true
+        // The long-text endpoint sometimes appends only client cards. Their rendered text
+        // can contain a super-topic token, a video title and a t.cn/http link, so checking
+        // the marker words alone incorrectly treats the response as new article content.
+        val meaningfulRemainder = CLIENT_SUPPLEMENT_MARKERS
+            .fold(appended) { remaining, marker -> remaining.replace(marker, "") }
+            .replace(
+                Regex("""https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+""", RegexOption.IGNORE_CASE),
+                "",
+            )
+            .replace(Regex("""(?:https?://)?t\.cn/[A-Za-z0-9]+""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""#?[^#\s]{1,80}\[超话]\]#?"""), "")
+            .replace(Regex("""#?[^#\s]{1,80}超话#?"""), "")
+            .replace(Regex("""[^\s/，。！？、:：;；]{0,60}的微博视频"""), "")
+            .replace(Regex("""微博视频"""), "")
+            .replace(Regex("""[\s\p{P}\p{S}]+"""), "")
+        return meaningfulRemainder.isBlank()
     }
 
     private fun normalizeLongTextForComparison(text: String): String =

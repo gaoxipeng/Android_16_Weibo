@@ -238,7 +238,7 @@ class RepostVideoLinkParseTest {
         """.trimIndent()
 
         val item = WeiboJsonParser.parseTimeline(raw).items.first()
-        assertTrue(item.isLongText)
+        assertFalse(item.isLongText)
         assertTrue(item.requiresLongTextFetch)
     }
 
@@ -482,7 +482,7 @@ class RepostVideoLinkParseTest {
         """.trimIndent()
 
         val item = WeiboJsonParser.parseTimeline(raw).items.first()
-        assertTrue(item.isLongText)
+        assertFalse(item.isLongText)
         assertFalse(item.text.contains("展开"))
         assertFalse(item.text.trimEnd().endsWith("..."))
         assertTrue(item.text.contains("极易"))
@@ -521,7 +521,7 @@ class RepostVideoLinkParseTest {
         """.trimIndent()
 
         val item = WeiboJsonParser.parseTimeline(raw).items.first()
-        assertTrue(item.isLongText)
+        assertFalse(item.isLongText)
         assertTrue(item.requiresLongTextFetch)
     }
 
@@ -576,6 +576,99 @@ class RepostVideoLinkParseTest {
         val item = WeiboJsonParser.parseTimeline(raw).items.first()
         assertTrue(item.text.contains("\"舆论场一定要弘扬就事论事\""))
         assertFalse(item.text.contains("&quot;"))
+    }
+
+    @Test
+    fun shortCaptionWithSeveralImagesDoesNotShowReadFullButton() {
+        val raw = """
+            {
+              "statuses": [{
+                "idstr": "5720474518",
+                "mblogid": "R8O0yaoJq",
+                "isLongText": true,
+                "text_raw": "短配文 #摄影[超话]#",
+                "text": "短配文 #摄影[超话]#",
+                "pic_num": 6,
+                "pic_ids": ["p1", "p2", "p3", "p4", "p5", "p6"],
+                "reposts_count": 0,
+                "comments_count": 0,
+                "attitudes_count": 0,
+                "user": { "idstr": "5720474518", "screen_name": "测试用户" }
+              }]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertFalse(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
+    @Test
+    fun shortSuperTopicVideoCaptionDoesNotShowReadFullButton() {
+        val token = "http://t.cn/A6video1"
+        val raw = """
+            {
+              "statuses": [{
+                "idstr": "5720474518",
+                "mblogid": "R8O0yaoJq",
+                "isLongText": true,
+                "text_raw": "短配文 #摄影[超话]# $token",
+                "text": "短配文 #摄影[超话]# $token",
+                "url_struct": [{
+                  "short_url": "$token",
+                  "url_title": "测试用户的微博视频",
+                  "long_url": "https://video.weibo.com/show?fid=1034:test"
+                }],
+                "page_info": {
+                  "type": "video",
+                  "page_title": "测试用户的微博视频",
+                  "media_info": { "mp4_hd_url": "https://example.com/video.mp4" }
+                },
+                "reposts_count": 0,
+                "comments_count": 0,
+                "attitudes_count": 0,
+                "user": { "idstr": "5720474518", "screen_name": "测试用户" }
+              }]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertFalse(item.isLongText)
+        assertTrue(item.requiresLongTextFetch)
+    }
+
+    @Test
+    fun longTextContainingOnlySuperTopicAndVideoSupplementDoesNotExpand() {
+        val preview = "真实正文".repeat(45)
+        val raw = """
+            {
+              "statuses": [{
+                "idstr": "supplement-only-1",
+                "mblogid": "R8TQ7irJZ",
+                "isLongText": true,
+                "text_raw": "$preview",
+                "text": "$preview",
+                "reposts_count": 0,
+                "comments_count": 0,
+                "attitudes_count": 0,
+                "user": { "idstr": "1682207150", "screen_name": "测试用户" }
+              }]
+            }
+        """.trimIndent()
+        val item = WeiboJsonParser.parseTimeline(raw).items.first()
+        assertFalse(item.isLongText)
+
+        val payload = JSONObject(
+            """{
+              "longTextContent_raw": "$preview #摄影[超话]# 某用户的微博视频 http://t.cn/A6abc123 大家都在搜",
+              "longTextContent": "$preview #摄影[超话]# 某用户的微博视频 http://t.cn/A6abc123 大家都在搜"
+            }""",
+        )
+        val merged = WeiboJsonParser.mergeLongTextIntoFeedItem(item, payload)
+
+        assertFalse(merged.isLongText)
+        assertFalse(merged.requiresLongTextFetch)
+        assertEquals(item.text, merged.text)
     }
 
     private fun countOccurrences(text: String, token: String): Int {

@@ -3155,6 +3155,8 @@ fun WeiboApp() {
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var longTextPreflightCheckedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val longTextAutoLoadSemaphore = remember { Semaphore(3) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var likeUsersOverlay by remember { mutableStateOf<LikeUsersOverlayState?>(null) }
     var likeUsers by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
@@ -4707,7 +4709,21 @@ fun WeiboApp() {
             runCatching { session.expandLongText(item) }
                 .onSuccess { expanded ->
                     if (!expanded.isLongText) {
-                        applyExpandedItem(expanded)
+                        // Reading the full text is a content-only update. The detail fallback
+                        // may return a different avatar CDN URL (or transient user metadata),
+                        // which would make the existing card avatar reload and flash.
+                        applyExpandedItem(
+                            expanded.copy(
+                                authorId = item.authorId,
+                                authorName = item.authorName,
+                                authorAvatarUrl = item.authorAvatarUrl,
+                                createdAt = item.createdAt,
+                                source = item.source,
+                                ipLocation = item.ipLocation,
+                                locationName = item.locationName,
+                                locationUrl = item.locationUrl,
+                            ),
+                        )
                     } else {
                         showMessage("\u5168\u6587\u52A0\u8F7D\u5931\u8D25", "\u5FAE\u535A\u957F\u6587\u5185\u5BB9\u4E3A\u7A7A")
                     }
@@ -4716,6 +4732,48 @@ fun WeiboApp() {
                     showMessage("\u5168\u6587\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u5FAE\u535A\u63A5\u53E3\u65E0\u54CD\u5E94")
                 }
             longTextLoadingIds = longTextLoadingIds - item.statusId
+        }
+    }
+
+    LaunchedEffect(items, minePosts, visitedPosts, selectedItem) {
+        val candidates = buildList {
+            fun addItemAndRetweet(item: FeedItem) {
+                add(item)
+                item.retweetedStatus?.let(::add)
+            }
+            items.forEach(::addItemAndRetweet)
+            minePosts.forEach(::addItemAndRetweet)
+            visitedPosts.forEach(::addItemAndRetweet)
+            selectedItem?.let(::addItemAndRetweet)
+        }.filter { it.requiresLongTextFetch }
+            .distinctBy { it.statusId.ifBlank { it.id } }
+
+        candidates.forEach { item ->
+            val key = item.statusId.ifBlank { item.id }
+            if (key in longTextPreflightCheckedIds) return@forEach
+            longTextPreflightCheckedIds = longTextPreflightCheckedIds + key
+            // Use the app scope so list recomposition cannot cancel requests already queued.
+            scope.launch {
+                runCatching {
+                    longTextAutoLoadSemaphore.withPermit { session.expandLongText(item) }
+                }.onSuccess { expanded ->
+                    applyExpandedItem(
+                        expanded.copy(
+                            isLongText = false,
+                            requiresLongTextFetch = false,
+                            authorId = item.authorId,
+                            authorName = item.authorName,
+                            authorAvatarUrl = item.authorAvatarUrl,
+                            createdAt = item.createdAt,
+                            source = item.source,
+                            ipLocation = item.ipLocation,
+                            locationName = item.locationName,
+                            locationUrl = item.locationUrl,
+                        ),
+                    )
+                }
+                // Automatic loading is silent. Failure keeps the preview without a button.
+            }
         }
     }
 
@@ -11882,7 +11940,7 @@ private fun InlineVideoPlayer(
                     val center = bounds?.let {
                         Offset(it.left + it.width / 2f, it.top + it.height / 2f)
                     } ?: Offset.Zero
-                    openInlineFloatingPlayback(center, fromAutoScroll = true)
+                    openInlineFloatingPlayback(center, fromAutoScroll = false)
                 },
                 autoEnterFloatingOnViewportHidden = false,
                 trackViewportPauseOverride = if (autoFloatingOnScrollAway) false else null,
@@ -12706,17 +12764,43 @@ private fun WeiboVideoSurface(
         }
     }
 
-    DisposableEffect(player) {
+    // The overlay keeps the same ExoPlayer while changing between peek and fullscreen.
+    // Register ownership separately from the player lifetime so the pause handler always
+    // belongs to the mode that is currently visible.
+    DisposableEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
         val pauseHandler = {
             val currentPosition = player.currentPosition.coerceAtLeast(0L)
             videoCoordinator.rememberPosition(playbackKey, currentPosition)
             player.pause()
+            player.playWhenReady = false
         }
         if (isPeekPlayback) {
             videoCoordinator.registerPeekPauseHandler(playbackKey, pauseHandler)
         } else {
             videoCoordinator.registerPauseHandler(playbackKey, isFullscreen, pauseHandler)
         }
+        onDispose {
+            if (isPeekPlayback) {
+                videoCoordinator.unregisterPeekPauseHandler(playbackKey)
+            } else {
+                videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen)
+            }
+        }
+    }
+
+    LaunchedEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
+        when {
+            isFullscreen -> videoCoordinator.claimFullscreenPlayback(playbackKey)
+            isPeekPlayback -> videoCoordinator.claimPeekPlayback(playbackKey)
+            else -> return@LaunchedEffect
+        }
+        // Ownership changes can pause the same handed-off instance through the old mode's
+        // handler. Resume only after all other owners have been stopped.
+        player.playWhenReady = true
+        player.play()
+    }
+
+    DisposableEffect(player) {
         val listener = object : androidx.media3.common.Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING
@@ -12756,12 +12840,10 @@ private fun WeiboVideoSurface(
         }
         player.addListener(listener)
         onDispose {
-            if (isPeekPlayback) {
-                videoCoordinator.unregisterPeekPauseHandler(playbackKey)
-                videoCoordinator.releasePeekPlayback(playbackKey)
-            } else {
-                videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen)
-            }
+            videoCoordinator.unregisterPeekPauseHandler(playbackKey)
+            videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen = false)
+            videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen = true)
+            videoCoordinator.releasePeekPlayback(playbackKey)
             if (effectiveSavePosition) {
                 if (videoCoordinator.isPeekRestartFromBeginning(playbackKey)) {
                     videoCoordinator.clearPosition(playbackKey)
@@ -12806,8 +12888,12 @@ private fun WeiboVideoSurface(
                 } else {
                     videoCoordinator.releaseSharedPlayer(playbackKey, player)
                     player.pause()
+                    player.playWhenReady = false
                     if (trackViewportPause && videoCoordinator.isPlaybackKeyActive(playbackKey)) {
                         videoCoordinator.activeKey = null
+                    }
+                    if (playerCache[videoUrl] === player) {
+                        playerCache.remove(videoUrl)
                     }
                     player.release()
                 }
