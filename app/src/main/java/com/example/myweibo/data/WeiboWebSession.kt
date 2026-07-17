@@ -20,7 +20,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -38,6 +40,7 @@ class WeiboWebSession(context: Context) {
 
     private val albumLoadMutex = Mutex()
     private val mweiboSessionMutex = Mutex()
+    private val profileLongTextSemaphore = Semaphore(3)
     private var mweiboSessionReady = false
     private val viewportCoordinator = SessionWebViewportCoordinator()
 
@@ -199,7 +202,34 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadUserTimeline(uid: String, page: Int = 1): TimelinePage {
         val raw = loadUserTimelineRaw(uid, page)
-        return WeiboJsonParser.parseUserTimeline(raw, uid, page)
+        val parsed = WeiboJsonParser.parseUserTimeline(raw, uid, page)
+        if (parsed.items.none { it.requiresLongTextFetch || it.retweetedStatus?.requiresLongTextFetch == true }) {
+            return parsed
+        }
+        val expandedItems = coroutineScope {
+            parsed.items.map { item ->
+                async { expandProfileTimelineLongText(item) }
+            }.awaitAll()
+        }
+        return parsed.copy(items = expandedItems)
+    }
+
+    private suspend fun expandProfileTimelineLongText(item: FeedItem): FeedItem {
+        var resolved = if (item.requiresLongTextFetch) {
+            profileLongTextSemaphore.withPermit {
+                runCatching { expandLongText(item) }.getOrDefault(item)
+            }
+        } else {
+            item
+        }
+        val retweeted = resolved.retweetedStatus
+        if (retweeted?.requiresLongTextFetch == true) {
+            val expandedRetweet = profileLongTextSemaphore.withPermit {
+                runCatching { expandLongText(retweeted) }.getOrDefault(retweeted)
+            }
+            resolved = resolved.copy(retweetedStatus = expandedRetweet)
+        }
+        return resolved
     }
 
     suspend fun loadUserTimelineRaw(uid: String, page: Int = 1): String =
