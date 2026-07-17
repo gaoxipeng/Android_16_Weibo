@@ -18492,10 +18492,11 @@ private fun MineScreen(
 
     val density = LocalDensity.current
     val compactBarContentHeight = 48.dp
-    val collapseThresholdPx = remember(density, profileHeaderHeight) {
+    val collapseThresholdPx = remember(density, profileHeaderHeight, topInset) {
         with(density) {
-            profileHeaderHeight
-                .takeIf { it > 0.dp }
+            profileHeaderHeight.takeIf { it > 0.dp }
+                ?.minus(topInset + compactBarContentHeight + ProfileHeaderCardCoverOverlap)
+                ?.coerceAtLeast(72.dp)
                 ?.roundToPx()
                 ?.coerceAtLeast(72.dp.roundToPx())
                 ?: 72.dp.roundToPx()
