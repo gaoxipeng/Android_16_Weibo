@@ -124,7 +124,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -458,9 +457,9 @@ private fun feedRefreshHintMessage(
     return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u66F4\u65B0\u4E86 $newCount \u6761\u5FAE\u535A"
 }
 
-private const val ListScrollToTopDurationMillis = 320
 private const val BottomBarCollapseScrollDelta = 12
 private const val ListLoadMoreItemsFromBottom = 3
+private const val ListScrollToTopMaxDurationMillis = 500L
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
     try {
@@ -896,46 +895,16 @@ private fun MediaLongPressConfiguration(content: @Composable () -> Unit) {
     CompositionLocalProvider(LocalViewConfiguration provides mediaConfig, content = content)
 }
 
-private fun LazyListState.scrollDistanceToTop(): Int {
-    if (firstVisibleItemIndex == 0) {
-        return firstVisibleItemScrollOffset
-    }
-
-    layoutInfo.visibleItemsInfo
-        .firstOrNull { it.index == firstVisibleItemIndex }
-        ?.let { firstVisible ->
-            return (-firstVisible.offset + firstVisibleItemScrollOffset).coerceAtLeast(0)
-        }
-
-    val averageItemSize = layoutInfo.visibleItemsInfo
-        .asSequence()
-        .map { it.size }
-        .average()
-        .takeIf { it > 0 }
-        ?: 400.0
-    return (firstVisibleItemScrollOffset + firstVisibleItemIndex * averageItemSize).toInt()
-}
-
-private suspend fun LazyListState.animateScrollToTopFixed(
-    durationMillis: Int = ListScrollToTopDurationMillis,
-) {
+private suspend fun LazyListState.animateScrollToTopSmooth() {
     if (layoutInfo.totalItemsCount == 0) return
     if (firstVisibleItemIndex == 0 && firstVisibleItemScrollOffset == 0) return
-
-    val scrollDistance = scrollDistanceToTop()
-    if (scrollDistance <= 0) {
-        scrollToItem(0, 0)
-        return
-    }
-
-    runCatching {
-        animateScrollBy(
-            value = -scrollDistance.toFloat(),
-            animationSpec = tween(durationMillis),
-        )
-    }
-
-    if (firstVisibleItemIndex != 0 || firstVisibleItemScrollOffset != 0) {
+    // Keep Compose's native lazy-list animation for smooth layout scheduling, but cap the
+    // whole trip so a deeply scrolled list never spends several seconds returning home.
+    val completedInTime = withTimeoutOrNull(ListScrollToTopMaxDurationMillis) {
+        animateScrollToItem(0, 0)
+        true
+    } == true
+    if (!completedInTime && (firstVisibleItemIndex != 0 || firstVisibleItemScrollOffset != 0)) {
         scrollToItem(0, 0)
     }
 }
@@ -4257,7 +4226,7 @@ fun WeiboApp() {
             feedLoadingMore = false
             hasLoginCookie = session.hasLoginCookie()
             if (feedListState.layoutInfo.totalItemsCount > 0) {
-                feedListState.animateScrollToTopFixed()
+                feedListState.animateScrollToTopSmooth()
             }
             runCatchingPreservingCancellation {
                 val raw = session.loadTimelineRaw(requestedKind)
@@ -4301,7 +4270,7 @@ fun WeiboApp() {
                 isLoading = false
                 timelineRefreshJob = null
                 if (feedListState.layoutInfo.totalItemsCount > 0) {
-                    feedListState.animateScrollToTopFixed()
+                    feedListState.animateScrollToTopSmooth()
                 }
             }
         }
@@ -4312,7 +4281,7 @@ fun WeiboApp() {
         return
         scope.launch {
             val previousItems = items
-            feedListState.animateScrollToTopFixed()
+            feedListState.animateScrollToTopSmooth()
             isLoading = true
             hasLoginCookie = session.hasLoginCookie()
             runCatching {
@@ -4348,7 +4317,7 @@ fun WeiboApp() {
                     showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                 }
             isLoading = false
-            feedListState.animateScrollToTopFixed()
+            feedListState.animateScrollToTopSmooth()
         }
     }
 
@@ -6710,9 +6679,9 @@ fun WeiboApp() {
                             MainTab.Mine -> {
                                 scope.launch {
                                     if (minePagerPage == 0) {
-                                        minePostsListState.animateScrollToTopFixed()
+                                        minePostsListState.animateScrollToTopSmooth()
                                     } else {
-                                        mineAlbumListState.animateScrollToTopFixed()
+                                        mineAlbumListState.animateScrollToTopSmooth()
                                     }
                                 }
                                 refreshMineProfile()
@@ -18784,8 +18753,8 @@ private fun MineScreen(
                                 if (sameTab) {
                                     coroutineScope.launch {
                                         when (tab) {
-                                            MineContentTab.Posts -> postsListState.animateScrollToTopFixed()
-                                            MineContentTab.Album -> albumListState.animateScrollToTopFixed()
+                                            MineContentTab.Posts -> postsListState.animateScrollToTopSmooth()
+                                            MineContentTab.Album -> albumListState.animateScrollToTopSmooth()
                                         }
                                     }
                                 } else {
@@ -21065,8 +21034,8 @@ private fun FollowFansListScreen(
                     if (sameTab) {
                         coroutineScope.launch {
                             when (tab) {
-FriendListTab.Following -> followingListState.animateScrollToTopFixed()
-                FriendListTab.Fans -> fansListState.animateScrollToTopFixed()
+FriendListTab.Following -> followingListState.animateScrollToTopSmooth()
+                FriendListTab.Fans -> fansListState.animateScrollToTopSmooth()
                             }
                         }
                     } else {
@@ -21158,7 +21127,7 @@ private fun FollowListTabPage(
                 errorMsg = null
                 loadFirstPage()
             }
-            runCatching { listState.animateScrollToTopFixed() }
+            runCatching { listState.animateScrollToTopSmooth() }
             refreshing = false
         }
     }
