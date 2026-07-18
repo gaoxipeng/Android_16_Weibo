@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <!-- Some embedded iQIYI video manifests redirect HTTPS playback to HTTP media
+         segments. Keep the exception limited to that provider instead of enabling
+         cleartext traffic application-wide. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">iqiyi.com</domain>
+    </domain-config>
+</network-security-config>

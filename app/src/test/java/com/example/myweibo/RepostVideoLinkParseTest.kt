@@ -709,6 +709,52 @@ class RepostVideoLinkParseTest {
         assertFalse(items[1].isPinned)
     }
 
+    @Test
+    fun repostDoesNotAdoptOriginalPlaceEntity() {
+        val placeToken = "http://t.cn/placeBeijing"
+        val place = "北京"
+        val placeEntity = """
+            {
+              "short_url": "$placeToken",
+              "url_title": "$place",
+              "object_type": "place",
+              "object_id": "B2094654D06FA4FB4099",
+              "h5_target_url": "https://weibo.com/p/100101B2094654D06FA4FB4099"
+            }
+        """.trimIndent()
+        val raw = """
+            {
+              "statuses": [{
+                "idstr": "outer-place",
+                "mblogid": "outerPlace",
+                "text_raw": "转发正文//@原作者:原文",
+                "text": "转发正文",
+                "reposts_count": 0,
+                "comments_count": 0,
+                "attitudes_count": 0,
+                "user": { "idstr": "1", "screen_name": "转发者" },
+                "url_struct": [$placeEntity],
+                "retweeted_status": {
+                  "idstr": "inner-place",
+                  "mblogid": "innerPlace",
+                  "text_raw": "原文 $placeToken",
+                  "text": "原文 $placeToken",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "2", "screen_name": "原作者" },
+                  "url_struct": [$placeEntity]
+                }
+              }]
+            }
+        """.trimIndent()
+
+        val outer = WeiboJsonParser.parseTimeline(raw).items.single()
+        val original = requireNotNull(outer.retweetedStatus)
+        assertTrue(outer.locationName.isNullOrBlank())
+        assertEquals(place, original.locationName)
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0

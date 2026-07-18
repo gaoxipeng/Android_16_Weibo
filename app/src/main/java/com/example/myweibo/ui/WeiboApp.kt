@@ -1623,6 +1623,14 @@ private class VideoPlaybackCoordinator {
         inlinePauseHandlers.values.forEach { it() }
         fullscreenPauseHandlers.values.forEach { it() }
         peekPauseHandlers.values.forEach { it() }
+        // A composition can lose its registered handler before its ExoPlayer is disposed.
+        // Pause coordinator-owned instances as a final guard against audible orphans.
+        (sharedPlayersByMediaKey.values + handoffPlayers.values)
+            .distinctBy { System.identityHashCode(it) }
+            .forEach { player ->
+                player.playWhenReady = false
+                player.pause()
+            }
     }
 
     fun pauseInlineOnly(exceptKey: String? = null) {
@@ -3464,6 +3472,10 @@ fun WeiboApp() {
     }
 
     fun clearVisitedProfileState() {
+        if (videoPlaybackCoordinator.activeKey != null) {
+            videoPlaybackCoordinator.pauseAll()
+            videoPlaybackCoordinator.activeKey = null
+        }
         visitedAlbumJob?.cancel()
         visitedListScrollResetGeneration = -1
         visitedUserId = null
@@ -3981,6 +3993,12 @@ fun WeiboApp() {
     }
 
     fun closeVisitedProfile() {
+        // Inline playback belongs to this profile surface and must not survive navigation.
+        // Floating playback has activeKey == null and remains intentionally unaffected.
+        if (videoPlaybackCoordinator.activeKey != null) {
+            videoPlaybackCoordinator.pauseAll()
+            videoPlaybackCoordinator.activeKey = null
+        }
         navigateBack()
     }
 
@@ -5753,16 +5771,24 @@ fun WeiboApp() {
                             videoPlaybackCoordinator.matchesPlaybackKey(candidate, key)
                         }
                     val peekKey = videoPlaybackCoordinator.peekPlaybackKey
-                    val peekActiveOnProfile = peekKey != null &&
-                        keyBelongsToProfile(peekKey) &&
-                        videoPeekController.activeRequest != null &&
-                        videoPeekController.pendingDismiss == null
-                    if (peekActiveOnProfile) {
-                        videoPlaybackCoordinator.pauseInlineOnly(exceptKey = peekKey)
+                    val overlayRequestKey = videoPeekController.activeRequest?.let { request ->
+                        videoPlaybackKey(request.media, request.playbackOwnerId)
+                    }
+                    val overlayActiveOnProfile = overlayRequestKey != null &&
+                        keyBelongsToProfile(overlayRequestKey) &&
+                        videoPeekController.pendingDismiss !in setOf(
+                            VideoPeekDismissReason.Cancel,
+                            VideoPeekDismissReason.PlaybackEnded,
+                        )
+                    if (overlayActiveOnProfile) {
+                        // During inline -> fullscreen expansion activeKey and peekPlaybackKey
+                        // are intentionally cleared. The persistent overlay request remains
+                        // the visible owner and must not be cancelled by the profile guard.
+                        videoPlaybackCoordinator.pauseInlineOnly(exceptKey = overlayRequestKey)
                         return@LaunchedEffect
                     }
                     val currentKey = videoPlaybackCoordinator.activeKey
-                    val preserveKey = currentKey?.takeIf { it in profilePlaybackKeys }
+                    val preserveKey = currentKey?.takeIf(::keyBelongsToProfile)
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
                     videoPlaybackCoordinator.activeKey = preserveKey
                     if (preserveKey == null && peekKey == null) {
@@ -8007,6 +8033,13 @@ private fun StatusTextSection(
     val locationOpenUrl = remember(item.locationName, item.locationUrl) {
         resolveFeedLocationOpenUrl(item.locationName, item.locationUrl)
     }
+    val trailingLocation = remember(item.text, item.locationName, item.urlEntities) {
+        item.locationName?.takeUnless { location ->
+            item.text.contains(location) || item.urlEntities.any { entity ->
+                entity.title.trim() == location.trim() && item.text.contains(entity.shortUrl)
+            }
+        }
+    }
     EmoticonText(
         modifier = Modifier.fillMaxWidth(),
         text = item.text,
@@ -8021,7 +8054,7 @@ private fun StatusTextSection(
         } else {
             null
         },
-        trailingLocation = item.locationName,
+        trailingLocation = trailingLocation,
         onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
             { onLoadLongText(item) }
         } else {
@@ -12884,7 +12917,7 @@ private fun WeiboVideoSurface(
                 ) {
                     configureExistingPlayer(
                         existingInlinePlayer,
-                        deferPlaybackUntilSurface = isDetailInlinePlayback,
+                        deferPlaybackUntilSurface = true,
                     )
                 }
                 return@LaunchedEffect
@@ -12907,7 +12940,7 @@ private fun WeiboVideoSurface(
             claimSharedPlayer()?.let { adopted ->
                 configureExistingPlayer(
                     adopted,
-                    deferPlaybackUntilSurface = isDetailInlinePlayback,
+                    deferPlaybackUntilSurface = true,
                 )
                 inlinePlayer = adopted
                 inlineWaitingForHandoff = false
@@ -12930,7 +12963,7 @@ private fun WeiboVideoSurface(
                     claimSharedPlayer()?.let { adopted ->
                         configureExistingPlayer(
                             adopted,
-                            deferPlaybackUntilSurface = isDetailInlinePlayback,
+                            deferPlaybackUntilSurface = true,
                         )
                         inlinePlayer = adopted
                         inlineWaitingForHandoff = false
@@ -12947,7 +12980,8 @@ private fun WeiboVideoSurface(
                 videoCoordinator.clearInlineReturn(playbackKey)
             }
 
-            val deferUntilSurface = isDetailInlinePlayback
+            // Inline audio must never start before its visible PlayerView owns a Surface.
+            val deferUntilSurface = true
             val cached = playerCache[videoUrl]?.takeUnless {
                 it.playbackState == androidx.media3.common.Player.STATE_IDLE &&
                     it.playerError != null

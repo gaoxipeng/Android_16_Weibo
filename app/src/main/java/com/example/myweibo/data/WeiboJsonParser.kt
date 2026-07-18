@@ -1329,7 +1329,14 @@ object WeiboJsonParser {
         }
 
         val (isEdited, editCount) = status.parseEditMetadata()
-        val statusLocation = parseStatusLocation(status)
+        val locationReferenceText = if (retweeted != null) {
+            // Desktop repost payloads often copy the original post's url_struct into the
+            // outer status. Only the text authored before the repost chain belongs to outer.
+            rawText.substringBefore("//@").substringBefore("//＠")
+        } else {
+            rawText
+        }
+        val statusLocation = parseStatusLocation(status, locationReferenceText)
         val item = FeedItem(
             id = id,
             statusId = status.optNullableString("mblogid") ?: id,
@@ -2064,11 +2071,18 @@ object WeiboJsonParser {
         return trimmed.matches(Regex("""^\d{1,2}:\d{2}(?::\d{2})?$"""))
     }
 
-    private fun parseStatusLocation(status: JSONObject): ParsedStatusLocation? {
+    private fun parseStatusLocation(
+        status: JSONObject,
+        referenceText: String,
+    ): ParsedStatusLocation? {
         val urls = status.optJSONArray("url_struct")
         for (index in 0 until (urls?.length() ?: 0)) {
             val entry = urls?.optJSONObject(index) ?: continue
             if (isAttachedMediaUrlStructEntity(entry)) continue
+            val shortUrl = entry.optNullableString("short_url")
+            // url_struct can contain entities inherited from a retweeted status. A place
+            // entity is owned by this status only when its token occurs in this status text.
+            if (shortUrl.isNullOrBlank() || !referenceText.contains(shortUrl)) continue
             val type = entry.optNullableString("object_type")
             val hasPoi = pickPoiId(entry) != null ||
                 pickPoiId(entry.optJSONObject("object")) != null
