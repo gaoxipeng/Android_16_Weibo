@@ -1643,6 +1643,21 @@ private class VideoPlaybackCoordinator {
         }
     }
 
+    fun retargetPlaybackKey(fromKey: String, toKey: String) {
+        if (fromKey == toKey || toKey.isBlank()) return
+        resolvePosition(fromKey)?.let { rememberPosition(toKey, it) }
+        fun retarget(current: String?): String? =
+            if (current != null && matchesPlaybackKey(current, fromKey)) toKey else current
+        activeKey = retarget(activeKey)
+        fullscreenKey = retarget(fullscreenKey)
+        peekPlaybackKey = retarget(peekPlaybackKey)
+        pendingPeekHandoffKey = retarget(pendingPeekHandoffKey)
+        pendingFullscreenHandoffKey = retarget(pendingFullscreenHandoffKey)
+        pendingInlineReturnKey = retarget(pendingInlineReturnKey)
+        autoScrollFloatingKey = retarget(autoScrollFloatingKey)
+        proactiveStashSignalKey = retarget(proactiveStashSignalKey)
+    }
+
     fun requestInlinePlayback(playbackKey: String) {
         clearPlaybackEndedReset(playbackKey)
         pausePeek()
@@ -1867,6 +1882,8 @@ private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
+private val LocalStaleVideoMediaRefresher =
+    staticCompositionLocalOf<((FeedMedia, String) -> Unit)?> { null }
 
 private enum class CapsuleHintTone {
     Neutral,
@@ -3035,6 +3052,31 @@ private fun videoMediaKey(media: FeedMedia): String =
 private fun videoPlaybackKey(media: FeedMedia, ownerId: String): String =
     "$ownerId|${videoMediaKey(media)}"
 
+private fun sameStaleVideoIdentity(left: FeedMedia, right: FeedMedia): Boolean {
+    if (left === right) return true
+    if (!left.coverUrl.isNullOrBlank() && left.coverUrl == right.coverUrl) return true
+    if (left.title.isNotBlank() && left.title == right.title && left.type == right.type) return true
+    return left.streamUrl == right.streamUrl ||
+        (!left.downloadUrl.isNullOrBlank() && left.downloadUrl == right.downloadUrl) ||
+        (!left.replayUrl.isNullOrBlank() && left.replayUrl == right.replayUrl)
+}
+
+private fun isLikelyExpiredPlaybackException(error: androidx.media3.common.PlaybackException): Boolean {
+    when (error.errorCode) {
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_NO_PERMISSION,
+        -> return true
+    }
+    val message = buildString {
+        append(error.message.orEmpty())
+        append(' ')
+        append(error.cause?.message.orEmpty())
+    }.lowercase()
+    return listOf("403", "404", "410", "expired", "forbidden", "access denied")
+        .any { token -> message.contains(token) }
+}
+
 private fun isMediaInlineExpanded(
     media: FeedMedia,
     playbackOwnerId: String,
@@ -3227,6 +3269,7 @@ fun WeiboApp() {
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var videoMediaRefreshInFlight by remember { mutableStateOf<Set<String>>(emptySet()) }
     var longTextPreflightCheckedIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     val longTextAutoLoadSemaphore = remember { Semaphore(3) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -4641,6 +4684,68 @@ fun WeiboApp() {
         }
     }
 
+    fun findFeedItemByStatusId(statusId: String): FeedItem? {
+        val id = statusId.trim()
+        if (id.isBlank()) return null
+        fun match(item: FeedItem): FeedItem? = when {
+            item.statusId == id -> item
+            item.retweetedStatus?.statusId == id -> item.retweetedStatus
+            else -> null
+        }
+        expandedFeedItems[id]?.let { return it }
+        sequenceOf(selectedItem)
+            .filterNotNull()
+            .plus(items)
+            .plus(minePosts)
+            .plus(visitedPosts)
+            .forEach { item ->
+                match(item)?.let { return it }
+            }
+        return null
+    }
+
+    fun refreshStaleVideoMedia(media: FeedMedia, playbackOwnerId: String) {
+        val statusId = playbackOwnerId.trim()
+        if (statusId.isBlank() || statusId in videoMediaRefreshInFlight) return
+        videoMediaRefreshInFlight = videoMediaRefreshInFlight + statusId
+        scope.launch {
+            try {
+                val detail = runCatching { session.loadStatusDetail(statusId) }.getOrNull() ?: return@launch
+                val freshMedia = MediaUrlResolver.pickRefreshedMedia(media, detail) ?: return@launch
+                if (!MediaUrlResolver.mediaPlaybackUrlsChanged(media, freshMedia)) return@launch
+
+                val oldKey = videoPlaybackKey(media, statusId)
+                val newKey = videoPlaybackKey(freshMedia, statusId)
+                videoPlaybackCoordinator.retargetPlaybackKey(oldKey, newKey)
+
+                val existing = findFeedItemByStatusId(statusId) ?: detail
+                applyExpandedItem(
+                    existing.copy(
+                        medias = detail.medias.takeIf { it.isNotEmpty() } ?: existing.medias,
+                    ),
+                )
+
+                mediaPreview = mediaPreview?.let { preview ->
+                    if (preview.playbackOwnerId == statusId && sameStaleVideoIdentity(preview.media, media)) {
+                        preview.copy(media = freshMedia)
+                    } else {
+                        preview
+                    }
+                }
+
+                videoPeekController.activeRequest = videoPeekController.activeRequest?.let { request ->
+                    if (request.playbackOwnerId == statusId && sameStaleVideoIdentity(request.media, media)) {
+                        request.copy(media = freshMedia)
+                    } else {
+                        request
+                    }
+                }
+            } finally {
+                videoMediaRefreshInFlight = videoMediaRefreshInFlight - statusId
+            }
+        }
+    }
+
     fun toggleStatusLike(item: FeedItem) {
         val likeId = item.id.trim().takeIf { it.isNotBlank() && it != "0" && it.all(Char::isDigit) }
             ?: return
@@ -5854,6 +5959,7 @@ fun WeiboApp() {
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
         LocalTopicClickHandler provides ::openSearchTopic,
+        LocalStaleVideoMediaRefresher provides ::refreshStaleVideoMedia,
     ) {
     MediaLongPressConfiguration {
     MyWeiboScaffold(
@@ -13114,6 +13220,7 @@ private fun WeiboVideoSurface(
     val scope = rememberCoroutineScope()
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
+    val staleVideoMediaRefresher = LocalStaleVideoMediaRefresher.current
     val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
     val isInlineFeedOrDetail = !isPeekPlayback && !isFullscreen && !seamlessOverlayPlayback
     val isLiveBroadcast = media.isLiveBroadcast()
@@ -13143,6 +13250,44 @@ private fun WeiboVideoSurface(
             media.type == MediaType.Live -> emptyList()
             else -> listOfNotNull(media.streamUrl, media.downloadUrl)
         }.flatMap(::videoUrlCandidates).distinct()
+    }
+    var mediaRefreshRequested by remember(
+        media.streamUrl,
+        media.downloadUrl,
+        media.replayUrl,
+        playbackOwnerId,
+    ) {
+        mutableStateOf(false)
+    }
+    LaunchedEffect(
+        media.streamUrl,
+        media.downloadUrl,
+        media.replayUrl,
+        playbackOwnerId,
+        playbackKey,
+        videoCoordinator.activeKey,
+        videoCoordinator.peekPlaybackKey,
+        videoCoordinator.fullscreenKey,
+        staleVideoMediaRefresher,
+    ) {
+        val isActivelyPlayingThisMedia =
+            videoCoordinator.isPlaybackKeyActive(playbackKey) ||
+                videoCoordinator.peekPlaybackKey?.let {
+                    videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                } == true ||
+                videoCoordinator.fullscreenKey?.let {
+                    videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                } == true
+        if (
+            isActivelyPlayingThisMedia &&
+            !mediaRefreshRequested &&
+            staleVideoMediaRefresher != null &&
+            !isLiveBroadcast &&
+            MediaUrlResolver.isFeedMediaPlaybackLikelyExpired(media)
+        ) {
+            mediaRefreshRequested = true
+            staleVideoMediaRefresher(media, playbackOwnerId)
+        }
     }
     val fullscreenSafePadding = WindowInsets.safeDrawing.asPaddingValues()
     val isDevicePortrait = LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -13211,6 +13356,19 @@ private fun WeiboVideoSurface(
     val videoUrl = videoCandidates.getOrElse(videoIndex) { playbackUrl }
     var playbackError by remember(videoUrl) { mutableStateOf<String?>(null) }
     var isBuffering by remember(videoUrl) { mutableStateOf(true) }
+    LaunchedEffect(
+        mediaRefreshRequested,
+        media.streamUrl,
+        media.downloadUrl,
+        media.replayUrl,
+    ) {
+        if (!mediaRefreshRequested) return@LaunchedEffect
+        delay(12_000)
+        if (mediaRefreshRequested && playbackError == null) {
+            playbackError = "视频无法播放"
+            isBuffering = false
+        }
+    }
     var positionMs by remember(videoUrl) { mutableStateOf(0L) }
     var durationMs by remember(videoUrl) { mutableStateOf(0L) }
     var isPlaying by remember(videoUrl) { mutableStateOf(true) }
@@ -13894,6 +14052,21 @@ private fun WeiboVideoSurface(
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 isBuffering = false
+                val shouldRefreshStaleMedia = !isLiveBroadcast &&
+                    staleVideoMediaRefresher != null &&
+                    !mediaRefreshRequested &&
+                    (
+                        isLikelyExpiredPlaybackException(error) ||
+                            videoIndex >= videoCandidates.lastIndex ||
+                            MediaUrlResolver.isPlaybackUrlLikelyExpired(videoUrl)
+                        )
+                if (shouldRefreshStaleMedia) {
+                    mediaRefreshRequested = true
+                    playbackError = null
+                    isBuffering = true
+                    staleVideoMediaRefresher?.invoke(media, playbackOwnerId)
+                    return
+                }
                 if (videoIndex < videoCandidates.lastIndex) {
                     playbackError = null
                     videoIndex += 1
@@ -19690,12 +19863,13 @@ private val appHelpSections = listOf(
         title = "首页信息流",
         items = listOf(
             "在首页下拉可刷新关注流；滚动到底部会自动加载更多。",
+            "可在设置中切换「连续信息流」与「单条浏览」：单条浏览时右侧切微博，左侧滚动正文与评论。",
             "列表使用系统默认滑动手感；惯性滚动中点击图片或视频，会先停止滚动，避免误触打开媒体。",
             "点击微博卡片进入详情；点击头像或 @昵称 进入用户主页。",
             "点击评论图标进入详情评论区；点击转发图标进入详情转发区。",
             "长按评论图标可快速打开评论输入框；长按「赞」可快速点赞或取消赞。",
             "点击正文中的 #话题# 会临时进入搜索页并搜索该话题，返回后回到首页。",
-            "长微博可点「阅读全文」展开；正文里的「查看图片」链接可直接看图。",
+            "长文会在浏览时自动拉取完整正文；正文里的「查看图片」链接可直接看图。",
             "点击卡片中的链接卡片，会在应用内打开文章阅读页。",
             "点击卡片右上角菜单，可跳转官方微博或分享链接。",
             "刷新完成后，顶部会短暂显示本次更新条数提示。",
@@ -19713,6 +19887,7 @@ private val appHelpSections = listOf(
             "长按视频会弹出大预览，上滑可进入浮窗，下滑可关闭；松手也可进入全屏。",
             "浮窗播放时切换 Tab、进入详情或用户主页，视频会继续播放；返回可回到原页面。",
             "从首页进入微博详情时，若视频正在播放，会自动续播并保持当前进度。",
+            "隔夜或长时间未刷新后播放旧信息流视频时，若播放地址过期会自动重新拉取并重试。",
             "详情页内播放视频后向上滑动，卡片滚出屏幕时会自动进入浮窗继续播放。",
             "详情页浮窗播放时向下滑动，待原视频卡片完全回到屏幕后，会自动缩回卡片内播放。",
             "用户主页微博列表中的视频卡片，长按、浮窗、全屏等手势与首页一致。",
@@ -19789,6 +19964,7 @@ private val appHelpSections = listOf(
         title = "设置项说明",
         items = listOf(
             "账号管理：登录、添加账号、切换已保存账号；切换后会重新加载对应账号数据。",
+            "首页浏览方式：连续信息流（上下连续刷）或单条浏览（右侧切博、左侧看正文与评论）。",
             "表情同步：从微博拉取表情配置到本地，改善正文与评论中的表情显示。",
             "浏览信息流时，正文里出现的表情也会自动收录到本地，同步时不会删除这些表情。",
             "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
