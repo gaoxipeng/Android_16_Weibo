@@ -3082,18 +3082,24 @@ private fun isMediaInlineExpanded(
     playbackOwnerId: String,
     videoCoordinator: VideoPlaybackCoordinator,
     isDetailInlinePlayback: Boolean,
+    detailInlinePeekActive: Boolean = false,
 ): Boolean {
     val playbackKey = videoPlaybackKey(media, playbackOwnerId)
     val suppressedByDetailOverlay = !isDetailInlinePlayback &&
         videoCoordinator.shouldSuppressInlineForDetailOverlay(playbackKey)
-    return !suppressedByDetailOverlay &&
-        (
-            videoCoordinator.isPlaybackKeyActive(playbackKey) ||
-                videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
-                (isDetailInlinePlayback && videoCoordinator.isDetailHandoffTarget(playbackKey))
-            ) &&
-        videoCoordinator.fullscreenKey != playbackKey &&
-        videoCoordinator.peekPlaybackKey != playbackKey
+    if (suppressedByDetailOverlay) return false
+    if (videoCoordinator.fullscreenKey?.let { videoCoordinator.matchesPlaybackKey(it, playbackKey) } == true) {
+        return false
+    }
+    val peekOwns = videoCoordinator.peekPlaybackKey?.let {
+        videoCoordinator.matchesPlaybackKey(it, playbackKey)
+    } == true
+    // 信息流：peek 是长按浮层，不抬升大卡。详情/单条：锚定播放会占 peek，仍应保持大卡展开。
+    if (peekOwns && !detailInlinePeekActive) return false
+    return videoCoordinator.isPlaybackKeyActive(playbackKey) ||
+        videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
+        (isDetailInlinePlayback && videoCoordinator.isDetailHandoffTarget(playbackKey)) ||
+        detailInlinePeekActive
 }
 
 private fun feedItemPlaybackOwnerId(item: FeedItem): String =
@@ -7787,8 +7793,12 @@ private fun ImmersiveFollowFeedScreen(
                                 onCommentLongClick = { onCommentLongClick(item) },
                                 onRepostClick = {},
                                 menuBackEnabled = feedUiOnTop,
+                                // 详情盖在单条浏览之上时关掉底层自动浮窗，否则同一 playbackKey
+                                // 会被底层可见卡片误判「应缩回内联」，与详情浮窗来回抢状态。
                                 autoFloatingOnScrollAway =
-                                    !pageSwitchInProgress && page == pagerState.currentPage,
+                                    feedUiOnTop &&
+                                        !pageSwitchInProgress &&
+                                        page == pagerState.currentPage,
                                 compactBottomSpacing = true,
                             )
                         }
@@ -11156,13 +11166,22 @@ private fun MediaStrip(
 
         medias.takeIf { it.isNotEmpty() }?.let { videoMedias ->
             val videoCoordinator = LocalVideoPlaybackCoordinator.current
+            val videoPeekController = LocalVideoPeekController.current
             val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
             val activeInlineMedia = videoMedias.firstOrNull { media ->
+                val playbackKey = videoPlaybackKey(media, playbackOwnerId)
+                val peekOwns = videoPeekController.activeRequest?.let {
+                    videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
+                } == true
+                val detailInlinePeekActive = isDetailInlinePlayback &&
+                    peekOwns &&
+                    (videoPeekController.isInlineAnchored || videoPeekController.isFloating)
                 isMediaInlineExpanded(
                     media = media,
                     playbackOwnerId = playbackOwnerId,
                     videoCoordinator = videoCoordinator,
                     isDetailInlinePlayback = isDetailInlinePlayback,
+                    detailInlinePeekActive = detailInlinePeekActive,
                 )
             }
             val gridMedias = if (activeInlineMedia != null) {
@@ -12984,7 +13003,9 @@ private fun InlineVideoPlayer(
                 .zIndex(if (actionOpen || peekActive) 10f else 0f)
                 .onGloballyPositioned { coordinates ->
                     anchorHolder.coordinates = coordinates
-                    if (autoFloatingOnScrollAway || isAutoScrollFloating) {
+                    // 仅由真正启用自动浮窗的卡片跟踪位置；被遮罩的底层卡片即使
+                    // isAutoScrollFloating 为 true 也不能参与缩回判断。
+                    if (autoFloatingOnScrollAway) {
                         val nextBounds = coordinates.boundsInWindow()
                         if (videoBoundsInWindow != nextBounds) videoBoundsInWindow = nextBounds
                     }
@@ -13016,8 +13037,8 @@ private fun InlineVideoPlayer(
                             val tapUptime = down.uptimeMillis
                             val pressWindowOffset = down.position.toWindowPosition(bounds)
                             if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
-                                if (isDetailInlinePlayback) openAnchoredInlinePlayback()
-                                else videoCoordinator.requestInlinePlayback(playbackKey)
+                                // 宫格多视频与信息流一致：先 requestInline 抬升大卡，再由大卡锚定交接。
+                                videoCoordinator.requestInlinePlayback(playbackKey)
                                 return@awaitEachGesture
                             }
                             val isDoubleTap = lastTapUptimeMs > 0L &&
@@ -13026,8 +13047,11 @@ private fun InlineVideoPlayer(
                                 lastTapUptimeMs = 0L
                                 if (media.isStreamPlayable()) {
                                     if (!inlinePlaying) {
-                                        if (isDetailInlinePlayback) openAnchoredInlinePlayback()
-                                        else videoCoordinator.requestInlinePlayback(playbackKey)
+                                        if (gridCell || !isDetailInlinePlayback) {
+                                            videoCoordinator.requestInlinePlayback(playbackKey)
+                                        } else {
+                                            openAnchoredInlinePlayback()
+                                        }
                                     }
                                 } else {
                                     onClick()
@@ -13115,8 +13139,11 @@ private fun InlineVideoPlayer(
                 TransparentLiquidIconButton(
                     onClick = {
                         if (media.isStreamPlayable()) {
-                            if (isDetailInlinePlayback) openAnchoredInlinePlayback()
-                            else videoCoordinator.requestInlinePlayback(playbackKey)
+                            if (gridCell || !isDetailInlinePlayback) {
+                                videoCoordinator.requestInlinePlayback(playbackKey)
+                            } else {
+                                openAnchoredInlinePlayback()
+                            }
                         } else {
                             onClick()
                         }
