@@ -6,6 +6,13 @@
 
 **当前版本：20260721**（需 Android 16+）
 
+<img src="https://github.com/user-attachments/assets/8b56791a-2c21-41d1-91fa-fe5223751c69" width="350" />
+<img src="https://github.com/user-attachments/assets/69e40c8b-a41d-4579-a1ef-b1a954a17aa6" width="350" />
+<img src="https://github.com/user-attachments/assets/1026fd9b-d620-4967-96f8-e63572b25f37" width="350" />
+<img src="https://github.com/user-attachments/assets/003361f0-544d-4919-b68b-b8611cd729bb" width="350" />
+<img src="https://github.com/user-attachments/assets/626810df-b48d-481d-a955-805627abd2a4" width="350" />
+<img src="https://github.com/user-attachments/assets/6b5de8dc-b5c3-4d9a-8538-b0a120e622a6" width="350" />
+
 ## 下载
 
 [GitHub Releases](https://github.com/gaoxipeng/Android_16_Weibo/releases/latest) 下载 `app-release.apk` 安装即可。
