@@ -212,6 +212,7 @@ import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.lerp
@@ -3125,6 +3126,7 @@ private fun videoDurationMs(media: FeedMedia): Long? =
 
 private const val VideoEndRestartThresholdMs = 500L
 private const val VideoPeekFloatingPlaybackSpeed = 2f
+private const val VideoHoldSpeedBoost = 2f
 private const val VideoPeekDockAspectRatio = 16f / 9f
 private enum class ForcedVideoOrientation {
     None,
@@ -13401,6 +13403,12 @@ private fun WeiboVideoSurface(
     var isPlaying by remember(videoUrl) { mutableStateOf(true) }
     var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
     var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
+    // 全屏/浮窗长按临时 2 倍速；松手恢复 selectedSpeed。
+    var holdSpeedBoostActive by remember(videoUrl) { mutableStateOf(false) }
+    val holdSpeedBoostActiveState = rememberUpdatedState(holdSpeedBoostActive)
+    val haptic = LocalHapticFeedback.current
+    val holdSpeedEnabled = (isFullscreen || isPeekPlayback) && playbackSpeedOverride == null
+    val holdSpeedEnabledState = rememberUpdatedState(holdSpeedEnabled)
     var controlsVisible by remember(videoUrl, initialControlsVisible) {
         mutableStateOf(initialControlsVisible)
     }
@@ -13448,7 +13456,14 @@ private fun WeiboVideoSurface(
     val screenHeightPx = remember(context) {
         context.resources.displayMetrics.heightPixels.toFloat()
     }
-    var isViewportVisible by remember(videoUrl) { mutableStateOf(true) }
+    val density = LocalDensity.current
+    val minViewportVisiblePx = remember(density) { with(density) { 56.dp.toPx() } }
+    // 视口跟踪开启时默认不可见，避免首帧/复用时未测量就出声。
+    var isViewportVisible by remember(videoUrl) { mutableStateOf(!trackViewportPause) }
+    var pausedByViewport by remember(videoUrl) { mutableStateOf(false) }
+    val isViewportVisibleState = rememberUpdatedState(isViewportVisible)
+    val trackViewportPauseState = rememberUpdatedState(trackViewportPause)
+    val pausedByViewportState = rememberUpdatedState(pausedByViewport)
 
     fun showControls() {
         controlsVisible = true
@@ -13867,9 +13882,18 @@ private fun WeiboVideoSurface(
                 view.player = target
             }
             videoCoordinator.markPlayerSurfaceBound(target)
+            // 卡片视口外禁止因 Surface 附着而提前出声。
+            if (trackViewportPauseState.value && !isViewportVisibleState.value) {
+                pausedByViewport = true
+                target.playWhenReady = false
+                target.pause()
+                resumeAfterSurfaceAttach = false
+                return
+            }
             target.playWhenReady = true
             target.play()
             resumeAfterSurfaceAttach = false
+            pausedByViewport = false
             if (isDetailInlinePlayback && videoCoordinator.shouldResumeInlineHandoff(playbackKey)) {
                 videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
             }
@@ -13977,8 +14001,20 @@ private fun WeiboVideoSurface(
         isPlaying = player.isPlaying
     }
 
-    LaunchedEffect(playbackSpeedOverride, selectedSpeed, player) {
-        player.setPlaybackSpeed(playbackSpeedOverride ?: selectedSpeed)
+    LaunchedEffect(playbackSpeedOverride, selectedSpeed, holdSpeedBoostActive, player) {
+        val speed = when {
+            holdSpeedBoostActive -> VideoHoldSpeedBoost
+            playbackSpeedOverride != null -> playbackSpeedOverride
+            else -> selectedSpeed
+        }
+        player.setPlaybackSpeed(speed)
+        displayedSpeed = speed
+    }
+
+    DisposableEffect(videoUrl) {
+        onDispose {
+            holdSpeedBoostActive = false
+        }
     }
 
     fun enterPictureInPicture() {
@@ -14195,29 +14231,49 @@ private fun WeiboVideoSurface(
                 !resumeAfterSurfaceAttach
             ) {
                 resumeInlineHandoffPlaybackIfNeeded(player)
+                pausedByViewport = false
                 if (isDetailInlinePlayback) {
                     videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
                 }
+            } else if (!isViewportVisible) {
+                val currentPosition = player.currentPosition.coerceAtLeast(0L)
+                videoCoordinator.rememberPosition(playbackKey, currentPosition)
+                player.pause()
+                player.playWhenReady = false
+                isPlaying = false
+                pausedByViewport = true
             }
             return@LaunchedEffect
         }
-        if (!trackViewportPause || isViewportVisible) return@LaunchedEffect
-        if (
-            autoEnterFloatingOnViewportHidden &&
-            onEnterFloatingPlayback != null &&
-            !isPeekPlayback &&
-            !isFullscreen &&
-            videoCoordinator.peekPlaybackKey != playbackKey &&
-            (player.isPlaying || player.playWhenReady)
-        ) {
-            onEnterFloatingPlayback()
+        if (!trackViewportPause) return@LaunchedEffect
+        if (!isViewportVisible) {
+            if (autoEnterFloatingOnViewportHidden &&
+                onEnterFloatingPlayback != null &&
+                !isPeekPlayback &&
+                !isFullscreen &&
+                videoCoordinator.peekPlaybackKey != playbackKey &&
+                (player.isPlaying || player.playWhenReady)
+            ) {
+                onEnterFloatingPlayback()
+                return@LaunchedEffect
+            }
+            val currentPosition = player.currentPosition.coerceAtLeast(0L)
+            videoCoordinator.rememberPosition(playbackKey, currentPosition)
+            player.pause()
+            player.playWhenReady = false
+            isPlaying = false
+            pausedByViewport = true
             return@LaunchedEffect
         }
-        val currentPosition = player.currentPosition.coerceAtLeast(0L)
-        videoCoordinator.rememberPosition(playbackKey, currentPosition)
-        player.pause()
-        player.playWhenReady = false
-        isPlaying = false
+        // 滚回可见：仅恢复「因视口暂停」或仍挂着的 active 内联播放，避免未入屏就出声。
+        if (resumeAfterSurfaceAttach) return@LaunchedEffect
+        val shouldResume = pausedByViewportState.value &&
+            videoCoordinator.isPlaybackKeyActive(playbackKey)
+        if (!shouldResume) return@LaunchedEffect
+        player.playWhenReady = true
+        player.play()
+        isPlaying = player.isPlaying
+        pausedByViewport = false
     }
 
     fun ensurePlaybackOwnership() {
@@ -14235,6 +14291,7 @@ private fun WeiboVideoSurface(
         showControls()
         if (player.isPlaying) {
             player.pause()
+            pausedByViewport = false
         } else {
             if (
                 player.playbackState == androidx.media3.common.Player.STATE_ENDED ||
@@ -14250,6 +14307,7 @@ private fun WeiboVideoSurface(
                 resumeAfterSurfaceAttach = false
                 videoCoordinator.markPlayerSurfaceBound(player)
             }
+            pausedByViewport = false
             player.playWhenReady = true
             player.play()
         }
@@ -14272,13 +14330,12 @@ private fun WeiboVideoSurface(
 
     LaunchedEffect(player, videoFrameReady, playbackKey, videoCoordinator.activeKey, resumeAfterSurfaceAttach, isViewportVisible) {
         if (!videoFrameReady || resumeAfterSurfaceAttach) return@LaunchedEffect
-        if (isDetailInlinePlayback &&
-            videoCoordinator.shouldResumeInlineHandoff(playbackKey) &&
-            !isViewportVisible
-        ) {
-            return@LaunchedEffect
-        }
+        if (trackViewportPause && !isViewportVisible) return@LaunchedEffect
+        if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
         resumeInlineHandoffPlaybackIfNeeded(player)
+        if (player.isPlaying || player.playWhenReady) {
+            pausedByViewport = false
+        }
     }
 
     LaunchedEffect(player, isDetailInlinePlayback, playbackKey) {
@@ -14330,7 +14387,8 @@ private fun WeiboVideoSurface(
                         val visibleBottom = min(bounds.bottom, screenHeightPx)
                         val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
                         val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
-                        isViewportVisible = fraction >= 0.35f
+                        // 提高可见门槛，避免只露出边缘就恢复声音。
+                        isViewportVisible = fraction >= 0.55f && visibleHeight >= minViewportVisiblePx
                     }
                 } else {
                     Modifier
@@ -14359,6 +14417,7 @@ private fun WeiboVideoSurface(
                             onPeekVerticalDismiss,
                             isFullscreen,
                             isPeekPlayback,
+                            holdSpeedEnabled,
                         ) {
                         val peekDismissActive = onPeekVerticalDismiss != null
                         val peekDismissThreshold = if (peekDismissActive) 48f else 82f
@@ -14366,19 +14425,48 @@ private fun WeiboVideoSurface(
                         val verticalDominanceRatio = if (peekDismissActive) 0.85f else 1.15f
                         val horizontalDominanceRatio = 1.15f
                         val allowSurfaceScrub = (isFullscreen || isPeekPlayback) && !peekDismissActive
+                        val allowHoldSpeedBoost = holdSpeedEnabledState.value
                         var lastTapUptimeMs = 0L
                         var pendingSingleTapJob: Job? = null
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             val slop = viewConfiguration.touchSlop
+                            // 长按 2 倍速允许轻微抖动手指，避免浮窗/全屏几乎无法触发。
+                            val holdCancelSlop = max(slop * 3.5f, 42f)
                             val doubleTapTimeout = viewConfiguration.doubleTapTimeoutMillis.toLong()
+                            val longPressTimeout = viewConfiguration.longPressTimeoutMillis
                             val anchorX = down.position.x
                             val startY = down.position.y
                             val anchorPosition = positionState
                             val width = size.width.toFloat()
                             var dragging = false
                             var peekDismissed = false
+                            var holdBoosted = false
+                            var cancelledHoldByMove = false
                             var lastSeekPosition = anchorPosition
+                            fun clearHoldSpeedBoost() {
+                                if (holdBoosted || holdSpeedBoostActiveState.value) {
+                                    holdBoosted = false
+                                    holdSpeedBoostActive = false
+                                }
+                            }
+                            fun activateHoldSpeedBoost() {
+                                if (!allowHoldSpeedBoost || holdBoosted || dragging || peekDismissed) return
+                                holdBoosted = true
+                                holdSpeedBoostActive = true
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            }
+                            val holdBoostJob = if (allowHoldSpeedBoost) {
+                                gestureScopeState.value.launch {
+                                    delay(longPressTimeout)
+                                    if (!cancelledHoldByMove && !dragging && !peekDismissed) {
+                                        activateHoldSpeedBoost()
+                                    }
+                                }
+                            } else {
+                                null
+                            }
+                            try {
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id }
@@ -14390,12 +14478,25 @@ private fun WeiboVideoSurface(
                                 val duration = durationState
                                 val peekDismiss = peekDismissState.value
                                 val verticalDominant = dy > dx * verticalDominanceRatio
+                                if (
+                                    allowHoldSpeedBoost &&
+                                    !holdBoosted &&
+                                    !dragging &&
+                                    !peekDismissed &&
+                                    (dx > holdCancelSlop || dy > holdCancelSlop)
+                                ) {
+                                    // 明显滑动才取消长按加速；已激活后保持到松手。
+                                    cancelledHoldByMove = true
+                                    holdBoostJob?.cancel()
+                                }
                                 if (peekDismiss != null && change.pressed) {
                                     peekFingerDragState.value?.invoke(totalDrag)
                                     if (dy > peekDismissThreshold && verticalDominant) {
                                         change.consume()
                                         peekDismissed = true
                                         pendingSingleTapJob?.cancel()
+                                        holdBoostJob?.cancel()
+                                        clearHoldSpeedBoost()
                                         peekDismiss.invoke()
                                         while (true) {
                                             val consumeEvent = awaitPointerEvent()
@@ -14406,23 +14507,30 @@ private fun WeiboVideoSurface(
                                     }
                                 }
                                 if (
+                                    // 全屏/浮窗长按加速时不要因纵向微移把整个手势交给列表。
+                                    !allowHoldSpeedBoost &&
                                     !peekDismissActive &&
                                     !dragging &&
                                     dy > slop &&
                                     dy > dx * horizontalDominanceRatio
                                 ) {
                                     // 纵向滑动交给外层列表，避免误触进度拖动。
+                                    holdBoostJob?.cancel()
+                                    clearHoldSpeedBoost()
                                     break
                                 }
                                 if (
                                     allowSurfaceScrub &&
                                     !dragging &&
+                                    !holdBoosted &&
                                     dx > slop &&
                                     dx > dy * horizontalDominanceRatio
                                 ) {
                                     dragging = true
                                     isScrubbing = true
                                     pendingSingleTapJob?.cancel()
+                                    holdBoostJob?.cancel()
+                                    clearHoldSpeedBoost()
                                     showControls()
                                     controlsHideSignal++
                                 }
@@ -14436,13 +14544,16 @@ private fun WeiboVideoSurface(
                                     }
                                 }
                                 if (event.changes.all { it.changedToUpIgnoreConsumed() }) {
+                                    holdBoostJob?.cancel()
+                                    val wasHoldBoosted = holdBoosted || holdSpeedBoostActiveState.value
+                                    clearHoldSpeedBoost()
                                     if (!dragging && !peekDismissed && peekDismiss != null) {
                                         if (dy > peekDismissReleaseThreshold && verticalDominant) {
                                             peekDismiss.invoke()
                                             peekDismissed = true
                                         }
                                     }
-                                    if (!dragging && !peekDismissed) {
+                                    if (!dragging && !peekDismissed && !wasHoldBoosted) {
                                         val upUptime = change.uptimeMillis
                                         pendingSingleTapJob?.cancel()
                                         if (
@@ -14464,6 +14575,10 @@ private fun WeiboVideoSurface(
                                     }
                                     break
                                 }
+                            }
+                            } finally {
+                                holdBoostJob?.cancel()
+                                clearHoldSpeedBoost()
                             }
                             if (peekDismissed) {
                                 peekFingerDragResetState.value?.invoke()
@@ -14534,6 +14649,8 @@ private fun WeiboVideoSurface(
         }
         }
         }
+
+
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isFullscreen && !isPeekPlayback && showFullscreenButton,
@@ -14779,11 +14896,13 @@ private fun WeiboVideoSurface(
                     showControls()
                     if (player.isPlaying) {
                         player.pause()
+                        pausedByViewport = false
                     } else {
                         if (durationMs > 0 && positionMs >= durationMs - 500) {
                             player.seekTo(0)
                         }
                         ensurePlaybackOwnership()
+                        pausedByViewport = false
                         player.playWhenReady = true
                         player.play()
                     }
