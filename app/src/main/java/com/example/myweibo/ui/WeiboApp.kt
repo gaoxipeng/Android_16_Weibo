@@ -3162,6 +3162,12 @@ fun WeiboApp() {
     val imageSettingsStore = remember { ImageSettingsStore(context) }
     val themeSettingsStore = remember { ThemeSettingsStore(context) }
     val typographySettingsStore = remember { TypographySettingsStore(context) }
+    DisposableEffect(session, accountStore) {
+        session.setCookieSnapshotListener { snapshot ->
+            accountStore.updateActiveAccountCookies(snapshot)
+        }
+        onDispose { session.setCookieSnapshotListener(null) }
+    }
     LaunchedEffect(context) {
         withContext(Dispatchers.IO) {
             RemoteDiskBytesCache.configure(java.io.File(context.cacheDir, "remote-image-bytes"))
@@ -4097,7 +4103,20 @@ fun WeiboApp() {
         }
         if (isCurrentUser) return
 
-        if (
+        val leavingDetailForProfile = selectedItem != null
+        if (leavingDetailForProfile) {
+            // The detail player can be hosted by the persistent peek layer even while it
+            // visually sits inside the card. Tear down every handoff before the profile
+            // overlay opens so neither its Surface nor audio can leak into the next page.
+            videoPlaybackCoordinator.pauseAll()
+            videoPlaybackCoordinator.activeKey = null
+            videoPlaybackCoordinator.fullscreenKey = null
+            videoPlaybackCoordinator.peekPlaybackKey = null
+            videoPlaybackCoordinator.pendingPeekHandoffKey = null
+            videoPlaybackCoordinator.pendingInlineReturnKey = null
+            videoPlaybackCoordinator.autoScrollFloatingKey = null
+            videoPeekController.cancel(snap = true)
+        } else if (
             selectedTab == MainTab.Feed &&
             feedBrowseMode == FeedBrowseMode.Immersive &&
             (videoPeekController.isInlineAnchored || videoPlaybackCoordinator.activeKey != null)
@@ -5594,10 +5613,13 @@ fun WeiboApp() {
 
     LaunchedEffect(Unit) {
         val savedActiveId = accountStore.readActiveAccountId()
-        if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
-            runCatching { session.activateAccount(accountStore, savedActiveId) }
-        } else if (session.hasLoginCookie()) {
+        if (session.hasLoginCookie()) {
+            // Keep WebView's potentially newer, server-refreshed session. Restoring the
+            // saved snapshot here would roll authentication back to an older cookie set.
             persistLoginSession(makeActive = true)
+        } else if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
+            // A snapshot is a fallback only when WebView has no authenticated SUB cookie.
+            runCatching { session.activateAccount(accountStore, savedActiveId) }
         }
         reloadStoredAccounts()
 

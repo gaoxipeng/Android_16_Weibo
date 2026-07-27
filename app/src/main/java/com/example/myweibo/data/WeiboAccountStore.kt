@@ -54,6 +54,24 @@ class WeiboAccountStore(context: Context) {
     }
 
     @Synchronized
+    fun updateActiveAccountCookies(cookies: Map<String, String>): Boolean {
+        if (cookies.isEmpty()) return false
+        val activeId = readActiveAccountId()?.takeIf { it.isNotBlank() } ?: return false
+        val accounts = readAccounts()
+        var updated = false
+        val merged = accounts.map { account ->
+            if (account.id != activeId) {
+                account
+            } else {
+                updated = true
+                account.copy(cookies = cookies)
+            }
+        }
+        if (updated) write(merged, activeId)
+        return updated
+    }
+
+    @Synchronized
     fun removeAccount(id: String) {
         val accounts = readAccounts().filterNot { it.id == id }
         val activeId = readActiveAccountId()

@@ -38,6 +38,13 @@ class WeiboWebSession(context: Context) {
     private val appContext = context.applicationContext
     val webView: WebView = WebView(context)
 
+    @Volatile
+    private var cookieSnapshotListener: ((Map<String, String>) -> Unit)? = null
+
+    fun setCookieSnapshotListener(listener: ((Map<String, String>) -> Unit)?) {
+        cookieSnapshotListener = listener
+    }
+
     private val albumLoadMutex = Mutex()
     private val mweiboSessionMutex = Mutex()
     private val profileLongTextSemaphore = Semaphore(3)
@@ -1510,9 +1517,11 @@ class WeiboWebSession(context: Context) {
     private fun syncResponseCookies(connection: HttpURLConnection) {
         val manager = CookieManager.getInstance()
         val requestUrl = connection.url.toString()
+        var receivedCookie = false
         connection.headerFields?.forEach { (key, values) ->
             if (key != null && key.equals("Set-Cookie", ignoreCase = true)) {
                 values.forEach { cookieLine ->
+                    receivedCookie = true
                     manager.setCookie(requestUrl, cookieLine)
                     COOKIE_ORIGINS.forEach { origin ->
                         manager.setCookie(origin, cookieLine)
@@ -1521,6 +1530,9 @@ class WeiboWebSession(context: Context) {
             }
         }
         manager.flush()
+        if (receivedCookie) {
+            cookieSnapshotListener?.invoke(captureCookieSnapshot())
+        }
     }
 
     private fun buildUrl(path: String, params: Map<String, String>): String {
