@@ -13663,7 +13663,7 @@ private fun WeiboVideoSurface(
                         }
                         return@LaunchedEffect
                     }
-                    delay(16)
+                    delay(50) // 降低轮询频率：20fps 足够，无需 60fps
                 }
                 inlineWaitingForHandoff = false
                 // If the source disappeared before it could stash the instance, recover
@@ -14410,7 +14410,9 @@ private fun WeiboVideoSurface(
                         val visibleHeight = (visibleBottom - visibleTop).coerceAtLeast(0f)
                         val fraction = visibleHeight / bounds.height.coerceAtLeast(1f)
                         // 提高可见门槛，避免只露出边缘就恢复声音。
-                        isViewportVisible = fraction >= 0.55f && visibleHeight >= minViewportVisiblePx
+                        // 显式等值守卫：避免每帧都触发 snapshot 写入，减少调度开销。
+                        val newVisible = fraction >= 0.55f && visibleHeight >= minViewportVisiblePx
+                        if (isViewportVisible != newVisible) isViewportVisible = newVisible
                     }
                 } else {
                     Modifier
@@ -23643,15 +23645,6 @@ private fun RemoteImage(
         mutableStateOf(FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable())
     }
     var failed by remember(loadKey) { mutableStateOf(false) }
-
-    SideEffect {
-        FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let { cached ->
-            if (bitmap !== cached) {
-                bitmap = cached
-                failed = false
-            }
-        }
-    }
 
     LaunchedEffect(loadKey, upgradeRevision) {
         FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let {

@@ -1,10 +1,14 @@
 package com.example.myweibo.data
 
+import androidx.compose.runtime.Immutable
+
+@Immutable
 data class TimelinePage(
     val items: List<FeedItem>,
     val nextCursor: String? = null
 )
 
+@Immutable
 data class FeedItem(
     val id: String,
     val statusId: String,
@@ -44,6 +48,7 @@ data class FeedItem(
         get() = medias.firstOrNull()
 }
 
+@Immutable
 data class FeedImage(
     val id: String,
     val thumbnailUrl: String,
@@ -150,6 +155,7 @@ fun FeedImage.toAlbumFeedMedia(): FeedMedia? {
     )
 }
 
+@Immutable
 data class AlbumPage(
     val images: List<FeedImage>,
     val nextCursor: String? = null,
@@ -161,6 +167,7 @@ data class MinePostsCache(
     val hasMore: Boolean = true,
 )
 
+@Immutable
 data class FeedMedia(
     val type: MediaType,
     val title: String,
