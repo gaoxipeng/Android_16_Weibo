@@ -230,6 +230,7 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.LayoutCoordinates
@@ -461,7 +462,7 @@ private fun feedRefreshHintMessage(
     return if (newCount == 0) "\u6682\u65E0\u65B0\u5FAE\u535A" else "\u66F4\u65B0\u4E86 $newCount \u6761\u5FAE\u535A"
 }
 
-private const val BottomBarCollapseScrollDelta = 12
+private const val BottomBarHideGestureThresholdPx = 36f
 private const val ListLoadMoreItemsFromBottom = 3
 private const val ListScrollToTopMaxDurationMillis = 500L
 
@@ -3195,8 +3196,34 @@ fun WeiboApp() {
     val profileHeaderHeights = remember { mutableStateMapOf<String, Dp>() }
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
-    var bottomBarExpanded by remember { mutableStateOf(true) }
-    var bottomBarAwaitingOutsideDismiss by remember { mutableStateOf(false) }
+    var bottomBarVisible by remember { mutableStateOf(true) }
+    var bottomBarScrollDistance by remember { mutableFloatStateOf(0f) }
+    val bottomBarScrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                val delta = available.y
+                if (delta == 0f) return Offset.Zero
+                if (bottomBarScrollDistance != 0f &&
+                    (bottomBarScrollDistance > 0f) != (delta > 0f)
+                ) {
+                    bottomBarScrollDistance = 0f
+                }
+                bottomBarScrollDistance = (bottomBarScrollDistance + delta)
+                    .coerceIn(-BottomBarHideGestureThresholdPx, BottomBarHideGestureThresholdPx)
+                when {
+                    bottomBarScrollDistance <= -BottomBarHideGestureThresholdPx -> {
+                        bottomBarVisible = false
+                        bottomBarScrollDistance = 0f
+                    }
+                    bottomBarScrollDistance >= BottomBarHideGestureThresholdPx -> {
+                        bottomBarVisible = true
+                        bottomBarScrollDistance = 0f
+                    }
+                }
+                return Offset.Zero
+            }
+        }
+    }
     var immersiveFeedScrollToTop by remember { mutableStateOf<(() -> Unit)?>(null) }
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
@@ -4073,7 +4100,7 @@ fun WeiboApp() {
         if (selectedTab == MainTab.Search && visitedUserId == null && selectedItem == null) {
             searchPendingQuery = normalized
             searchPendingMode = SearchMode.Weibo
-            bottomBarExpanded = true
+            bottomBarVisible = true
             return
         }
         pushNavigation(NavOverlayKind.TabSwitch) {
@@ -4087,7 +4114,7 @@ fun WeiboApp() {
             searchPendingQuery = normalized
             searchPendingMode = SearchMode.Weibo
             selectedTab = MainTab.Search
-            bottomBarExpanded = true
+            bottomBarVisible = true
         }
     }
 
@@ -5748,7 +5775,7 @@ fun WeiboApp() {
         }
     }
 
-    val bottomBarListState: LazyListState? = when {
+    val activeMainListState: LazyListState? = when {
         selectedItem != null -> null
         visitedUserId != null -> {
             if (visitedMinePagerPage == MineContentTab.Posts.ordinal) {
@@ -5768,41 +5795,30 @@ fun WeiboApp() {
         else -> null
     }
 
-    LaunchedEffect(selectedTab, visitedUserId) {
-        if (selectedTab != MainTab.Messages && selectedTab != MainTab.Compose) {
-            bottomBarExpanded = true
+    LaunchedEffect(selectedTab, visitedUserId, selectedItem) {
+        if (selectedItem == null &&
+            visitedUserId == null &&
+            selectedTab != MainTab.Messages &&
+            selectedTab != MainTab.Compose
+        ) {
+            bottomBarVisible = true
         }
-        bottomBarAwaitingOutsideDismiss = false
+        bottomBarScrollDistance = 0f
     }
 
-    LaunchedEffect(bottomBarListState) {
-        val state = bottomBarListState ?: run {
+    LaunchedEffect(activeMainListState) {
+        val state = activeMainListState ?: run {
             feedListScrollCoordinator.isListScrolling = false
             feedListScrollCoordinator.stopScrollAction = null
             return@LaunchedEffect
         }
         feedListScrollCoordinator.stopScrollAction = { state.stopScroll(MutatePriority.UserInput) }
-        var lastScrollTotal =
-            state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
         try {
-            coroutineScope {
-                launch {
-                    snapshotFlow { state.isScrollInProgress }
-                        .distinctUntilChanged()
-                        .collect { scrolling ->
-                            feedListScrollCoordinator.isListScrolling = scrolling
-                        }
+            snapshotFlow { state.isScrollInProgress }
+                .distinctUntilChanged()
+                .collect { scrolling ->
+                    feedListScrollCoordinator.isListScrolling = scrolling
                 }
-                snapshotFlow {
-                    state.firstVisibleItemIndex * 10_000 + state.firstVisibleItemScrollOffset
-                }.collect { scrollTotal ->
-                    if (scrollTotal > lastScrollTotal + BottomBarCollapseScrollDelta) {
-                        bottomBarExpanded = false
-                        bottomBarAwaitingOutsideDismiss = false
-                    }
-                    lastScrollTotal = scrollTotal
-                }
-            }
         } finally {
             feedListScrollCoordinator.stopScrollAction = null
             feedListScrollCoordinator.isListScrolling = false
@@ -6168,7 +6184,8 @@ fun WeiboApp() {
                 Modifier
                     .fillMaxSize()
                     .zIndex(1f)
-                    .layerBackdrop(bottomBarBackdrop),
+                    .layerBackdrop(bottomBarBackdrop)
+                    .nestedScroll(bottomBarScrollConnection),
             ) {
                 Box(
                     Modifier
@@ -6250,10 +6267,6 @@ fun WeiboApp() {
                             feedUiOnTop = feedUiOnTop,
                             onImmersiveScrollToTopRegistration = { action ->
                                 immersiveFeedScrollToTop = action
-                            },
-                            onImmersiveForwardScroll = {
-                                bottomBarExpanded = false
-                                bottomBarAwaitingOutsideDismiss = false
                             },
                             onRefresh = { refreshTimeline() },
                             onLoadMore = { loadMore() },
@@ -6829,7 +6842,7 @@ fun WeiboApp() {
             }
 
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail
-            val bottomBarVisible = visitedUserId == null &&
+            val bottomBarNavVisible = visitedUserId == null &&
                 (selectedItem == null || detailExiting)
             if (selectedItem == null && visitedUserId == null) {
                 if (timelineMenuExpanded) {
@@ -6844,55 +6857,24 @@ fun WeiboApp() {
                             ),
                     )
                 }
-                if (bottomBarExpanded && bottomBarAwaitingOutsideDismiss) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .zIndex(40f)
-                            .clickable(
-                                indication = null,
-                                interactionSource = remember { MutableInteractionSource() },
-                                onClick = {
-                                    bottomBarExpanded = false
-                                    bottomBarAwaitingOutsideDismiss = false
-                                },
-                            ),
-                    )
-                }
             }
             val timelineMenuLabels = remember {
                 listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
             }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
-            if (bottomBarVisible) {
+            AnimatedVisibility(
+                visible = bottomBarNavVisible && bottomBarVisible,
+                enter = slideInVertically(tween(200)) { it },
+                exit = slideOutVertically(tween(160)) { it },
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .zIndex(91f),
+            ) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
-                    expanded = bottomBarExpanded,
                     backdrop = bottomBarBackdrop,
                     timelineMenuExpanded = timelineMenuExpanded,
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
-                    onExpandRequest = {
-                        if (!bottomBarExpanded) {
-                            bottomBarAwaitingOutsideDismiss = true
-                        }
-                        bottomBarExpanded = true
-                    },
-                    onCollapsedTap = {
-                        when (selectedTab) {
-                            MainTab.Feed -> refreshTimelineFromTop()
-                            MainTab.Mine -> {
-                                scope.launch {
-                                    if (minePagerPage == 0) {
-                                        minePostsListState.animateScrollToTopSmooth()
-                                    } else {
-                                        mineAlbumListState.animateScrollToTopSmooth()
-                                    }
-                                }
-                                refreshMineProfile()
-                            }
-                            else -> Unit
-                        }
-                    },
                     feedTabLabel = timelineKind.label,
                     selectedTimelineKind = timelineKind,
                     onTimelineKindChange = { kind ->
@@ -6901,14 +6883,29 @@ fun WeiboApp() {
                         switchTimelineKind(kind)
                     },
                     onTabChange = { tab ->
+                        bottomBarVisible = true
+                        bottomBarScrollDistance = 0f
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {
                                 clearVisitedProfileState()
                             }
                         }
-                        if (tab == MainTab.Feed && selectedTab == MainTab.Feed) {
-                            refreshTimelineFromTop()
+                        if (tab == selectedTab) {
+                            when (tab) {
+                                MainTab.Feed -> refreshTimelineFromTop()
+                                MainTab.Mine -> {
+                                    scope.launch {
+                                        if (minePagerPage == 0) {
+                                            minePostsListState.animateScrollToTopSmooth()
+                                        } else {
+                                            mineAlbumListState.animateScrollToTopSmooth()
+                                        }
+                                    }
+                                    refreshMineProfile()
+                                }
+                                else -> Unit
+                            }
                         } else {
                             if (tab == MainTab.Feed) {
                                 hasLoginCookie = session.hasLoginCookie()
@@ -6947,9 +6944,6 @@ fun WeiboApp() {
                     },
                     timelineMenuWidth = timelineMenuWidth,
                     timelineMenuHeight = ActionMenuTwoRowHeight,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .zIndex(91f),
                 )
             }
 
@@ -7422,7 +7416,6 @@ private fun FollowFeedScreen(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
     onImmersiveScrollToTopRegistration: ((() -> Unit)?) -> Unit = {},
-    onImmersiveForwardScroll: () -> Unit = {},
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -7469,7 +7462,6 @@ private fun FollowFeedScreen(
             onUrlEntityClick = onUrlEntityClick,
             feedUiOnTop = feedUiOnTop,
             onScrollToTopRegistration = onImmersiveScrollToTopRegistration,
-            onForwardScroll = onImmersiveForwardScroll,
         )
         return
     }
@@ -7610,7 +7602,6 @@ private fun ImmersiveFollowFeedScreen(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)?,
     feedUiOnTop: Boolean,
     onScrollToTopRegistration: ((() -> Unit)?) -> Unit,
-    onForwardScroll: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val videoPlaybackCoordinator = LocalVideoPlaybackCoordinator.current
@@ -7642,7 +7633,6 @@ private fun ImmersiveFollowFeedScreen(
 
     LaunchedEffect(pagerState.currentPage, items.size) {
         items.getOrNull(pagerState.currentPage)?.statusId?.takeIf { it.isNotBlank() }?.let(onStatusChanged)
-        if (pagerState.currentPage > 0) onForwardScroll()
         if (pagerState.currentPage >= items.lastIndex - 2) onLoadMore()
     }
 
@@ -7720,24 +7710,6 @@ private fun ImmersiveFollowFeedScreen(
                 }
             }
 
-            LaunchedEffect(listState, item.statusId) {
-                var previous = listState.firstVisibleItemIndex * 10_000 +
-                    listState.firstVisibleItemScrollOffset
-                snapshotFlow {
-                    Triple(
-                        listState.isScrollInProgress,
-                        listState.firstVisibleItemIndex,
-                        listState.firstVisibleItemScrollOffset,
-                    )
-                }.collect { (scrolling, index, offset) ->
-                    val current = index * 10_000 + offset
-                    if (scrolling && current > previous + BottomBarCollapseScrollDelta) {
-                        onForwardScroll()
-                    }
-                    previous = current
-                }
-            }
-
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -7764,7 +7736,6 @@ private fun ImmersiveFollowFeedScreen(
                                 else -> page
                             }.coerceIn(0, items.lastIndex)
                             if (target != page) {
-                                if (target > page) onForwardScroll()
                                 scope.launch {
                                     val generation = ++pageSwitchGeneration
                                     pageSwitchInProgress = true
@@ -16213,7 +16184,14 @@ private fun ComposeWeiboScreen(
 
     var hasAutoFocused by remember { mutableStateOf(false) }
     LaunchedEffect(active) {
-        if (!active || hasAutoFocused) return@LaunchedEffect
+        if (!active) {
+            // Compose tab stays composed while hidden; drop focus so returning from the
+            // launcher does not resurrect the IME on Feed/other tabs.
+            focusManager.clearFocus(force = true)
+            keyboard?.hide()
+            return@LaunchedEffect
+        }
+        if (hasAutoFocused) return@LaunchedEffect
         hasAutoFocused = true
         delay(150)
         runCatching { focusRequester.requestFocus() }
@@ -16385,10 +16363,11 @@ private fun ComposeWeiboScreen(
                             }
                             text = next
                         },
-                        enabled = !submitting,
+                        enabled = active && !submitting,
                         modifier = Modifier
                             .fillMaxSize()
-                            .focusRequester(focusRequester),
+                            .focusRequester(focusRequester)
+                            .focusProperties { canFocus = active },
                         textStyle = inputTextStyle,
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
                         decorationBox = { innerTextField ->
@@ -20017,12 +19996,10 @@ private val appHelpSections = listOf(
         title = "底部导航",
         items = listOf(
             "底部共有五个入口：首页、消息、搜索、写微博、我的。",
-            "向下滚动列表时，底部栏会自动收起到左侧小胶囊；单击小胶囊可展开。",
-            "展开后点击空白区域可再次收起；点击其他 Tab 时选中块会滑向目标位置。",
+            "向上滑动列表时，底部栏会向下滑出隐藏；向下滑动时再滑回显示。",
+            "切换 Tab、再次点击当前 Tab 时会重新显示底部栏；点击其他 Tab 时选中块会滑向目标位置。",
             "底部栏文字大小固定，不受系统字体缩放影响。",
-            "在小胶囊上长按并左右拖动，可快速切换 Tab；松手后停留在目标页。",
-            "双击小胶囊：在首页刷新信息流；在「我的」回到顶部并刷新资料。",
-            "再次点击当前选中的「首页」，也会从顶部刷新关注流。",
+            "再次点击当前选中的「首页」，会从顶部刷新关注流；再次点击「我的」会回到顶部并刷新资料。",
             "长按底部「首页」按钮，可在「最新微博」与「朋友圈」之间切换。",
             "写微博页为全屏编辑界面，不显示底部五个按钮；按返回键回到首页。",
             "在「消息」页按系统返回键，优先网页内后退；无法后退时留在当前页。",
