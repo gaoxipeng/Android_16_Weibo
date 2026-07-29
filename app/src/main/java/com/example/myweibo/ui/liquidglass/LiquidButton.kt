@@ -128,6 +128,9 @@ fun LiquidButton(
     val pillShape = RoundedCornerShape(percent = 50)
     val isLightTheme = isAppLightTheme()
     val menuBorderColor = liquidMenuBorderColor(isLightTheme)
+    val resolvedSurfaceColor =
+        if (surfaceColor.isSpecified) surfaceColor.copy(alpha = 1f)
+        else liquidSurfaceColor(isLightTheme)
 
     Row(
         modifier
@@ -136,16 +139,18 @@ fun LiquidButton(
                 backdrop = backdrop,
                 shape = { pillShape },
                 effects = {
-                    if (useMenuGlassStyle) {
-                        liquidMenuGlassEffects()
-                    } else {
+                    if (!surfaceColor.isSpecified) {
                         vibrancy()
                         blur(LiquidGlassBlurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     }
                 },
-                highlight = if (!showEdgeEffects || useMenuGlassStyle) null else ({ Highlight.Default }),
-                shadow = if (!showEdgeEffects || useMenuGlassStyle) null else ({ Shadow.Default }),
+                highlight =
+                    if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
+                    else ({ Highlight.Default }),
+                shadow =
+                    if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
+                    else ({ Shadow.Default }),
                 layerBlock = if (isInteractive) {
                     {
                         val width = size.width
@@ -172,10 +177,9 @@ fun LiquidButton(
                     null
                 },
                 onDrawSurface = {
-                    if (tint.isSpecified) {
-                        drawLiquidTintedSurface(tint = tint, surfaceColor = surfaceColor)
-                    } else if (surfaceColor.isSpecified) {
-                        drawRect(surfaceColor)
+                    when {
+                        tint.isSpecified -> drawRect(tint)
+                        surfaceColor.isSpecified -> drawRect(resolvedSurfaceColor)
                     }
                 },
             )
@@ -204,8 +208,11 @@ fun LiquidButton(
 
 @Composable
 fun liquidSurfaceColor(isLightTheme: Boolean): Color {
-    val surface = MaterialTheme.colorScheme.surface
-    return if (isLightTheme) Color.White.copy(0.48f) else surface.copy(alpha = 0.22f)
+    return if (isLightTheme) {
+        Color(0xFFF7F7F7)
+    } else {
+        MaterialTheme.colorScheme.surfaceContainerHigh
+    }
 }
 
 @Composable
@@ -232,55 +239,22 @@ fun SurfaceLiquidCapsule(
     val menuBorderColor = liquidMenuBorderColor(isLightTheme)
     val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
 
-    if (resolvedBackdrop != null) {
-        Box(
-            modifier
-                .graphicsLayer { clip = false }
-                .drawBackdrop(
-                    backdrop = resolvedBackdrop,
-                    shape = { shape },
-                    effects = {
-                        if (useMenuGlassStyle) {
-                            liquidMenuGlassEffects()
-                        } else {
-                            vibrancy()
-                            blur(LiquidGlassBlurRadius.toPx())
-                            lens(12f.dp.toPx(), 24f.dp.toPx())
-                        }
-                    },
-                    highlight = if (useMenuGlassStyle) null else ({ Highlight.Default }),
-                    shadow = if (useMenuGlassStyle) null else ({ Shadow.Default }),
-                    onDrawSurface = {
-                        drawLiquidTintedSurface(tint = tint, surfaceColor = surfaceColor)
-                    },
-                )
-                .then(
-                    if (useMenuGlassStyle) {
-                        Modifier.border(LiquidMenuBorderWidth, menuBorderColor, shape)
-                    } else {
-                        Modifier
-                    },
-                ),
-            content = content,
-        )
-    } else {
-        Box(
-            modifier
-                .clip(shape)
-                .background(
-                    if (tint.isSpecified) tint.copy(alpha = 0.82f) else surfaceColor,
-                    shape,
-                )
-                .then(
-                    if (useMenuGlassStyle) {
-                        Modifier.border(LiquidMenuBorderWidth, menuBorderColor, shape)
-                    } else {
-                        Modifier
-                    },
-                ),
-            content = content,
-        )
-    }
+    Box(
+        modifier
+            .clip(shape)
+            .background(
+                if (tint.isSpecified) tint.copy(alpha = 1f) else surfaceColor,
+                shape,
+            )
+            .then(
+                if (useMenuGlassStyle) {
+                    Modifier.border(LiquidMenuBorderWidth, menuBorderColor, shape)
+                } else {
+                    Modifier
+                },
+            ),
+        content = content,
+    )
 }
 
 @Composable
@@ -415,59 +389,15 @@ fun SurfaceLiquidMenuCard(
     val resolvedSurfaceColor =
         if (surfaceColor.isSpecified) surfaceColor else liquidSurfaceColor(isLightTheme)
     val borderColor = liquidMenuBorderColor(isLightTheme)
-    val menuHazeStyle = HazeMaterials.thick(containerColor = resolvedSurfaceColor)
-
-    if (hazeState != null) {
-        Column(
-            modifier
-                .clip(shape)
-                .hazeEffect(state = hazeState) {
-                    style = menuHazeStyle
-                    this.blurRadius = blurRadius
-                }
-                .background(resolvedSurfaceColor, shape)
-                .border(LiquidMenuBorderWidth, borderColor, shape)
-                .padding(contentPadding),
-            horizontalAlignment = Alignment.Start,
-            content = content,
-        )
-        return
-    }
-
-    if (backdrop != null) {
-        Column(
-            modifier
-                .graphicsLayer { clip = false }
-                .drawBackdrop(
-                    backdrop = backdrop,
-                    shape = { shape },
-                    effects = {
-                        vibrancy()
-                        lens(12f.dp.toPx(), 24f.dp.toPx())
-                        blur(blurRadius.toPx(), TileMode.Decal)
-                    },
-                    highlight = null,
-                    shadow = null,
-                    onDrawSurface = {
-                        drawRect(resolvedSurfaceColor)
-                    },
-                )
-                .border(LiquidMenuBorderWidth, borderColor, shape)
-                .padding(contentPadding),
-            horizontalAlignment = Alignment.Start,
-            content = content,
-        )
-    } else {
-        Column(
-            modifier
-                .clip(shape)
-                .background(resolvedSurfaceColor, shape)
-                .border(LiquidMenuBorderWidth, borderColor, shape)
-                .padding(contentPadding),
-            horizontalAlignment = Alignment.Start,
-            content = content,
-        )
-    }
+    Column(
+        modifier
+            .clip(shape)
+            .background(resolvedSurfaceColor.copy(alpha = 1f), shape)
+            .border(LiquidMenuBorderWidth, borderColor, shape)
+            .padding(contentPadding),
+        horizontalAlignment = Alignment.Start,
+        content = content,
+    )
 }
 
 @Composable

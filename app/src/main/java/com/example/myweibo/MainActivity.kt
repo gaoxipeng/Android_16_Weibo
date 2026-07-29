@@ -1,6 +1,8 @@
 package com.example.myweibo
 
 import android.os.Bundle
+import android.os.Build
+import android.view.Display
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -10,6 +12,24 @@ import java.net.CookieManager
 import java.net.URI
 
 class MainActivity : ComponentActivity() {
+    private fun requestHighestRefreshRate() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val currentDisplay = display ?: return
+        val currentMode = currentDisplay.mode
+        val fastestMode = currentDisplay.supportedModes
+            .asSequence()
+            .filter {
+                it.physicalWidth == currentMode.physicalWidth &&
+                    it.physicalHeight == currentMode.physicalHeight
+            }
+            .maxByOrNull(Display.Mode::getRefreshRate)
+            ?: return
+        window.attributes = window.attributes.apply {
+            preferredDisplayModeId = fastestMode.modeId
+            preferredRefreshRate = fastestMode.refreshRate
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -42,8 +62,14 @@ class MainActivity : ComponentActivity() {
         })
 
         enableEdgeToEdge()
+        requestHighestRefreshRate()
         setContent {
             WeiboApp()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        requestHighestRefreshRate()
     }
 }

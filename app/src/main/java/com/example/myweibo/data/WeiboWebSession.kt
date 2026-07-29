@@ -81,7 +81,10 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadTimeline(kind: TimelineKind, cursor: String? = null): TimelinePage {
         val raw = loadTimelineRaw(kind, cursor)
-        return WeiboJsonParser.parseTimeline(raw)
+        // JSON 解析是 CPU 密集操作，移到 Default 避免阻塞主线程。
+        return withContext(Dispatchers.Default) {
+            WeiboJsonParser.parseTimeline(raw)
+        }
     }
 
     suspend fun loadHotSearch(): List<HotSearchItem> {

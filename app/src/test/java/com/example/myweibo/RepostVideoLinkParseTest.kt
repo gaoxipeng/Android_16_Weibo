@@ -755,6 +755,49 @@ class RepostVideoLinkParseTest {
         assertEquals(place, original.locationName)
     }
 
+    @Test
+    fun normalWebLinkInRepostDoesNotConsumeFollowingCaption() {
+        val webLink = "http://t.cn/A6Web123"
+        val raw = """
+            {
+              "statuses": [{
+                "idstr": "outer-web-link",
+                "mblogid": "outerWebLink",
+                "text_raw": "用这个链接：$webLink，感谢支持！ //@yunlongLuo:链接失败是没货了嘛",
+                "text": "用这个链接：<a href=\"$webLink\">网页链接</a>，感谢支持！ //@yunlongLuo:链接失败是没货了嘛",
+                "reposts_count": 0,
+                "comments_count": 0,
+                "attitudes_count": 0,
+                "user": { "idstr": "1", "screen_name": "Sunbelife" },
+                "url_struct": [{
+                  "short_url": "$webLink",
+                  "url_title": "网页链接",
+                  "url_type": 0,
+                  "long_url": "https://example.com/product"
+                }],
+                "retweeted_status": {
+                  "idstr": "inner-web-link",
+                  "mblogid": "innerWebLink",
+                  "text_raw": "@Sunbelife:早，宣布一个好消息。",
+                  "text": "@Sunbelife:早，宣布一个好消息。",
+                  "reposts_count": 0,
+                  "comments_count": 0,
+                  "attitudes_count": 0,
+                  "user": { "idstr": "2", "screen_name": "原作者" }
+                }
+              }]
+            }
+        """.trimIndent()
+
+        val item = WeiboJsonParser.parseTimeline(raw).items.single()
+
+        assertEquals(1, item.urlEntities.size)
+        assertEquals("网页链接", item.urlEntities.single().title)
+        assertTrue(item.text.contains(webLink))
+        assertTrue(item.text.contains("感谢支持！"))
+        assertTrue(item.text.contains("//@yunlongLuo:链接失败是没货了嘛"))
+    }
+
     private fun countOccurrences(text: String, token: String): Int {
         if (token.isBlank()) return 0
         var count = 0

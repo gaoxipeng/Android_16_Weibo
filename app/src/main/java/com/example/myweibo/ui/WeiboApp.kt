@@ -79,6 +79,7 @@ import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.ScrollScope
+import androidx.compose.foundation.gestures.ScrollableDefaults
 import androidx.compose.foundation.gestures.animateTo
 import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -198,7 +199,6 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
@@ -380,6 +380,7 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.gestures.stopScroll
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
@@ -971,41 +972,34 @@ private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
-private const val WeiboListFlingFriction = 0.45f
-private const val WeiboListFlingStopVelocity = 0.75f
-
-/**
- * A slightly shorter, more controlled decay than Compose's platform default. It preserves the
- * release velocity, but removes the long low-speed tail that makes content feel as if it is
- * drifting after the finger has stopped.
- */
 @Composable
 private fun rememberWeiboListFlingBehavior(): FlingBehavior {
-    val decay = remember {
-        exponentialDecay<Float>(
-            frictionMultiplier = WeiboListFlingFriction,
-            absVelocityThreshold = WeiboListFlingStopVelocity,
-        )
+    return ScrollableDefaults.flingBehavior()
+}
+
+/**
+ * LazyColumn should only reuse a composition for a card with the same structural branches.
+ * Reusing one generic type for text, gallery, video and repost cards forces Compose to tear down
+ * and insert large subtrees exactly when a new item crosses the viewport edge during a fling.
+ */
+private fun feedCardContentType(item: FeedItem): Int {
+    fun mediaShape(value: FeedItem): Int = when {
+        value.medias.any { it.type == MediaType.Video } -> 10
+        value.medias.any { it.type == MediaType.Live } -> 11
+        value.medias.any { it.type == MediaType.Audio } -> 12
+        value.images.isEmpty() -> 0
+        else -> value.images.size.coerceAtMost(9)
     }
-    return remember(decay) {
-        object : FlingBehavior {
-            override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
-                if (abs(initialVelocity) < WeiboListFlingStopVelocity) return initialVelocity
-                var lastValue = 0f
-                val animation = AnimationState(
-                    initialValue = 0f,
-                    initialVelocity = initialVelocity,
-                )
-                animation.animateDecay(decay) {
-                    val delta = value - lastValue
-                    val consumed = scrollBy(delta)
-                    lastValue = value
-                    if (abs(delta - consumed) > 0.5f) cancelAnimation()
-                }
-                return animation.velocity
-            }
-        }
+
+    val repost = item.retweetedStatus
+    var type = mediaShape(item)
+    if (repost != null) {
+        type = type or (1 shl 5)
+        type = type or (mediaShape(repost) shl 6)
     }
+    if (item.emoticons.isNotEmpty()) type = type or (1 shl 11)
+    if (repost?.emoticons?.isNotEmpty() == true) type = type or (1 shl 12)
+    return type
 }
 
 private class LayoutAnchorHolder {
@@ -1051,6 +1045,7 @@ private const val AlbumGridMaxReadBytes = 768 * 1024
 private const val AlbumGridPrefetchConcurrency = 4
 private const val AlbumGridPrefetchBatchSize = 24
 private const val FeedImageLoadConcurrency = 4
+private const val FeedBitmapDecodeConcurrency = 2
 private const val FeedBitmapCacheMaxBytes = 32 * 1024 * 1024
 private const val FullscreenBitmapCacheMaxBytes = 160 * 1024 * 1024
 
@@ -1096,6 +1091,8 @@ private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
     MorandiThemeColors.firstOrNull { it.storageValue == value } ?: MorandiThemeColors.first()
 
 private val FeedImageLoadSemaphore = Semaphore(FeedImageLoadConcurrency)
+private val FeedBitmapDecodeSemaphore =
+    java.util.concurrent.Semaphore(FeedBitmapDecodeConcurrency, true)
 
 private const val RemoteBytesCacheMaxTotal = 32 * 1024 * 1024
 private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
@@ -2945,8 +2942,25 @@ private fun remoteReadLimitForDecodeDim(maxDecodeDim: Int): Int = when {
     else -> 48 * 1024 * 1024
 }
 
-private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? =
-    BitmapExifOrientation.decodeSampledBitmap(bytes, maxDecodeDim)
+private fun decodeBitmapFromBytes(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
+    FeedBitmapDecodeSemaphore.acquireUninterruptibly()
+    val tid = android.os.Process.myTid()
+    val previousPriority = runCatching {
+        android.os.Process.getThreadPriority(tid)
+    }.getOrDefault(android.os.Process.THREAD_PRIORITY_DEFAULT)
+    return try {
+        // BitmapFactory/ImageDecoder workers otherwise run at the same priority as
+        // Compose's UI work. During a fling several newly visible cards may decode
+        // concurrently and starve the frame thread even though decoding is off-main.
+        runCatching {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        }
+        BitmapExifOrientation.decodeSampledBitmap(bytes, maxDecodeDim)
+    } finally {
+        runCatching { android.os.Process.setThreadPriority(previousPriority) }
+        FeedBitmapDecodeSemaphore.release()
+    }
+}
 
 private fun Bitmap?.takeIfDrawable(): Bitmap? = this?.takeIf { !it.isRecycled }
 
@@ -3197,27 +3211,34 @@ fun WeiboApp() {
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
     var bottomBarVisible by remember { mutableStateOf(true) }
-    var bottomBarScrollDistance by remember { mutableFloatStateOf(0f) }
-    val bottomBarScrollConnection = remember {
+    // Gesture accumulation is not UI state. Making every pixel a mutableFloatState write
+    // invalidates the WeiboApp root composition throughout a drag/fling.
+    val bottomBarScrollDistance = remember { floatArrayOf(0f) }
+    val bottomBarScrollConnection = remember(selectedTab) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (selectedTab == MainTab.Search) {
+                    bottomBarVisible = true
+                    bottomBarScrollDistance[0] = 0f
+                    return Offset.Zero
+                }
                 val delta = available.y
                 if (delta == 0f) return Offset.Zero
-                if (bottomBarScrollDistance != 0f &&
-                    (bottomBarScrollDistance > 0f) != (delta > 0f)
+                if (bottomBarScrollDistance[0] != 0f &&
+                    (bottomBarScrollDistance[0] > 0f) != (delta > 0f)
                 ) {
-                    bottomBarScrollDistance = 0f
+                    bottomBarScrollDistance[0] = 0f
                 }
-                bottomBarScrollDistance = (bottomBarScrollDistance + delta)
+                bottomBarScrollDistance[0] = (bottomBarScrollDistance[0] + delta)
                     .coerceIn(-BottomBarHideGestureThresholdPx, BottomBarHideGestureThresholdPx)
                 when {
-                    bottomBarScrollDistance <= -BottomBarHideGestureThresholdPx -> {
+                    bottomBarScrollDistance[0] <= -BottomBarHideGestureThresholdPx -> {
                         bottomBarVisible = false
-                        bottomBarScrollDistance = 0f
+                        bottomBarScrollDistance[0] = 0f
                     }
-                    bottomBarScrollDistance >= BottomBarHideGestureThresholdPx -> {
+                    bottomBarScrollDistance[0] >= BottomBarHideGestureThresholdPx -> {
                         bottomBarVisible = true
-                        bottomBarScrollDistance = 0f
+                        bottomBarScrollDistance[0] = 0f
                     }
                 }
                 return Offset.Zero
@@ -4478,10 +4499,21 @@ fun WeiboApp() {
                     if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
                         return@onSuccess
                     }
-                    val (merged, appended) = mergeFeedTimelinePages(items, page.items)
+                    // \u5728 Default \u7EBF\u7A0B\u6C60\u505A\u7EAF CPU \u8BA1\u7B97\uFF08merge \u53BB\u91CD + emoticon \u6536\u96C6\uFF09\uFF0C
+                    // \u907F\u514D\u5728\u5206\u9875\u89E6\u53D1\u5E27\u963B\u585E\u4E3B\u7EBF\u7A0B\u3002
+                    val currentItems = items  // \u5728 Main \u4E0A\u5148\u62CD\u5FEB\u7167
+                    val (merged, appended) = withContext(Dispatchers.Default) {
+                        mergeFeedTimelinePages(currentItems, page.items)
+                    }
+                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                        return@onSuccess
+                    }
+                    val discoveredEmoticons = withContext(Dispatchers.Default) {
+                        page.items.collectAllEmoticons()
+                    }
                     items = merged
                     reconcileFeedLikeState(page.items)
-                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
+                    absorbDiscoveredEmoticons(discoveredEmoticons)
                     nextCursor = when {
                         page.items.isEmpty() -> null
                         appended == 0 -> null
@@ -5803,7 +5835,7 @@ fun WeiboApp() {
         ) {
             bottomBarVisible = true
         }
-        bottomBarScrollDistance = 0f
+        bottomBarScrollDistance[0] = 0f
     }
 
     LaunchedEffect(activeMainListState) {
@@ -6085,7 +6117,7 @@ fun WeiboApp() {
             val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
-            Box(Modifier.matchParentSize().hazeSource(state = hazeState)) {
+            Box(Modifier.matchParentSize()) {
             Box(Modifier.fillMaxSize().padding(innerPadding)) {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
@@ -6184,7 +6216,6 @@ fun WeiboApp() {
                 Modifier
                     .fillMaxSize()
                     .zIndex(1f)
-                    .layerBackdrop(bottomBarBackdrop)
                     .nestedScroll(bottomBarScrollConnection),
             ) {
                 Box(
@@ -6884,7 +6915,7 @@ fun WeiboApp() {
                     },
                     onTabChange = { tab ->
                         bottomBarVisible = true
-                        bottomBarScrollDistance = 0f
+                        bottomBarScrollDistance[0] = 0f
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {
@@ -7522,7 +7553,7 @@ private fun FollowFeedScreen(
                 }
             }
 
-            items(items, key = { it.id }, contentType = { "feed_card" }) { item ->
+            items(items, key = { it.id }, contentType = ::feedCardContentType) { item ->
                 val resolved = resolveFeedItem(item)
                 FeedCard(
                     item = resolved,
@@ -7631,8 +7662,18 @@ private fun ImmersiveFollowFeedScreen(
         onDispose { onScrollToTopRegistration(null) }
     }
 
+    LaunchedEffect(pagerState, items) {
+        snapshotFlow { pagerState.settledPage }
+            .distinctUntilChanged()
+            .collect { settledPage ->
+                items.getOrNull(settledPage)
+                    ?.statusId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let(onStatusChanged)
+            }
+    }
+
     LaunchedEffect(pagerState.currentPage, items.size) {
-        items.getOrNull(pagerState.currentPage)?.statusId?.takeIf { it.isNotBlank() }?.let(onStatusChanged)
         if (pagerState.currentPage >= items.lastIndex - 2) onLoadMore()
     }
 
@@ -7720,6 +7761,8 @@ private fun ImmersiveFollowFeedScreen(
                             if (down.position.x < size.width / 2f) return@awaitEachGesture
                             var drag = 0f
                             var active = true
+                            var playbackStoppedForGesture = false
+                            val threshold = size.height * 0.08f
                             while (active) {
                                 val event = awaitPointerEvent(PointerEventPass.Initial)
                                 val change = event.changes.firstOrNull { it.id == down.id }
@@ -7727,22 +7770,50 @@ private fun ImmersiveFollowFeedScreen(
                                     ?: break
                                 drag += change.position.y - change.previousPosition.y
                                 if (kotlin.math.abs(drag) > 12f) change.consume()
+                                if (!playbackStoppedForGesture && kotlin.math.abs(drag) >= threshold) {
+                                    val canChangePage = when {
+                                        drag < 0f -> page < items.lastIndex
+                                        drag > 0f -> page > 0
+                                        else -> false
+                                    }
+                                    val hasActivePlayback =
+                                        videoPlaybackCoordinator.activeKey != null ||
+                                            videoPlaybackCoordinator.peekPlaybackKey != null ||
+                                            videoPlaybackCoordinator.fullscreenKey != null ||
+                                            videoPeekController.isInlineAnchored
+                                    if (canChangePage && hasActivePlayback) {
+                                        videoPlaybackCoordinator.pauseAll()
+                                        videoPlaybackCoordinator.activeKey = null
+                                        if (videoPeekController.isInlineAnchored) {
+                                            videoPeekController.cancel(snap = true)
+                                        }
+                                        playbackStoppedForGesture = true
+                                    }
+                                }
                                 active = change.pressed
                             }
-                            val threshold = size.height * 0.08f
                             val target = when {
                                 drag < -threshold -> page + 1
                                 drag > threshold -> page - 1
                                 else -> page
                             }.coerceIn(0, items.lastIndex)
                             if (target != page) {
-                                scope.launch {
+                                scope.launch(start = CoroutineStart.UNDISPATCHED) {
                                     val generation = ++pageSwitchGeneration
                                     pageSwitchInProgress = true
-                                    videoPlaybackCoordinator.pauseAll()
-                                    videoPlaybackCoordinator.activeKey = null
-                                    if (videoPeekController.isInlineAnchored) {
-                                        videoPeekController.cancel()
+                                    if (!playbackStoppedForGesture) {
+                                        val hasActivePlayback =
+                                            videoPlaybackCoordinator.activeKey != null ||
+                                                videoPlaybackCoordinator.peekPlaybackKey != null ||
+                                                videoPlaybackCoordinator.fullscreenKey != null ||
+                                                videoPeekController.isInlineAnchored
+                                        if (hasActivePlayback) {
+                                            videoPlaybackCoordinator.pauseAll()
+                                        }
+                                        videoPlaybackCoordinator.activeKey = null
+                                        if (videoPeekController.isInlineAnchored) {
+                                            videoPeekController.cancel(snap = true)
+                                        }
                                     }
                                     try {
                                         pagerState.animateScrollToPage(
@@ -8037,11 +8108,20 @@ private fun EmoticonText(
         emoticonMap = emoticonMap,
         metrics = feedTypographyMetrics,
     )
-    val inlineContent = remember(sharedInlineContent, missingInlineContent, style.fontSize, primaryColor) {
+    // Passing the global emoticon map to every Text makes paragraph layout inspect hundreds of
+    // unused inline-content entries. Keep only placeholders that occur in this status.
+    val usedSharedInlineContent = remember(sharedInlineContent, emoticonTokensInText) {
+        buildMap {
+            emoticonTokensInText.forEach { token ->
+                sharedInlineContent[token]?.let { content -> put(token, content) }
+            }
+        }
+    }
+    val inlineContent = remember(usedSharedInlineContent, missingInlineContent, style.fontSize, primaryColor) {
         val withEmoticons = if (missingInlineContent.isEmpty()) {
-            sharedInlineContent
+            usedSharedInlineContent
         } else {
-            sharedInlineContent + missingInlineContent
+            usedSharedInlineContent + missingInlineContent
         }
         withEmoticons + (UrlLinkIconInlineContentKey to urlLinkIconInlineContent(style.fontSize, primaryColor))
     }
@@ -8397,6 +8477,16 @@ private fun EmojiImage(url: String) {
 }
 
 @Composable
+private fun TraceComposition(
+    sectionName: String,
+    content: @Composable () -> Unit,
+) {
+    android.os.Trace.beginSection(sectionName)
+    content()
+    android.os.Trace.endSection()
+}
+
+@Composable
 private fun FeedCard(
     item: FeedItem,
     onClick: () -> Unit,
@@ -8462,11 +8552,13 @@ private fun FeedCard(
                                 onClick = onClick,
                             ),
                     ) {
-                        AuthorRow(
-                            item = item,
-                            onUserClick = onUserClick,
-                            avatarClickable = true,
-                        )
+                        TraceComposition("WeiboCard.Author") {
+                            AuthorRow(
+                                item = item,
+                                onUserClick = onUserClick,
+                                avatarClickable = true,
+                            )
+                        }
                     }
                     if (menuBackEnabled) {
                         FeedCardActionMenu(
@@ -8487,53 +8579,61 @@ private fun FeedCard(
                     ),
                 verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
             ) {
-                StatusTextSection(
-                    item = displayItem,
-                    emoticonMap = resolvedEmoticonMap,
-                    style = feedBodyTextStyle(),
-                    onUserClick = onUserClick,
-                    isLongTextLoading = isLongTextLoading(item),
-                    onLoadLongText = onLoadLongText,
-                    inlineImageLinks = displayItem.inlineImageLinks,
-                    onInlineImageClick = { inlineImagePreview = it },
-                    urlEntities = urlEntityMap,
-                    onUrlEntityClick = onUrlEntityClick,
-                )
+                TraceComposition("WeiboCard.Text") {
+                    StatusTextSection(
+                        item = displayItem,
+                        emoticonMap = resolvedEmoticonMap,
+                        style = feedBodyTextStyle(),
+                        onUserClick = onUserClick,
+                        isLongTextLoading = isLongTextLoading(item),
+                        onLoadLongText = onLoadLongText,
+                        inlineImageLinks = displayItem.inlineImageLinks,
+                        onInlineImageClick = { inlineImagePreview = it },
+                        urlEntities = urlEntityMap,
+                        onUrlEntityClick = onUrlEntityClick,
+                    )
+                }
             }
             displayItem.retweetedStatus?.let { retweeted ->
-                QuotedStatus(
+                TraceComposition("WeiboCard.Repost") {
+                    QuotedStatus(
+                        modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
+                        item = retweeted,
+                        playbackOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) },
+                        onMediaClick = onMediaClick,
+                        emoticonMap = emoticonMap,
+                        onClick = onRetweetClick?.let { cb -> { cb(retweeted, item) } },
+                        onUserClick = onUserClick,
+                        isLongTextLoading = isLongTextLoading(retweeted),
+                        onLoadLongText = onLoadLongText,
+                        onUrlEntityClick = onUrlEntityClick,
+                        autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                    )
+                }
+            }
+            TraceComposition("WeiboCard.Media") {
+                MediaStrip(
                     modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
-                    item = retweeted,
-                    playbackOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) },
+                    images = displayItem.images,
+                    medias = displayItem.medias,
+                    playbackOwnerId = feedItemPlaybackOwnerId(item),
                     onMediaClick = onMediaClick,
-                    emoticonMap = emoticonMap,
-                    onClick = onRetweetClick?.let { cb -> { cb(retweeted, item) } },
-                    onUserClick = onUserClick,
-                    isLongTextLoading = isLongTextLoading(retweeted),
-                    onLoadLongText = onLoadLongText,
-                    onUrlEntityClick = onUrlEntityClick,
+                    onDetailClick = if (showAuthorRow) onClick else null,
+                    imageOwner = item,
                     autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
-            MediaStrip(
-                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
-                images = displayItem.images,
-                medias = displayItem.medias,
-                playbackOwnerId = feedItemPlaybackOwnerId(item),
-                onMediaClick = onMediaClick,
-                onDetailClick = if (showAuthorRow) onClick else null,
-                imageOwner = item,
-                autoFloatingOnScrollAway = autoFloatingOnScrollAway,
-            )
-            StatusActions(
-                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
-                item = item,
-                onRepostClick = onRepostClick ?: onClick,
-                onCommentClick = onCommentClick ?: onClick,
-                onCommentLongClick = onCommentLongClick,
-                onLikeClick = onLikeClick?.let { open -> { bounds -> open(item, bounds) } },
-                onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
-            )
+            TraceComposition("WeiboCard.Actions") {
+                StatusActions(
+                    modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
+                    item = item,
+                    onRepostClick = onRepostClick ?: onClick,
+                    onCommentClick = onCommentClick ?: onClick,
+                    onCommentLongClick = onCommentLongClick,
+                    onLikeClick = onLikeClick?.let { open -> { bounds -> open(item, bounds) } },
+                    onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
+                )
+            }
         }
     }
     Box(
@@ -15585,7 +15685,7 @@ private fun CommentComposerDialog(
     val canSubmit = (text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
     val sendColor = Color(0xFFFFB36B)
     val cardColor = if (isLightAppearance()) Color(0xFFFFFBFF) else MaterialTheme.colorScheme.surface
-    val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.72f)
+    val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest
     val inputTextStyle = MaterialTheme.typography.bodyMedium.copy(
         color = MaterialTheme.colorScheme.onSurface,
         lineHeight = 22.sp,
@@ -15736,7 +15836,7 @@ private fun CommentComposerDialog(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(10.dp))
-                                .background(inputColor.copy(alpha = 0.48f))
+                                .background(inputColor)
                                 .padding(horizontal = 10.dp, vertical = 6.dp),
                             fontSize = 12.sp,
                             lineHeight = 16.sp,
@@ -15988,9 +16088,9 @@ private fun hintCapsuleTextColor(): Color =
 @Composable
 private fun actionMenuSurfaceColor(): Color =
     if (isLightAppearance()) {
-        Color(0x8AF0F0F0)
+        Color(0xFFF2F2F2)
     } else {
-        MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.54f)
+        MaterialTheme.colorScheme.surfaceContainer
     }
 
 @Composable
@@ -18813,7 +18913,7 @@ private fun SearchScreen(
                             }
                         }
                         else -> {
-                            items(resultItems, key = { it.id }, contentType = { "feed_card" }) { item ->
+                            items(resultItems, key = { it.id }, contentType = ::feedCardContentType) { item ->
                                 val resolved = resolveFeedItem(item)
                                 FeedCard(
                                     item = resolved,
@@ -19638,7 +19738,7 @@ private fun MineScreen(
                                         }
                                     }
                                 } else {
-                                    items(posts, key = { it.id }, contentType = { "feed_card" }) { post ->
+                                    items(posts, key = { it.id }, contentType = ::feedCardContentType) { post ->
                                         FeedCard(
                                             item = post,
                                             onClick = { onItemClick(post) },
@@ -23953,15 +24053,17 @@ private object RemoteBytesCache {
 }
 
 private object RemoteDiskBytesCache {
+    @Volatile
     private var directory: java.io.File? = null
+    private val trimLock = Any()
+    private val writesSinceTrim = java.util.concurrent.atomic.AtomicInteger()
+    private val pendingFileSequence = java.util.concurrent.atomic.AtomicLong()
 
-    @Synchronized
     fun configure(cacheDir: java.io.File) {
         directory = cacheDir.also { it.mkdirs() }
-        trimLocked()
+        trim()
     }
 
-    @Synchronized
     fun get(url: String, maxBytes: Int): ByteArray? {
         val dir = directory ?: return null
         val file = java.io.File(dir, cacheFileName(url))
@@ -23972,33 +24074,55 @@ private object RemoteDiskBytesCache {
         }.getOrNull()
     }
 
-    @Synchronized
     fun put(url: String, bytes: ByteArray) {
         if (bytes.isEmpty() || bytes.size > RemoteBytesAnimatedMaxRead) return
         val dir = directory ?: return
         dir.mkdirs()
         val file = java.io.File(dir, cacheFileName(url))
-        val tempFile = java.io.File(dir, "${file.name}.tmp")
+        // A unique pending file lets unrelated image writes proceed concurrently. The previous
+        // implementation held one object monitor while writing, renaming, scanning and trimming
+        // the whole cache; a cache read could consequently stall a lazy-list prefetch for 100ms+.
+        val tempFile = java.io.File(
+            dir,
+            "${file.name}.${pendingFileSequence.incrementAndGet()}.pending",
+        )
         runCatching {
             tempFile.writeBytes(bytes)
-            if (file.exists()) file.delete()
-            if (!tempFile.renameTo(file)) {
-                tempFile.delete()
-                return
+            runCatching {
+                java.nio.file.Files.move(
+                    tempFile.toPath(),
+                    file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            }.getOrElse {
+                java.nio.file.Files.move(
+                    tempFile.toPath(),
+                    file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
             }
             file.setLastModified(System.currentTimeMillis())
+            if (writesSinceTrim.incrementAndGet() >= 32) {
+                trim()
+            }
+        }.onFailure {
+            tempFile.delete()
+        }
+    }
+
+    fun trim() {
+        synchronized(trimLock) {
+            writesSinceTrim.set(0)
             trimLocked()
         }
     }
 
-    @Synchronized
-    fun trim() {
-        trimLocked()
-    }
-
     private fun trimLocked() {
         val dir = directory ?: return
-        val files = dir.listFiles()?.filter { it.isFile } ?: return
+        val files = dir.listFiles()
+            ?.filter { it.isFile && !it.name.endsWith(".pending") }
+            ?: return
         var totalBytes = files.sumOf { it.length() }
         if (totalBytes <= RemoteDiskBytesCacheMaxTotal) return
         files.sortedBy { it.lastModified() }.forEach { file ->

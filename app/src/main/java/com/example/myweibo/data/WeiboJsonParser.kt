@@ -455,7 +455,10 @@ object WeiboJsonParser {
 
     private fun stripOrphanMediaLinksExcept(text: String, preserveUrls: Set<String>): String {
         var result = text
-        Regex("""https?://t\.cn/\S+""").findAll(text).forEach { match ->
+        // A t.cn token is frequently followed immediately by Chinese punctuation/text.
+        // Using \S+ consumes the entire remainder (for example “，感谢支持！ //@...”),
+        // so a preserved normal web link can accidentally erase the repost caption.
+        Regex("""https?://t\.cn/[A-Za-z0-9]+""").findAll(text).forEach { match ->
             val token = match.value
             if (token !in preserveUrls) {
                 result = result.replace(token, "")
@@ -537,7 +540,7 @@ object WeiboJsonParser {
 
     private fun stripOrphanMediaLinks(text: String): String =
         text
-            .replace(Regex("""https?://t\.cn/\S+"""), "")
+            .replace(Regex("""https?://t\.cn/[A-Za-z0-9]+"""), "")
             .replace(Regex("""(?<!\S)https?:(?=\s|$)"""), "")
             .replace(Regex("""(?:[ \t]*https?://\S+)+[ \t]*$"""), "")
             .replace(Regex("[ \\t]{2,}"), " ")
@@ -2586,7 +2589,7 @@ object WeiboJsonParser {
     }
 
     private fun countTcShortLinks(text: String): Int =
-        Regex("""https?://t\.cn/\S+""").findAll(text).count()
+        Regex("""https?://t\.cn/[A-Za-z0-9]+""").findAll(text).count()
 
     private fun countTopicMarkers(text: String): Int {
         if (text.isBlank()) return 0
