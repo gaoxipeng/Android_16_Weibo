@@ -4,7 +4,7 @@
 
 基于 Jetpack Compose 的第三方微博客户端，通过 WebView 登录态 + 微博 PC 端 `ajax` 接口读取数据，原生渲染信息流、详情、搜索与个人主页。
 
-**当前版本：20260729**（需 Android 16+）
+**当前版本：20260804**（需 Android 16+）
 
 <img src="https://github.com/user-attachments/assets/8b56791a-2c21-41d1-91fa-fe5223751c69" width="350" />
 <img src="https://github.com/user-attachments/assets/69e40c8b-a41d-4579-a1ef-b1a954a17aa6" width="350" />
@@ -103,6 +103,13 @@ app/src/main/java/com/example/myweibo/
 - **浮窗**：右上角可全屏；竖屏全屏时可切换横屏/竖屏；底部胶囊进度条可拖动，倍速显示为 `1×`，控件约 2 秒后自动隐藏；上下滑优先关闭
 - **底部栏**：上滑列表时整栏向下隐藏，下滑时再显示；再次点击当前 Tab 可刷新；文字大小不受系统字体缩放影响
 - **图片清晰度**：设置中省流 / 标准 / 高清三档，影响信息流缩略图规格与解码尺寸；全屏看图仍会尽量加载高清图
+
+## 20260804 更新摘要
+
+- 版本号 `20260804`（versionCode 30）
+- 首页图标替换为与 Bilibili 一致的小房子图标
+- 调近底部五个导航项的图标与文字间距
+- Release APK 已完成构建并可从 GitHub Releases 下载
 
 ## 20260729 更新摘要
 
