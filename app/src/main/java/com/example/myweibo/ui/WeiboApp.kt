@@ -9369,6 +9369,7 @@ private fun FeedImageCell(
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
     var pressHoldProgress by remember(image.id) { mutableFloatStateOf(0f) }
+    var lastReportedAnchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
     val anchorHolder = remember(image.id) { LayoutAnchorHolder() }
     val imagePeekController = LocalImagePeekController.current
     val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
@@ -9417,6 +9418,11 @@ private fun FeedImageCell(
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
                 anchorHolder.coordinates = coordinates
+                val bounds = coordinates.boundsInWindow()
+                if (bounds != lastReportedAnchorBounds) {
+                    lastReportedAnchorBounds = bounds
+                    onAnchorBoundsChanged(bounds)
+                }
             }
             .graphicsLayer {
                 scaleX = holdScale
@@ -11178,6 +11184,9 @@ private fun MediaStrip(
                             },
                             onAnchorBoundsChanged = { bounds ->
                                 thumbnailBoundsByIndex = thumbnailBoundsByIndex + (0 to bounds)
+                                if (viewerOpen) {
+                                    viewerSourceBoundsByIndex = viewerSourceBoundsByIndex + (0 to bounds)
+                                }
                             },
                         )
                         if (onDetailClick != null) {
@@ -11217,6 +11226,9 @@ private fun MediaStrip(
                                     },
                                     onAnchorBoundsChanged = { bounds ->
                                         thumbnailBoundsByIndex = thumbnailBoundsByIndex + (cellIndex to bounds)
+                                        if (viewerOpen) {
+                                            viewerSourceBoundsByIndex = viewerSourceBoundsByIndex + (cellIndex to bounds)
+                                        }
                                     },
                                 )
                             }
@@ -11451,9 +11463,11 @@ private fun FullscreenImageViewer(
     var dismissBoundsProviders by remember { mutableStateOf<Map<Int, () -> Rect>>(emptyMap()) }
     fun dismissViewer(startBounds: Rect? = null) {
         if (!transitionClosing) {
-            val closeBounds = sourceBoundsByIndex[pagerState.currentPage]
+            val currentSourceBounds = sourceBoundsByIndex[pagerState.currentPage]
+            val currentBoundsProvider = dismissBoundsProviders[pagerState.currentPage]
+            val closeBounds = currentSourceBounds ?: currentBoundsProvider?.invoke()
             if (closeBounds != null) {
-                closeStartBounds = startBounds ?: dismissBoundsProviders[pagerState.currentPage]?.invoke()
+                closeStartBounds = startBounds ?: currentBoundsProvider?.invoke() ?: currentSourceBounds
                 transitionClosing = true
                 onCloseStart?.invoke()
                 scope.launch {
@@ -17669,6 +17683,9 @@ private fun CommentImageStrip(
                     },
                     onAnchorBoundsChanged = { bounds ->
                         thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to bounds)
+                        if (viewerOpen) {
+                            viewerSourceBoundsByIndex = viewerSourceBoundsByIndex + (index to bounds)
+                        }
                     },
                 )
             }
