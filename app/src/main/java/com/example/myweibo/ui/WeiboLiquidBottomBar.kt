@@ -62,7 +62,7 @@ internal fun WeiboLiquidBottomBar(
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
-            .padding(start = 18.dp, top = 4.dp, end = 18.dp, bottom = 24.dp)
+            .padding(start = 18.dp, top = 4.dp, end = 18.dp, bottom = 16.dp)
             .navigationBarsPadding(),
         contentAlignment = Alignment.BottomStart,
     ) {

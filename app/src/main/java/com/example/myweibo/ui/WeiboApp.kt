@@ -965,8 +965,8 @@ private val LiquidBottomBarReserve = 100.dp
 private val LiquidBottomBarContentGap = 8.dp
 private val SearchBarBottomGap = 20.dp
 private val SearchBarCompanionGap = 8.dp
-// 与 WeiboLiquidBottomBar 一致：64dp 栏高 + 24dp 底边距
-private val SearchBottomBarClearance = 64.dp + 24.dp
+// 与 WeiboLiquidBottomBar 一致：64dp 栏高 + 16dp 底边距
+private val SearchBottomBarClearance = 64.dp + 16.dp
 private val SearchSuggestionPanelMaxHeight = 176.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
 private val FeedCardContentHorizontalPadding = 12.dp
@@ -1810,6 +1810,7 @@ private data class ScrollRestore(
 
 private data class NavRestoreState(
     val selectedTab: MainTab = MainTab.Feed,
+    val bottomBarVisible: Boolean = true,
     val feedScroll: ScrollRestore = ScrollRestore(),
     val minePostsScroll: ScrollRestore = ScrollRestore(),
     val mineAlbumScroll: ScrollRestore = ScrollRestore(),
@@ -3845,6 +3846,7 @@ fun WeiboApp() {
 
     fun captureNavRestoreState(): NavRestoreState = NavRestoreState(
         selectedTab = selectedTab,
+        bottomBarVisible = bottomBarVisible,
         feedScroll = ScrollRestore(
             feedListState.firstVisibleItemIndex,
             feedListState.firstVisibleItemScrollOffset,
@@ -3950,6 +3952,7 @@ fun WeiboApp() {
 
     fun applyNavRestoreState(state: NavRestoreState) {
         selectedTab = state.selectedTab
+        bottomBarVisible = state.bottomBarVisible
         minePagerPage = state.minePagerPage
 
         if (navExitPendingKind != null) {
@@ -5831,7 +5834,8 @@ fun WeiboApp() {
         if (selectedItem == null &&
             visitedUserId == null &&
             selectedTab != MainTab.Messages &&
-            selectedTab != MainTab.Compose
+            selectedTab != MainTab.Compose &&
+            navExitPendingKind == null
         ) {
             bottomBarVisible = true
         }
