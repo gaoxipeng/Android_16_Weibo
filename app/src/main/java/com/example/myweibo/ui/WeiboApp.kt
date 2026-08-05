@@ -3144,6 +3144,8 @@ private fun videoDurationMs(media: FeedMedia): Long? =
 private const val VideoEndRestartThresholdMs = 500L
 private const val VideoPeekFloatingPlaybackSpeed = 2f
 private const val VideoHoldSpeedBoost = 2f
+private const val VideoCacheMaxBytes = 500L * 1024L * 1024L
+private const val TotalAppCacheLimitBytes = 1L * 1024L * 1024L * 1024L
 private const val VideoPeekDockAspectRatio = 16f / 9f
 private enum class ForcedVideoOrientation {
     None,
@@ -3187,6 +3189,7 @@ fun WeiboApp() {
     }
     LaunchedEffect(context) {
         withContext(Dispatchers.IO) {
+            clearAppCacheDirectoryIfNeeded(context.cacheDir)
             RemoteDiskBytesCache.configure(java.io.File(context.cacheDir, "remote-image-bytes"))
         }
     }
@@ -24410,15 +24413,35 @@ private fun buildVideoMediaSource(
 }
 
 private var videoCache: androidx.media3.datasource.cache.SimpleCache? = null
+private val videoCacheLock = Any()
+
+private fun directorySizeBytes(directory: java.io.File): Long {
+    if (!directory.exists()) return 0L
+    return directory.walkTopDown()
+        .filter { it.isFile }
+        .sumOf { it.length() }
+}
+
+private fun clearAppCacheDirectoryIfNeeded(cacheDirectory: java.io.File) {
+    if (directorySizeBytes(cacheDirectory) <= TotalAppCacheLimitBytes) return
+    cacheDirectory.listFiles()?.forEach { child ->
+        child.deleteRecursively()
+    }
+}
+
 private fun getVideoCache(context: android.content.Context): androidx.media3.datasource.cache.SimpleCache {
-    return videoCache ?: run {
-        val cacheDir = java.io.File(context.cacheDir, "weibo-video")
-        cacheDir.mkdirs()
-        androidx.media3.datasource.cache.SimpleCache(
-            cacheDir,
-            androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor(200L * 1024 * 1024),
-            androidx.media3.database.StandaloneDatabaseProvider(context),
-        ).also { videoCache = it }
+    videoCache?.let { return it }
+    return synchronized(videoCacheLock) {
+        videoCache ?: run {
+            val cacheDir = java.io.File(context.cacheDir, "weibo-video")
+            clearAppCacheDirectoryIfNeeded(context.cacheDir)
+            cacheDir.mkdirs()
+            androidx.media3.datasource.cache.SimpleCache(
+                cacheDir,
+                androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor(VideoCacheMaxBytes),
+                androidx.media3.database.StandaloneDatabaseProvider(context),
+            ).also { videoCache = it }
+        }
     }
 }
 
