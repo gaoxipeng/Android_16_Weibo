@@ -1032,6 +1032,7 @@ private val VideoFullscreenTopControlInset = 18.dp
 private val VideoFullscreenTopControlRowSpacing = 8.dp
 private val VideoFullscreenHorizontalControlInset = 16.dp
 private const val VideoMaxWidthFraction = 1f
+private val VideoSpeedOptions = listOf(0.5f, 0.75f, 1f, 1.5f, 2f, 3f)
 private const val AlbumGridMaxDecodeDim = 320
 private const val FullscreenDefaultMaxDecodeDim = 4096
 private const val FullscreenLongImageMaxDecodeDim = 8192
@@ -13514,6 +13515,7 @@ private fun WeiboVideoSurface(
     var isPlaying by remember(videoUrl) { mutableStateOf(true) }
     var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
     var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
+    var showSpeedMenu by remember(videoUrl) { mutableStateOf(false) }
     // 全屏/浮窗长按临时 2 倍速；松手恢复 selectedSpeed。
     var holdSpeedBoostActive by remember(videoUrl) { mutableStateOf(false) }
     val holdSpeedBoostActiveState = rememberUpdatedState(holdSpeedBoostActive)
@@ -13582,24 +13584,36 @@ private fun WeiboVideoSurface(
     }
 
     fun toggleControls() {
-        if (controlsVisible) {
+        if (controlsVisible || showSpeedMenu) {
+            showSpeedMenu = false
             controlsVisible = false
         } else {
             showControls()
         }
     }
 
-    LaunchedEffect(isPlaying, isBuffering, playbackError, controlsHideSignal, isProgressBarScrubbing) {
+    LaunchedEffect(
+        isPlaying,
+        isBuffering,
+        playbackError,
+        controlsHideSignal,
+        isProgressBarScrubbing,
+        showSpeedMenu,
+    ) {
         if (!isPlaying || isBuffering || playbackError != null) {
             controlsVisible = true
             return@LaunchedEffect
         }
-        if (isProgressBarScrubbing) {
+        if (isProgressBarScrubbing || showSpeedMenu) {
             controlsVisible = true
             return@LaunchedEffect
         }
         delay(2_000)
-        controlsVisible = false
+        if (!showSpeedMenu) controlsVisible = false
+    }
+
+    LaunchedEffect(controlsVisible) {
+        if (!controlsVisible) showSpeedMenu = false
     }
 
     val playerCache = remember { mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>() }
@@ -13624,7 +13638,10 @@ private fun WeiboVideoSurface(
         if (playbackSpeedOverride != null) {
             target.setPlaybackSpeed(playbackSpeedOverride)
         } else {
-            target.setPlaybackSpeed(1f)
+            val currentSpeed = target.playbackParameters.speed
+            selectedSpeed = VideoSpeedOptions.minByOrNull { option ->
+                abs(option - currentSpeed)
+            } ?: 1f
         }
         if (deferPlaybackUntilSurface) {
             resumeAfterSurfaceAttach = true
@@ -15034,18 +15051,89 @@ private fun WeiboVideoSurface(
                 },
                 onSpeedClick = {
                     showControls()
-                    selectedSpeed = when (selectedSpeed) {
-                        1f -> 1.5f
-                        1.5f -> 2f
-                        else -> 1f
-                    }
-                    displayedSpeed = selectedSpeed
-                    player.setPlaybackSpeed(selectedSpeed)
+                    showSpeedMenu = !showSpeedMenu
                 },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(VideoControlBarHeight),
             )
+        }
+
+        if (showSpeedMenu && controlsEnabled && controlsVisible && !hideProgressControls) {
+            WeiboVideoSpeedPopup(
+                selectedSpeed = selectedSpeed,
+                backdrop = videoControlBackdrop,
+                onSpeedSelected = { speed ->
+                    selectedSpeed = speed
+                    displayedSpeed = speed
+                    player.setPlaybackSpeed(speed)
+                    showSpeedMenu = false
+                    showControls()
+                },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .zIndex(12f)
+                    .padding(
+                        end = if (isFullscreen) VideoFullscreenHorizontalControlInset + 6.dp else 6.dp,
+                        bottom = (if (isFullscreen) {
+                            if (isDevicePortrait) 49.dp else fullscreenBottomInset + VideoControlBarBottomFullscreen
+                        } else {
+                            VideoControlBarBottomInline
+                        }) + VideoControlBarHeight + 6.dp,
+                    ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun WeiboVideoSpeedPopup(
+    selectedSpeed: Float,
+    backdrop: Backdrop,
+    onSpeedSelected: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    TransparentLiquidCapsule(
+        modifier = modifier
+            .width(246.dp)
+            .height(VideoControlBarHeight),
+        backdrop = backdrop,
+        pill = true,
+        surfaceColor = Color.White.copy(alpha = 0.14f),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 4.dp, vertical = 3.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            VideoSpeedOptions.forEach { option ->
+                val selected = selectedSpeed == option
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(percent = 50))
+                        .background(
+                            if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.88f)
+                            else Color.Transparent,
+                        )
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick = { onSpeedSelected(option) },
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = speedLabel(option),
+                        color = Color.White,
+                        style = videoControlTextStyle(11),
+                        maxLines = 1,
+                    )
+                }
+            }
         }
     }
 }
