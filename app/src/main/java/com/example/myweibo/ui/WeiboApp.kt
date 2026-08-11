@@ -18949,7 +18949,10 @@ private fun SearchScreen(
                                 HotSearchRow(
                                     rank = index + 1,
                                     item = item,
-                                    onClick = { submitQuery(item.word) },
+                                    onClick = {
+                                        onSearchModeChange(SearchMode.Weibo)
+                                        submitQuery(item.word, modeOverride = SearchMode.Weibo)
+                                    },
                                 )
                                 if (index < hotSearchItems.lastIndex) {
                                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
