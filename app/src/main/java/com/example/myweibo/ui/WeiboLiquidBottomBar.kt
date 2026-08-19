@@ -21,14 +21,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
-import com.example.myweibo.ui.theme.fixedSp
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
@@ -42,7 +40,6 @@ internal fun WeiboLiquidBottomBar(
     backdrop: Backdrop,
     timelineMenuExpanded: Boolean,
     onTimelineMenuExpandedChange: (Boolean) -> Unit,
-    feedTabLabel: String = MainTab.Feed.label,
     selectedTimelineKind: TimelineKind = TimelineKind.Following,
     onTimelineKindChange: (TimelineKind) -> Unit = {},
     timelineMenuContent: @Composable (dismiss: () -> Unit) -> Unit,
@@ -89,18 +86,11 @@ internal fun WeiboLiquidBottomBar(
                         onClick = { onTabChange(tab) },
                     ) {
                         Box(
-                            modifier = Modifier.size(28.dp),
+                            modifier = Modifier.size(36.dp),
                             contentAlignment = Alignment.Center,
                         ) {
-                            WeiboTabIcon(tab = tab, color = tabContentColor)
+                            WeiboTabIcon(tab = tab, color = tabContentColor, size = 22.dp)
                         }
-                        Text(
-                            text = if (tab == MainTab.Feed) feedTabLabel else tab.label,
-                            fontSize = fixedSp(12),
-                            color = tabContentColor,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
                     }
                 }
             }

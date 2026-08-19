@@ -260,6 +260,7 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.PlatformTextStyle
@@ -335,8 +336,6 @@ import com.example.myweibo.data.MediaType
 import com.example.myweibo.data.MineCacheStore
 import com.example.myweibo.data.FeedThumbnailQuality
 import com.example.myweibo.data.FeedFontSize
-import com.example.myweibo.data.FeedBrowseMode
-import com.example.myweibo.data.FeedSettingsStore
 import com.example.myweibo.data.FeedLineSpacing
 import com.example.myweibo.data.ImageSettingsStore
 import com.example.myweibo.data.PlaybackSettingsStore
@@ -969,6 +968,33 @@ private val SearchBarCompanionGap = 8.dp
 private val SearchBottomBarClearance = 64.dp + 16.dp
 private val SearchSuggestionPanelMaxHeight = 176.dp
 private val FeedRefreshIndicatorColor = Color(0xFF9E9E9E)
+private const val InlineImageAnchorAnnotationTag = "weibo-inline-image-anchor"
+private const val LocationAnchorAnnotationTag = "weibo-location-anchor"
+
+private fun textRangeBoundsInWindow(
+    layout: TextLayoutResult,
+    coordinates: LayoutCoordinates,
+    start: Int,
+    end: Int,
+): Rect? {
+    if (!coordinates.isAttached || start < 0 || end <= start) return null
+    var bounds: Rect? = null
+    (start until end).forEach { offset ->
+        val box = layout.getBoundingBox(offset)
+        bounds = bounds?.let { current ->
+            Rect(
+                left = minOf(current.left, box.left),
+                top = minOf(current.top, box.top),
+                right = maxOf(current.right, box.right),
+                bottom = maxOf(current.bottom, box.bottom),
+            )
+        } ?: box
+    }
+    val local = bounds ?: return null
+    val topLeft = coordinates.localToWindow(Offset(local.left, local.top))
+    val bottomRight = coordinates.localToWindow(Offset(local.right, local.bottom))
+    return Rect(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y)
+}
 private val FeedCardContentHorizontalPadding = 12.dp
 private val FeedCardSectionSpacing = 10.dp
 private val FeedCardItemSpacing = 8.dp
@@ -1873,6 +1899,11 @@ private const val NavOverlayExitZIndex = 595f
 private data class MediaPreviewRequest(
     val media: FeedMedia,
     val playbackOwnerId: String,
+)
+
+private data class InlineImagePreviewRequest(
+    val images: List<FeedImage>,
+    val anchorBounds: Rect?,
 )
 
 private fun FeedImage.albumStatusCacheKey(): String =
@@ -3177,7 +3208,6 @@ fun WeiboApp() {
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val searchHistoryStore = remember { SearchHistoryStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
-    val feedSettingsStore = remember { FeedSettingsStore(context) }
     val imageSettingsStore = remember { ImageSettingsStore(context) }
     val themeSettingsStore = remember { ThemeSettingsStore(context) }
     val typographySettingsStore = remember { TypographySettingsStore(context) }
@@ -3250,7 +3280,6 @@ fun WeiboApp() {
             }
         }
     }
-    var immersiveFeedScrollToTop by remember { mutableStateOf<(() -> Unit)?>(null) }
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
@@ -3312,8 +3341,6 @@ fun WeiboApp() {
     var detailRequestGeneration by remember { mutableIntStateOf(0) }
     var commentSort by remember { mutableStateOf(commentSortStore.read()) }
     var backgroundPlaybackEnabled by remember { mutableStateOf(playbackSettingsStore.readBackgroundPlaybackEnabled()) }
-    var feedBrowseMode by remember { mutableStateOf(feedSettingsStore.readBrowseMode()) }
-    var immersiveLastStatusId by remember { mutableStateOf(feedSettingsStore.readImmersiveLastStatusId()) }
     var feedThumbnailQuality by remember { mutableStateOf(imageSettingsStore.readThumbnailQuality()) }
     var feedLineSpacing by remember { mutableStateOf(typographySettingsStore.readLineSpacing()) }
     var feedFontSize by remember { mutableStateOf(typographySettingsStore.readFontSize()) }
@@ -4171,14 +4198,6 @@ fun WeiboApp() {
             videoPlaybackCoordinator.pendingInlineReturnKey = null
             videoPlaybackCoordinator.autoScrollFloatingKey = null
             videoPeekController.cancel(snap = true)
-        } else if (
-            selectedTab == MainTab.Feed &&
-            feedBrowseMode == FeedBrowseMode.Immersive &&
-            (videoPeekController.isInlineAnchored || videoPlaybackCoordinator.activeKey != null)
-        ) {
-            videoPlaybackCoordinator.pauseAll()
-            videoPlaybackCoordinator.activeKey = null
-            videoPeekController.cancel()
         }
 
         pushNavigation(NavOverlayKind.VisitedProfile(value)) {
@@ -4374,7 +4393,7 @@ fun WeiboApp() {
         }
     }
 
-    fun refreshTimeline() {
+    fun refreshTimeline(showRefreshHint: Boolean = true) {
         timelineRefreshJob?.cancel()
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
@@ -4408,8 +4427,10 @@ fun WeiboApp() {
                     if (page.items.isEmpty()) {
                         feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
-                    } else {
+                    } else if (showRefreshHint) {
                         feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
+                    } else {
+                        feedRefreshHint = null
                     }
                 }
                 .onFailure { error ->
@@ -4437,7 +4458,6 @@ fun WeiboApp() {
     }
 
     fun refreshTimelineFromTop() {
-        immersiveFeedScrollToTop?.invoke()
         refreshTimeline()
         return
         scope.launch {
@@ -4491,7 +4511,7 @@ fun WeiboApp() {
         items = emptyList()
         nextCursor = null
         feedRefreshHint = null
-        refreshTimeline()
+        refreshTimeline(showRefreshHint = false)
     }
 
     fun loadMore() {
@@ -6286,16 +6306,10 @@ fun WeiboApp() {
                     ) {
                         FollowFeedScreen(
                             session = session,
-                            browseMode = feedBrowseMode,
                             commentSort = commentSort,
                             onCommentSortChange = { sort ->
                                 commentSort = sort
                                 commentSortStore.write(sort)
-                            },
-                            immersiveLastStatusId = immersiveLastStatusId,
-                            onImmersiveStatusChanged = { statusId ->
-                                immersiveLastStatusId = statusId
-                                feedSettingsStore.writeImmersiveLastStatusId(statusId)
                             },
                             listState = feedListState,
                             items = items,
@@ -6304,9 +6318,6 @@ fun WeiboApp() {
                             hasLoginCookie = hasLoginCookie,
                             emoticonMap = emoticonMap,
                             feedUiOnTop = feedUiOnTop,
-                            onImmersiveScrollToTopRegistration = { action ->
-                                immersiveFeedScrollToTop = action
-                            },
                             onRefresh = { refreshTimeline() },
                             onLoadMore = { loadMore() },
                             onOpenLoginSettings = ::openAccountLoginManagement,
@@ -6587,11 +6598,6 @@ fun WeiboApp() {
                                 onBackgroundPlaybackChange = { enabled ->
                                     backgroundPlaybackEnabled = enabled
                                     playbackSettingsStore.writeBackgroundPlaybackEnabled(enabled)
-                                },
-                                feedBrowseMode = feedBrowseMode,
-                                onFeedBrowseModeChange = { mode ->
-                                    feedBrowseMode = mode
-                                    feedSettingsStore.writeBrowseMode(mode)
                                 },
                                 feedThumbnailQuality = feedThumbnailQuality,
                                 onFeedThumbnailQualityChange = { quality ->
@@ -6914,7 +6920,6 @@ fun WeiboApp() {
                     backdrop = bottomBarBackdrop,
                     timelineMenuExpanded = timelineMenuExpanded,
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
-                    feedTabLabel = timelineKind.label,
                     selectedTimelineKind = timelineKind,
                     onTimelineKindChange = { kind ->
                         dismissFollowListForTabSwitch()
@@ -7425,11 +7430,8 @@ private fun AppPullToRefreshBox(
 @Composable
 private fun FollowFeedScreen(
     session: WeiboWebSession,
-    browseMode: FeedBrowseMode,
     commentSort: CommentSort,
     onCommentSortChange: (CommentSort) -> Unit,
-    immersiveLastStatusId: String?,
-    onImmersiveStatusChanged: (String) -> Unit,
     listState: LazyListState,
     items: List<FeedItem>,
     isLoading: Boolean,
@@ -7454,7 +7456,6 @@ private fun FollowFeedScreen(
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
-    onImmersiveScrollToTopRegistration: ((() -> Unit)?) -> Unit = {},
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -7471,43 +7472,6 @@ private fun FollowFeedScreen(
             CircularProgressIndicator()
         }
         return
-    }
-
-    if (browseMode == FeedBrowseMode.Immersive && items.isNotEmpty()) {
-        ImmersiveFollowFeedScreen(
-            session = session,
-            items = items,
-            globalCommentSort = commentSort,
-            onGlobalCommentSortChange = onCommentSortChange,
-            initialStatusId = immersiveLastStatusId,
-            onStatusChanged = onImmersiveStatusChanged,
-            isLoading = isLoading,
-            emoticonMap = emoticonMap,
-            onRefresh = onRefresh,
-            onLoadMore = onLoadMore,
-            onUserClick = onUserClick,
-            onItemClick = onItemClick,
-            onRetweetClick = onRetweetClick,
-            onCommentClick = onCommentClick,
-            onCommentLongClick = onCommentLongClick,
-            onReplyToComment = onReplyToComment,
-            onRepostClick = onRepostClick,
-            onMediaClick = onMediaClick,
-            resolveFeedItem = resolveFeedItem,
-            isLongTextLoading = isLongTextLoading,
-            onLoadLongText = onLoadLongText,
-            onToggleLike = onToggleLike,
-            onLikeClick = onLikeClick,
-            onUrlEntityClick = onUrlEntityClick,
-            feedUiOnTop = feedUiOnTop,
-            onScrollToTopRegistration = onImmersiveScrollToTopRegistration,
-        )
-        return
-    }
-
-    DisposableEffect(Unit) {
-        onImmersiveScrollToTopRegistration(null)
-        onDispose { }
     }
 
     val feedContent: @Composable BoxScope.() -> Unit = {
@@ -7529,18 +7493,7 @@ private fun FollowFeedScreen(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
-            if (isLoading && items.isEmpty()) {
-                item(key = "feed-loading") {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 48.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                }
-            } else if (items.isEmpty()) {
+            if (items.isEmpty() && !isLoading) {
                 item(key = "feed-empty") {
                     EmptyState(
                         title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
@@ -7603,383 +7556,6 @@ private fun FollowFeedScreen(
     )
 }
 
-private data class ImmersiveCommentsState(
-    val items: List<CommentItem> = emptyList(),
-    val nextCursor: String? = null,
-    val loading: Boolean = false,
-    val loadingMore: Boolean = false,
-    val loaded: Boolean = false,
-    val sort: CommentSort = CommentSort.Time,
-    val nestedLoadingIds: Set<String> = emptySet(),
-)
-
-@Composable
-private fun ImmersiveFollowFeedScreen(
-    session: WeiboWebSession,
-    items: List<FeedItem>,
-    globalCommentSort: CommentSort,
-    onGlobalCommentSortChange: (CommentSort) -> Unit,
-    initialStatusId: String?,
-    onStatusChanged: (String) -> Unit,
-    isLoading: Boolean,
-    emoticonMap: Map<String, String>,
-    onRefresh: () -> Unit,
-    onLoadMore: () -> Unit,
-    onUserClick: ((String) -> Unit)?,
-    onItemClick: (FeedItem, Rect?) -> Unit,
-    onRetweetClick: (FeedItem, FeedItem) -> Unit,
-    onCommentClick: (FeedItem) -> Unit,
-    onCommentLongClick: (FeedItem) -> Unit,
-    onReplyToComment: (FeedItem, CommentItem) -> Unit,
-    onRepostClick: (FeedItem) -> Unit,
-    onMediaClick: (FeedMedia, String) -> Unit,
-    resolveFeedItem: (FeedItem) -> FeedItem,
-    isLongTextLoading: (FeedItem) -> Boolean,
-    onLoadLongText: ((FeedItem) -> Unit)?,
-    onToggleLike: ((FeedItem) -> Unit)?,
-    onLikeClick: ((FeedItem, Rect) -> Unit)?,
-    onUrlEntityClick: ((FeedUrlEntity) -> Unit)?,
-    feedUiOnTop: Boolean,
-    onScrollToTopRegistration: ((() -> Unit)?) -> Unit,
-) {
-    val scope = rememberCoroutineScope()
-    val videoPlaybackCoordinator = LocalVideoPlaybackCoordinator.current
-    val videoPeekController = LocalVideoPeekController.current
-    var pageSwitchInProgress by remember { mutableStateOf(false) }
-    var pageSwitchGeneration by remember { mutableIntStateOf(0) }
-    val initialPage = remember(items, initialStatusId) {
-        items.indexOfFirst { it.statusId == initialStatusId || it.id == initialStatusId }
-            .takeIf { it >= 0 }
-            ?: 0
-    }
-    val pagerState = rememberPagerState(
-        initialPage = initialPage,
-        pageCount = { items.size },
-    )
-    val commentsByStatus = remember { mutableStateMapOf<String, ImmersiveCommentsState>() }
-    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val density = LocalDensity.current
-    val immersiveVideoViewport = remember(topInset, density) {
-        DetailVideoViewport(headerBottomPx = with(density) { topInset.toPx() })
-    }
-
-    DisposableEffect(pagerState) {
-        onScrollToTopRegistration {
-            scope.launch { pagerState.animateScrollToPage(0) }
-        }
-        onDispose { onScrollToTopRegistration(null) }
-    }
-
-    LaunchedEffect(pagerState, items) {
-        snapshotFlow { pagerState.settledPage }
-            .distinctUntilChanged()
-            .collect { settledPage ->
-                items.getOrNull(settledPage)
-                    ?.statusId
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let(onStatusChanged)
-            }
-    }
-
-    LaunchedEffect(pagerState.currentPage, items.size) {
-        if (pagerState.currentPage >= items.lastIndex - 2) onLoadMore()
-    }
-
-    AppPullToRefreshBox(
-        isRefreshing = isLoading,
-        onRefresh = onRefresh,
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        VerticalPager(
-            state = pagerState,
-            userScrollEnabled = false,
-            beyondViewportPageCount = 1,
-            pageSpacing = 8.dp,
-            modifier = Modifier.fillMaxSize(),
-        ) { page ->
-            val item = resolveFeedItem(items[page])
-            val listState = rememberLazyListState()
-            val savedCommentState = commentsByStatus[item.statusId]
-            val commentState = if (savedCommentState?.sort == globalCommentSort) {
-                savedCommentState
-            } else {
-                ImmersiveCommentsState(sort = globalCommentSort)
-            }
-
-            LaunchedEffect(item.statusId, globalCommentSort) {
-                if (commentsByStatus[item.statusId]?.sort != globalCommentSort) {
-                    commentsByStatus[item.statusId] = ImmersiveCommentsState(sort = globalCommentSort)
-                }
-            }
-
-            LaunchedEffect(item.statusId, commentState.sort, kotlin.math.abs(page - pagerState.currentPage) <= 1) {
-                if (kotlin.math.abs(page - pagerState.currentPage) > 1 || commentState.loaded || commentState.loading) {
-                    return@LaunchedEffect
-                }
-                commentsByStatus[item.statusId] = commentState.copy(loading = true)
-                val result = runCatchingPreservingCancellation {
-                    session.loadComments(item, commentState.sort)
-                }
-                commentsByStatus[item.statusId] = result.fold(
-                    onSuccess = { loaded ->
-                        ImmersiveCommentsState(
-                            items = loaded.items,
-                            nextCursor = loaded.nextCursor,
-                            loaded = true,
-                            sort = commentState.sort,
-                        )
-                    },
-                    onFailure = { commentState.copy(loading = false, loaded = true) },
-                )
-            }
-
-            LaunchedEffect(listState, item.statusId) {
-                snapshotFlow {
-                    val info = listState.layoutInfo
-                    val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
-                    info.totalItemsCount > 1 && last >= info.totalItemsCount - 3
-                }.distinctUntilChanged().filter { it }.collect {
-                    val current = commentsByStatus[item.statusId] ?: return@collect
-                    val cursor = current.nextCursor ?: return@collect
-                    if (current.loadingMore) return@collect
-                    commentsByStatus[item.statusId] = current.copy(loadingMore = true)
-                    val result = runCatchingPreservingCancellation {
-                        session.loadMoreComments(item, cursor, current.sort)
-                    }
-                    commentsByStatus[item.statusId] = result.fold(
-                        onSuccess = { loaded ->
-                            current.copy(
-                                items = mergeCommentItems(current.items, loaded.items),
-                                nextCursor = loaded.nextCursor,
-                                loadingMore = false,
-                            )
-                        },
-                        onFailure = { current.copy(loadingMore = false) },
-                    )
-                }
-            }
-
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.surface)
-                    .pointerInput(items.size, page) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
-                            if (down.position.x < size.width / 2f) return@awaitEachGesture
-                            var drag = 0f
-                            var active = true
-                            var playbackStoppedForGesture = false
-                            val threshold = size.height * 0.08f
-                            while (active) {
-                                val event = awaitPointerEvent(PointerEventPass.Initial)
-                                val change = event.changes.firstOrNull { it.id == down.id }
-                                    ?: event.changes.firstOrNull()
-                                    ?: break
-                                drag += change.position.y - change.previousPosition.y
-                                if (kotlin.math.abs(drag) > 12f) change.consume()
-                                if (!playbackStoppedForGesture && kotlin.math.abs(drag) >= threshold) {
-                                    val canChangePage = when {
-                                        drag < 0f -> page < items.lastIndex
-                                        drag > 0f -> page > 0
-                                        else -> false
-                                    }
-                                    val hasActivePlayback =
-                                        videoPlaybackCoordinator.activeKey != null ||
-                                            videoPlaybackCoordinator.peekPlaybackKey != null ||
-                                            videoPlaybackCoordinator.fullscreenKey != null ||
-                                            videoPeekController.isInlineAnchored
-                                    if (canChangePage && hasActivePlayback) {
-                                        videoPlaybackCoordinator.pauseAll()
-                                        videoPlaybackCoordinator.activeKey = null
-                                        if (videoPeekController.isInlineAnchored) {
-                                            videoPeekController.cancel(snap = true)
-                                        }
-                                        playbackStoppedForGesture = true
-                                    }
-                                }
-                                active = change.pressed
-                            }
-                            val target = when {
-                                drag < -threshold -> page + 1
-                                drag > threshold -> page - 1
-                                else -> page
-                            }.coerceIn(0, items.lastIndex)
-                            if (target != page) {
-                                scope.launch(start = CoroutineStart.UNDISPATCHED) {
-                                    val generation = ++pageSwitchGeneration
-                                    pageSwitchInProgress = true
-                                    if (!playbackStoppedForGesture) {
-                                        val hasActivePlayback =
-                                            videoPlaybackCoordinator.activeKey != null ||
-                                                videoPlaybackCoordinator.peekPlaybackKey != null ||
-                                                videoPlaybackCoordinator.fullscreenKey != null ||
-                                                videoPeekController.isInlineAnchored
-                                        if (hasActivePlayback) {
-                                            videoPlaybackCoordinator.pauseAll()
-                                        }
-                                        videoPlaybackCoordinator.activeKey = null
-                                        if (videoPeekController.isInlineAnchored) {
-                                            videoPeekController.cancel(snap = true)
-                                        }
-                                    }
-                                    try {
-                                        pagerState.animateScrollToPage(
-                                            page = target,
-                                            animationSpec = tween(260, easing = FastOutSlowInEasing),
-                                        )
-                                    } finally {
-                                        if (generation == pageSwitchGeneration) {
-                                            pageSwitchInProgress = false
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-            ) {
-                LazyColumn(
-                    state = listState,
-                    flingBehavior = rememberWeiboListFlingBehavior(),
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(top = topInset + 8.dp, bottom = 40.dp),
-                ) {
-                    item(key = "post-${item.id}") {
-                        CompositionLocalProvider(
-                            LocalDetailInlineVideoPlayback provides true,
-                            LocalDetailVideoViewport provides immersiveVideoViewport,
-                        ) {
-                            FeedCard(
-                                item = item,
-                                onClick = {},
-                                onMediaClick = onMediaClick,
-                                emoticonMap = emoticonMap,
-                                onUserClick = onUserClick,
-                                onRetweetClick = onRetweetClick,
-                                isLongTextLoading = isLongTextLoading,
-                                onLoadLongText = onLoadLongText,
-                                onToggleLike = onToggleLike,
-                                onLikeClick = onLikeClick,
-                                onUrlEntityClick = onUrlEntityClick,
-                                onCommentClick = {
-                                    scope.launch { listState.animateScrollToItem(1) }
-                                },
-                                onCommentLongClick = { onCommentLongClick(item) },
-                                onRepostClick = {},
-                                menuBackEnabled = feedUiOnTop,
-                                // 详情盖在单条浏览之上时关掉底层自动浮窗，否则同一 playbackKey
-                                // 会被底层可见卡片误判「应缩回内联」，与详情浮窗来回抢状态。
-                                autoFloatingOnScrollAway =
-                                    feedUiOnTop &&
-                                        !pageSwitchInProgress &&
-                                        page == pagerState.currentPage,
-                                compactBottomSpacing = true,
-                            )
-                        }
-                    }
-                    item(key = "comments-title-${item.id}") {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = CommentRowOuterStart, end = 8.dp, top = 0.dp, bottom = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                text = "评论 ${item.commentsCount}",
-                                fontSize = CommentAuthorFontSize,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                            CommentSortToggle(
-                                selected = commentState.sort,
-                                onSelected = { sort ->
-                                    onGlobalCommentSortChange(sort)
-                                    commentsByStatus[item.statusId] = ImmersiveCommentsState(
-                                        loading = false,
-                                        loaded = false,
-                                        sort = sort,
-                                    )
-                                },
-                            )
-                        }
-                    }
-                    if (commentState.loading) {
-                        item { Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() } }
-                    } else if (commentState.items.isEmpty()) {
-                        item {
-                            Text(
-                                text = "暂无评论",
-                                modifier = Modifier.fillMaxWidth().padding(28.dp),
-                                textAlign = TextAlign.Center,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    } else {
-                        items(commentState.items, key = { "${item.id}-comment-${it.id}" }) { comment ->
-                            CommentRow(
-                                comment = comment,
-                                onUserClick = onUserClick,
-                                onReplyClick = { reply -> onReplyToComment(item, reply) },
-                                nestedCommentsLoadingIds = commentState.nestedLoadingIds,
-                                onExpandNestedComments = expand@{ commentId ->
-                                    val current = commentsByStatus[item.statusId]
-                                        ?: return@expand
-                                    if (commentId in current.nestedLoadingIds) return@expand
-                                    val parent = findCommentInTree(current.items, commentId)
-                                        ?: return@expand
-                                    val append = parent.moreInfoText == null && parent.nestedNextCursor != null
-                                    if (!append && parent.moreInfoText == null) return@expand
-                                    val authorUid = item.authorId.takeIf { it.isNotBlank() }
-                                        ?: return@expand
-                                    val cursor = if (append) parent.nestedNextCursor else null
-                                    commentsByStatus[item.statusId] = current.copy(
-                                        nestedLoadingIds = current.nestedLoadingIds + commentId,
-                                    )
-                                    scope.launch {
-                                        val result = runCatchingPreservingCancellation {
-                                            session.loadNestedComments(commentId, authorUid, cursor)
-                                        }
-                                        val latest = commentsByStatus[item.statusId]
-                                            ?: return@launch
-                                        commentsByStatus[item.statusId] = result.fold(
-                                            onSuccess = { loaded ->
-                                                latest.copy(
-                                                    items = updateCommentTree(latest.items, commentId) { existing ->
-                                                        existing.copy(
-                                                            comments = if (append) {
-                                                                mergeCommentItems(existing.comments, loaded.items)
-                                                            } else {
-                                                                sortNestedCommentsByTime(loaded.items)
-                                                            },
-                                                            moreInfoText = null,
-                                                            nestedNextCursor = loaded.nextCursor,
-                                                        )
-                                                    },
-                                                    nestedLoadingIds = latest.nestedLoadingIds - commentId,
-                                                )
-                                            },
-                                            onFailure = {
-                                                latest.copy(
-                                                    nestedLoadingIds = latest.nestedLoadingIds - commentId,
-                                                )
-                                            },
-                                        )
-                                    }
-                                },
-                            )
-                            CommentDivider()
-                        }
-                    }
-                    if (commentState.loadingMore) {
-                        item { Box(Modifier.fillMaxWidth().padding(18.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(22.dp)) } }
-                    }
-                }
-
-            }
-        }
-    }
-}
-
 private fun resolveEmoticonMap(
     global: Map<String, String>,
     item: Map<String, String>,
@@ -8015,7 +7591,7 @@ private fun EmoticonText(
     onTrailingClick: (() -> Unit)? = null,
     onLocationClick: (() -> Unit)? = null,
     inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
-    onInlineImageClick: ((List<FeedImage>) -> Unit)? = null,
+    onInlineImageClick: ((List<FeedImage>, Rect?) -> Unit)? = null,
     urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     maxLines: Int = Int.MAX_VALUE,
@@ -8060,13 +7636,6 @@ private fun EmoticonText(
         } else {
             FeedEmoticonLinkDispatcher.unregisterTrailing(linkScopeKey)
         }
-        if (locationClickState.value != null) {
-            FeedEmoticonLinkDispatcher.registerLocation(linkScopeKey) {
-                locationClickState.value?.invoke()
-            }
-        } else {
-            FeedEmoticonLinkDispatcher.unregisterLocation(linkScopeKey)
-        }
         leadingAuthorName?.let { authorName ->
             if (leadingAuthorClickState.value != null) {
                 FeedEmoticonLinkDispatcher.registerLeadingAuthor(authorName) {
@@ -8074,13 +7643,6 @@ private fun EmoticonText(
                 }
             } else {
                 FeedEmoticonLinkDispatcher.unregisterLeadingAuthor(authorName)
-            }
-        }
-        inlineImageLinks.forEach { (token, images) ->
-            if (inlineImageClickState.value != null) {
-                FeedEmoticonLinkDispatcher.registerInlineImage(linkScopeKey, token, images) {
-                    inlineImageClickState.value?.invoke(images)
-                }
             }
         }
         if (urlEntities.isNotEmpty()) {
@@ -8194,11 +7756,65 @@ private fun EmoticonText(
         ).also { FeedEmoticonTextCache.put(cacheKey, it) }
     }
 
+    var inlineImageLayoutResult by remember(annotatedString) { mutableStateOf<TextLayoutResult?>(null) }
+    var inlineImageCoordinates by remember(annotatedString) { mutableStateOf<LayoutCoordinates?>(null) }
+    val locationAnnotation = remember(annotatedString, trailingLocation) {
+        annotatedString
+            .getStringAnnotations(LocationAnchorAnnotationTag, 0, annotatedString.length)
+            .firstOrNull()
+    }
+    val locationStart = locationAnnotation?.start ?: -1
+    val locationEnd = locationAnnotation?.end
+    val locationLayoutState = rememberUpdatedState(inlineImageLayoutResult)
+    val inlineImageAnchorRanges = remember(annotatedString, inlineImageLinks) {
+        annotatedString
+            .getStringAnnotations(InlineImageAnchorAnnotationTag, 0, annotatedString.length)
+            .associate { annotation -> annotation.item to (annotation.start to annotation.end) }
+    }
+    val inlineImageAnchorResolver = rememberUpdatedState<(String) -> Rect?> { token ->
+        val range = inlineImageAnchorRanges[token] ?: return@rememberUpdatedState null
+        val layout = inlineImageLayoutResult ?: return@rememberUpdatedState null
+        val coordinates = inlineImageCoordinates ?: return@rememberUpdatedState null
+        textRangeBoundsInWindow(layout, coordinates, range.first, range.second)
+    }
+    SideEffect {
+        inlineImageLinks.forEach { (token, images) ->
+            if (inlineImageClickState.value != null) {
+                FeedEmoticonLinkDispatcher.registerInlineImage(linkScopeKey, token, images) {
+                    inlineImageClickState.value?.invoke(images, inlineImageAnchorResolver.value(token))
+                }
+            }
+        }
+    }
     Text(
         text = annotatedString,
         inlineContent = inlineContent,
         style = style,
-        modifier = modifier,
+        modifier = modifier
+            .onGloballyPositioned { coordinates -> inlineImageCoordinates = coordinates }
+            .then(
+                if (locationStart >= 0 && locationEnd != null && onLocationClick != null) {
+                    Modifier.pointerInput(linkScopeKey, locationStart, locationEnd) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val layout = locationLayoutState.value
+                            val offset = layout?.getOffsetForPosition(down.position)
+                            if (offset == null || offset < locationStart || offset >= locationEnd) {
+                                return@awaitEachGesture
+                            }
+                            down.consume()
+                            val up = waitForUpOrCancellation()
+                            if (up != null) {
+                                up.consume()
+                                locationClickState.value?.invoke()
+                            }
+                        }
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+        onTextLayout = { result -> inlineImageLayoutResult = result },
         maxLines = maxLines,
         overflow = overflow,
     )
@@ -8261,6 +7877,7 @@ private fun buildEmoticonAnnotatedString(
                         fontWeight = FontWeight.Medium,
                         textDecoration = TextDecoration.None,
                     )
+                    val anchorStart = length
                     withLink(
                         LinkAnnotation.Clickable(
                             tag = "view-image:$token",
@@ -8273,6 +7890,12 @@ private fun buildEmoticonAnnotatedString(
                             append("\u67E5\u770B\u56FE\u7247")
                         }
                     }
+                    addStringAnnotation(
+                        tag = InlineImageAnchorAnnotationTag,
+                        annotation = token,
+                        start = anchorStart,
+                        end = length,
+                    )
                 }
                 inlineImageLinks.containsKey(token) -> {
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
@@ -8380,27 +8003,17 @@ private fun buildEmoticonAnnotatedString(
                 fontWeight = FontWeight.Bold,
                 textDecoration = TextDecoration.None,
             )
-            if (linkScopeKey != null && hasLocationLink) {
-                withLink(
-                    LinkAnnotation.Clickable(
-                        tag = "location:$linkScopeKey",
-                        linkInteractionListener = {
-                            FeedEmoticonLinkDispatcher.locationClick(linkScopeKey)
-                        },
-                    ),
-                ) {
-                    withStyle(locationStyle) {
-                        appendInlineContent(UrlLinkIconInlineContentKey, "链接")
-                        append('\u2009')
-                        append(location.trim())
-                    }
-                }
-            } else {
-                withStyle(locationStyle) {
-                    appendInlineContent(UrlLinkIconInlineContentKey, "链接")
-                    append('\u2009')
-                    append(location.trim())
-                }
+            withStyle(locationStyle) {
+                appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                append('\u2009')
+                val anchorStart = length
+                append(location.trim())
+                addStringAnnotation(
+                    tag = LocationAnchorAnnotationTag,
+                    annotation = location.trim(),
+                    start = anchorStart,
+                    end = length,
+                )
             }
         }
         trailingLabel?.let { label ->
@@ -8523,7 +8136,7 @@ private fun FeedCard(
     val urlEntityMap = remember(displayItem.urlEntities) {
         displayItem.urlEntities.associateBy { entity -> entity.shortUrl }
     }
-    var inlineImagePreview by remember(displayItem.statusId) { mutableStateOf<List<FeedImage>?>(null) }
+    var inlineImagePreview by remember(displayItem.statusId) { mutableStateOf<InlineImagePreviewRequest?>(null) }
     val cardContainerColor = MaterialTheme.colorScheme.surface
     val contentVerticalPadding = when {
         insetRounded -> 14.dp
@@ -8596,7 +8209,9 @@ private fun FeedCard(
                         isLongTextLoading = isLongTextLoading(item),
                         onLoadLongText = onLoadLongText,
                         inlineImageLinks = displayItem.inlineImageLinks,
-                        onInlineImageClick = { inlineImagePreview = it },
+                        onInlineImageClick = { images, anchorBounds ->
+                            inlineImagePreview = InlineImagePreviewRequest(images, anchorBounds)
+                        },
                         urlEntities = urlEntityMap,
                         onUrlEntityClick = onUrlEntityClick,
                     )
@@ -8615,6 +8230,9 @@ private fun FeedCard(
                         isLongTextLoading = isLongTextLoading(retweeted),
                         onLoadLongText = onLoadLongText,
                         onUrlEntityClick = onUrlEntityClick,
+                        onInlineImageClick = { images, anchorBounds ->
+                            inlineImagePreview = InlineImagePreviewRequest(images, anchorBounds)
+                        },
                         autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                     )
                 }
@@ -8670,11 +8288,14 @@ private fun FeedCard(
                 cardBody()
             }
         }
-        inlineImagePreview?.let { images ->
+        inlineImagePreview?.let { request ->
             FullscreenImageViewer(
-                images = images,
+                images = request.images,
                 initialIndex = 0,
                 onDismiss = { inlineImagePreview = null },
+                sourceBoundsByIndex = request.anchorBounds?.let { bounds ->
+                    request.images.indices.associateWith { bounds }
+                }.orEmpty(),
             )
         }
     }
@@ -8691,7 +8312,7 @@ private fun StatusTextSection(
     leadingAuthorName: String? = null,
     onLeadingAuthorClick: (() -> Unit)? = null,
     inlineImageLinks: Map<String, List<FeedImage>> = emptyMap(),
-    onInlineImageClick: ((List<FeedImage>) -> Unit)? = null,
+    onInlineImageClick: ((List<FeedImage>, Rect?) -> Unit)? = null,
     urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
@@ -8758,6 +8379,7 @@ private fun QuotedStatus(
     onUserClick: ((String) -> Unit)? = null,
     isLongTextLoading: Boolean = false,
     onLoadLongText: ((FeedItem) -> Unit)? = null,
+    onInlineImageClick: ((List<FeedImage>, Rect?) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     autoFloatingOnScrollAway: Boolean = false,
     modifier: Modifier = Modifier,
@@ -8819,7 +8441,7 @@ private fun QuotedStatus(
                         null
                     },
                     inlineImageLinks = displayItem.inlineImageLinks,
-                    onInlineImageClick = null,
+                    onInlineImageClick = onInlineImageClick,
                     urlEntities = displayItem.urlEntities.associateBy { entity -> entity.shortUrl },
                     onUrlEntityClick = onUrlEntityClick,
                 )
@@ -19396,8 +19018,6 @@ private fun MineScreen(
     onPendingOpenAccountLoginConsumed: () -> Unit = {},
     backgroundPlaybackEnabled: Boolean = false,
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
-    feedBrowseMode: FeedBrowseMode = FeedBrowseMode.Timeline,
-    onFeedBrowseModeChange: (FeedBrowseMode) -> Unit = {},
     feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
     feedLineSpacing: FeedLineSpacing = FeedLineSpacing.Compact,
@@ -19526,8 +19146,6 @@ private fun MineScreen(
                 emoticonSyncing = emoticonSyncing,
                 backgroundPlaybackEnabled = backgroundPlaybackEnabled,
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
-                feedBrowseMode = feedBrowseMode,
-                onFeedBrowseModeChange = onFeedBrowseModeChange,
                 feedThumbnailQuality = feedThumbnailQuality,
                 onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
                 feedLineSpacing = feedLineSpacing,
@@ -20053,8 +19671,6 @@ private fun SettingsScreen(
     emoticonSyncing: Boolean,
     backgroundPlaybackEnabled: Boolean,
     onBackgroundPlaybackChange: (Boolean) -> Unit,
-    feedBrowseMode: FeedBrowseMode,
-    onFeedBrowseModeChange: (FeedBrowseMode) -> Unit,
     feedThumbnailQuality: FeedThumbnailQuality,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
     feedLineSpacing: FeedLineSpacing,
@@ -20078,7 +19694,6 @@ private fun SettingsScreen(
     var typographyExpanded by remember { mutableStateOf(false) }
     var themeExpanded by remember { mutableStateOf(false) }
     var appearanceExpanded by remember { mutableStateOf(false) }
-    var feedBrowseModeExpanded by remember { mutableStateOf(false) }
     var showHelp by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val versionName = remember {
@@ -20129,14 +19744,6 @@ private fun SettingsScreen(
                         emoticonMap = emoticonMap,
                         emoticonSyncing = emoticonSyncing,
                         onSyncEmoticons = onSyncEmoticons,
-                    )
-                }
-                item {
-                    SettingsFeedBrowseModeCard(
-                        expanded = feedBrowseModeExpanded,
-                        onExpandedChange = { feedBrowseModeExpanded = it },
-                        mode = feedBrowseMode,
-                        onModeChange = onFeedBrowseModeChange,
                     )
                 }
                 item {
@@ -20225,7 +19832,6 @@ private val appHelpSections = listOf(
         title = "首页信息流",
         items = listOf(
             "在首页下拉可刷新关注流；滚动到底部会自动加载更多。",
-            "可在设置中切换「连续信息流」与「单条浏览」：单条浏览时右侧切微博，左侧滚动正文与评论。",
             "列表使用系统默认滑动手感；惯性滚动中点击图片或视频，会先停止滚动，避免误触打开媒体。",
             "点击微博卡片进入详情；点击头像或 @昵称 进入用户主页。",
             "点击评论图标进入详情评论区；点击转发图标进入详情转发区。",
@@ -20326,7 +19932,6 @@ private val appHelpSections = listOf(
         title = "设置项说明",
         items = listOf(
             "账号管理：登录、添加账号、切换已保存账号；切换后会重新加载对应账号数据。",
-            "首页浏览方式：连续信息流（上下连续刷）或单条浏览（右侧切博、左侧看正文与评论）。",
             "表情同步：从微博拉取表情配置到本地，改善正文与评论中的表情显示。",
             "浏览信息流时，正文里出现的表情也会自动收录到本地，同步时不会删除这些表情。",
             "图片清晰度：省流 / 标准 / 高清三档，影响信息流缩略图加载规格；全屏仍会尽量加载高清图。",
@@ -21114,98 +20719,6 @@ private fun SettingsAppearanceCard(
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
                     AppearanceMode.entries.forEach { option ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .clickable { onModeChange(option) }
-                                .padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        ) {
-                            RadioButton(
-                                selected = mode == option,
-                                onClick = { onModeChange(option) },
-                            )
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Text(
-                                    text = option.label,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = if (mode == option) FontWeight.SemiBold else FontWeight.Normal,
-                                )
-                                Text(
-                                    text = option.description,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsFeedBrowseModeCard(
-    expanded: Boolean,
-    onExpandedChange: (Boolean) -> Unit,
-    mode: FeedBrowseMode,
-    onModeChange: (FeedBrowseMode) -> Unit,
-) {
-    SettingsPlainCard {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(14.dp),
-            ) {
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(5.dp),
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            text = "首页浏览方式",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
-                            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                            shape = RoundedCornerShape(8.dp),
-                        ) {
-                            Text(
-                                text = mode.label,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                style = MaterialTheme.typography.labelSmall,
-                            )
-                        }
-                    }
-                    Text(
-                        text = mode.description,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
-            }
-
-            AnimatedVisibility(visible = expanded) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    FeedBrowseMode.entries.forEach { option ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
