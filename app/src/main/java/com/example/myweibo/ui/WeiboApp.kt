@@ -3372,6 +3372,7 @@ fun WeiboApp() {
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
     var feedInitialScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
     var feedInitialScrollReconciled by remember { mutableStateOf(false) }
+    var feedResumeGeneration by remember { mutableIntStateOf(0) }
     var lastFeedResumeRefreshAt by remember { mutableStateOf(0L) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -4539,49 +4540,54 @@ fun WeiboApp() {
             if (feedListState.layoutInfo.totalItemsCount > 0) {
                 feedListState.animateScrollToTopSmooth()
             }
-            runCatchingPreservingCancellation {
-                val raw = session.loadTimelineRaw(requestedKind)
-                if (requestedKind == TimelineKind.Following) {
-                    timelineCacheStore.writeFollowingTimeline(raw)
+            try {
+                runCatchingPreservingCancellation {
+                    val raw = session.loadTimelineRaw(requestedKind)
+                    if (requestedKind == TimelineKind.Following) {
+                        timelineCacheStore.writeFollowingTimeline(raw)
+                    }
+                    WeiboJsonParser.parseTimeline(raw)
                 }
-                WeiboJsonParser.parseTimeline(raw)
+                    .onSuccess { page ->
+                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                            return@onSuccess
+                        }
+                        items = sortFeedTimelineItems(page.items)
+                        reconcileFeedLikeState(page.items)
+                        nextCursor = page.nextCursor
+                        absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
+                        hasLoginCookie = true
+                        persistLoginSession()
+                        if (page.items.isEmpty()) {
+                            feedRefreshHint = null
+                            showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
+                        } else if (showRefreshHint) {
+                            feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
+                        } else {
+                            feedRefreshHint = null
+                        }
+                    }
+                    .onFailure { error ->
+                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                            return@onFailure
+                        }
+                        feedRefreshHint = null
+                        if (isLoginStateFailure(error)) {
+                            hasLoginCookie = false
+                            mineHasLoginCookie = false
+                        } else {
+                            hasLoginCookie = session.hasLoginCookie()
+                            mineHasLoginCookie = hasLoginCookie
+                        }
+                        showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
+                    }
+            } finally {
+                if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
+                    isLoading = false
+                    timelineRefreshJob = null
+                }
             }
-                .onSuccess { page ->
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
-                        return@onSuccess
-                    }
-                    items = sortFeedTimelineItems(page.items)
-                    reconcileFeedLikeState(page.items)
-                    nextCursor = page.nextCursor
-                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
-                    hasLoginCookie = true
-                    persistLoginSession()
-                    if (page.items.isEmpty()) {
-                        feedRefreshHint = null
-                        showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
-                    } else if (showRefreshHint) {
-                        feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
-                    } else {
-                        feedRefreshHint = null
-                    }
-                }
-                .onFailure { error ->
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
-                        return@onFailure
-                    }
-                    feedRefreshHint = null
-                    if (isLoginStateFailure(error)) {
-                        hasLoginCookie = false
-                        mineHasLoginCookie = false
-                    } else {
-                        hasLoginCookie = session.hasLoginCookie()
-                        mineHasLoginCookie = hasLoginCookie
-                    }
-                    showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
-                }
             if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
-                isLoading = false
-                timelineRefreshJob = null
                 if (feedListState.layoutInfo.totalItemsCount > 0) {
                     feedListState.animateScrollToTopSmooth()
                 }
@@ -6091,6 +6097,22 @@ fun WeiboApp() {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_START -> {
+                    val homeIsForeground = cacheLoaded &&
+                        selectedTab == MainTab.Feed &&
+                        visitedUserId == null &&
+                        selectedItem == null &&
+                        mediaPreview == null &&
+                        articleOverlay == null &&
+                        followListOverlay == null &&
+                        albumViewerState == null
+                    if (homeIsForeground &&
+                        videoPlaybackCoordinator.activeKey == null &&
+                        videoPeekController.activeRequest == null
+                    ) {
+                        // Recreate only the feed UI subtree when the app returns to the home feed.
+                        // Its LazyListState is held outside the subtree, so scroll position survives.
+                        feedResumeGeneration++
+                    }
                     val now = android.os.SystemClock.elapsedRealtime()
                     val shouldRetryEmptyFeed = cacheLoaded &&
                         selectedTab == MainTab.Feed &&
@@ -6515,40 +6537,42 @@ fun WeiboApp() {
                             .graphicsLayer { alpha = feedVisibleAlpha }
                             .blockHiddenTouches(feedUiOnTop || composeWebVisible),
                     ) {
-                        FollowFeedScreen(
-                            session = session,
-                            commentSort = commentSort,
-                            onCommentSortChange = { sort ->
-                                commentSort = sort
-                                commentSortStore.write(sort)
-                            },
-                            listState = feedListState,
-                            items = items,
-                            isLoading = isLoading,
-                            cacheLoaded = cacheLoaded,
-                            hasLoginCookie = hasLoginCookie,
-                            emoticonMap = emoticonMap,
-                            feedUiOnTop = feedUiOnTop,
-                            onRefresh = { refreshTimeline() },
-                            onLoadMore = { loadMore() },
-                            onOpenLoginSettings = ::openAccountLoginManagement,
-                            onUserClick = ::openUser,
-                            onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
-                            onRetweetClick = { retweeted, host ->
-                                openDetailFromSource(retweeted, null, host)
-                            },
-                            onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
-                            onCommentLongClick = { item -> openCommentComposer(item) },
-                            onReplyToComment = { item, comment -> openCommentComposer(item, comment) },
-                            onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
-                            onMediaClick = ::pushMediaPreview,
-                            resolveFeedItem = ::resolveFeedItem,
-                            isLongTextLoading = { it.statusId in longTextLoadingIds },
-                            onLoadLongText = ::loadLongText,
-                            onToggleLike = ::toggleStatusLike,
-                            onLikeClick = ::openLikeUsers,
-                            onUrlEntityClick = ::openUrlEntity,
-                        )
+                        key(feedResumeGeneration) {
+                            FollowFeedScreen(
+                                session = session,
+                                commentSort = commentSort,
+                                onCommentSortChange = { sort ->
+                                    commentSort = sort
+                                    commentSortStore.write(sort)
+                                },
+                                listState = feedListState,
+                                items = items,
+                                isLoading = isLoading,
+                                cacheLoaded = cacheLoaded,
+                                hasLoginCookie = hasLoginCookie,
+                                emoticonMap = emoticonMap,
+                                feedUiOnTop = feedUiOnTop,
+                                onRefresh = { refreshTimeline() },
+                                onLoadMore = { loadMore() },
+                                onOpenLoginSettings = ::openAccountLoginManagement,
+                                onUserClick = ::openUser,
+                                onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                                onRetweetClick = { retweeted, host ->
+                                    openDetailFromSource(retweeted, null, host)
+                                },
+                                onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
+                                onCommentLongClick = { item -> openCommentComposer(item) },
+                                onReplyToComment = { item, comment -> openCommentComposer(item, comment) },
+                                onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
+                                onMediaClick = ::pushMediaPreview,
+                                resolveFeedItem = ::resolveFeedItem,
+                                isLongTextLoading = { it.statusId in longTextLoadingIds },
+                                onLoadLongText = ::loadLongText,
+                                onToggleLike = ::toggleStatusLike,
+                                onLikeClick = ::openLikeUsers,
+                                onUrlEntityClick = ::openUrlEntity,
+                            )
+                        }
                     }
                 }
 
@@ -15073,6 +15097,7 @@ private fun GlassTextButton(
         modifier = modifier,
         enabled = enabled,
         textColor = Color.White,
+        style = videoControlTextStyle(12),
     )
 }
 
@@ -24363,6 +24388,11 @@ private fun videoControlTextStyle(sizeSp: Int): TextStyle = TextStyle(
     fontSize = videoControlFixedSp(sizeSp),
     lineHeight = videoControlFixedSp(sizeSp),
     fontWeight = FontWeight.Bold,
+    shadow = androidx.compose.ui.graphics.Shadow(
+        color = Color.Black.copy(alpha = 0.92f),
+        offset = with(LocalDensity.current) { Offset(0f, 1.dp.toPx()) },
+        blurRadius = with(LocalDensity.current) { 2.dp.toPx() },
+    ),
     platformStyle = PlatformTextStyle(includeFontPadding = false),
 )
 

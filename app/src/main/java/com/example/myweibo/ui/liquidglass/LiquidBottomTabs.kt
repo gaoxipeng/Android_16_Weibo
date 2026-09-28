@@ -335,7 +335,7 @@ fun LiquidBottomTabs(
                 .drawBackdrop(
                     backdrop = backdrop,
                     shape = { barShape },
-                    effects = {},
+                    effects = { liquidMenuGlassEffects() },
                     highlight = null,
                     shadow = null,
                     onDrawSurface = { drawRect(surfaceColor) },
