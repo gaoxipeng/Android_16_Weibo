@@ -392,6 +392,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
@@ -1754,6 +1755,8 @@ private data class VisitedProfileSnapshot(
 private data class AlbumViewerState(
     val images: List<FeedImage>,
     val initialIndex: Int,
+    val sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
+    val animateOpenFromSource: Boolean = true,
     val statusCache: Map<String, FeedItem> = emptyMap(),
     val profilePagerPage: Int? = null,
     val albumScrollIndex: Int = 0,
@@ -1908,6 +1911,11 @@ private data class InlineImagePreviewRequest(
 
 private fun FeedImage.albumStatusCacheKey(): String =
     statusId?.takeIf { it.isNotBlank() } ?: largeUrl
+
+private fun FeedImage.albumAnchorKey(): String =
+    largeUrl.takeIf { it.isNotBlank() }
+        ?: thumbnailUrl.takeIf { it.isNotBlank() }
+        ?: id
 
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
@@ -3318,6 +3326,7 @@ fun WeiboApp() {
     var mediaOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var articleOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
+    var albumDismissScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
     var commentsLoadingMore by remember { mutableStateOf(false) }
@@ -3361,6 +3370,9 @@ fun WeiboApp() {
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var cacheLoaded by remember { mutableStateOf(false) }
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
+    var feedInitialScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
+    var feedInitialScrollReconciled by remember { mutableStateOf(false) }
+    var lastFeedResumeRefreshAt by remember { mutableStateOf(0L) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
     var longTextLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var videoMediaRefreshInFlight by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -4005,11 +4017,28 @@ fun WeiboApp() {
 
     fun popNavigation(): Boolean {
         if (navStack.isEmpty()) return false
-        navExitPendingKind = navOverlayStack.lastOrNull()
+        val exitingKind = navOverlayStack.lastOrNull()
+        navExitPendingKind = exitingKind
         navEnterPendingKind = null
-        val previous = navStack.last()
+        val previous = navStack.last().let { state ->
+            val target = albumDismissScrollTarget
+            if (exitingKind != NavOverlayKind.AlbumViewer || target == null) {
+                state
+            } else {
+                state.copy(
+                    mineAlbumScroll = target,
+                    visitedProfile = state.visitedProfile?.copy(
+                        albumScrollIndex = target.index,
+                        albumScrollOffset = target.offset,
+                    ),
+                )
+            }
+        }
         navStack = navStack.dropLast(1)
         navOverlayStack = navOverlayStack.dropLast(1)
+        if (exitingKind == NavOverlayKind.AlbumViewer) {
+            albumDismissScrollTarget = null
+        }
         applyNavRestoreState(previous)
         return true
     }
@@ -4120,14 +4149,117 @@ fun WeiboApp() {
     }
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
+        albumDismissScrollTarget = null
         pushNavigation(NavOverlayKind.AlbumViewer) {
             albumOverlayInstanceKey = navStack.size
             albumViewerState = viewer
         }
     }
 
+    fun updateAlbumViewerAnchor(imageKey: String, bounds: Rect) {
+        val viewer = albumViewerState ?: return
+        val index = viewer.images.indexOfFirst { it.albumAnchorKey() == imageKey }
+        if (index < 0) return
+        if (viewer.sourceBoundsByIndex[index] == bounds) return
+        albumViewerState = viewer.copy(
+            sourceBoundsByIndex = viewer.sourceBoundsByIndex + (index to bounds),
+        )
+    }
+
+    fun albumListStateForViewer(): LazyListState? = when {
+        visitedUserId != null -> visitedAlbumListState
+        selectedTab == MainTab.Mine -> mineAlbumListState
+        else -> null
+    }
+
+    fun albumRowIndexForImage(image: FeedImage): Int? {
+        val albumImages = when {
+            visitedUserId != null -> visitedAlbumImages
+            selectedTab == MainTab.Mine -> mineAlbumImages
+            else -> emptyList()
+        }
+        val targetKey = image.albumAnchorKey()
+        return buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
+            .indexOfFirst { row -> row.rowImages.any { it.albumAnchorKey() == targetKey } }
+            .takeIf { it >= 0 }
+    }
+
+    suspend fun onAlbumViewerPageChanged(index: Int) {
+        // Keep the album at its original scroll position while browsing. If the
+        // active image leaves the viewport, the close choreography below moves the
+        // list and shrinks the image together.
+    }
+
+    suspend fun prepareAlbumViewerDismiss(index: Int) {
+        val viewer = albumViewerState ?: return
+        val image = viewer.images.getOrNull(index) ?: return
+        val rowIndex = albumRowIndexForImage(image) ?: return
+        val listState = albumListStateForViewer() ?: return
+        val rowVisible = listState.layoutInfo.visibleItemsInfo.any { it.index == rowIndex }
+        if (rowVisible) return
+
+        val layoutInfo = listState.layoutInfo
+        val viewportHeight = (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset).coerceAtLeast(1)
+        val densityValue = context.resources.displayMetrics.density.coerceAtLeast(1f)
+        val estimatedRowHeight = layoutInfo.visibleItemsInfo.firstOrNull()?.size
+            ?: (120f * densityValue).roundToInt()
+        val scrollingDown = rowIndex > viewer.albumScrollIndex
+        val targetOffset = if (scrollingDown) {
+            // LazyListState offsets are measured from the item's start; a
+            // positive value moves the item upward. Use a negative offset so
+            // the target row's bottom edge lands at the viewport bottom.
+            -(viewportHeight - estimatedRowHeight).coerceAtLeast(0)
+        } else {
+            0
+        }
+        albumDismissScrollTarget = ScrollRestore(rowIndex, targetOffset)
+
+        // Give the viewer a provisional target immediately. As the animated list
+        // scroll composes the real tile, updateAlbumViewerAnchor replaces it with
+        // the exact window bounds, keeping both motions synchronized.
+        val template = viewer.sourceBoundsByIndex.values.firstOrNull()
+        if (template != null) {
+            val densityValue = context.resources.displayMetrics.density.coerceAtLeast(1f)
+            val gapPx = 6f * densityValue
+            val sourceIndex = viewer.initialIndex
+            val columnDelta = (index % 3) - (sourceIndex % 3)
+            val targetWidth = template.width.coerceAtLeast(1f)
+            val targetHeight = template.height.coerceAtLeast(1f)
+            val screenWidth = context.resources.displayMetrics.widthPixels.toFloat()
+            val screenHeight = context.resources.displayMetrics.heightPixels.toFloat()
+            val targetLeft = (template.left + columnDelta * (targetWidth + gapPx))
+                .coerceIn(0f, (screenWidth - targetWidth).coerceAtLeast(0f))
+            val targetTop = if (scrollingDown) {
+                (screenHeight - targetHeight - 24f * densityValue).coerceAtLeast(0f)
+            } else {
+                24f * densityValue
+            }
+            albumViewerState = viewer.copy(
+                sourceBoundsByIndex = viewer.sourceBoundsByIndex + (
+                    index to Rect(
+                        left = targetLeft,
+                        top = targetTop,
+                        right = targetLeft + targetWidth,
+                        bottom = targetTop + targetHeight,
+                    )
+                ),
+            )
+        }
+        scope.launch {
+            listState.animateScrollToItem(rowIndex, targetOffset)
+        }
+    }
+
     fun dismissAlbumViewer() {
         if (albumViewerState == null) return
+        // The viewer's close callback can be delivered more than once while the
+        // deferred navigation restore is being flushed. Ignore any callback after
+        // the AlbumViewer entry has already been popped.
+        if (navExitPendingKind == NavOverlayKind.AlbumViewer &&
+            navOverlayStack.lastOrNull() != NavOverlayKind.AlbumViewer
+        ) {
+            return
+        }
         if (navOverlayStack.lastOrNull() == NavOverlayKind.AlbumViewer) {
             popNavigation()
             return
@@ -5474,6 +5606,10 @@ fun WeiboApp() {
         val resolved = resolveFeedItem(item)
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
+        // Persist the viewer state that should be restored after returning from the
+        // status detail. In particular, returning must not replay the source-open
+        // animation after the large image was already visible.
+        albumViewerState = viewer
         pushNavigation(NavOverlayKind.Detail(resolved.id)) {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = null
@@ -5714,6 +5850,12 @@ fun WeiboApp() {
         timelineCacheStore.readFollowingTimeline()?.let { page ->
             items = sortFeedTimelineItems(page.items)
             nextCursor = page.nextCursor
+            if (page.items.isNotEmpty()) {
+                feedInitialScrollTarget = ScrollRestore(
+                    initialFollowingScroll.first,
+                    initialFollowingScroll.second,
+                )
+            }
             absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
         }
         mineCacheStore.readProfile()?.let { profile ->
@@ -5745,8 +5887,48 @@ fun WeiboApp() {
         mineHasLoginCookie = hasLoginCookie
         cacheLoaded = true
         feedScrollRestoreApplied = true
-        if (items.isEmpty() && hasLoginCookie) {
-            refreshTimeline()
+        if (feedInitialScrollTarget == null) {
+            // 没有可恢复的缓存时，首次网络加载始终从首页顶部开始。
+            feedInitialScrollTarget = ScrollRestore(0, 0)
+        }
+    }
+
+    LaunchedEffect(cacheLoaded, items.size, feedInitialScrollTarget) {
+        if (!cacheLoaded || items.isEmpty() || feedInitialScrollReconciled) return@LaunchedEffect
+        val target = feedInitialScrollTarget ?: return@LaunchedEffect
+        withFrameNanos { }
+        val safeIndex = target.index.coerceIn(0, items.lastIndex)
+        val safeOffset = if (safeIndex == target.index) target.offset else 0
+        runCatching {
+            feedListState.scrollToItem(safeIndex, safeOffset)
+        }
+        feedInitialScrollReconciled = true
+    }
+
+    LaunchedEffect(cacheLoaded, hasLoginCookie, items.isEmpty()) {
+        if (!cacheLoaded || !hasLoginCookie || items.isNotEmpty()) return@LaunchedEffect
+        // WebView Cookie 状态可能在冷启动后才恢复；只要首页仍为空，就自动补一次同步。
+        refreshTimeline(showRefreshHint = false)
+    }
+
+    LaunchedEffect(cacheLoaded, selectedTab, selectedItem, items.isEmpty()) {
+        if (!cacheLoaded || selectedTab != MainTab.Feed || selectedItem != null || items.isNotEmpty()) {
+            return@LaunchedEffect
+        }
+        // Keep an empty feed visibly loading/retrying even if the previous request was interrupted
+        // while the app was backgrounded and left its loading flag set.
+        repeat(3) { attempt ->
+            if (items.isNotEmpty() || selectedTab != MainTab.Feed || selectedItem != null) return@LaunchedEffect
+            if (attempt > 0) delay(1_500L)
+            if (!isLoading) refreshTimeline(showRefreshHint = false)
+            withTimeoutOrNull(20_000L) {
+                snapshotFlow { isLoading }.first { loading -> !loading }
+            }
+            if (isLoading) {
+                timelineRefreshJob?.cancel()
+                timelineRefreshJob = null
+                isLoading = false
+            }
         }
     }
 
@@ -5886,7 +6068,18 @@ fun WeiboApp() {
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, backgroundPlaybackEnabled, timelineKind, cacheLoaded, feedScrollRestoreApplied) {
+    DisposableEffect(
+        lifecycleOwner,
+        backgroundPlaybackEnabled,
+        timelineKind,
+        cacheLoaded,
+        feedScrollRestoreApplied,
+        selectedTab,
+        selectedItem,
+        hasLoginCookie,
+        isLoading,
+        items.isEmpty(),
+    ) {
         fun persistFeedScrollNow() {
             if (timelineKind == TimelineKind.Following && cacheLoaded && feedScrollRestoreApplied) {
                 timelineCacheStore.writeFollowingScroll(
@@ -5896,12 +6089,30 @@ fun WeiboApp() {
             }
         }
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
-                persistFeedScrollNow()
-                if (!backgroundPlaybackEnabled) {
-                    videoPlaybackCoordinator.pauseAll()
-                    videoPlaybackCoordinator.activeKey = null
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    val shouldRetryEmptyFeed = cacheLoaded &&
+                        selectedTab == MainTab.Feed &&
+                        selectedItem == null &&
+                        items.isEmpty() &&
+                        hasLoginCookie &&
+                        now - lastFeedResumeRefreshAt >= 2_000L
+                    if (shouldRetryEmptyFeed) {
+                        lastFeedResumeRefreshAt = now
+                        timelineRefreshJob?.cancel()
+                        isLoading = false
+                        refreshTimeline(showRefreshHint = false)
+                    }
                 }
+                Lifecycle.Event.ON_STOP -> {
+                    persistFeedScrollNow()
+                    if (!backgroundPlaybackEnabled) {
+                        videoPlaybackCoordinator.pauseAll()
+                        videoPlaybackCoordinator.activeKey = null
+                    }
+                }
+                else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -6495,9 +6706,10 @@ fun WeiboApp() {
                                     onSyncEmoticons = { syncEmoticons() },
                                     onItemClick = ::openDetail,
                                     onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
-                                    onCommentLongClick = ::openCommentComposer,
-                                    onOpenAlbumViewer = ::pushAlbumViewer,
-                                    onMediaClick = ::pushMediaPreview,
+                                     onCommentLongClick = ::openCommentComposer,
+                                     onOpenAlbumViewer = ::pushAlbumViewer,
+                                     onAlbumImageAnchorBoundsChanged = ::updateAlbumViewerAnchor,
+                                     onMediaClick = ::pushMediaPreview,
                                     onUserClick = ::openUser,
                                     isLongTextLoading = { it.statusId in longTextLoadingIds },
                                     onLoadLongText = ::loadLongText,
@@ -6564,9 +6776,10 @@ fun WeiboApp() {
                                 onSyncEmoticons = { syncEmoticons() },
                                 onItemClick = ::openDetail,
                                 onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
-                                onCommentLongClick = ::openCommentComposer,
-                                onOpenAlbumViewer = ::pushAlbumViewer,
-                                onMediaClick = ::pushMediaPreview,
+                                 onCommentLongClick = ::openCommentComposer,
+                                 onOpenAlbumViewer = ::pushAlbumViewer,
+                                 onAlbumImageAnchorBoundsChanged = ::updateAlbumViewerAnchor,
+                                 onMediaClick = ::pushMediaPreview,
                                 onUserClick = ::openUser,
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
@@ -7110,6 +7323,9 @@ fun WeiboApp() {
                 stackTop = albumViewerVisible,
                 layerBaseZIndex = 560f,
                 visible = albumViewerVisible,
+                // The image viewer owns its morph animation; avoid a second nav slide
+                // that leaves the Dialog intercepting taps after the thumbnail return.
+                stackAnimated = false,
                 animationKey = albumOverlayInstanceKey,
                 navKind = NavOverlayKind.AlbumViewer,
                 pendingEnterKind = navEnterPendingKind,
@@ -7125,7 +7341,18 @@ fun WeiboApp() {
                 FullscreenImageViewer(
                     images = viewer.images,
                     initialIndex = viewer.initialIndex,
+                    sourceBoundsByIndex = viewer.sourceBoundsByIndex,
+                    animateOpenFromSource = viewer.animateOpenFromSource &&
+                        viewer.sourceBoundsByIndex[viewer.initialIndex] != null,
+                    sourceCornerRadius = 8.dp,
+                    avoidOpeningCropForExtremeAspect = true,
                     onDismiss = { dismissAlbumViewer() },
+                    // onDismiss already performs the navigation pop. Calling the
+                    // index callback as well would run dismissAlbumViewer twice
+                    // and restore the album to its pre-viewer scroll position.
+                    onDismissWithIndex = null,
+                    onPageChanged = ::onAlbumViewerPageChanged,
+                    onPrepareDismiss = ::prepareAlbumViewerDismiss,
                     session = session,
                     relatedPosts = relatedPosts,
                     emoticonMap = emoticonMap,
@@ -7136,6 +7363,8 @@ fun WeiboApp() {
                             AlbumViewerState(
                                 images = viewer.images,
                                 initialIndex = index,
+                                sourceBoundsByIndex = viewer.sourceBoundsByIndex,
+                                animateOpenFromSource = false,
                                 statusCache = cache,
                                 profilePagerPage = viewer.profilePagerPage,
                                 albumScrollIndex = viewer.albumScrollIndex,
@@ -7493,7 +7722,16 @@ private fun FollowFeedScreen(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
-            if (items.isEmpty() && !isLoading) {
+            if (items.isEmpty() && isLoading) {
+                item(key = "feed-loading") {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                }
+            } else if (items.isEmpty()) {
                 item(key = "feed-empty") {
                     EmptyState(
                         title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
@@ -8269,7 +8507,9 @@ private fun FeedCard(
             ElevatedCard(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = FeedCardContentHorizontalPadding),
+                    // 详情正文上方的间距为 8.dp，卡片左右外边距也保持一致，
+                    // 避免底部浅灰阴影在顶部与两侧呈现不同宽度。
+                    .padding(horizontal = 8.dp),
                 shape = RoundedCornerShape(8.dp),
                 colors = CardDefaults.elevatedCardColors(
                     containerColor = cardContainerColor,
@@ -11061,8 +11301,13 @@ private fun FullscreenImageViewer(
     images: List<FeedImage>,
     initialIndex: Int,
     onDismiss: () -> Unit,
+    onDismissWithIndex: ((Int) -> Unit)? = null,
+    onPageChanged: (suspend (Int) -> Unit)? = null,
+    onPrepareDismiss: (suspend (Int) -> Unit)? = null,
     sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
     animateOpenFromSource: Boolean = true,
+    sourceCornerRadius: Dp = ThumbnailMorphCornerRadius,
+    avoidOpeningCropForExtremeAspect: Boolean = false,
     onCloseStart: (() -> Unit)? = null,
     imageOwner: FeedItem? = null,
     session: WeiboWebSession? = null,
@@ -11084,13 +11329,23 @@ private fun FullscreenImageViewer(
         Animatable(if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
     }
     var transitionClosing by remember { mutableStateOf(false) }
+    var dismissPreparing by remember { mutableStateOf(false) }
     var dragDismissProgress by remember { mutableFloatStateOf(0f) }
     var closeStartBounds by remember { mutableStateOf<Rect?>(null) }
     var dismissBoundsProviders by remember { mutableStateOf<Map<Int, () -> Rect>>(emptyMap()) }
+    val latestSourceBoundsByIndex = rememberUpdatedState(sourceBoundsByIndex)
+    val latestDismissBoundsProviders = rememberUpdatedState(dismissBoundsProviders)
     fun dismissViewer(startBounds: Rect? = null) {
-        if (!transitionClosing) {
-            val currentSourceBounds = sourceBoundsByIndex[pagerState.currentPage]
-            val currentBoundsProvider = dismissBoundsProviders[pagerState.currentPage]
+        fun finishDismiss() {
+            onDismissWithIndex?.invoke(pagerState.currentPage)
+            onDismiss()
+        }
+        if (transitionClosing || dismissPreparing) return
+        val page = pagerState.currentPage
+        fun beginDismiss() {
+            if (transitionClosing) return
+            val currentSourceBounds = latestSourceBoundsByIndex.value[page]
+            val currentBoundsProvider = latestDismissBoundsProviders.value[page]
             val closeBounds = currentSourceBounds ?: currentBoundsProvider?.invoke()
             if (closeBounds != null) {
                 closeStartBounds = startBounds ?: currentBoundsProvider?.invoke() ?: currentSourceBounds
@@ -11101,12 +11356,26 @@ private fun FullscreenImageViewer(
                         targetValue = 0f,
                         animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
                     )
-                    onDismiss()
+                    finishDismiss()
                 }
             } else {
                 onCloseStart?.invoke()
-                onDismiss()
+                finishDismiss()
             }
+        }
+        if (onPrepareDismiss != null) {
+            dismissPreparing = true
+            scope.launch {
+                // Start the album list scroll and the image shrink in the same
+                // frame. The list publishes the real tile bounds while it moves;
+                // rememberUpdatedState then lets the morph target follow it.
+                onPrepareDismiss.invoke(page)
+                withFrameNanos { }
+                dismissPreparing = false
+                beginDismiss()
+            }
+        } else {
+            beginDismiss()
         }
     }
     val pagerFling = PagerDefaults.flingBehavior(
@@ -11117,6 +11386,9 @@ private fun FullscreenImageViewer(
     val showStatusCaption = onOpenStatus != null && session != null
     val currentPage = pagerState.currentPage
     val currentImage = viewerImages.getOrNull(currentPage)
+    LaunchedEffect(currentPage) {
+        onPageChanged?.invoke(currentPage)
+    }
     var resolvedStatusCache by remember(images, statusCache) { mutableStateOf(statusCache) }
     val initialImage = images.getOrNull(initialIndex)
     var statusItem by remember(images, statusCache, initialIndex) {
@@ -11227,10 +11499,19 @@ private fun FullscreenImageViewer(
                     morphCenterX = lerp(morphSourceBounds.center.x, containerWidthPx / 2f, transition)
                     morphCenterY = lerp(morphSourceBounds.center.y, containerHeightPx / 2f, transition)
                 }
-                uniformScale = maxOf(
+                val coverScale = maxOf(
                     morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
                     morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
-                ).coerceIn(0.05f, 4f)
+                )
+                val containScale = minOf(
+                    morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
+                    morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
+                )
+                val useContainScale = !transitionClosing &&
+                    avoidOpeningCropForExtremeAspect &&
+                    (imageAspect <= 0.7f || imageAspect >= 1.43f)
+                uniformScale = (if (useContainScale) containScale else coverScale)
+                    .coerceIn(0.05f, 4f)
             } else {
                 morphWidth = fitLayout.fitWidthPx
                 morphHeight = fitLayout.fitHeightPx
@@ -11248,9 +11529,23 @@ private fun FullscreenImageViewer(
             val morphTop = morphCenterY - morphHeight / 2f
             val morphRight = morphCenterX + morphWidth / 2f
             val morphBottom = morphCenterY + morphHeight / 2f
-            val morphCornerRadiusPx = with(density) {
-                ThumbnailMorphCornerRadius.toPx() * (1f - transition).coerceIn(0f, 1f)
+            // The pager content is rendered in the transformed layer, so its
+            // clip radius must be expressed in pre-transform coordinates. The
+            // scrim, however, is drawn in window coordinates and must use the
+            // original thumbnail radius directly. Sharing the former value with
+            // the scrim made the closing frame look like a tiny, overly-rounded
+            // image before the thumbnail appeared.
+            val thumbnailCornerRadiusPx = with(density) {
+                sourceCornerRadius.toPx() * (1f - transition).coerceIn(0f, 1f)
             }
+            val scrimCornerRadiusPx = thumbnailCornerRadiusPx.coerceAtMost(
+                minOf(morphWidth, morphHeight).coerceAtLeast(0f) / 2f,
+            )
+            val morphCornerRadiusPx = (thumbnailCornerRadiusPx /
+                uniformScale.coerceAtLeast(0.01f)).coerceAtMost(
+                minOf(morphWidth, morphHeight).coerceAtLeast(0f) /
+                    (2f * uniformScale.coerceAtLeast(0.01f)),
+            )
             when {
                 activeMorph && transitionClosing -> {
                     MorphRevealScrim(
@@ -11258,7 +11553,7 @@ private fun FullscreenImageViewer(
                         morphTop = morphTop,
                         morphRight = morphRight,
                         morphBottom = morphBottom,
-                        cornerRadiusPx = morphCornerRadiusPx,
+                        cornerRadiusPx = scrimCornerRadiusPx,
                         scrimColor = Color.Black.copy(alpha = effectiveBackdropAlpha),
                     )
                 }
@@ -11268,7 +11563,7 @@ private fun FullscreenImageViewer(
                         morphTop = morphTop,
                         morphRight = morphRight,
                         morphBottom = morphBottom,
-                        cornerRadiusPx = morphCornerRadiusPx,
+                        cornerRadiusPx = scrimCornerRadiusPx,
                         scrimColor = Color.Black.copy(alpha = backdropAlpha),
                     )
                 }
@@ -18999,6 +19294,7 @@ private fun MineScreen(
     onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
     onCommentLongClick: (FeedItem) -> Unit = {},
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
+    onAlbumImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
     onMediaClick: (FeedMedia, String) -> Unit,
     onUserClick: ((String) -> Unit)? = null,
     isLongTextLoading: (FeedItem) -> Boolean = { false },
@@ -19038,9 +19334,13 @@ private fun MineScreen(
     var showSettings by remember { mutableStateOf(false) }
     var showAccountManagement by remember { mutableStateOf(false) }
     var avatarViewerOpen by remember { mutableStateOf(false) }
+    var avatarSourceBounds by remember { mutableStateOf<Rect?>(null) }
     val avatarImage = remember(profile?.avatarUrl) { profileAvatarFeedImage(profile?.avatarUrl) }
-    val openAvatarViewer = {
-        if (avatarImage != null) avatarViewerOpen = true
+    val openAvatarViewer: (Rect?) -> Unit = { bounds ->
+        if (avatarImage != null) {
+            avatarSourceBounds = bounds
+            avatarViewerOpen = true
+        }
     }
     val openFollowListForProfile: ((FriendListTab) -> Unit)? = onOpenFollowList?.let { callback ->
         { tab ->
@@ -19054,6 +19354,9 @@ private fun MineScreen(
         pageCount = { MineContentTab.entries.size },
     )
     val coroutineScope = rememberCoroutineScope()
+    val albumAnchorBoundsByKey = remember(albumImages) {
+        mutableStateMapOf<String, Rect>()
+    }
     val captureAlbumViewerOpen: (AlbumViewerState) -> Unit = { state ->
         onOpenAlbumViewer(
             state.copy(
@@ -19322,7 +19625,7 @@ private fun MineScreen(
                                     .clip(CircleShape)
                                     .clickable(
                                         enabled = avatarImage != null,
-                                        onClick = openAvatarViewer,
+                                        onClick = { openAvatarViewer(null) },
                                     ),
                                 contentScale = ContentScale.Crop,
                             )
@@ -19554,10 +19857,28 @@ private fun MineScreen(
                                                 modifier = Modifier
                                                     .padding(horizontal = 12.dp)
                                                     .padding(bottom = 6.dp),
-                                                onImageClick = { groupImages, index ->
+                                                onImageClick = { groupImages, index, sourceBounds ->
+                                                    val observedBounds = groupImages.mapIndexedNotNull { imageIndex, image ->
+                                                        albumAnchorBoundsByKey[image.albumAnchorKey()]?.let {
+                                                            imageIndex to it
+                                                        }
+                                                    }.toMap()
+                                                    val sourceBoundsByIndex = observedBounds + sourceBounds?.let {
+                                                        mapOf(index to it)
+                                                    }.orEmpty()
                                                     captureAlbumViewerOpen(
-                                                        AlbumViewerState(groupImages, index),
+                                                        AlbumViewerState(
+                                                            images = groupImages,
+                                                            initialIndex = index,
+                                                            sourceBoundsByIndex = sourceBoundsByIndex,
+                                                        ),
                                                     )
+                                                },
+                                                onImageAnchorBoundsChanged = { imageKey, bounds ->
+                                                    if (albumAnchorBoundsByKey[imageKey] != bounds) {
+                                                        albumAnchorBoundsByKey[imageKey] = bounds
+                                                    }
+                                                    onAlbumImageAnchorBoundsChanged(imageKey, bounds)
                                                 },
                                                 onVideoClick = onMediaClick,
                                             )
@@ -19614,7 +19935,12 @@ private fun MineScreen(
         FullscreenImageViewer(
             images = listOf(avatarImage),
             initialIndex = 0,
-            onDismiss = { avatarViewerOpen = false },
+            sourceBoundsByIndex = avatarSourceBounds?.let { mapOf(0 to it) }.orEmpty(),
+            animateOpenFromSource = avatarSourceBounds != null,
+            onDismiss = {
+                avatarViewerOpen = false
+                avatarSourceBounds = null
+            },
         )
     }
     }
@@ -21205,6 +21531,7 @@ private fun ProfileCoverBanner(
     val coverImages = remember(coverUrls) { WeiboJsonParser.profileCoverImages(coverUrls) }
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
+    val sourceBoundsByIndex = remember(coverImages) { mutableStateMapOf<Int, Rect>() }
     val pagerState = rememberPagerState(pageCount = { coverImages.size.coerceAtLeast(1) })
 
     Box(modifier) {
@@ -21213,6 +21540,9 @@ private fun ProfileCoverBanner(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .onGloballyPositioned { coordinates ->
+                            sourceBoundsByIndex[0] = coordinates.boundsInRoot()
+                        }
                         .clickable {
                             viewerIndex = 0
                             viewerOpen = true
@@ -21236,6 +21566,9 @@ private fun ProfileCoverBanner(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
+                            .onGloballyPositioned { coordinates ->
+                                sourceBoundsByIndex[page] = coordinates.boundsInRoot()
+                            }
                             .clickable {
                                 viewerIndex = page
                                 viewerOpen = true
@@ -21292,6 +21625,8 @@ private fun ProfileCoverBanner(
         FullscreenImageViewer(
             images = coverImages,
             initialIndex = viewerIndex.coerceIn(0, coverImages.lastIndex),
+            sourceBoundsByIndex = sourceBoundsByIndex.toMap(),
+            animateOpenFromSource = sourceBoundsByIndex.containsKey(viewerIndex),
             onDismiss = { viewerOpen = false },
         )
     }
@@ -21313,13 +21648,14 @@ private fun MineProfileHeader(
     hasLoginCookie: Boolean,
     loadError: String?,
     onOpenSettings: (() -> Unit)?,
-    onAvatarClick: (() -> Unit)? = null,
+    onAvatarClick: ((Rect?) -> Unit)? = null,
     showFollowActions: Boolean = false,
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
     onOpenFollowList: ((FriendListTab) -> Unit)? = null,
 ) {
     val avatarExposeAboveCard = ProfileHeaderAvatarFrameSize / 3f
+    var avatarBounds by remember { mutableStateOf<Rect?>(null) }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         BoxWithConstraints(
@@ -21483,10 +21819,14 @@ private fun MineProfileHeader(
                         .fillMaxSize()
                         .padding(ProfileHeaderAvatarInset)
                         .clip(CircleShape)
+                        .onGloballyPositioned { coordinates ->
+                            // The avatar is partly outside its card; record the actual visible image bounds.
+                            avatarBounds = coordinates.boundsInRoot()
+                        }
                         .clickable(
                             enabled = onAvatarClick != null &&
                                 !profile?.avatarUrl.isNullOrBlank(),
-                            onClick = { onAvatarClick?.invoke() },
+                            onClick = { onAvatarClick?.invoke(avatarBounds) },
                         ),
                     contentScale = ContentScale.Crop,
                 )
@@ -21538,6 +21878,7 @@ private fun VisitedUserProfileContent(
     onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
     onCommentLongClick: (FeedItem) -> Unit,
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
+    onAlbumImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
     onMediaClick: (FeedMedia, String) -> Unit,
     onUserClick: (String) -> Unit,
     isLongTextLoading: (FeedItem) -> Boolean,
@@ -21581,9 +21922,10 @@ private fun VisitedUserProfileContent(
         onSyncEmoticons = onSyncEmoticons,
         onItemClick = onItemClick,
         onRetweetClick = onRetweetClick,
-        onCommentLongClick = onCommentLongClick,
-        onOpenAlbumViewer = onOpenAlbumViewer,
-        onMediaClick = onMediaClick,
+         onCommentLongClick = onCommentLongClick,
+         onOpenAlbumViewer = onOpenAlbumViewer,
+         onAlbumImageAnchorBoundsChanged = onAlbumImageAnchorBoundsChanged,
+         onMediaClick = onMediaClick,
         onUserClick = onUserClick,
         isLongTextLoading = isLongTextLoading,
         onLoadLongText = onLoadLongText,
@@ -22541,7 +22883,8 @@ private fun MineAlbumGridRow(
     rowImages: List<FeedImage>,
     rowStartIndex: Int,
     relatedPosts: List<FeedItem>,
-    onImageClick: (List<FeedImage>, Int) -> Unit,
+    onImageClick: (List<FeedImage>, Int, Rect?) -> Unit,
+    onImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
     onVideoClick: (FeedMedia, String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -22571,7 +22914,10 @@ private fun MineAlbumGridRow(
                         allImages = monthImages,
                         imageIndex = imageIndex,
                         relatedPosts = relatedPosts,
-                        onOpenViewer = { index, _, _, _ -> onImageClick(monthImages, index) },
+                        onOpenViewer = { index, bounds, _, _ -> onImageClick(monthImages, index, bounds) },
+                        onAnchorBoundsChanged = { bounds ->
+                            onImageAnchorBoundsChanged(image.albumAnchorKey(), bounds)
+                        },
                         onVideoClick = onVideoClick,
                     )
                 }
@@ -22588,6 +22934,7 @@ private fun MineAlbumTile(
     imageIndex: Int,
     relatedPosts: List<FeedItem>,
     onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
+    onAnchorBoundsChanged: (Rect) -> Unit = {},
     onVideoClick: (FeedMedia, String) -> Unit,
 ) {
     val imageOwner = remember(image.id, image.largeUrl, relatedPosts) {
@@ -22615,6 +22962,7 @@ private fun MineAlbumTile(
             cornerRadius = 8.dp,
             maxDecodeDimOverride = AlbumGridMaxDecodeDim,
             onOpenViewer = onOpenViewer,
+            onAnchorBoundsChanged = onAnchorBoundsChanged,
         )
     }
 }
