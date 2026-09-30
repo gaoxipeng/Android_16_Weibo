@@ -113,13 +113,7 @@ internal fun BackdropEffectScope.liquidPopupGlassEffects() {
 
 internal fun BackdropEffectScope.liquidRegularMenuGlassEffects() {
     vibrancy()
-    blur(12.dp.toPx())
-    lens(
-        refractionHeight = 3.dp.toPx(),
-        refractionAmount = 50.dp.toPx(),
-        chromaticAberration = true,
-        chromaticAberrationAmount = 0.3f,
-    )
+    blur(32.dp.toPx())
 }
 
 internal val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
@@ -366,6 +360,9 @@ fun TransparentLiquidCapsule(
     pill: Boolean = false,
     cornerRadius: Dp = 22.dp,
     surfaceColor: Color = Color.Unspecified,
+    borderColor: Color = Color.Unspecified,
+    borderWidth: Dp = LiquidMenuBorderWidth,
+    frostedBlurRadius: Dp? = null,
     useLargeCapsuleEffect: Boolean = false,
     usePopupGlassEffect: Boolean = false,
     showShadow: Boolean = true,
@@ -375,7 +372,11 @@ fun TransparentLiquidCapsule(
 ) {
     val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
     val isLightTheme = isAppLightTheme()
-    val borderColor = liquidMenuBorderColor(isLightTheme)
+    val resolvedBorderColor = if (borderColor.isSpecified) {
+        borderColor
+    } else {
+        liquidMenuBorderColor(isLightTheme)
+    }
     Box(
         modifier
             .graphicsLayer { clip = false }
@@ -383,7 +384,9 @@ fun TransparentLiquidCapsule(
                 backdrop = backdrop,
                 shape = { shape },
                 effects = {
-                    if (usePopupGlassEffect) {
+                    if (frostedBlurRadius != null) {
+                        blur(frostedBlurRadius.toPx(), TileMode.Decal)
+                    } else if (usePopupGlassEffect) {
                         liquidPopupGlassEffects()
                     } else if (useLargeCapsuleEffect) {
                         liquidLargeCapsuleGlassEffects(
@@ -396,8 +399,12 @@ fun TransparentLiquidCapsule(
                         blur(LiquidGlassBlurRadius.toPx(), TileMode.Decal)
                     }
                 },
-                highlight = if (useLargeCapsuleEffect || usePopupGlassEffect) ({ Highlight.Default }) else null,
-                shadow = if (useLargeCapsuleEffect && showShadow && !usePopupGlassEffect) {
+                highlight = when {
+                    frostedBlurRadius != null -> ({ Highlight.Default.copy(alpha = 0.2f) })
+                    useLargeCapsuleEffect || usePopupGlassEffect -> ({ Highlight.Default })
+                    else -> null
+                },
+                shadow = if (useLargeCapsuleEffect && showShadow && !usePopupGlassEffect && frostedBlurRadius == null) {
                     { Shadow.Default }
                 } else {
                     null
@@ -410,7 +417,7 @@ fun TransparentLiquidCapsule(
                     )
                 },
             )
-            .border(LiquidMenuBorderWidth, borderColor, shape),
+            .border(borderWidth, resolvedBorderColor, shape),
         content = content,
     )
 }
@@ -508,6 +515,9 @@ fun TransparentLiquidIconButton(
     onDoubleClick: (() -> Unit)? = null,
     isInteractive: Boolean = true,
     inputEnabled: Boolean = true,
+    useLargeCapsuleEffect: Boolean = false,
+    largeCapsuleRefractionHeight: Dp = 24.dp,
+    largeCapsuleRefractionAmount: Dp = 40.dp,
     content: @Composable RowScope.() -> Unit,
 ) {
     LiquidButton(
@@ -517,6 +527,9 @@ fun TransparentLiquidIconButton(
         onDoubleClick = onDoubleClick,
         isInteractive = isInteractive,
         inputEnabled = inputEnabled,
+        useLargeCapsuleEffect = useLargeCapsuleEffect,
+        largeCapsuleRefractionHeight = largeCapsuleRefractionHeight,
+        largeCapsuleRefractionAmount = largeCapsuleRefractionAmount,
         showEdgeEffects = false,
         showMenuBorder = true,
         content = content,

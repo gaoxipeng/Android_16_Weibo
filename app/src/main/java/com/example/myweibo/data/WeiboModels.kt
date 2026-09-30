@@ -31,6 +31,7 @@ data class FeedItem(
     val commentsCount: String,
     val likesCount: String,
     val liked: Boolean = false,
+    val favorited: Boolean = false,
     val images: List<FeedImage>,
     val medias: List<FeedMedia> = emptyList(),
     /** 转发评论等正文短链配图，展示为蓝色「查看图片」 */
@@ -292,6 +293,8 @@ data class UserProfile(
 enum class TimelineKind(val label: String) {
     Following("\u6700\u65B0\u5FAE\u535A"),
     FriendsCircle("\u597D\u53CB\u5708"),
+    Favorites("\u6211\u7684\u6536\u85CF"),
+    Liked("\u6211\u7684\u8D5E"),
 }
 
 data class WeiboEmoticon(

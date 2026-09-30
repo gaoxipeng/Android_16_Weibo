@@ -109,7 +109,7 @@ internal fun WeiboLiquidBottomBar(
                             WeiboTabIcon(tab = tab, color = tabColor, size = 22.dp)
                         }
                         Text(
-                            text = tab.label,
+                            text = if (tab == MainTab.Feed) selectedTimelineKind.label else tab.label,
                             color = tabColor,
                             fontSize = 10.sp,
                             lineHeight = 12.sp,

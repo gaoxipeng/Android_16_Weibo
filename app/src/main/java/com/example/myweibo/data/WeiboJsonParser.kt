@@ -45,6 +45,31 @@ object WeiboJsonParser {
         )
     }
 
+    fun parsePersonalFeed(raw: String, page: Int): TimelinePage {
+        val root = JSONObject(raw)
+        val data = root.optJSONObject("data")
+        val statuses = root.optJSONArray("statuses")
+            ?: data?.optJSONArray("statuses")
+            ?: data?.optJSONArray("list")
+            ?: data?.optJSONArray("favorites")
+            ?: root.optJSONArray("list")
+            ?: root.optJSONArray("data")
+            ?: JSONArray()
+        val items = buildList {
+            for (index in 0 until statuses.length()) {
+                val entry = statuses.optJSONObject(index) ?: continue
+                val status = entry.optJSONObject("mblog")
+                    ?: entry.optJSONObject("status")
+                    ?: entry.optJSONObject("weibo")
+                    ?: entry
+                if (status.looksLikeAd()) continue
+                parseStatus(status, allowRetweeted = true)?.let(::add)
+            }
+        }
+        val more = data?.optBoolean("has_more", false) == true || items.isNotEmpty()
+        return TimelinePage(items, (page + 1).toString().takeIf { more })
+    }
+
     fun parseStatusDetail(raw: String): FeedItem? {
         val root = JSONObject(raw)
         val status = unwrapStatusDetailPayload(root) ?: return null
@@ -1361,6 +1386,7 @@ object WeiboJsonParser {
             commentsCount = formatCount(status.opt("comments_count")),
             likesCount = formatCount(status.opt("attitudes_count")),
             liked = status.parseAttitudesStatus(),
+            favorited = status.optBoolean("favorited", status.optBoolean("is_favorite", false)),
             images = images,
             medias = resolvedMedias,
             inlineImageLinks = inlineImageLinks,

@@ -34,6 +34,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateBounds
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.fadeIn
@@ -102,6 +103,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -199,6 +201,10 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.haze
+import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
@@ -235,6 +241,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.LookaheadScope
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.boundsInRoot
@@ -289,6 +297,7 @@ import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
@@ -303,6 +312,7 @@ import com.example.myweibo.data.AlbumPage
 import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
+import com.example.myweibo.data.FeedDisplaySettingsStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.MentionSuggestionCacheStore
 import com.example.myweibo.data.SearchHistoryStore
@@ -1949,7 +1959,7 @@ private class ImageSaveHintController {
     fun showProgress(current: Int, total: Int) {
         activeHint = AppCapsuleHintState(
             message = "正在保存 $current/$total",
-            tone = CapsuleHintTone.Progress,
+            tone = CapsuleHintTone.Theme,
             autoDismissMillis = null,
             progress = if (total > 0) current.toFloat() / total.toFloat() else null,
         )
@@ -1963,7 +1973,7 @@ private class ImageSaveHintController {
         }
         activeHint = AppCapsuleHintState(
             message = message,
-            tone = CapsuleHintTone.Progress,
+            tone = CapsuleHintTone.Theme,
             autoDismissMillis = null,
             progress = if (progress.total > 0) {
                 progress.completed.toFloat() / progress.total.toFloat()
@@ -1976,7 +1986,7 @@ private class ImageSaveHintController {
     fun showVideoProgress(progress: Float?) {
         activeHint = AppCapsuleHintState(
             message = "正在保存视频",
-            tone = CapsuleHintTone.Progress,
+            tone = CapsuleHintTone.Theme,
             autoDismissMillis = null,
             progress = progress,
         )
@@ -1985,7 +1995,7 @@ private class ImageSaveHintController {
     fun showSuccess(message: String) {
         activeHint = AppCapsuleHintState(
             message = message,
-            tone = CapsuleHintTone.Success,
+            tone = CapsuleHintTone.Theme,
             autoDismissMillis = 2400L,
         )
     }
@@ -1993,7 +2003,7 @@ private class ImageSaveHintController {
     fun showFailure(message: String) {
         activeHint = AppCapsuleHintState(
             message = message,
-            tone = CapsuleHintTone.Neutral,
+            tone = CapsuleHintTone.Theme,
             autoDismissMillis = 2800L,
         )
     }
@@ -3218,6 +3228,7 @@ fun WeiboApp() {
     val mentionSuggestionCacheStore = remember { MentionSuggestionCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
+    val feedDisplaySettingsStore = remember { FeedDisplaySettingsStore(context) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val searchHistoryStore = remember { SearchHistoryStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
@@ -3259,13 +3270,19 @@ fun WeiboApp() {
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
     var bottomBarVisible by remember { mutableStateOf(true) }
+    var hideBottomBarOnFeedScroll by remember {
+        mutableStateOf(feedDisplaySettingsStore.readHideBottomBarOnScroll())
+    }
+    var suppressNextBottomBarAutoShow by remember { mutableStateOf(false) }
     // Gesture accumulation is not UI state. Making every pixel a mutableFloatState write
     // invalidates the WeiboApp root composition throughout a drag/fling.
     val bottomBarScrollDistance = remember { floatArrayOf(0f) }
-    val bottomBarScrollConnection = remember(selectedTab) {
+    val bottomBarScrollConnection = remember(selectedTab, hideBottomBarOnFeedScroll) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (selectedTab == MainTab.Search) {
+                if (selectedTab == MainTab.Search ||
+                    ((selectedTab == MainTab.Feed || selectedTab == MainTab.Mine) && !hideBottomBarOnFeedScroll)
+                ) {
                     bottomBarVisible = true
                     bottomBarScrollDistance[0] = 0f
                     return Offset.Zero
@@ -3298,6 +3315,7 @@ fun WeiboApp() {
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
+    var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -3374,6 +3392,7 @@ fun WeiboApp() {
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var cacheLoaded by remember { mutableStateOf(false) }
+    var feedCacheLoaded by remember { mutableStateOf(false) }
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
     var feedInitialScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
     var feedInitialScrollReconciled by remember { mutableStateOf(false) }
@@ -3999,6 +4018,12 @@ fun WeiboApp() {
         flushDeferredNavRestore()
     }
 
+    fun finishVisitedProfileExit() {
+        clearVisitedProfileState()
+        navExitPendingKind = null
+        flushDeferredNavRestore()
+    }
+
     fun applyNavRestoreState(state: NavRestoreState) {
         selectedTab = state.selectedTab
         bottomBarVisible = state.bottomBarVisible
@@ -4040,6 +4065,8 @@ fun WeiboApp() {
                 )
             }
         }
+        // Keep the existing feed composition alive beneath the profile. Re-keying it here
+        // clears its first layout while the profile exits, which briefly reveals a white page.
         navStack = navStack.dropLast(1)
         navOverlayStack = navOverlayStack.dropLast(1)
         if (exitingKind == NavOverlayKind.AlbumViewer) {
@@ -4282,6 +4309,21 @@ fun WeiboApp() {
         if (videoPlaybackCoordinator.activeKey != null) {
             videoPlaybackCoordinator.pauseAll()
             videoPlaybackCoordinator.activeKey = null
+        }
+        if (navOverlayStack.lastOrNull() == NavOverlayKind.VisitedProfile(visitedUserId.orEmpty())) {
+            // A profile opened from the feed is a visual page layered over the feed, not a
+            // replacement for it. Keep the exact feed state/composition intact while the
+            // profile slides away; do not run generic state restoration or scroll commands.
+            bottomBarVisible = navStack.lastOrNull()?.bottomBarVisible ?: bottomBarVisible
+            bottomBarScrollDistance[0] = 0f
+            suppressNextBottomBarAutoShow = true
+            navExitPendingKind = navOverlayStack.lastOrNull()
+            navEnterPendingKind = null
+            navOverlayStack = navOverlayStack.dropLast(1)
+            navStack = navStack.dropLast(1)
+            pendingDeferredNavRestore = null
+            deferredNavRestoreGeneration++
+            return
         }
         navigateBack()
     }
@@ -4547,11 +4589,15 @@ fun WeiboApp() {
             }
             try {
                 runCatchingPreservingCancellation {
-                    val raw = session.loadTimelineRaw(requestedKind)
-                    if (requestedKind == TimelineKind.Following) {
-                        timelineCacheStore.writeFollowingTimeline(raw)
+                    if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                        val raw = session.loadTimelineRaw(requestedKind)
+                        if (requestedKind == TimelineKind.Following) {
+                            timelineCacheStore.writeFollowingTimeline(raw)
+                        }
+                        WeiboJsonParser.parseTimeline(raw)
+                    } else {
+                        session.loadTimeline(requestedKind)
                     }
-                    WeiboJsonParser.parseTimeline(raw)
                 }
                     .onSuccess { page ->
                         if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
@@ -4609,11 +4655,15 @@ fun WeiboApp() {
             isLoading = true
             hasLoginCookie = session.hasLoginCookie()
             runCatching {
-                val raw = session.loadTimelineRaw(timelineKind)
-                if (timelineKind == TimelineKind.Following) {
-                    timelineCacheStore.writeFollowingTimeline(raw)
+                if (timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle) {
+                    val raw = session.loadTimelineRaw(timelineKind)
+                    if (timelineKind == TimelineKind.Following) {
+                        timelineCacheStore.writeFollowingTimeline(raw)
+                    }
+                    WeiboJsonParser.parseTimeline(raw)
+                } else {
+                    session.loadTimeline(timelineKind)
                 }
-                WeiboJsonParser.parseTimeline(raw)
             }
                 .onSuccess { page ->
                     items = sortFeedTimelineItems(page.items)
@@ -5845,6 +5895,25 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(Unit) {
+        // Restore the home timeline before session/account/profile caches. Those reads can be
+        // slower, but the persisted feed should be visible as soon as its own cache is ready.
+        timelineCacheStore.readFollowingTimeline()?.let { page ->
+            items = sortFeedTimelineItems(page.items)
+            nextCursor = page.nextCursor
+            if (page.items.isNotEmpty()) {
+                feedInitialScrollTarget = ScrollRestore(
+                    initialFollowingScroll.first,
+                    initialFollowingScroll.second,
+                )
+            }
+            absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
+        }
+        if (feedInitialScrollTarget == null) {
+            feedInitialScrollTarget = ScrollRestore(0, 0)
+        }
+        feedScrollRestoreApplied = true
+        feedCacheLoaded = true
+
         val savedActiveId = accountStore.readActiveAccountId()
         if (session.hasLoginCookie()) {
             // Keep WebView's potentially newer, server-refreshed session. Restoring the
@@ -5858,17 +5927,6 @@ fun WeiboApp() {
 
         emoticonMap = emoticonCacheStore.read()
         recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in emoticonMap }
-        timelineCacheStore.readFollowingTimeline()?.let { page ->
-            items = sortFeedTimelineItems(page.items)
-            nextCursor = page.nextCursor
-            if (page.items.isNotEmpty()) {
-                feedInitialScrollTarget = ScrollRestore(
-                    initialFollowingScroll.first,
-                    initialFollowingScroll.second,
-                )
-            }
-            absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
-        }
         mineCacheStore.readProfile()?.let { profile ->
             mineProfile = profile
             mineProfileError = null
@@ -5904,8 +5962,25 @@ fun WeiboApp() {
         }
     }
 
-    LaunchedEffect(cacheLoaded, items.size, feedInitialScrollTarget) {
-        if (!cacheLoaded || items.isEmpty() || feedInitialScrollReconciled) return@LaunchedEffect
+    fun toggleStatusFavorite(item: FeedItem, favorite: Boolean) {
+        val id = item.id.trim().takeIf { it.isNotBlank() && it != "0" }
+            ?: item.statusId.trim().takeIf { it.isNotBlank() && it != "0" }
+            ?: return
+        val key = item.actionMenuKey()
+        val previous = favoriteOverrides[key] ?: item.favorited
+        if (previous == favorite) return
+        favoriteOverrides = favoriteOverrides + (key to favorite)
+        scope.launch {
+            runCatching { session.setStatusFavorite(id, favorite) }
+                .onFailure { error ->
+                    favoriteOverrides = favoriteOverrides + (key to previous)
+                    showMessage(if (favorite) "收藏失败" else "取消收藏失败", error.message ?: "请稍后重试")
+                }
+        }
+    }
+
+    LaunchedEffect(feedCacheLoaded, items.size, feedInitialScrollTarget) {
+        if (!feedCacheLoaded || items.isEmpty() || feedInitialScrollReconciled) return@LaunchedEffect
         val target = feedInitialScrollTarget ?: return@LaunchedEffect
         withFrameNanos { }
         val safeIndex = target.index.coerceIn(0, items.lastIndex)
@@ -6048,11 +6123,14 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(selectedTab, visitedUserId, selectedItem) {
+        val suppressAutoShow = suppressNextBottomBarAutoShow
+        suppressNextBottomBarAutoShow = false
         if (selectedItem == null &&
             visitedUserId == null &&
             selectedTab != MainTab.Messages &&
             selectedTab != MainTab.Compose &&
-            navExitPendingKind == null
+            navExitPendingKind == null &&
+            !suppressAutoShow
         ) {
             bottomBarVisible = true
         }
@@ -6109,7 +6187,9 @@ fun WeiboApp() {
                         mediaPreview == null &&
                         articleOverlay == null &&
                         followListOverlay == null &&
-                        albumViewerState == null
+                        albumViewerState == null &&
+                        navExitPendingKind == null &&
+                        navStack.isEmpty()
                     if (homeIsForeground &&
                         videoPlaybackCoordinator.activeKey == null &&
                         videoPeekController.activeRequest == null
@@ -6374,6 +6454,11 @@ fun WeiboApp() {
                 ?: (navExitPendingKind as? NavOverlayKind.Detail)
             val profileLayerActive = navOverlayStack.any { it is NavOverlayKind.VisitedProfile } && visitedUserId != null
             val visitedProfileVisible = overlayTop == OverlayTop.VisitedProfile && profileLayerActive
+            val profileIsExiting = navExitPendingKind is NavOverlayKind.VisitedProfile
+            val visitedProfileNavKind = visitedUserId
+                ?.takeIf { profileLayerActive }
+                ?.let { NavOverlayKind.VisitedProfile(it) }
+                ?: (navExitPendingKind as? NavOverlayKind.VisitedProfile)
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
                 followListOverlay != null
             val followListUiOnTop = overlayTop == OverlayTop.FollowList && followListLayerActive
@@ -6569,7 +6654,7 @@ fun WeiboApp() {
                                 listState = feedListState,
                                 items = items,
                                 isLoading = isLoading,
-                                cacheLoaded = cacheLoaded,
+                                cacheLoaded = feedCacheLoaded,
                                 hasLoginCookie = hasLoginCookie,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
@@ -6691,16 +6776,16 @@ fun WeiboApp() {
                     target = visitedProfileNavTarget,
                     modifier = Modifier
                         .fillMaxSize()
-                        .blockHiddenTouches(visitedProfileVisible),
+                        .blockHiddenTouches(visitedProfileVisible && !profileIsExiting),
                     stackTop = visitedProfileVisible,
                     layerBaseZIndex = 540f,
                     visible = visitedProfileVisible,
                     animationKey = visitedProfileLoadGeneration,
-                    navKind = visitedProfileNavTarget?.let { NavOverlayKind.VisitedProfile(it) },
+                    navKind = visitedProfileNavKind,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     onClearPendingEnter = { navEnterPendingKind = null },
-                    onClearPendingExit = ::clearNavExitPendingKind,
+                    onClearPendingExit = ::finishVisitedProfileExit,
                 ) { uid ->
                     key(uid) {
                         Box(Modifier.fillMaxSize()) {
@@ -6778,6 +6863,7 @@ fun WeiboApp() {
                     },
                     modifier = Modifier
                         .fillMaxSize()
+                        .nestedScroll(bottomBarScrollConnection)
                         .blockHiddenTouches(mineUiOnTop),
                     stackTop = mineUiOnTop,
                     visible = mineUiOnTop,
@@ -6790,6 +6876,10 @@ fun WeiboApp() {
                     }
                     MineScreen(
                                 session = session,
+                                onSettingsOpened = {
+                                    bottomBarVisible = false
+                                    bottomBarScrollDistance[0] = 0f
+                                },
                                 profile = mineProfile,
                                 profileHeaderHeight = profileHeaderHeights["mine-self"] ?: 0.dp,
                                 onProfileHeaderHeightChange = { height ->
@@ -6856,6 +6946,15 @@ fun WeiboApp() {
                                 onBackgroundPlaybackChange = { enabled ->
                                     backgroundPlaybackEnabled = enabled
                                     playbackSettingsStore.writeBackgroundPlaybackEnabled(enabled)
+                                },
+                                hideBottomBarOnFeedScroll = hideBottomBarOnFeedScroll,
+                                onHideBottomBarOnFeedScrollChange = { enabled ->
+                                    hideBottomBarOnFeedScroll = enabled
+                                    feedDisplaySettingsStore.writeHideBottomBarOnScroll(enabled)
+                                    if (!enabled) {
+                                        bottomBarVisible = true
+                                        bottomBarScrollDistance[0] = 0f
+                                    }
                                 },
                                 feedThumbnailQuality = feedThumbnailQuality,
                                 onFeedThumbnailQualityChange = { quality ->
@@ -7030,7 +7129,7 @@ fun WeiboApp() {
 
                 likeUsersOverlay?.let { overlay ->
                     val overlayItem = resolveFeedItem(overlay.item)
-                    Box(Modifier.fillMaxSize().zIndex(580f)) {
+                    Box(Modifier.fillMaxSize().zIndex(610f)) {
                         LikeUsersOverlay(
                             item = overlayItem,
                             anchorBounds = overlay.anchorBounds,
@@ -7054,54 +7153,62 @@ fun WeiboApp() {
             HiddenSessionWebView(session)
             }
 
-            if (searchBarOverlay.active) {
-                val suggestionReserve = if (searchBarOverlay.suggestionsVisible) {
-                    SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
-                } else {
-                    0.dp
-                }
-                val searchFieldHeight = 44.dp
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .height(searchBarOverlay.bottomPadding + searchFieldHeight + suggestionReserve)
-                        .zIndex(84f),
-                )
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .zIndex(85f)
-                        .padding(
-                            start = 18.dp,
-                            end = 18.dp,
-                            bottom = searchBarOverlay.bottomPadding,
-                        ),
-                ) {
-                    SearchSuggestionPanel(
-                        suggestions = searchBarOverlay.suggestions,
-                        visible = searchBarOverlay.suggestionsVisible,
-                        loading = searchBarOverlay.suggestionsLoading,
-                        onSuggestionClick = searchBarOverlay.onSuggestionClick,
-                        onUserClick = searchBarOverlay.onSuggestionUserClick,
+            }
+            }
+            // Keep the search glass outside the layerBackdrop it samples. If it is inside
+            // bottomBarBackdrop's captured subtree, it samples itself and can stall RenderThread.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+            ) {
+                if (searchBarOverlay.active) {
+                    val suggestionReserve = if (searchBarOverlay.suggestionsVisible) {
+                        SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
+                    } else {
+                        0.dp
+                    }
+                    val searchFieldHeight = 44.dp
+                    Box(
                         modifier = Modifier
+                            .align(Alignment.BottomCenter)
                             .fillMaxWidth()
-                            .padding(bottom = SearchBarCompanionGap),
+                            .height(searchBarOverlay.bottomPadding + searchFieldHeight + suggestionReserve)
+                            .zIndex(84f),
                     )
-                    SearchCapsuleField(
-                        value = searchBarOverlay.queryInput,
-                        onValueChange = searchBarOverlay.onQueryInputChange,
-                        mode = searchBarOverlay.mode,
-                        onModeChange = searchBarOverlay.onModeChange,
-                        onSearch = searchBarOverlay.onSearch,
-                        onClear = searchBarOverlay.onClear,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .zIndex(85f)
+                            .padding(
+                                start = 18.dp,
+                                end = 18.dp,
+                                bottom = searchBarOverlay.bottomPadding,
+                            ),
+                    ) {
+                        SearchSuggestionPanel(
+                            suggestions = searchBarOverlay.suggestions,
+                            visible = searchBarOverlay.suggestionsVisible,
+                            loading = searchBarOverlay.suggestionsLoading,
+                            onSuggestionClick = searchBarOverlay.onSuggestionClick,
+                            onUserClick = searchBarOverlay.onSuggestionUserClick,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = SearchBarCompanionGap),
+                        )
+                        SearchCapsuleField(
+                            value = searchBarOverlay.queryInput,
+                            onValueChange = searchBarOverlay.onQueryInputChange,
+                            mode = searchBarOverlay.mode,
+                            onModeChange = searchBarOverlay.onModeChange,
+                            onSearch = searchBarOverlay.onSearch,
+                            onClear = searchBarOverlay.onClear,
+                            backdrop = menuGlassBackdrop,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
-            }
-
-            }
             }
             Box(Modifier.fillMaxSize()) {
             val feedCapsuleHint = if (
@@ -7147,7 +7254,7 @@ fun WeiboApp() {
                 }
             }
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail
-            val bottomBarNavVisible = visitedUserId == null &&
+            val bottomBarNavVisible = (visitedUserId == null || profileIsExiting) &&
                 (selectedItem == null || detailExiting)
             if (selectedItem == null && visitedUserId == null) {
                 if (timelineMenuExpanded) {
@@ -7163,10 +7270,10 @@ fun WeiboApp() {
                     )
                 }
             }
-            val timelineMenuLabels = remember {
-                listOf(TimelineKind.Following.label, TimelineKind.FriendsCircle.label)
-            }
+            val timelineMenuKinds = remember { listOf(TimelineKind.Following, TimelineKind.FriendsCircle, TimelineKind.Favorites, TimelineKind.Liked) }
+            val timelineMenuLabels = remember { timelineMenuKinds.map(TimelineKind::label) }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
+            val timelineMenuHeight = ActionMenuFourRowHeight
             AnimatedVisibility(
                 visible = bottomBarNavVisible && bottomBarVisible,
                 enter = slideInVertically(tween(200)) { it },
@@ -7220,35 +7327,26 @@ fun WeiboApp() {
                     timelineMenuContent = { dismiss ->
                         ImageActionFrostedCard(
                             modifier = Modifier.width(timelineMenuWidth),
-                            menuHeight = ActionMenuTwoRowHeight,
+                            menuHeight = timelineMenuHeight,
                         ) {
-                            ImageActionRow(
-                                label = TimelineKind.Following.label,
-                                enabled = true,
-                                selected = timelineKind == TimelineKind.Following,
-                                onClick = {
-                                    dismiss()
-                                    dismissFollowListForTabSwitch()
-                                    selectedTab = MainTab.Feed
-                                    switchTimelineKind(TimelineKind.Following)
-                                },
-                            )
-                            ImageActionRow(
-                                label = TimelineKind.FriendsCircle.label,
-                                enabled = true,
-                                selected = timelineKind == TimelineKind.FriendsCircle,
-                                separatorBefore = true,
-                                onClick = {
-                                    dismiss()
-                                    dismissFollowListForTabSwitch()
-                                    selectedTab = MainTab.Feed
-                                    switchTimelineKind(TimelineKind.FriendsCircle)
-                                },
-                            )
+                            timelineMenuKinds.forEachIndexed { index, kind ->
+                                ImageActionRow(
+                                    label = kind.label,
+                                    enabled = true,
+                                    selected = timelineKind == kind,
+                                    separatorBefore = index > 0,
+                                    onClick = {
+                                        dismiss()
+                                        dismissFollowListForTabSwitch()
+                                        selectedTab = MainTab.Feed
+                                        switchTimelineKind(kind)
+                                    },
+                                )
+                            }
                         }
                     },
                     timelineMenuWidth = timelineMenuWidth,
-                    timelineMenuHeight = ActionMenuTwoRowHeight,
+                    timelineMenuHeight = timelineMenuHeight,
                 )
             }
 
@@ -7263,6 +7361,8 @@ fun WeiboApp() {
                 backdrop = menuGlassBackdrop,
                 currentUserId = mineProfile?.id ?: activeAccountId,
                 deletingStatusId = deletingStatusId,
+                favoriteOverrides = favoriteOverrides,
+                onToggleFavorite = ::toggleStatusFavorite,
                 onDelete = { item, anchor ->
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
@@ -7595,15 +7695,16 @@ private fun FeedRefreshCapsuleHint(
                 fontWeight = FontWeight.SemiBold,
                 color = textColor,
             )
-            if (tone == CapsuleHintTone.Progress) {
+            if (tone == CapsuleHintTone.Progress || (tone == CapsuleHintTone.Theme && autoDismissMillis == null)) {
                 Spacer(modifier = Modifier.height(8.dp))
-                val trackColor = HintCapsuleProgressText.copy(alpha = 0.18f)
+                val progressColor = if (tone == CapsuleHintTone.Theme) textColor else HintCapsuleProgressText
+                val trackColor = progressColor.copy(alpha = 0.22f)
                 HintProgressBar(
                     progress = progress,
                     modifier = Modifier
                         .width(132.dp)
                         .height(3.dp),
-                    color = HintCapsuleProgressText,
+                    color = progressColor,
                     trackColor = trackColor,
                 )
             }
@@ -7816,16 +7917,7 @@ private fun FollowFeedScreen(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = topInset + 12.dp, bottom = 24.dp),
         ) {
-            if (items.isEmpty() && isLoading) {
-                item(key = "feed-loading") {
-                    Box(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                }
-            } else if (items.isEmpty()) {
+            if (items.isEmpty() && !isLoading) {
                 item(key = "feed-empty") {
                     EmptyState(
                         title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
@@ -7864,6 +7956,7 @@ private fun FollowFeedScreen(
                     onCommentLongClick = { onCommentLongClick(resolved) },
                     onRepostClick = { onRepostClick(resolved) },
                     menuBackEnabled = feedUiOnTop,
+                    showActionMenu = true,
                 )
             }
 
@@ -8458,6 +8551,7 @@ private fun FeedCard(
     onRepostClick: (() -> Unit)? = null,
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
+    showActionMenu: Boolean = menuBackEnabled,
     insetRounded: Boolean = false,
     compactBottomSpacing: Boolean = false,
 ) {
@@ -8513,7 +8607,7 @@ private fun FeedCard(
                             )
                         }
                     }
-                    if (menuBackEnabled) {
+                    if (showActionMenu) {
                         FeedCardActionMenu(
                             item = item,
                             backHandlerEnabled = menuBackEnabled,
@@ -8900,6 +8994,8 @@ private fun FeedCardActionMenuOverlay(
     backdrop: Backdrop,
     currentUserId: String?,
     deletingStatusId: String?,
+    favoriteOverrides: Map<String, Boolean>,
+    onToggleFavorite: (FeedItem, Boolean) -> Unit,
     onDelete: (FeedItem, Rect) -> Unit,
 ) {
     val activeRequest = controller.activeRequest
@@ -8934,14 +9030,17 @@ private fun FeedCardActionMenuOverlay(
     }
 
     val canDelete = !currentUserId.isNullOrBlank() && request.item.authorId == currentUserId
-    val menuLabels = remember(canDelete) {
+    val isFavorited = favoriteOverrides[request.item.actionMenuKey()] ?: request.item.favorited
+    val favoriteLabel = if (isFavorited) "取消收藏" else "收藏"
+    val menuLabels = remember(canDelete, favoriteLabel) {
         buildList {
             add("\u8df3\u8f6c\u5230\u5fae\u535a")
             add("\u5206\u4eab")
+            add(favoriteLabel)
             if (canDelete) add("删除微博")
         }
     }
-    val menuHeight = if (canDelete) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
+    val menuHeight = if (canDelete) ActionMenuFourRowHeight else ActionMenuThreeRowHeight
     val gapFromButton = 6.dp
     val screenMargin = 14.dp
     val anchor = request.anchorBoundsInRoot
@@ -9013,6 +9112,15 @@ private fun FeedCardActionMenuOverlay(
                     onClick = {
                         dismissMenu()
                         WeiboStatusActions.shareLink(context, request.item)
+                    },
+                )
+                ImageActionRow(
+                    label = favoriteLabel,
+                    enabled = deletingStatusId == null,
+                    separatorBefore = true,
+                    onClick = {
+                        dismissMenu()
+                        onToggleFavorite(request.item, !isFavorited)
                     },
                 )
                 if (canDelete) {
@@ -9521,9 +9629,10 @@ private fun FeedImageCell(
 
 }
 
-private val ActionMenuMaxWidth = 220.dp
+private val ActionMenuPreferredWidth = 260.dp
+private val ActionMenuWidthExtra = 24.dp
 private val ActionMenuCornerRadius = 20.dp
-private val ActionMenuBlurRadius = 12.dp
+private val ActionMenuBlurRadius = 16.dp
 private val ActionMenuCardInset = 5.dp
 private val ActionMenuItemGap = 3.dp
 private val ActionMenuCapsuleHeight = 38.dp
@@ -9532,6 +9641,8 @@ private val ActionMenuTwoRowHeight =
     ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 2 + ActionMenuItemGap
 private val ActionMenuThreeRowHeight =
     ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 3 + ActionMenuItemGap * 2
+private val ActionMenuFourRowHeight =
+    ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 4 + ActionMenuItemGap * 3
 
 @Composable
 private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
@@ -9546,7 +9657,7 @@ private fun actionMenuTextStyle(selected: Boolean = false): TextStyle =
 @Composable
 private fun rememberActionMenuWidth(
     labels: List<String>,
-    maxWidth: Dp = ActionMenuMaxWidth,
+    maxWidth: Dp = ActionMenuPreferredWidth,
 ): Dp {
     val textMeasurer = rememberTextMeasurer()
     val style = actionMenuTextStyle()
@@ -9565,7 +9676,7 @@ private fun rememberActionMenuWidth(
         val widthDp = with(density) {
             (maxTextWidthPx.toFloat() + horizontalPadding.toPx()).toDp()
         }
-        minOf(widthDp, maxWidth)
+        minOf(widthDp + ActionMenuWidthExtra, maxWidth)
     }
 }
 
@@ -9573,6 +9684,7 @@ private fun rememberActionMenuWidth(
 private fun ImageActionFrostedCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
+    hazeState: HazeState? = null,
     menuHeight: Dp? = null,
     useBackdrop: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
@@ -9597,32 +9709,62 @@ private fun ImageActionFrostedCard(
                 }
             },
         )
+    } else if (hazeState != null) {
+        val cardShape = RoundedCornerShape(ActionMenuCornerRadius)
+        val isLightTheme = isAppLightTheme()
+        val baseSurface = if (isLightTheme) Color.White else Color(0xFF242424)
+        val tint = if (isLightTheme) Color.White.copy(alpha = 0.2f)
+        else Color.White.copy(alpha = 0.12f)
+        Column(
+            modifier = cardModifier
+                .clip(cardShape)
+                .hazeEffect(
+                    state = hazeState,
+                    style = HazeStyle(
+                        backgroundColor = baseSurface,
+                        tint = HazeTint(tint),
+                        blurRadius = 32.dp,
+                        noiseFactor = 0f,
+                    ),
+                )
+                .border(
+                    width = 0.75.dp,
+                    color = if (isLightTheme) Color.Black.copy(alpha = 0.16f)
+                    else Color.White.copy(alpha = 0.24f),
+                    shape = cardShape,
+                )
+                .padding(PaddingValues(ActionMenuCardInset)),
+            horizontalAlignment = Alignment.Start,
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(ActionMenuItemGap),
+            ) {
+                content()
+            }
+        }
     } else {
         val cardShape = RoundedCornerShape(ActionMenuCornerRadius)
         val isLightTheme = isAppLightTheme()
         val frostedTint = if (isLightTheme) {
-            Color.White.copy(alpha = 0.5f)
+            Color.White.copy(alpha = 0.46f)
         } else {
-            Color(0xFF242424).copy(alpha = 0.5f)
+            Color(0xFF3A3A3A).copy(alpha = 0.5f)
         }
         Column(
             modifier = cardModifier
-                .graphicsLayer {
-                    shape = cardShape
-                    clip = true
-                }
                 .drawBackdrop(
                     backdrop = resolvedBackdrop,
                     shape = { cardShape },
                     effects = { liquidRegularMenuGlassEffects() },
-                    highlight = { Highlight.Plain },
+                    highlight = { Highlight.Default.copy(alpha = 0.38f) },
                     shadow = null,
                     onDrawSurface = { drawRect(frostedTint) },
                 )
                 .border(
                     width = 0.75.dp,
-                    color = if (isLightTheme) Color.Black.copy(alpha = 0.18f)
-                    else Color.White.copy(alpha = 0.28f),
+                    color = if (isLightTheme) Color.Black.copy(alpha = 0.16f)
+                    else Color.White.copy(alpha = 0.24f),
                     shape = cardShape,
                 )
                 .padding(PaddingValues(ActionMenuCardInset)),
@@ -9984,6 +10126,7 @@ private fun ImageActionOverlay(
                 }
             } else {
             val previewMenuBackdrop = rememberLayerBackdrop()
+            val previewHazeState = rememberHazeState()
 
             val screenAspect = maxWidthPx / maxHeightPx.coerceAtLeast(1f)
             val fullscreenImageWidthPx: Float
@@ -10036,7 +10179,12 @@ private fun ImageActionOverlay(
                 menuWidthPx = menuWidthPx,
                 menuHeightPx = menuHeightPx,
             )
-            Box(Modifier.fillMaxSize().layerBackdrop(previewMenuBackdrop)) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .haze(previewHazeState)
+                    .layerBackdrop(previewMenuBackdrop),
+            ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -10116,6 +10264,7 @@ private fun ImageActionOverlay(
                 ImageActionFrostedCard(
                     modifier = Modifier.fillMaxSize(),
                     backdrop = previewMenuBackdrop,
+                    hazeState = previewHazeState,
                 ) {
                     ImageActionRow(
                         label = "保存",
@@ -11320,20 +11469,6 @@ private fun MediaStrip(
                     detailInlinePeekActive = detailInlinePeekActive,
                 )
             }
-            val gridMedias = if (activeInlineMedia != null) {
-                videoMedias.filter { it != activeInlineMedia }
-            } else {
-                videoMedias
-            }
-            val gridColumns = when (gridMedias.size) {
-                1 -> 1
-                2 -> 2
-                3 -> 3
-                4 -> 2
-                else -> 3
-            }
-            val rows = gridMedias.chunked(gridColumns)
-
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (videoMedias.size == 1) {
                     InlineVideoPlayer(
@@ -11346,54 +11481,125 @@ private fun MediaStrip(
                         showVideoTitle = showVideoTitle,
                     )
                 } else {
-                    activeInlineMedia?.let { media ->
-                        InlineVideoPlayer(
-                            media = media,
-                            playbackOwnerId = playbackOwnerId,
-                            onClick = { onMediaClick(media, playbackOwnerId) },
-                            onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
-                            onDetailClick = onDetailClick,
-                            autoFloatingOnScrollAway = autoFloatingOnScrollAway,
-                            showVideoTitle = showVideoTitle,
-                        )
-                    }
-                    if (gridMedias.isNotEmpty()) {
-                        rows.forEachIndexed { _, row ->
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                row.forEach { media ->
-                                    InlineVideoPlayer(
-                                        media = media,
-                                        playbackOwnerId = playbackOwnerId,
-                                        onClick = { onMediaClick(media, playbackOwnerId) },
-                                        onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
-                                        autoFloatingOnScrollAway = autoFloatingOnScrollAway,
-                                        showVideoTitle = showVideoTitle,
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .aspectRatio(1f),
-                                        gridCell = true,
-                                    )
-                                }
-                                repeat(gridColumns - row.size) {
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .aspectRatio(1f)
-                                            .then(
-                                                if (onDetailClick != null) {
-                                                    Modifier.clickable(
-                                                        indication = null,
-                                                        interactionSource = remember { MutableInteractionSource() },
-                                                        onClick = onDetailClick,
+                    LookaheadScope {
+                        val lookahead = this
+                        Layout(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .animateContentSize(
+                                    animationSpec = tween(
+                                        durationMillis = 380,
+                                        easing = FastOutSlowInEasing,
+                                    ),
+                                ),
+                            content = {
+                                videoMedias.forEach { media ->
+                                    val playbackKey = videoPlaybackKey(media, playbackOwnerId)
+                                    val expanded = activeInlineMedia?.let {
+                                        videoPlaybackKey(it, playbackOwnerId) == playbackKey
+                                    } == true
+                                    key(playbackKey) {
+                                        InlineVideoPlayer(
+                                            media = media,
+                                            playbackOwnerId = playbackOwnerId,
+                                            onClick = { onMediaClick(media, playbackOwnerId) },
+                                            onFullscreenRequest = { onMediaClick(media, playbackOwnerId) },
+                                            onDetailClick = if (expanded) onDetailClick else null,
+                                            autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                                            showVideoTitle = showVideoTitle,
+                                            modifier = Modifier.animateBounds(
+                                                lookaheadScope = lookahead,
+                                                boundsTransform = { _, _ ->
+                                                    tween(
+                                                        durationMillis = 380,
+                                                        easing = FastOutSlowInEasing,
                                                     )
-                                                } else {
-                                                    Modifier
                                                 },
                                             ),
+                                            gridCell = !expanded,
+                                        )
+                                    }
+                                }
+                            },
+                            measurePolicy = { measurables, constraints ->
+                                val width = constraints.maxWidth
+                                    .takeIf { it != Constraints.Infinity }
+                                    ?: constraints.minWidth
+                                val activeIndex = activeInlineMedia?.let { active ->
+                                    videoMedias.indexOfFirst {
+                                        videoPlaybackKey(it, playbackOwnerId) ==
+                                            videoPlaybackKey(active, playbackOwnerId)
+                                    }
+                                }?.takeIf { it >= 0 }
+                                val gapPx = 4.dp.roundToPx()
+                                val activeLayout = activeIndex?.let { index ->
+                                    feedVideoFeedLayout(videoMedias[index])
+                                }
+                                val activeHeight = activeLayout?.let { layout ->
+                                    ((width * layout.widthFraction) / layout.aspectRatio)
+                                        .roundToInt()
+                                } ?: 0
+                                val gridCount = videoMedias.size - if (activeIndex != null) 1 else 0
+                                val columns = when (gridCount) {
+                                    1 -> 1
+                                    2 -> 2
+                                    3 -> 3
+                                    4 -> 2
+                                    else -> 3
+                                }.coerceAtLeast(1)
+                                val cellWidth = ((width - gapPx * (columns - 1)) / columns)
+                                    .coerceAtLeast(0)
+                                val gridRows = if (gridCount == 0) 0 else {
+                                    (gridCount + columns - 1) / columns
+                                }
+                                val gridHeight = if (gridRows == 0) 0 else {
+                                    gridRows * cellWidth + (gridRows - 1) * gapPx
+                                }
+                                val totalHeight = activeHeight +
+                                    (if (activeIndex != null && gridCount > 0) gapPx else 0) +
+                                    gridHeight
+                                val layoutWidth = width.coerceAtLeast(constraints.minWidth)
+                                val layoutHeight = totalHeight.coerceAtLeast(constraints.minHeight).let {
+                                    if (constraints.maxHeight == Constraints.Infinity) it
+                                    else it.coerceAtMost(constraints.maxHeight)
+                                }
+                                val placeables = measurables.mapIndexed { index, measurable ->
+                                    val isExpanded = index == activeIndex
+                                    val childWidth = if (isExpanded) width else cellWidth
+                                    val childHeight = if (isExpanded) activeHeight else cellWidth
+                                    measurable.measure(
+                                        Constraints.fixed(
+                                            childWidth.coerceAtLeast(0),
+                                            childHeight.coerceAtLeast(0),
+                                        ),
                                     )
                                 }
-                            }
-                        }
+                                layout(
+                                    layoutWidth,
+                                    layoutHeight,
+                                ) {
+                                    var gridIndex = 0
+                                    placeables.forEachIndexed { index, placeable ->
+                                        if (index == activeIndex) {
+                                            placeable.placeRelative(0, 0)
+                                        } else {
+                                            val row = gridIndex / columns
+                                            val column = gridIndex % columns
+                                            val top = if (activeIndex != null) {
+                                                activeHeight + gapPx + row * (cellWidth + gapPx)
+                                            } else {
+                                                row * (cellWidth + gapPx)
+                                            }
+                                            placeable.placeRelative(
+                                                column * (cellWidth + gapPx),
+                                                top,
+                                            )
+                                            gridIndex++
+                                        }
+                                    }
+                                }
+                            },
+                        )
                     }
                 }
             }
@@ -13182,7 +13388,11 @@ private fun InlineVideoPlayer(
     val playButtonSize = if (gridCell) 44.dp else 65.dp
     val playIconSize = if (gridCell) 36.dp else 60.dp
 
-    Box(modifier = if (gridCell) modifier else Modifier.fillMaxWidth()) {
+    Box(
+        modifier = modifier.then(
+            if (gridCell) Modifier else Modifier.fillMaxWidth(),
+        ),
+    ) {
         Box(
             modifier = Modifier
                 .then(
@@ -13231,27 +13441,22 @@ private fun InlineVideoPlayer(
                         if (pressResult == MediaLongPressResult.Tap) {
                             val tapUptime = down.uptimeMillis
                             val pressWindowOffset = down.position.toWindowPosition(bounds)
-                            if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
-                                // 宫格多视频与信息流一致：先 requestInline 抬升大卡，再由大卡锚定交接。
-                                videoCoordinator.requestInlinePlayback(playbackKey)
-                                return@awaitEachGesture
-                            }
                             val isDoubleTap = lastTapUptimeMs > 0L &&
                                 tapUptime - lastTapUptimeMs <= viewConfiguration.doubleTapTimeoutMillis
                             if (isDoubleTap) {
                                 lastTapUptimeMs = 0L
                                 if (media.isStreamPlayable()) {
-                                    if (!inlinePlaying) {
-                                        if (gridCell || !isDetailInlinePlayback) {
-                                            videoCoordinator.requestInlinePlayback(playbackKey)
-                                        } else {
-                                            openAnchoredInlinePlayback()
-                                        }
-                                    }
+                                    // 双击播放封面/卡片直接进入浮窗；单击仍由播放按钮启动卡片内播放。
+                                    openInlineFloatingPlayback(pressWindowOffset)
                                 } else {
                                     onClick()
                                 }
                             } else {
+                                if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
+                                    // 宫格单击与信息流一致：先 requestInline 抬升大卡，再由大卡锚定交接。
+                                    videoCoordinator.requestInlinePlayback(playbackKey)
+                                    return@awaitEachGesture
+                                }
                                 lastTapUptimeMs = tapUptime
                             }
                         }
@@ -13345,6 +13550,9 @@ private fun InlineVideoPlayer(
                     },
                     backdrop = coverPlayBackdrop,
                     modifier = Modifier.size(playButtonSize),
+                    useLargeCapsuleEffect = true,
+                    largeCapsuleRefractionHeight = 12.dp,
+                    largeCapsuleRefractionAmount = 20.dp,
                 ) {
                     Icon(
                         painter = painterResource(R.drawable.ic_video_play),
@@ -16494,6 +16702,8 @@ private fun ComposeWeiboScreen(
     val toolbarMutedColor = composeWeiboToolbarMutedColor()
     val bottomBarGap = LiquidBottomBarContentGap
     val bottomBarReserve = LiquidBottomBarReserve + bottomBarGap
+    val visibilityPickerBackdrop = rememberLayerBackdrop()
+    val visibilityPickerHazeState = rememberHazeState()
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
     val imeInsetForLayout = maxOf(imeBottom, imeTargetBottom)
@@ -16515,6 +16725,12 @@ private fun ComposeWeiboScreen(
             .statusBarsPadding()
             .padding(bottom = bottomBarClearance),
     ) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .haze(visibilityPickerHazeState)
+                .layerBackdrop(visibilityPickerBackdrop),
+        ) {
         Column(Modifier.fillMaxSize()) {
             Row(
                 modifier = Modifier
@@ -16767,12 +16983,15 @@ private fun ComposeWeiboScreen(
                 )
             }
         }
+        }
 
         displayedVisibilityAnchor?.let { anchor ->
             ComposeVisibilityPickerOverlay(
                 visible = visibilityMenuVisible,
                 selected = visibility,
                 anchorBounds = anchor,
+                backdrop = visibilityPickerBackdrop,
+                hazeState = visibilityPickerHazeState,
                 onDismiss = { visibilityMenuVisible = false },
                 onExitComplete = { visibilityMenuAnchor = null },
                 onSelected = { option ->
@@ -16789,13 +17008,12 @@ private fun ComposeVisibilityPickerOverlay(
     visible: Boolean,
     selected: WeiboPostVisibility,
     anchorBounds: Rect,
+    backdrop: Backdrop,
+    hazeState: HazeState,
     onDismiss: () -> Unit,
     onExitComplete: () -> Unit,
     onSelected: (WeiboPostVisibility) -> Unit,
 ) {
-    // This picker is hosted inside bottomBarBackdrop's capture tree. It must not
-    // sample that same tree or RenderThread recursively captures itself.
-    val backdrop: Backdrop? = null
     val density = LocalDensity.current
     val options = WeiboPostVisibility.entries
     val menuHeight = visibilityMenuHeight(options)
@@ -16871,8 +17089,9 @@ private fun ComposeVisibilityPickerOverlay(
             ImageActionFrostedCard(
                 modifier = Modifier.fillMaxSize(),
                 backdrop = backdrop,
+                hazeState = hazeState,
                 menuHeight = menuHeight,
-                useBackdrop = false,
+                useBackdrop = true,
             ) {
                 options.forEachIndexed { index, option ->
                     VisibilityMenuRow(
@@ -16889,7 +17108,6 @@ private fun ComposeVisibilityPickerOverlay(
 }
 
 private val VisibilityMenuRowTallHeight = 56.dp
-private val VisibilityMenuWidthExtra = 12.dp
 private val VisibilityMenuSubtitleColor = Color(0xFF999999)
 
 @Composable
@@ -16985,9 +17203,9 @@ private fun rememberVisibilityMenuWidth(
             maxOf(titleWidth, subtitleWidth)
         }
         val widthDp = with(density) {
-            (maxTextWidthPx.toFloat() + horizontalPadding.toPx()).toDp() + VisibilityMenuWidthExtra
+            (maxTextWidthPx.toFloat() + horizontalPadding.toPx()).toDp()
         }
-        minOf(widthDp, maxWidth)
+        minOf(widthDp + ActionMenuWidthExtra, maxWidth)
     }
 }
 
@@ -17972,6 +18190,7 @@ private fun SearchCapsuleField(
     onModeChange: (SearchMode) -> Unit,
     onSearch: () -> Unit,
     onClear: () -> Unit,
+    backdrop: Backdrop,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
 ) {
@@ -17982,10 +18201,15 @@ private fun SearchCapsuleField(
         lineHeight = 20.sp,
     )
     val placeholderStyle = fieldTextStyle.copy(color = hintCapsulePlaceholderColor())
-    SurfaceLiquidCapsule(
+    TransparentLiquidCapsule(
         modifier = modifier,
+        backdrop = backdrop,
         pill = true,
-        useMenuGlassStyle = true,
+        surfaceColor = Color.White.copy(alpha = 0.2f),
+        borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
+        else Color.White.copy(alpha = 0.24f),
+        borderWidth = 0.75.dp,
+        frostedBlurRadius = 8.dp,
     ) {
         Row(
             modifier = Modifier
@@ -19448,6 +19672,7 @@ private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
 @Composable
 private fun MineScreen(
     session: WeiboWebSession,
+    onSettingsOpened: () -> Unit = {},
     profile: UserProfile?,
     profileHeaderHeight: Dp,
     onProfileHeaderHeightChange: (Dp) -> Unit,
@@ -19499,6 +19724,8 @@ private fun MineScreen(
     onPendingOpenAccountLoginConsumed: () -> Unit = {},
     backgroundPlaybackEnabled: Boolean = false,
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
+    hideBottomBarOnFeedScroll: Boolean = true,
+    onHideBottomBarOnFeedScrollChange: (Boolean) -> Unit = {},
     feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
     feedLineSpacing: FeedLineSpacing = FeedLineSpacing.Compact,
@@ -19564,6 +19791,7 @@ private fun MineScreen(
         onPendingOpenAccountLoginConsumed()
         coroutineScope.launch {
             onPrepareAddAccount()
+            onSettingsOpened()
             showSettings = true
             showAccountManagement = true
         }
@@ -19634,6 +19862,8 @@ private fun MineScreen(
                 emoticonSyncing = emoticonSyncing,
                 backgroundPlaybackEnabled = backgroundPlaybackEnabled,
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                hideBottomBarOnFeedScroll = hideBottomBarOnFeedScroll,
+                onHideBottomBarOnFeedScrollChange = onHideBottomBarOnFeedScrollChange,
                 feedThumbnailQuality = feedThumbnailQuality,
                 onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
                 feedLineSpacing = feedLineSpacing,
@@ -19824,7 +20054,7 @@ private fun MineScreen(
                                 Text(
                                     text = profile?.screenName
                                         ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
-                                    style = MaterialTheme.typography.titleMedium,
+                                    style = MaterialTheme.typography.bodyMedium,
                                     fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -20101,10 +20331,13 @@ private fun MineScreen(
 
     if (enableSettings) {
         IconButton(
-            onClick = { showSettings = true },
+            onClick = {
+                onSettingsOpened()
+                showSettings = true
+            },
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .padding(top = 32.dp, end = 10.dp)
+                .padding(top = topInset + 4.dp, end = 10.dp)
                 .size(40.dp)
                 .zIndex(4f),
         ) {
@@ -20182,6 +20415,8 @@ private fun SettingsScreen(
     emoticonSyncing: Boolean,
     backgroundPlaybackEnabled: Boolean,
     onBackgroundPlaybackChange: (Boolean) -> Unit,
+    hideBottomBarOnFeedScroll: Boolean,
+    onHideBottomBarOnFeedScrollChange: (Boolean) -> Unit,
     feedThumbnailQuality: FeedThumbnailQuality,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
     feedLineSpacing: FeedLineSpacing,
@@ -20255,6 +20490,12 @@ private fun SettingsScreen(
                         emoticonMap = emoticonMap,
                         emoticonSyncing = emoticonSyncing,
                         onSyncEmoticons = onSyncEmoticons,
+                    )
+                }
+                item {
+                    SettingsFeedDisplayCard(
+                        hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
+                        onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
                     )
                 }
                 item {
@@ -21391,6 +21632,42 @@ private fun SettingsPlaybackCard(
             Switch(
                 checked = backgroundPlaybackEnabled,
                 onCheckedChange = onBackgroundPlaybackChange,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsFeedDisplayCard(
+    hideBottomBarOnScroll: Boolean,
+    onHideBottomBarOnScrollChange: (Boolean) -> Unit,
+) {
+    SettingsPlainCard {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Text(
+                    text = "自动隐藏底栏",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = if (hideBottomBarOnScroll) "滚动时，底栏自动隐藏" else "滚动时，底栏保持显示",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = hideBottomBarOnScroll,
+                onCheckedChange = onHideBottomBarOnScrollChange,
             )
         }
     }

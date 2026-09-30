@@ -80,10 +80,29 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun loadTimeline(kind: TimelineKind, cursor: String? = null): TimelinePage {
-        val raw = loadTimelineRaw(kind, cursor)
+        val raw = when (kind) {
+            TimelineKind.Following, TimelineKind.FriendsCircle -> loadTimelineRaw(kind, cursor)
+            TimelineKind.Favorites, TimelineKind.Liked -> {
+                val uid = loadCurrentUserConfig().optString("uid")
+                    .takeIf { it.isNotBlank() && it != "0" }
+                    ?: throw IllegalStateException("\u672A\u8BFB\u5230\u5F53\u524D\u767B\u5F55\u7528\u6237 UID")
+                val page = cursor?.toIntOrNull() ?: 1
+                val endpoint = if (kind == TimelineKind.Favorites) WeiboEndpoints.FAVORITES else WeiboEndpoints.LIKED_STATUSES
+                val params = if (kind == TimelineKind.Favorites) {
+                    linkedMapOf("uid" to uid, "page" to page.toString())
+                } else {
+                    linkedMapOf("uid" to uid, "relate" to "fans", "page" to page.toString())
+                }
+                fetchJson(endpoint, params, if (kind == TimelineKind.Favorites) "https://weibo.com/fav" else WEIBO_HOME)
+            }
+        }
         // JSON 解析是 CPU 密集操作，移到 Default 避免阻塞主线程。
         return withContext(Dispatchers.Default) {
-            WeiboJsonParser.parseTimeline(raw)
+            if (kind == TimelineKind.Favorites || kind == TimelineKind.Liked) {
+                WeiboJsonParser.parsePersonalFeed(raw, cursor?.toIntOrNull() ?: 1)
+            } else {
+                WeiboJsonParser.parseTimeline(raw)
+            }
         }
     }
 
@@ -440,10 +459,13 @@ class WeiboWebSession(context: Context) {
                     put("max_id", cursor)
                 }
             }
+
+            TimelineKind.Favorites, TimelineKind.Liked -> error("\u8BE5\u9996\u9875\u7C7B\u578B\u4F7F\u7528\u4E2A\u4EBA\u4FE1\u606F\u6D41\u63A5\u53E3")
         }
 
         val referer = when (kind) {
             TimelineKind.FriendsCircle -> "https://weibo.com/mygroups?gid=$FRIENDS_CIRCLE_GID"
+            TimelineKind.Favorites -> "https://weibo.com/fav"
             else -> WEIBO_HOME
         }
         return fetchJson(WeiboEndpoints.timelinePath(kind), params, referer)
@@ -977,6 +999,17 @@ class WeiboWebSession(context: Context) {
         WeiboJsonParser.assertMutationSuccess(raw, "\u53D6\u6D88\u70B9\u8D5E\u5931\u8D25")
     }
 
+    suspend fun setStatusFavorite(statusId: String, favorite: Boolean) {
+        val id = statusId.trim().takeIf { it.isNotBlank() && it != "0" }
+            ?: throw IllegalArgumentException("\u65E0\u6548\u7684\u5FAE\u535A ID")
+        val raw = postJson(
+            path = if (favorite) WeiboEndpoints.STATUS_FAVORITE_CREATE else WeiboEndpoints.STATUS_FAVORITE_DESTROY,
+            json = JSONObject().put("id", id),
+            referer = "https://weibo.com/fav",
+        )
+        WeiboJsonParser.assertMutationSuccess(raw, if (favorite) "\u6536\u85CF\u5931\u8D25" else "\u53D6\u6D88\u6536\u85CF\u5931\u8D25")
+    }
+
     private fun statusLikeReferer(mblogId: String?, likeId: String): String {
         val detailKey = mblogId?.trim()?.takeIf { it.isNotBlank() } ?: likeId
         return "https://weibo.com/detail/$detailKey"
@@ -1120,6 +1153,16 @@ class WeiboWebSession(context: Context) {
         return nativePostForm(path, params, referer)
     }
 
+    suspend fun postJson(
+        path: String,
+        json: JSONObject,
+        referer: String = WEIBO_HOME,
+    ): String {
+        ensureOnWeiboOrigin()
+        waitForWeiboOrigin()
+        return nativePostJson(path, json, referer)
+    }
+
     private suspend fun nativeFetchJson(
         path: String,
         params: Map<String, String>,
@@ -1225,6 +1268,49 @@ class WeiboWebSession(context: Context) {
             }
             responseBody
         }
+
+    private suspend fun nativePostJson(
+        path: String,
+        json: JSONObject,
+        referer: String = WEIBO_HOME,
+    ): String = withContext(Dispatchers.IO) {
+        CookieManager.getInstance().flush()
+        val cookie = mergedCookieHeader(referer)
+        if (!hasAuthenticatedCookie(cookie)) {
+            throw IllegalStateException("未发现微博登录 Cookie，请到账户页登录后回到微博首页")
+        }
+        val connection = (URL("https://weibo.com$path").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 12_000
+            readTimeout = 12_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+            setRequestProperty("Accept", "application/json, text/plain, */*")
+            setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+            setRequestProperty("Referer", referer)
+            setRequestProperty("Origin", "https://weibo.com")
+            setRequestProperty("X-Requested-With", "XMLHttpRequest")
+            setRequestProperty("Cookie", cookie)
+        }
+        extractCookieValue(cookie, "XSRF-TOKEN")?.let { token ->
+            connection.setRequestProperty("X-XSRF-TOKEN", URLDecoder.decode(token, Charsets.UTF_8.name()))
+        }
+        connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(json.toString()) }
+        val status = connection.responseCode
+        syncResponseCookies(connection)
+        val body = if (status in 200..299) {
+            connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } else {
+            val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            throw IllegalStateException("weibo-native-post-failed:$status ${errorBody.take(160)}")
+        }
+        if (body.trimStart().startsWith("<")) {
+            throw IllegalStateException("微博返回了 HTML 页面，可能登录未生效或被跳转 @ $currentUrl")
+        }
+        body
+    }
 
     private data class PreparedUploadImage(
         val mime: String,
