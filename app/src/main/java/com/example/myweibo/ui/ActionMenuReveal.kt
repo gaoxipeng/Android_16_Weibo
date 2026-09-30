@@ -62,7 +62,7 @@ internal fun ActionMenuReveal(
             scale.animateTo(
                 targetValue = 1f,
                 animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioLowBouncy,
+                    dampingRatio = 0.86f,
                     stiffness = Spring.StiffnessMedium,
                 ),
             )
@@ -95,4 +95,4 @@ internal fun ActionMenuReveal(
     }
 }
 
-private const val ActionMenuRevealHiddenScale = 0.02f
+private const val ActionMenuRevealHiddenScale = 0.9f

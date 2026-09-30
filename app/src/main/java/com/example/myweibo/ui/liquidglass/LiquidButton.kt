@@ -66,6 +66,13 @@ internal val LiquidMenuBorderWidth = 0.5.dp
 internal fun liquidMenuBorderColor(isLightTheme: Boolean): Color =
     if (isLightTheme) Color(0x24000000) else Color(0x33FFFFFF)
 
+internal fun liquidLargeCapsuleSurfaceColor(isLightTheme: Boolean): Color =
+    if (isLightTheme) {
+        Color(0xFF8A8A8A).copy(alpha = 0.24f)
+    } else {
+        Color(0xFF555555).copy(alpha = 0.28f)
+    }
+
 internal fun DrawScope.drawLiquidTintedSurface(
     tint: Color,
     surfaceColor: Color,
@@ -84,6 +91,37 @@ internal fun BackdropEffectScope.liquidMenuGlassEffects() {
     lens(12f.dp.toPx(), 24f.dp.toPx())
 }
 
+internal fun BackdropEffectScope.liquidLargeCapsuleGlassEffects(
+    refractionHeight: Dp = 24.dp,
+    refractionAmount: Dp = 40.dp,
+) {
+    vibrancy()
+    lens(refractionHeight.toPx(), refractionAmount.toPx())
+}
+
+internal fun BackdropEffectScope.liquidLongPressCapsuleGlassEffects() {
+    vibrancy()
+    blur(6.dp.toPx())
+    lens(32.dp.toPx(), 48.dp.toPx(), chromaticAberration = true)
+}
+
+internal fun BackdropEffectScope.liquidPopupGlassEffects() {
+    vibrancy()
+    blur(36.dp.toPx())
+    lens(14.dp.toPx(), 22.dp.toPx(), chromaticAberration = true)
+}
+
+internal fun BackdropEffectScope.liquidRegularMenuGlassEffects() {
+    vibrancy()
+    blur(12.dp.toPx())
+    lens(
+        refractionHeight = 3.dp.toPx(),
+        refractionAmount = 50.dp.toPx(),
+        chromaticAberration = true,
+        chromaticAberrationAmount = 0.3f,
+    )
+}
+
 internal val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
 internal val LocalLiquidMenuBackdrop = staticCompositionLocalOf<Backdrop?> { null }
 
@@ -98,6 +136,9 @@ fun LiquidButton(
     surfaceColor: Color = Color.Unspecified,
     onDoubleClick: (() -> Unit)? = null,
     useMenuGlassStyle: Boolean = false,
+    useLargeCapsuleEffect: Boolean = false,
+    largeCapsuleRefractionHeight: Dp = 24.dp,
+    largeCapsuleRefractionAmount: Dp = 40.dp,
     showEdgeEffects: Boolean = true,
     showMenuBorder: Boolean = false,
     content: @Composable RowScope.() -> Unit,
@@ -128,9 +169,11 @@ fun LiquidButton(
     val pillShape = RoundedCornerShape(percent = 50)
     val isLightTheme = isAppLightTheme()
     val menuBorderColor = liquidMenuBorderColor(isLightTheme)
-    val resolvedSurfaceColor =
-        if (surfaceColor.isSpecified) surfaceColor.copy(alpha = 1f)
-        else liquidSurfaceColor(isLightTheme)
+    val resolvedSurfaceColor = when {
+        surfaceColor.isSpecified -> surfaceColor.copy(alpha = 1f)
+        useLargeCapsuleEffect -> liquidLargeCapsuleSurfaceColor(isLightTheme)
+        else -> liquidSurfaceColor(isLightTheme)
+    }
 
     Row(
         modifier
@@ -139,17 +182,24 @@ fun LiquidButton(
                 backdrop = backdrop,
                 shape = { pillShape },
                 effects = {
-                    if (!surfaceColor.isSpecified) {
+                    if (useLargeCapsuleEffect) {
+                        liquidLargeCapsuleGlassEffects(
+                            largeCapsuleRefractionHeight,
+                            largeCapsuleRefractionAmount,
+                        )
+                    } else if (!surfaceColor.isSpecified) {
                         vibrancy()
                         blur(LiquidGlassBlurRadius.toPx())
                         lens(12f.dp.toPx(), 24f.dp.toPx())
                     }
                 },
                 highlight =
-                    if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
+                    if (useLargeCapsuleEffect) ({ Highlight.Default })
+                    else if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
                     else ({ Highlight.Default }),
                 shadow =
-                    if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
+                    if (useLargeCapsuleEffect) ({ Shadow.Default })
+                    else if (surfaceColor.isSpecified || !showEdgeEffects || useMenuGlassStyle) null
                     else ({ Shadow.Default }),
                 layerBlock = if (isInteractive) {
                     {
@@ -179,7 +229,7 @@ fun LiquidButton(
                 onDrawSurface = {
                     when {
                         tint.isSpecified -> drawRect(tint)
-                        surfaceColor.isSpecified -> drawRect(resolvedSurfaceColor)
+                        surfaceColor.isSpecified || useLargeCapsuleEffect -> drawRect(resolvedSurfaceColor)
                     }
                 },
             )
@@ -316,6 +366,11 @@ fun TransparentLiquidCapsule(
     pill: Boolean = false,
     cornerRadius: Dp = 22.dp,
     surfaceColor: Color = Color.Unspecified,
+    useLargeCapsuleEffect: Boolean = false,
+    usePopupGlassEffect: Boolean = false,
+    showShadow: Boolean = true,
+    largeCapsuleRefractionHeight: Dp = 24.dp,
+    largeCapsuleRefractionAmount: Dp = 40.dp,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val shape = if (pill) RoundedCornerShape(percent = 50) else RoundedCornerShape(cornerRadius)
@@ -328,16 +383,31 @@ fun TransparentLiquidCapsule(
                 backdrop = backdrop,
                 shape = { shape },
                 effects = {
-                    vibrancy()
-                    lens(12f.dp.toPx(), 24f.dp.toPx())
-                    blur(LiquidGlassBlurRadius.toPx(), TileMode.Decal)
-                },
-                highlight = null,
-                shadow = null,
-                onDrawSurface = {
-                    if (surfaceColor.isSpecified) {
-                        drawRect(surfaceColor)
+                    if (usePopupGlassEffect) {
+                        liquidPopupGlassEffects()
+                    } else if (useLargeCapsuleEffect) {
+                        liquidLargeCapsuleGlassEffects(
+                            largeCapsuleRefractionHeight,
+                            largeCapsuleRefractionAmount,
+                        )
+                    } else {
+                        vibrancy()
+                        lens(12f.dp.toPx(), 24f.dp.toPx())
+                        blur(LiquidGlassBlurRadius.toPx(), TileMode.Decal)
                     }
+                },
+                highlight = if (useLargeCapsuleEffect || usePopupGlassEffect) ({ Highlight.Default }) else null,
+                shadow = if (useLargeCapsuleEffect && showShadow && !usePopupGlassEffect) {
+                    { Shadow.Default }
+                } else {
+                    null
+                },
+                onDrawSurface = {
+                    drawRect(
+                        if (surfaceColor.isSpecified) surfaceColor
+                        else if (useLargeCapsuleEffect) liquidLargeCapsuleSurfaceColor(isLightTheme)
+                        else Color.Transparent,
+                    )
                 },
             )
             .border(LiquidMenuBorderWidth, borderColor, shape),
@@ -354,12 +424,18 @@ fun TransparentLiquidTextButton(
     enabled: Boolean = true,
     textColor: Color = Color.White,
     style: TextStyle? = null,
+    useLargeCapsuleEffect: Boolean = false,
+    largeCapsuleRefractionHeight: Dp = 24.dp,
+    largeCapsuleRefractionAmount: Dp = 40.dp,
 ) {
     LiquidButton(
         onClick = onClick,
         backdrop = backdrop,
         modifier = modifier,
         isInteractive = enabled,
+        useLargeCapsuleEffect = useLargeCapsuleEffect,
+        largeCapsuleRefractionHeight = largeCapsuleRefractionHeight,
+        largeCapsuleRefractionAmount = largeCapsuleRefractionAmount,
         showEdgeEffects = false,
         showMenuBorder = true,
     ) {

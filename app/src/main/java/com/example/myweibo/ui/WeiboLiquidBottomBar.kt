@@ -19,16 +19,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabPressProgress
+import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabCoverage
 import com.example.myweibo.ui.liquidglass.rememberLiquidBottomTabsGestureController
 import com.kyant.backdrop.Backdrop
 import kotlin.math.roundToInt
@@ -81,16 +87,35 @@ internal fun WeiboLiquidBottomBar(
                 onTabLongPress = { onTimelineMenuExpandedChange(true) },
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                val tabCoverage = LocalLiquidBottomTabCoverage.current
+                val pressProgress = LocalLiquidBottomTabPressProgress.current
                 tabs.forEachIndexed { index, tab ->
+                    val coverage = tabCoverage(index)
+                    val tabColor = lerp(Color.Black, tabContentColor, coverage)
                     LiquidBottomTab(
                         onClick = { onTabChange(tab) },
                     ) {
                         Box(
-                            modifier = Modifier.size(36.dp),
+                            modifier = Modifier
+                                .size(36.dp)
+                                .graphicsLayer {
+                                    val iconScale = 1f + 0.2f * pressProgress * coverage
+                                    transformOrigin = TransformOrigin.Center
+                                    scaleX = iconScale
+                                    scaleY = iconScale
+                                },
                             contentAlignment = Alignment.Center,
                         ) {
-                            WeiboTabIcon(tab = tab, color = tabContentColor, size = 22.dp)
+                            WeiboTabIcon(tab = tab, color = tabColor, size = 22.dp)
                         }
+                        Text(
+                            text = tab.label,
+                            color = tabColor,
+                            fontSize = 10.sp,
+                            lineHeight = 12.sp,
+                            fontWeight = if (coverage > 0.5f) FontWeight.SemiBold else FontWeight.Normal,
+                            maxLines = 1,
+                        )
                     }
                 }
             }

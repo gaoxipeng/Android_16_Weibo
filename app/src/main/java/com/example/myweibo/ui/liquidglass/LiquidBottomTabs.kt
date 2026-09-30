@@ -4,7 +4,6 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOut
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -33,15 +32,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
@@ -49,14 +48,10 @@ import androidx.compose.ui.util.fastRoundToInt
 import androidx.compose.ui.util.lerp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
-import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
-import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
-import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
-import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -85,8 +80,11 @@ fun LiquidBottomTabs(
     content: @Composable RowScope.() -> Unit,
 ) {
     val isLightTheme = isAppLightTheme()
-    val surfaceColor = liquidSurfaceColor(isLightTheme)
-    val tabsBackdrop = rememberLayerBackdrop()
+    val capsuleSurfaceColor = if (isLightTheme) {
+        Color.White.copy(alpha = 0.28f)
+    } else {
+        Color.White.copy(alpha = 0.18f)
+    }
 
     BoxWithConstraints(
         modifier = modifier.graphicsLayer { clip = false },
@@ -282,8 +280,6 @@ fun LiquidBottomTabs(
             }
         }
 
-        val indicatorIndex = dampedDragAnimation.targetValue.fastRoundToInt()
-            .fastCoerceIn(0, tabsCount - 1)
         val interactiveHighlight = remember(animationScope, tabWidth) {
             InteractiveHighlight(
                 animationScope = animationScope,
@@ -319,6 +315,17 @@ fun LiquidBottomTabs(
             label = "liquid-tab-glass-motion",
         )
 
+        val velocity = animatedVelocity / 10f
+        val indicatorScaleX = animatedScaleX /
+            (1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f))
+        val indicatorScaleY = animatedScaleY *
+            (1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f))
+        val visualIndicatorValue = if (isLtr) {
+            animatedIndicatorValue
+        } else {
+            tabsCount - 1f - animatedIndicatorValue
+        }
+
         Box(
             Modifier
                 .graphicsLayer {
@@ -335,10 +342,10 @@ fun LiquidBottomTabs(
                 .drawBackdrop(
                     backdrop = backdrop,
                     shape = { barShape },
-                    effects = { liquidMenuGlassEffects() },
-                    highlight = null,
-                    shadow = null,
-                    onDrawSurface = { drawRect(surfaceColor) },
+                    effects = { liquidLargeCapsuleGlassEffects() },
+                    highlight = { Highlight.Default },
+                    shadow = { Shadow.Default },
+                    onDrawSurface = { drawRect(capsuleSurfaceColor) },
                 )
                 .border(LiquidMenuBorderWidth, barBorderColor, barShape)
                 .height(64.dp)
@@ -350,18 +357,37 @@ fun LiquidBottomTabs(
                 .padding(horizontal = 4.dp)
                 .graphicsLayer {
                     clip = false
-                    translationX =
-                        if (isLtr) animatedIndicatorValue * tabWidth + panelOffset
-                        else (tabsCount - 1f - animatedIndicatorValue) * tabWidth + panelOffset
-                    scaleX = animatedScaleX
-                    scaleY = animatedScaleY
-                    val velocity = animatedVelocity / 10f
-                    scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
-                    scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
+                    transformOrigin = TransformOrigin.Center
+                    translationX = visualIndicatorValue * tabWidth + panelOffset
+                    scaleX = indicatorScaleX
+                    scaleY = indicatorScaleY
                 }
-                .background(
-                    color = if (isLightTheme) Color(0xFFE2E2E2) else Color(0xFF3A3A3A),
-                    shape = RoundedCornerShape(percent = 50),
+                .drawBackdrop(
+                    backdrop = backdrop,
+                    shape = { RoundedCornerShape(percent = 50) },
+                    effects = {
+                        blur(8.dp.toPx() * (1f - animatedPressProgress), TileMode.Decal)
+                        lens(
+                            10.dp.toPx() * animatedPressProgress,
+                            14.dp.toPx() * animatedPressProgress,
+                            chromaticAberration = true,
+                        )
+                    },
+                    highlight = {
+                        Highlight.Default.copy(alpha = 0.2f + 0.6f * animatedPressProgress)
+                    },
+                    shadow = null,
+                    onDrawSurface = {
+                        drawRect(
+                            (if (isLightTheme) Color(0xFFB9BDC3) else Color(0xFF92979E)).copy(
+                                alpha = if (isLightTheme) {
+                                    lerp(0.32f, 0.015f, animatedPressProgress)
+                                } else {
+                                    lerp(0.22f, 0.01f, animatedPressProgress)
+                                },
+                            ),
+                        )
+                    },
                 )
                 .height(56.dp)
                 .fillMaxWidth(1f / tabsCount),
@@ -370,8 +396,14 @@ fun LiquidBottomTabs(
         CompositionLocalProvider(
             LocalLiquidBottomTabGlassMotionProgress provides glassMotionProgress,
             LocalLiquidBottomTabPressProgress provides animatedPressProgress,
+            LocalLiquidBottomTabCoverage provides { index: Int ->
+                val iconHalfWidth = with(density) { 11.dp.toPx() }
+                val capsuleHalfWidth = tabWidth * indicatorScaleX / 2f
+                val centerDistance = abs(index - animatedIndicatorValue) * tabWidth
+                ((capsuleHalfWidth + iconHalfWidth - centerDistance) /
+                    (2f * iconHalfWidth)).coerceIn(0f, 1f)
+            },
         ) {
-        CompositionLocalProvider(LocalLiquidBottomTabIndicatorIndex provides indicatorIndex) {
             Row(
                 Modifier
                     .graphicsLayer {
@@ -385,37 +417,6 @@ fun LiquidBottomTabs(
                 verticalAlignment = Alignment.CenterVertically,
                 content = content,
             )
-        }
-
-        CompositionLocalProvider(
-            LocalLiquidBottomTabScale provides {
-                lerp(1f, 1.2f, animatedPressProgress)
-            },
-            LocalLiquidBottomTabIndicatorIndex provides indicatorIndex,
-        ) {
-            Row(
-                Modifier
-                    .clearAndSetSemantics {}
-                    .alpha(0f)
-                    .layerBackdrop(tabsBackdrop)
-                    .graphicsLayer {
-                        translationX = panelOffset
-                    }
-                    .drawBackdrop(
-                        backdrop = backdrop,
-                        shape = { RoundedCornerShape(percent = 50) },
-                        effects = {},
-                        highlight = null,
-                        onDrawSurface = { drawRect(surfaceColor) },
-                    )
-                    .then(interactiveHighlight.modifier)
-                    .height(56.dp)
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                content = content,
-            )
-        }
 
         Box(
             Modifier

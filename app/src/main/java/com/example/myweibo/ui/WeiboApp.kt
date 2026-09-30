@@ -219,6 +219,8 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
+import com.kyant.backdrop.drawBackdrop
+import com.kyant.backdrop.highlight.Highlight
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -373,6 +375,8 @@ import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
 import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
 import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
 import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
+import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
+import com.example.myweibo.ui.liquidglass.liquidRegularMenuGlassEffects
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
@@ -1929,6 +1933,7 @@ private enum class CapsuleHintTone {
     Neutral,
     Success,
     Progress,
+    Theme,
 }
 
 private data class AppCapsuleHintState(
@@ -6306,6 +6311,7 @@ fun WeiboApp() {
     ) { innerPadding ->
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
+        val menuGlassBackdrop = bottomBarBackdrop
         val searchBarOverlay = remember { SearchBarOverlayController() }
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
@@ -6346,7 +6352,7 @@ fun WeiboApp() {
         }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
-            LocalLiquidMenuBackdrop provides bottomBarBackdrop,
+            LocalLiquidMenuBackdrop provides menuGlassBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalFeedListScrollCoordinator provides feedListScrollCoordinator,
@@ -6365,6 +6371,7 @@ fun WeiboApp() {
             val detailLayerActive = navOverlayStack.any { it is NavOverlayKind.Detail } && detailOverlayItem != null
             val detailOverlayVisible = overlayTop == OverlayTop.Detail && detailLayerActive
             val detailNavKind = detailOverlayItem?.id?.let { NavOverlayKind.Detail(itemId = it) }
+                ?: (navExitPendingKind as? NavOverlayKind.Detail)
             val profileLayerActive = navOverlayStack.any { it is NavOverlayKind.VisitedProfile } && visitedUserId != null
             val visitedProfileVisible = overlayTop == OverlayTop.VisitedProfile && profileLayerActive
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
@@ -6379,7 +6386,16 @@ fun WeiboApp() {
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
             Box(Modifier.matchParentSize()) {
-            Box(Modifier.fillMaxSize().padding(innerPadding)) {
+            Box(
+                Modifier
+                    .matchParentSize()
+                    .layerBackdrop(bottomBarBackdrop),
+            ) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding),
+            ) {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
             val composeWebVisible = selectedTab == MainTab.Compose && mainContentClear
@@ -6491,12 +6507,17 @@ fun WeiboApp() {
                             .background(Color.White),
                     )
                 }
+            // selectedItem may outlive its detail overlay briefly during navigation.
+            // Use the actually visible top layer so a visible feed never keeps the
+            // hidden-touch blocker or hides each card's action button by stale state.
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
-                detailOverlayItem == null
+                !detailOverlayVisible &&
+                navExitPendingKind == null
             val keepFeedAlive = selectedTab == MainTab.Feed && (
                 (visitedUserId != null && detailOverlayItem == null) ||
-                detailOverlayItem != null
+                detailOverlayItem != null ||
+                navExitPendingKind is NavOverlayKind.Detail
             )
             val feedLayerVisible = selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)
             val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
@@ -7080,6 +7101,9 @@ fun WeiboApp() {
                 }
             }
 
+            }
+            }
+            Box(Modifier.fillMaxSize()) {
             val feedCapsuleHint = if (
                 selectedTab == MainTab.Feed &&
                 selectedItem == null &&
@@ -7096,7 +7120,7 @@ fun WeiboApp() {
                     AppCapsuleHintState(message = it)
                 }
                 ?: feedCapsuleHint?.let {
-                    AppCapsuleHintState(message = it)
+                    AppCapsuleHintState(message = it, tone = CapsuleHintTone.Theme)
                 }
             val feedRefreshTopInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
             AnimatedVisibility(
@@ -7122,7 +7146,6 @@ fun WeiboApp() {
                     )
                 }
             }
-
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail
             val bottomBarNavVisible = visitedUserId == null &&
                 (selectedItem == null || detailExiting)
@@ -7214,6 +7237,7 @@ fun WeiboApp() {
                                 label = TimelineKind.FriendsCircle.label,
                                 enabled = true,
                                 selected = timelineKind == TimelineKind.FriendsCircle,
+                                separatorBefore = true,
                                 onClick = {
                                     dismiss()
                                     dismissFollowListForTabSwitch()
@@ -7236,7 +7260,7 @@ fun WeiboApp() {
             )
             FeedCardActionMenuOverlay(
                 controller = feedCardActionMenuController,
-                backdrop = bottomBarBackdrop,
+                backdrop = menuGlassBackdrop,
                 currentUserId = mineProfile?.id ?: activeAccountId,
                 deletingStatusId = deletingStatusId,
                 onDelete = { item, anchor ->
@@ -7245,7 +7269,7 @@ fun WeiboApp() {
             )
             pendingDeleteStatus?.let { request ->
                 DeleteStatusConfirmOverlay(
-                    backdrop = bottomBarBackdrop,
+                    backdrop = menuGlassBackdrop,
                     anchorBoundsInRoot = request.anchorBoundsInRoot,
                     deleting = deletingStatusId != null,
                     onConfirm = {
@@ -7459,23 +7483,44 @@ private fun OpaqueHintCapsule(
     tone: CapsuleHintTone = CapsuleHintTone.Neutral,
     content: @Composable () -> Unit,
 ) {
-    val cornerRadius = 22.dp
-    val tint = when (tone) {
-        CapsuleHintTone.Success -> HintCapsuleSuccessBg
-        CapsuleHintTone.Progress -> HintCapsuleProgressBg
-        CapsuleHintTone.Neutral -> Color.Unspecified
+    val isLightTheme = isAppLightTheme()
+    val shape = RoundedCornerShape(percent = 50)
+    if (tone == CapsuleHintTone.Theme) {
+        val backdrop = LocalLiquidMenuBackdrop.current ?: rememberLayerBackdrop()
+        TransparentLiquidCapsule(
+            modifier = modifier,
+            backdrop = backdrop,
+            pill = true,
+            surfaceColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.56f),
+            useLargeCapsuleEffect = true,
+            largeCapsuleRefractionHeight = 16.dp,
+            largeCapsuleRefractionAmount = 28.dp,
+        ) {
+            content()
+        }
+        return
     }
-    SurfaceLiquidCapsule(
-        modifier = modifier,
-        cornerRadius = cornerRadius,
-        useMenuGlassStyle = tone == CapsuleHintTone.Neutral,
-        tint = tint,
+    val surfaceColor = when (tone) {
+        CapsuleHintTone.Success -> HintCapsuleSuccessBg.copy(alpha = 0.68f)
+        CapsuleHintTone.Progress -> HintCapsuleProgressBg.copy(alpha = 0.68f)
+        CapsuleHintTone.Neutral -> Color.Transparent
+        CapsuleHintTone.Theme -> Color.Transparent
+    }
+    // This hint can be inside bottomBarBackdrop's capture layer. Sampling that same
+    // backdrop here creates a RenderNode cycle and crashes RenderThread.
+    Box(
+        modifier = modifier
+            .clip(shape)
+            .background(surfaceColor, shape)
+            .border(
+                width = 0.5.dp,
+                color = if (isLightTheme) Color.Black.copy(alpha = 0.16f)
+                else Color.White.copy(alpha = 0.26f),
+                shape = shape,
+            ),
+        contentAlignment = Alignment.Center,
     ) {
-        Box(
-            modifier = Modifier.wrapContentSize(),
-            contentAlignment = Alignment.Center,
-            content = { content() },
-        )
+        content()
     }
 }
 
@@ -7526,6 +7571,7 @@ private fun FeedRefreshCapsuleHint(
     val textColor = when (tone) {
         CapsuleHintTone.Success -> HintCapsuleSuccessText
         CapsuleHintTone.Progress -> HintCapsuleProgressText
+        CapsuleHintTone.Theme -> MaterialTheme.colorScheme.onPrimary
         CapsuleHintTone.Neutral -> hintCapsuleTextColor()
     }
     OpaqueHintCapsule(modifier = modifier, tone = tone) {
@@ -7535,7 +7581,17 @@ private fun FeedRefreshCapsuleHint(
         ) {
             Text(
                 text = message,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    shadow = if (tone == CapsuleHintTone.Theme) {
+                        Shadow(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            offset = Offset(0f, 2f),
+                            blurRadius = 4f,
+                        )
+                    } else {
+                        null
+                    },
+                ),
                 fontWeight = FontWeight.SemiBold,
                 color = textColor,
             )
@@ -7618,13 +7674,27 @@ private fun ExitConfirmCapsule(
         ),
         exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.94f),
     ) {
-        OpaqueHintCapsule {
+        val exitBackdrop = LocalLiquidMenuBackdrop.current ?: rememberLayerBackdrop()
+        TransparentLiquidCapsule(
+            backdrop = exitBackdrop,
+            pill = true,
+            surfaceColor = Color(0xFFE00000).copy(alpha = 0.5f),
+            useLargeCapsuleEffect = true,
+            largeCapsuleRefractionHeight = 16.dp,
+            largeCapsuleRefractionAmount = 28.dp,
+        ) {
             Text(
                 text = "再按一次退出程序",
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    shadow = Shadow(
+                        color = Color.Black.copy(alpha = 0.58f),
+                        offset = Offset(0f, 2f),
+                        blurRadius = 4f,
+                    ),
+                ),
                 fontWeight = FontWeight.SemiBold,
-                color = hintCapsuleTextColor(),
+                color = Color.White,
             )
         }
     }
@@ -8939,6 +9009,7 @@ private fun FeedCardActionMenuOverlay(
                 ImageActionRow(
                     label = "分享",
                     enabled = shareUrl != null,
+                    separatorBefore = true,
                     onClick = {
                         dismissMenu()
                         WeiboStatusActions.shareLink(context, request.item)
@@ -8948,6 +9019,7 @@ private fun FeedCardActionMenuOverlay(
                     ImageActionRow(
                         label = "删除微博",
                         enabled = deletingStatusId == null,
+                        separatorBefore = true,
                         onClick = {
                             dismissMenu()
                             onDelete(request.item, request.anchorBoundsInRoot)
@@ -9450,8 +9522,8 @@ private fun FeedImageCell(
 }
 
 private val ActionMenuMaxWidth = 220.dp
-private val ActionMenuCornerRadius = 22.dp
-private val ActionMenuBlurRadius = 16.dp
+private val ActionMenuCornerRadius = 20.dp
+private val ActionMenuBlurRadius = 12.dp
 private val ActionMenuCardInset = 5.dp
 private val ActionMenuItemGap = 3.dp
 private val ActionMenuCapsuleHeight = 38.dp
@@ -9502,26 +9574,68 @@ private fun ImageActionFrostedCard(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
     menuHeight: Dp? = null,
+    useBackdrop: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    SurfaceLiquidMenuCard(
-        modifier = modifier.then(
-            if (menuHeight != null) Modifier.height(menuHeight) else Modifier,
-        ),
-        backdrop = backdrop ?: LocalLiquidMenuBackdrop.current,
-        cornerRadius = ActionMenuCornerRadius,
-        blurRadius = ActionMenuBlurRadius,
-        surfaceColor = actionMenuSurfaceColor(),
-        contentPadding = PaddingValues(ActionMenuCardInset),
-        content = {
+    val cardModifier = modifier.then(
+        if (menuHeight != null) Modifier.height(menuHeight) else Modifier,
+    )
+    val resolvedBackdrop = if (useBackdrop) backdrop ?: LocalLiquidMenuBackdrop.current else null
+    if (resolvedBackdrop == null) {
+        SurfaceLiquidMenuCard(
+            modifier = cardModifier,
+            cornerRadius = ActionMenuCornerRadius,
+            blurRadius = ActionMenuBlurRadius,
+            surfaceColor = actionMenuSurfaceColor(),
+            contentPadding = PaddingValues(ActionMenuCardInset),
+            content = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(ActionMenuItemGap),
+                ) {
+                    content()
+                }
+            },
+        )
+    } else {
+        val cardShape = RoundedCornerShape(ActionMenuCornerRadius)
+        val isLightTheme = isAppLightTheme()
+        val frostedTint = if (isLightTheme) {
+            Color.White.copy(alpha = 0.5f)
+        } else {
+            Color(0xFF242424).copy(alpha = 0.5f)
+        }
+        Column(
+            modifier = cardModifier
+                .graphicsLayer {
+                    shape = cardShape
+                    clip = true
+                }
+                .drawBackdrop(
+                    backdrop = resolvedBackdrop,
+                    shape = { cardShape },
+                    effects = { liquidRegularMenuGlassEffects() },
+                    highlight = { Highlight.Plain },
+                    shadow = null,
+                    onDrawSurface = { drawRect(frostedTint) },
+                )
+                .border(
+                    width = 0.75.dp,
+                    color = if (isLightTheme) Color.Black.copy(alpha = 0.18f)
+                    else Color.White.copy(alpha = 0.28f),
+                    shape = cardShape,
+                )
+                .padding(PaddingValues(ActionMenuCardInset)),
+            horizontalAlignment = Alignment.Start,
+        ) {
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(ActionMenuItemGap),
             ) {
                 content()
             }
-        },
-    )
+        }
+    }
 }
 
 @Composable
@@ -9869,17 +9983,7 @@ private fun ImageActionOverlay(
                     }
                 }
             } else {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
-                .clickable(
-                    enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = { requestDismiss() },
-                ),
-        )
+            val previewMenuBackdrop = rememberLayerBackdrop()
 
             val screenAspect = maxWidthPx / maxHeightPx.coerceAtLeast(1f)
             val fullscreenImageWidthPx: Float
@@ -9931,6 +10035,18 @@ private fun ImageActionOverlay(
                 menuOffset = menuPlacement.offset,
                 menuWidthPx = menuWidthPx,
                 menuHeightPx = menuHeightPx,
+            )
+            Box(Modifier.fillMaxSize().layerBackdrop(previewMenuBackdrop)) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
+                    .clickable(
+                        enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = { requestDismiss() },
+                    ),
             )
             Box(
                 modifier = Modifier
@@ -9984,6 +10100,7 @@ private fun ImageActionOverlay(
                     )
                 }
             }
+            }
 
             ActionMenuReveal(
                 visible = menuRevealVisible,
@@ -9998,6 +10115,7 @@ private fun ImageActionOverlay(
             ) {
                 ImageActionFrostedCard(
                     modifier = Modifier.fillMaxSize(),
+                    backdrop = previewMenuBackdrop,
                 ) {
                     ImageActionRow(
                         label = "保存",
@@ -10016,6 +10134,7 @@ private fun ImageActionOverlay(
                         ImageActionRow(
                             label = "保存全部",
                             enabled = !saving,
+                            separatorBefore = true,
                             onClick = {
                                 saving = true
                                 scope.launch {
@@ -10031,6 +10150,7 @@ private fun ImageActionOverlay(
                     ImageActionRow(
                         label = "分享",
                         enabled = !saving,
+                        separatorBefore = true,
                         onClick = {
                             saving = true
                             scope.launch {
@@ -10937,13 +11057,28 @@ private fun ImageActionRow(
     enabled: Boolean,
     selected: Boolean = false,
     textColor: Color? = null,
+    separatorBefore: Boolean = false,
     onClick: () -> Unit,
 ) {
     val capsuleShape = RoundedCornerShape(percent = 50)
+    val isLightTheme = isAppLightTheme()
+    val separatorColor = if (isLightTheme) Color.Black.copy(alpha = 0.12f)
+    else Color.White.copy(alpha = 0.18f)
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(ActionMenuCapsuleHeight)
+            .drawBehind {
+                if (separatorBefore) {
+                    val inset = ActionMenuCapsulePaddingHorizontal.toPx()
+                    drawLine(
+                        color = separatorColor,
+                        start = Offset(inset, 0f),
+                        end = Offset(size.width - inset, 0f),
+                        strokeWidth = 0.5.dp.toPx(),
+                    )
+                }
+            }
             .clip(capsuleShape)
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = ActionMenuCapsulePaddingHorizontal),
@@ -12564,6 +12699,7 @@ private fun BoxScope.FullscreenImageActionMenu(
                 ImageActionRow(
                     label = "保存全部",
                     enabled = !saving,
+                    separatorBefore = true,
                     onClick = {
                         saving = true
                         scope.launch {
@@ -12579,6 +12715,7 @@ private fun BoxScope.FullscreenImageActionMenu(
             ImageActionRow(
                 label = "分享",
                 enabled = !saving,
+                separatorBefore = true,
                 onClick = {
                     saving = true
                     scope.launch {
@@ -13500,10 +13637,6 @@ private fun WeiboVideoSurface(
     } else {
         VideoFullscreenHorizontalControlInset
     }
-    FullscreenForcedOrientationEffect(
-        orientation = forcedOrientation,
-        enabled = isFullscreen,
-    )
     val trackViewportPause = trackViewportPauseOverride ?: (
         !isFullscreen &&
             controlsEnabled &&
@@ -15004,7 +15137,7 @@ private fun WeiboVideoSurface(
         }
 
         if (showSpeedMenu && controlsEnabled && controlsVisible && !hideProgressControls) {
-            WeiboVideoSpeedPopup(
+    WeiboVideoSpeedPopup(
                 selectedSpeed = selectedSpeed,
                 backdrop = videoControlBackdrop,
                 onSpeedSelected = { speed ->
@@ -15043,7 +15176,10 @@ private fun WeiboVideoSpeedPopup(
             .height(VideoControlBarHeight),
         backdrop = backdrop,
         pill = true,
-        surfaceColor = Color.White.copy(alpha = 0.14f),
+        surfaceColor = liquidLargeCapsuleSurfaceColor(isAppLightTheme()),
+        useLargeCapsuleEffect = true,
+        largeCapsuleRefractionHeight = 12.dp,
+        largeCapsuleRefractionAmount = 20.dp,
     ) {
         Row(
             modifier = Modifier
@@ -15098,6 +15234,9 @@ private fun GlassTextButton(
         enabled = enabled,
         textColor = Color.White,
         style = videoControlTextStyle(12),
+        useLargeCapsuleEffect = true,
+        largeCapsuleRefractionHeight = 10.dp,
+        largeCapsuleRefractionAmount = 18.dp,
     )
 }
 
@@ -15178,7 +15317,10 @@ private fun VideoControls(
             },
         backdrop = backdrop,
         pill = true,
-        surfaceColor = Color.White.copy(alpha = 0.14f),
+        surfaceColor = liquidLargeCapsuleSurfaceColor(isAppLightTheme()),
+        useLargeCapsuleEffect = true,
+        largeCapsuleRefractionHeight = 12.dp,
+        largeCapsuleRefractionAmount = 20.dp,
     ) {
         VideoControlCapsuleProgressBackground(
             progress = progress,
@@ -16651,7 +16793,9 @@ private fun ComposeVisibilityPickerOverlay(
     onExitComplete: () -> Unit,
     onSelected: (WeiboPostVisibility) -> Unit,
 ) {
-    val backdrop = LocalLiquidMenuBackdrop.current
+    // This picker is hosted inside bottomBarBackdrop's capture tree. It must not
+    // sample that same tree or RenderThread recursively captures itself.
+    val backdrop: Backdrop? = null
     val density = LocalDensity.current
     val options = WeiboPostVisibility.entries
     val menuHeight = visibilityMenuHeight(options)
@@ -16728,12 +16872,14 @@ private fun ComposeVisibilityPickerOverlay(
                 modifier = Modifier.fillMaxSize(),
                 backdrop = backdrop,
                 menuHeight = menuHeight,
+                useBackdrop = false,
             ) {
-                options.forEach { option ->
+                options.forEachIndexed { index, option ->
                     VisibilityMenuRow(
                         label = option.label,
                         subtitle = option.subtitle,
                         selected = selected == option,
+                        separatorBefore = index > 0,
                         onClick = { onSelected(option) },
                     )
                 }
@@ -16751,6 +16897,7 @@ private fun VisibilityMenuRow(
     label: String,
     subtitle: String,
     selected: Boolean,
+    separatorBefore: Boolean,
     onClick: () -> Unit,
 ) {
     val titleStyle = actionMenuTextStyle(selected = selected)
@@ -16759,10 +16906,23 @@ private fun VisibilityMenuRow(
     } else {
         MaterialTheme.colorScheme.onSurface
     }
+    val separatorColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.1f)
+    else Color.White.copy(alpha = 0.16f)
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .height(VisibilityMenuRowTallHeight)
+            .drawBehind {
+                if (separatorBefore) {
+                    val inset = ActionMenuCapsulePaddingHorizontal.toPx()
+                    drawLine(
+                        color = separatorColor,
+                        start = Offset(inset, 0f),
+                        end = Offset(size.width - inset, 0f),
+                        strokeWidth = 0.5.dp.toPx(),
+                    )
+                }
+            }
             .clip(RoundedCornerShape(percent = 50))
             .clickable(onClick = onClick)
             .padding(horizontal = ActionMenuCapsulePaddingHorizontal),
@@ -23503,8 +23663,8 @@ private fun FullscreenForcedOrientationEffect(
             return@DisposableEffect onDispose {}
         }
         activity.requestedOrientation = when (orientation) {
-            ForcedVideoOrientation.Landscape -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            ForcedVideoOrientation.Portrait -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            ForcedVideoOrientation.Landscape -> ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
+            ForcedVideoOrientation.Portrait -> ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT
             ForcedVideoOrientation.None -> ActivityInfo.SCREEN_ORIENTATION_USER
         }
         onDispose {
