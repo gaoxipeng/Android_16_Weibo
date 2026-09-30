@@ -4049,7 +4049,10 @@ fun WeiboApp() {
     fun popNavigation(): Boolean {
         if (navStack.isEmpty()) return false
         val exitingKind = navOverlayStack.lastOrNull()
-        navExitPendingKind = exitingKind
+        // TabSwitch records the page to restore after opening a topic search, but it
+        // has no NavAnimatedOverlay to finish an exit and clear this pending state.
+        // Leaving it pending makes feedUiOnTop permanently false when returning home.
+        navExitPendingKind = exitingKind?.takeUnless { it == NavOverlayKind.TabSwitch }
         navEnterPendingKind = null
         val previous = navStack.last().let { state ->
             val target = albumDismissScrollTarget
@@ -6602,7 +6605,7 @@ fun WeiboApp() {
             val keepFeedAlive = selectedTab == MainTab.Feed && (
                 (visitedUserId != null && detailOverlayItem == null) ||
                 detailOverlayItem != null ||
-                navExitPendingKind is NavOverlayKind.Detail
+                navExitPendingKind != null
             )
             val feedLayerVisible = selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)
             val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
@@ -13177,6 +13180,21 @@ private fun InlineVideoPlayer(
         )
     }
 
+    LaunchedEffect(isDetailInlinePlayback, videoPeekController.activeRequest, playbackKey) {
+        if (!isDetailInlinePlayback || (!actionOpen && !peekActive)) return@LaunchedEffect
+        val hostedPlaybackKey = videoPeekController.activeRequest?.let {
+            videoPlaybackKey(it.media, it.playbackOwnerId)
+        }
+        // 切换详情页中的另一个视频时，旧卡片不再由锚定播放器覆盖。
+        // 清除旧卡片的隐藏态，否则它会缩回宫格后仍透明，但继续拦截触摸。
+        if (hostedPlaybackKey != playbackKey) {
+            actionOpen = false
+            peekActive = false
+            pressHoldProgress = 0f
+            videoPeekController.resetFingerDragOffset()
+        }
+    }
+
     LaunchedEffect(
         isDetailInlinePlayback,
         inlinePlaying,
@@ -13453,8 +13471,13 @@ private fun InlineVideoPlayer(
                                 }
                             } else {
                                 if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
-                                    // 宫格单击与信息流一致：先 requestInline 抬升大卡，再由大卡锚定交接。
-                                    videoCoordinator.requestInlinePlayback(playbackKey)
+                                    // 详情页直接锚定到被点中的宫格，避免先取得内联播放权、
+                                    // 再由 LaunchedEffect 二次交接时卡片短暂失去视频 Surface。
+                                    if (isDetailInlinePlayback) {
+                                        openAnchoredInlinePlayback()
+                                    } else {
+                                        videoCoordinator.requestInlinePlayback(playbackKey)
+                                    }
                                     return@awaitEachGesture
                                 }
                                 lastTapUptimeMs = tapUptime
@@ -13539,7 +13562,9 @@ private fun InlineVideoPlayer(
                 TransparentLiquidIconButton(
                     onClick = {
                         if (media.isStreamPlayable()) {
-                            if (gridCell || !isDetailInlinePlayback) {
+                            if (gridCell && isDetailInlinePlayback) {
+                                openAnchoredInlinePlayback()
+                            } else if (gridCell || !isDetailInlinePlayback) {
                                 videoCoordinator.requestInlinePlayback(playbackKey)
                             } else {
                                 openAnchoredInlinePlayback()
