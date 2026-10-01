@@ -8,29 +8,35 @@ import org.json.JSONObject
 import java.io.File
 
 class MineCacheStore(context: Context) {
-    private val profileFile = File(context.filesDir, "mine_profile_cache.json")
-    private val postsFile = File(context.filesDir, "mine_posts_cache.json")
-    private val albumFile = File(context.filesDir, "mine_album_cache.json")
+    private val accountCacheDir = File(context.filesDir, "mine_account_cache")
 
-    suspend fun readProfile(): UserProfile? =
+    suspend fun readProfile(accountId: String): UserProfile? =
         withContext(Dispatchers.IO) {
             runCatching {
-                if (!profileFile.exists()) return@withContext null
-                profileFromJson(JSONObject(profileFile.readText(Charsets.UTF_8)))
+                val file = cacheFile(accountId, "profile")
+                if (!file.exists()) return@withContext null
+                profileFromJson(JSONObject(file.readText(Charsets.UTF_8)))
+                    .takeIf { it.id == accountId }
             }.getOrNull()
         }
 
-    suspend fun writeProfile(profile: UserProfile) {
+    suspend fun writeProfile(accountId: String, profile: UserProfile) {
+        if (accountId.isBlank() || profile.id != accountId) return
         withContext(Dispatchers.IO) {
-            runCatching { profileFile.writeText(profile.toJson().toString(), Charsets.UTF_8) }
+            runCatching {
+                val file = cacheFile(accountId, "profile")
+                file.parentFile?.mkdirs()
+                file.writeText(profile.toJson().toString(), Charsets.UTF_8)
+            }
         }
     }
 
-    suspend fun readPosts(): MinePostsCache? =
+    suspend fun readPosts(accountId: String): MinePostsCache? =
         withContext(Dispatchers.IO) {
             runCatching {
-                if (!postsFile.exists()) return@withContext null
-                val root = JSONObject(postsFile.readText(Charsets.UTF_8))
+                val file = cacheFile(accountId, "posts")
+                if (!file.exists()) return@withContext null
+                val root = JSONObject(file.readText(Charsets.UTF_8))
                 MinePostsCache(
                     items = root.optJSONArray("items").toFeedItems(),
                     page = root.optInt("page", 1).coerceAtLeast(1),
@@ -39,10 +45,13 @@ class MineCacheStore(context: Context) {
             }.getOrNull()
         }
 
-    suspend fun writePosts(cache: MinePostsCache) {
+    suspend fun writePosts(accountId: String, cache: MinePostsCache) {
+        if (accountId.isBlank()) return
         withContext(Dispatchers.IO) {
             runCatching {
-                postsFile.writeText(
+                val file = cacheFile(accountId, "posts")
+                file.parentFile?.mkdirs()
+                file.writeText(
                     JSONObject()
                         .put("page", cache.page)
                         .put("has_more", cache.hasMore)
@@ -54,11 +63,12 @@ class MineCacheStore(context: Context) {
         }
     }
 
-    suspend fun readAlbum(): AlbumPage? =
+    suspend fun readAlbum(accountId: String): AlbumPage? =
         withContext(Dispatchers.IO) {
             runCatching {
-                if (!albumFile.exists()) return@withContext null
-                val root = JSONObject(albumFile.readText(Charsets.UTF_8))
+                val file = cacheFile(accountId, "album")
+                if (!file.exists()) return@withContext null
+                val root = JSONObject(file.readText(Charsets.UTF_8))
                 AlbumPage(
                     images = root.optJSONArray("images").toFeedImages(),
                     nextCursor = root.optNullableString("next_cursor"),
@@ -66,10 +76,13 @@ class MineCacheStore(context: Context) {
             }.getOrNull()
         }
 
-    suspend fun writeAlbum(page: AlbumPage) {
+    suspend fun writeAlbum(accountId: String, page: AlbumPage) {
+        if (accountId.isBlank()) return
         withContext(Dispatchers.IO) {
             runCatching {
-                albumFile.writeText(
+                val file = cacheFile(accountId, "album")
+                file.parentFile?.mkdirs()
+                file.writeText(
                     JSONObject()
                         .put("next_cursor", page.nextCursor)
                         .put("images", page.images.toFeedImagesJsonArray())
@@ -78,6 +91,13 @@ class MineCacheStore(context: Context) {
                 )
             }
         }
+    }
+
+    private fun cacheFile(accountId: String, kind: String): File {
+        val safeAccountId = accountId.filter { it.isLetterOrDigit() || it == '-' || it == '_' }
+            .takeIf { it.isNotBlank() }
+            ?: "unknown"
+        return File(accountCacheDir, "${safeAccountId}_$kind.json")
     }
 
     private fun UserProfile.toJson(): JSONObject =

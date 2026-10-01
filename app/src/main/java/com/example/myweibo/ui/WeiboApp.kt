@@ -3413,6 +3413,7 @@ fun WeiboApp() {
     var likeUsersNextPage by remember { mutableStateOf<Int?>(null) }
     var likeUsersError by remember { mutableStateOf<String?>(null) }
     var mineProfile by remember { mutableStateOf<UserProfile?>(null) }
+    var mineAccountGeneration by remember { mutableIntStateOf(0) }
     var mineProfileLoading by remember { mutableStateOf(false) }
     var mineProfileError by remember { mutableStateOf<String?>(null) }
     var mineHasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
@@ -3551,8 +3552,27 @@ fun WeiboApp() {
     }
 
     fun reloadStoredAccounts() {
+        val previousActiveAccountId = activeAccountId
         storedAccounts = accountStore.readAccounts()
         activeAccountId = accountStore.readActiveAccountId()
+        if (previousActiveAccountId != activeAccountId) {
+            mineAccountGeneration += 1
+            mineAlbumJob?.cancel()
+            mineProfile = null
+            mineProfileLoading = false
+            mineProfileError = null
+            minePosts = emptyList()
+            minePostsError = null
+            minePostsPage = 1
+            minePostsHasMore = true
+            minePostsLoadingMore = false
+            mineAlbumImages = emptyList()
+            mineAlbumNextCursor = null
+            mineAlbumHasMore = true
+            mineAlbumLoading = false
+            mineAlbumLoadingMore = false
+            mineAlbumError = null
+        }
     }
 
     suspend fun persistLoginSession(makeActive: Boolean = false) {
@@ -4759,6 +4779,7 @@ fun WeiboApp() {
         val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
         if (!force && mineAlbumImages.isNotEmpty()) return
         if (mineAlbumLoading || mineAlbumLoadingMore) return
+        val requestGeneration = mineAccountGeneration
         mineAlbumJob?.cancel()
         mineAlbumJob = scope.launch {
             mineAlbumLoading = true
@@ -4770,6 +4791,9 @@ fun WeiboApp() {
             }
             try {
                 val page = session.loadUserAlbumImages(uid = uid)
+                if (requestGeneration != mineAccountGeneration || activeAccountId != uid || mineProfile?.id != uid) {
+                    return@launch
+                }
                 val lookup = buildAlbumPostLookup(minePosts)
                 mineAlbumImages = filterOutRetweetedOnlyImages(
                     enrichAlbumImagesFromPosts(page.images, lookup),
@@ -4782,13 +4806,15 @@ fun WeiboApp() {
                 } else {
                     null
                 }
-                mineCacheStore.writeAlbum(page)
+                if (activeAccountId == uid && mineProfile?.id == uid) {
+                    mineCacheStore.writeAlbum(uid, page)
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Throwable) {
                 mineAlbumError = error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u76F8\u518C"
             } finally {
-                mineAlbumLoading = false
+                if (requestGeneration == mineAccountGeneration) mineAlbumLoading = false
             }
         }
     }
@@ -4799,21 +4825,39 @@ fun WeiboApp() {
             mineProfileError = "\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A"
             return
         }
+        val requestGeneration = mineAccountGeneration
+        val requestedAccountId = activeAccountId
         scope.launch {
             mineProfileLoading = true
             runCatching { session.loadCurrentUserProfile() }
                 .onSuccess { profile ->
+                    if (requestGeneration != mineAccountGeneration ||
+                        requestedAccountId != activeAccountId ||
+                        (requestedAccountId != null && profile.id != requestedAccountId)
+                    ) {
+                        if (requestGeneration == mineAccountGeneration &&
+                            requestedAccountId == activeAccountId &&
+                            requestedAccountId != null && profile.id != requestedAccountId
+                        ) {
+                            mineProfileError = "\u767B\u5F55\u72B6\u6001\u4E0E\u5F53\u524D\u9009\u4E2D\u8D26\u53F7\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55\u8BE5\u8D26\u53F7"
+                        }
+                        return@onSuccess
+                    }
                     mineProfile = profile
                     mineProfileError = null
                     mineHasLoginCookie = true
-                    mineCacheStore.writeProfile(profile)
+                    mineCacheStore.writeProfile(profile.id, profile)
                     runCatching { session.loadUserTimeline(profile.id) }
                         .onSuccess { page ->
+                            if (requestGeneration != mineAccountGeneration ||
+                                requestedAccountId != activeAccountId || mineProfile?.id != profile.id
+                            ) return@onSuccess
                             minePosts = page.items
                             minePostsPage = 1
                             minePostsHasMore = page.nextCursor != null
                             minePostsError = null
                             mineCacheStore.writePosts(
+                                profile.id,
                                 MinePostsCache(
                                     page.items,
                                     page = 1,
@@ -4822,16 +4866,22 @@ fun WeiboApp() {
                             )
                         }
                         .onFailure {
-                            minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
+                            if (requestGeneration == mineAccountGeneration &&
+                                requestedAccountId == activeAccountId && mineProfile?.id == profile.id
+                            ) {
+                                minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
+                            }
                         }
                     if (minePagerPage == MineContentTab.Album.ordinal) {
                         loadMineAlbumFirstPage(force = true)
                     }
                 }
                 .onFailure {
-                    mineProfileError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u5FAE\u535A\u7528\u6237\u8D44\u6599"
+                    if (requestGeneration == mineAccountGeneration && requestedAccountId == activeAccountId) {
+                        mineProfileError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u5FAE\u535A\u7528\u6237\u8D44\u6599"
+                    }
                 }
-            mineProfileLoading = false
+            if (requestGeneration == mineAccountGeneration) mineProfileLoading = false
         }
     }
 
@@ -4886,17 +4936,22 @@ fun WeiboApp() {
     fun loadMoreMinePosts() {
         val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
         if (minePostsLoadingMore || mineProfileLoading || !minePostsHasMore) return
+        val requestGeneration = mineAccountGeneration
         scope.launch {
             minePostsLoadingMore = true
             val nextPage = minePostsPage + 1
             runCatching { session.loadUserTimeline(uid, page = nextPage) }
                 .onSuccess { page ->
+                    if (requestGeneration != mineAccountGeneration || activeAccountId != uid || mineProfile?.id != uid) {
+                        return@onSuccess
+                    }
                     val merged = (minePosts + page.items).distinctBy { it.id }
                     minePosts = merged
                     minePostsPage = nextPage
                     minePostsHasMore = page.nextCursor != null
                     minePostsError = null
                     mineCacheStore.writePosts(
+                        uid,
                         MinePostsCache(
                             items = merged,
                             page = nextPage,
@@ -4907,13 +4962,14 @@ fun WeiboApp() {
                 .onFailure { error ->
                     minePostsError = error.message ?: "\u65E0\u6CD5\u7EE7\u7EED\u8BFB\u53D6\u4E2A\u4EBA\u4E3B\u9875\u5FAE\u535A"
                 }
-            minePostsLoadingMore = false
+            if (requestGeneration == mineAccountGeneration) minePostsLoadingMore = false
         }
     }
 
     fun loadMoreMineAlbum() {
         val uid = mineProfile?.id?.takeIf { it.isNotBlank() } ?: return
         if (mineAlbumLoadingMore || mineProfileLoading || !mineAlbumHasMore) return
+        val requestGeneration = mineAccountGeneration
         scope.launch {
             mineAlbumLoadingMore = true
             val cursor = mineAlbumNextCursor
@@ -4925,6 +4981,9 @@ fun WeiboApp() {
                 )
             }
                 .onSuccess { page ->
+                    if (requestGeneration != mineAccountGeneration || activeAccountId != uid || mineProfile?.id != uid) {
+                        return@onSuccess
+                    }
                     val lookup = buildAlbumPostLookup(minePosts)
                     val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
                     mineAlbumImages = filterOutRetweetedOnlyImages(
@@ -4935,6 +4994,7 @@ fun WeiboApp() {
                     mineAlbumHasMore = page.nextCursor != null
                     mineAlbumError = null
                     mineCacheStore.writeAlbum(
+                        uid,
                         AlbumPage(
                             images = mineAlbumImages,
                             nextCursor = mineAlbumNextCursor,
@@ -4944,7 +5004,7 @@ fun WeiboApp() {
                 .onFailure { error ->
                     mineAlbumError = error.message ?: "\u65E0\u6CD5\u7EE7\u7EED\u8BFB\u53D6\u76F8\u518C"
                 }
-            mineAlbumLoadingMore = false
+            if (requestGeneration == mineAccountGeneration) mineAlbumLoadingMore = false
         }
     }
 
@@ -5930,28 +5990,28 @@ fun WeiboApp() {
 
         emoticonMap = emoticonCacheStore.read()
         recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in emoticonMap }
-        mineCacheStore.readProfile()?.let { profile ->
-            mineProfile = profile
-            mineProfileError = null
-        }
-        mineCacheStore.readPosts()?.let { cache ->
-            minePosts = cache.items
-            minePostsPage = cache.page
-            minePostsHasMore = cache.hasMore
-            minePostsError = null
-        }
-        mineCacheStore.readAlbum()?.let { page ->
-            val lookup = buildAlbumPostLookup(minePosts)
-            mineAlbumImages = filterOutRetweetedOnlyImages(
-                enrichAlbumImagesFromPosts(page.images, lookup),
-                minePosts,
-            )
-            mineAlbumNextCursor = page.nextCursor?.takeIf {
-                it.startsWith("wall:") || it.startsWith("waterfall:cursor:")
-            }
-            mineAlbumHasMore = mineAlbumNextCursor != null
-        }
         activeAccountId?.takeIf { it.isNotBlank() }?.let { uid ->
+            mineCacheStore.readProfile(uid)?.let { profile ->
+                mineProfile = profile
+                mineProfileError = null
+            }
+            mineCacheStore.readPosts(uid)?.let { cache ->
+                minePosts = cache.items
+                minePostsPage = cache.page
+                minePostsHasMore = cache.hasMore
+                minePostsError = null
+            }
+            mineCacheStore.readAlbum(uid)?.let { page ->
+                val lookup = buildAlbumPostLookup(minePosts)
+                mineAlbumImages = filterOutRetweetedOnlyImages(
+                    enrichAlbumImagesFromPosts(page.images, lookup),
+                    minePosts,
+                )
+                mineAlbumNextCursor = page.nextCursor?.takeIf {
+                    it.startsWith("wall:") || it.startsWith("waterfall:cursor:")
+                }
+                mineAlbumHasMore = mineAlbumNextCursor != null
+            }
             applyMentionSuggestionCache(uid)
             mentionSuggestionsUid = uid
         }

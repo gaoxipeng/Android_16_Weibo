@@ -41,8 +41,15 @@ class WeiboWebSession(context: Context) {
     @Volatile
     private var cookieSnapshotListener: ((Map<String, String>) -> Unit)? = null
 
+    @Volatile
+    private var cookieSnapshotUpdatesEnabled: Boolean = true
+
     fun setCookieSnapshotListener(listener: ((Map<String, String>) -> Unit)?) {
         cookieSnapshotListener = listener
+    }
+
+    private fun setCookieSnapshotUpdatesEnabled(enabled: Boolean) {
+        cookieSnapshotUpdatesEnabled = enabled
     }
 
     private val albumLoadMutex = Mutex()
@@ -1619,7 +1626,7 @@ class WeiboWebSession(context: Context) {
             }
         }
         manager.flush()
-        if (receivedCookie) {
+        if (receivedCookie && cookieSnapshotUpdatesEnabled) {
             cookieSnapshotListener?.invoke(captureCookieSnapshot())
         }
     }
@@ -1780,28 +1787,52 @@ class WeiboWebSession(context: Context) {
         makeActive: Boolean = false,
     ): StoredWeiboAccount? {
         if (!hasLoginCookie()) return null
-        val profile = loadCurrentUserProfile()
-        val account = StoredWeiboAccount(
-            id = profile.id,
-            screenName = profile.screenName,
-            avatarUrl = profile.avatarUrl,
-            cookies = captureCookieSnapshot(),
-        )
-        store.upsertAccount(account, makeActive = makeActive)
-        return account
+        // During login/add-account the current store active id can still point to the
+        // previous account. Do not let response Set-Cookie headers overwrite that snapshot
+        // while identifying and persisting the newly authenticated account.
+        val previousCookieSnapshotUpdatesEnabled = cookieSnapshotUpdatesEnabled
+        setCookieSnapshotUpdatesEnabled(false)
+        var accountPersisted = false
+        return try {
+            val profile = loadCurrentUserProfile()
+            val account = StoredWeiboAccount(
+                id = profile.id,
+                screenName = profile.screenName,
+                avatarUrl = profile.avatarUrl,
+                cookies = captureCookieSnapshot(),
+            )
+            store.upsertAccount(account, makeActive = makeActive)
+            accountPersisted = true
+            account
+        } finally {
+            // AccountStore has been switched to the identified account before subsequent
+            // native responses are allowed to refresh the active cookie snapshot.
+            setCookieSnapshotUpdatesEnabled(
+                if (accountPersisted) store.readActiveAccountId() != null
+                else previousCookieSnapshotUpdatesEnabled,
+            )
+        }
     }
 
     suspend fun activateAccount(store: WeiboAccountStore, accountId: String) {
         val account = store.getAccount(accountId)
             ?: throw IllegalStateException("未找到账号 $accountId")
-        clearAllCookies()
-        restoreCookieSnapshot(account.cookies)
-        store.setActiveAccountId(accountId)
-        webView.loadUrl(WEIBO_HOME)
-        delay(400)
+        setCookieSnapshotUpdatesEnabled(false)
+        try {
+            clearAllCookies()
+            restoreCookieSnapshot(account.cookies)
+            store.setActiveAccountId(accountId)
+            webView.loadUrl(WEIBO_HOME)
+            delay(400)
+            setCookieSnapshotUpdatesEnabled(true)
+        } catch (error: Throwable) {
+            setCookieSnapshotUpdatesEnabled(store.readActiveAccountId() != null)
+            throw error
+        }
     }
 
     suspend fun prepareAddAccount() {
+        setCookieSnapshotUpdatesEnabled(false)
         withContext(Dispatchers.Main) {
             webView.stopLoading()
             webView.loadUrl("about:blank")
