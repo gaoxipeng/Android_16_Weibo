@@ -6,6 +6,51 @@ import android.net.Uri
 import android.widget.Toast
 
 object WeiboStatusActions {
+    /** Open a super-topic with the official client when its native container ID is present. */
+    fun openSuperTopicInWeiboApp(context: Context, vararg rawUrls: String): Boolean {
+        val containerId = rawUrls.asSequence()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .mapNotNull(::superTopicContainerId)
+            .firstOrNull()
+            ?: return false
+        val packageManager = context.packageManager
+        val originalNativeUri = rawUrls.asSequence()
+            .map(String::trim)
+            .firstOrNull { it.startsWith("sinaweibo://pageinfo", ignoreCase = true) }
+            ?.let(Uri::parse)
+        val candidates = buildList {
+            originalNativeUri?.let { add(it) }
+            add(Uri.parse("sinaweibo://pageinfo?containerid=${Uri.encode(containerId)}"))
+        }
+        val intent = candidates.asSequence()
+            .map { uri ->
+                Intent(Intent.ACTION_VIEW, uri).apply {
+                    setPackage("com.sina.weibo")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            .firstOrNull { it.resolveActivity(packageManager) != null }
+            ?: return false
+        return runCatching {
+            context.startActivity(intent)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun superTopicContainerId(rawUrl: String): String? {
+        // Weibo super-topic pages use container IDs beginning with 100808. Links can
+        // arrive as a direct /p/<id> URL or nested/percent-encoded containerid query.
+        val decoded = generateSequence(rawUrl) { previous ->
+            Uri.decode(previous).takeIf { it != previous }
+        }.take(4).toList().joinToString(" ")
+        val match = Regex(
+            "(?i)(?:^|[?&](?:containerid|pageid)=|(?:containerid|pageid)%3D|/p/)(100808[A-Za-z0-9_-]+)",
+        ).find(decoded)
+            ?: Regex("(?i)^(100808[A-Za-z0-9_-]+)$").find(decoded.trim())
+        return match?.groupValues?.get(1)
+    }
+
     fun weiboUrl(item: FeedItem): String? {
         val authorId = item.authorId.takeIf { it.isNotBlank() } ?: return null
         val statusKey = item.statusId.takeIf { it.isNotBlank() }

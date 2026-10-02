@@ -7,4 +7,5 @@ data class FeedUrlEntity(
     val shortUrl: String,
     val title: String,
     val url: String,
+    val nativeUrl: String? = null,
 )

@@ -4,7 +4,6 @@ package com.example.myweibo.ui
 
 import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.content.ComponentCallbacks2
 import android.content.Intent
@@ -114,6 +113,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imeAnimationTarget
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBars
@@ -506,10 +506,6 @@ private val MediaPeekEnterEasing = CubicBezierEasing(0.22f, 1f, 0.36f, 1f)
 
 private val MediaPeekEnterAnimationSpec = tween<Float>(
     durationMillis = 480,
-    easing = MediaPeekEnterEasing,
-)
-private val MediaPeekDockAnimationSpec = tween<Float>(
-    durationMillis = 380,
     easing = MediaPeekEnterEasing,
 )
 private val MediaPeekDismissAnimationSpec = tween<Float>(
@@ -965,7 +961,6 @@ private fun commentFailureMessage(error: Throwable): String {
 }
 
 
-private val HintCapsuleWhite = Color.White
 private val HintCapsuleText = Color(0xFF1F1F1F)
 private val HintCapsuleProgressBg = Color(0xFF007AFF)
 private val HintCapsuleProgressText = Color.White
@@ -977,8 +972,8 @@ private val SettingsBottomBarInset = 96.dp
 // 64dp 胶囊高度 + 24dp 底边距 + 12dp 展开动画溢出
 private val LiquidBottomBarReserve = 100.dp
 private val LiquidBottomBarContentGap = 8.dp
-private val SearchBarBottomGap = 20.dp
-private val SearchBarCompanionGap = 8.dp
+private val SearchBarBottomGap = 8.dp
+private val SearchBarCompanionGap = SearchBarBottomGap
 // 与 WeiboLiquidBottomBar 一致：64dp 栏高 + 16dp 底边距
 private val SearchBottomBarClearance = 64.dp + 16.dp
 private val SearchSuggestionPanelMaxHeight = 176.dp
@@ -1070,7 +1065,6 @@ private val VideoControlBarHeight = 32.dp
 private val VideoControlBarBottomFullscreen = 26.dp
 private val VideoControlBarBottomInline = 8.dp
 private val VideoFullscreenTopControlInset = 18.dp
-private val VideoFullscreenTopControlRowSpacing = 8.dp
 private val VideoFullscreenHorizontalControlInset = 16.dp
 private const val VideoMaxWidthFraction = 1f
 private val VideoSpeedOptions = listOf(0.5f, 0.75f, 1f, 1.5f, 2f, 3f)
@@ -3201,12 +3195,6 @@ private const val VideoHoldSpeedBoost = 2f
 private const val VideoCacheMaxBytes = 500L * 1024L * 1024L
 private const val TotalAppCacheLimitBytes = 1L * 1024L * 1024L * 1024L
 private const val VideoPeekDockAspectRatio = 16f / 9f
-private enum class ForcedVideoOrientation {
-    None,
-    Landscape,
-    Portrait,
-}
-
 private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     val url = avatarUrl?.takeIf { it.isNotBlank() } ?: return null
     return FeedImage(
@@ -5679,6 +5667,15 @@ fun WeiboApp() {
     }
 
     fun openUrlEntity(entity: FeedUrlEntity) {
+        if (WeiboStatusActions.openSuperTopicInWeiboApp(
+                context,
+                entity.nativeUrl.orEmpty(),
+                entity.url,
+                entity.shortUrl,
+            )
+        ) {
+            return
+        }
         val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
         if (articleId != null) {
             pushNavigation(NavOverlayKind.Article) {
@@ -7256,6 +7253,7 @@ fun WeiboApp() {
                             loading = searchBarOverlay.suggestionsLoading,
                             onSuggestionClick = searchBarOverlay.onSuggestionClick,
                             onUserClick = searchBarOverlay.onSuggestionUserClick,
+                            backdrop = menuGlassBackdrop,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = SearchBarCompanionGap),
@@ -9408,22 +9406,6 @@ private fun feedVideoFeedLayout(
 
 private fun feedVideoDisplayAspectRatio(media: FeedMedia): Float =
     feedVideoFeedLayout(media).aspectRatio
-
-private fun isPortraitFeedVideo(aspectRatio: Float, media: FeedMedia): Boolean {
-    when (media.videoOrientation?.lowercase()) {
-        "vertical", "portrait" -> return true
-        "horizontal", "landscape" -> return false
-    }
-    val coverWidth = media.coverWidth ?: 0
-    val coverHeight = media.coverHeight ?: 0
-    if (coverWidth > 0 && coverHeight > 0 && coverWidth != coverHeight) {
-        return coverHeight > coverWidth
-    }
-    if (aspectRatio > 0f && abs(aspectRatio - 16f / 9f) > 0.02f) {
-        return aspectRatio < 1f
-    }
-    return feedVideoDisplayAspectRatio(media) < 1f
-}
 
 @Composable
 private fun FeedImageThumbnailContent(
@@ -13906,30 +13888,13 @@ private fun WeiboVideoSurface(
     var aspectRatio by remember(videoUrl) {
         mutableFloatStateOf(feedVideoDisplayAspectRatio(media))
     }
-    var forcedOrientation by remember(videoUrl) { mutableStateOf(ForcedVideoOrientation.None) }
-    val isPortraitVideo = isPortraitFeedVideo(aspectRatio, media)
-    val isLandscapeVideo = !isPortraitVideo
     val effectiveResizeMode = videoResizeMode
-    LaunchedEffect(isFullscreen, isLandscapeVideo) {
-        forcedOrientation = if (isFullscreen && isLandscapeVideo) {
-            ForcedVideoOrientation.Landscape
-        } else {
-            ForcedVideoOrientation.None
-        }
-    }
-    val showLandscapeToggle = false
-    val showPortraitToggle = false
     val fullscreenPrimaryControlTop = if (isDevicePortrait) {
         18.dp
     } else {
         fullscreenTopInset + VideoFullscreenTopControlInset
     }
     val fullscreenFloatingButtonTop = fullscreenPrimaryControlTop
-    val fullscreenSecondaryButtonEnd = if (isFullscreen && onEnterFloatingPlayback != null) {
-        VideoFullscreenHorizontalControlInset + 62.dp
-    } else {
-        VideoFullscreenHorizontalControlInset
-    }
     val trackViewportPause = trackViewportPauseOverride ?: (
         !isFullscreen &&
             controlsEnabled &&
@@ -15209,56 +15174,6 @@ private fun WeiboVideoSurface(
                     contentScale = ContentScale.Fit,
                 )
             }
-        }
-
-        AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && isFullscreen && showLandscapeToggle,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .zIndex(21f),
-        ) {
-            GlassTextButton(
-                text = "横屏",
-                backdrop = videoControlBackdrop,
-                modifier = Modifier
-                    .padding(
-                        end = fullscreenSecondaryButtonEnd,
-                        top = fullscreenPrimaryControlTop,
-                    )
-                    .width(54.dp)
-                    .height(28.dp),
-                onClick = {
-                    showControls()
-                    forcedOrientation = ForcedVideoOrientation.Landscape
-                },
-            )
-        }
-
-        AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && isFullscreen && showPortraitToggle,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .zIndex(21f),
-        ) {
-            GlassTextButton(
-                text = "竖屏",
-                backdrop = videoControlBackdrop,
-                modifier = Modifier
-                    .padding(
-                        end = fullscreenSecondaryButtonEnd,
-                        top = fullscreenPrimaryControlTop,
-                    )
-                    .width(54.dp)
-                    .height(28.dp),
-                onClick = {
-                    showControls()
-                    forcedOrientation = ForcedVideoOrientation.Portrait
-                },
-            )
         }
 
         AnimatedVisibility(
@@ -18365,6 +18280,7 @@ private fun SearchSuggestionPanel(
     loading: Boolean,
     onSuggestionClick: (String, SearchMode) -> Unit,
     onUserClick: (SearchUserItem) -> Unit,
+    backdrop: Backdrop,
     modifier: Modifier = Modifier,
 ) {
     val querySuggestions = suggestions.hotQueries.distinct().take(5)
@@ -18375,10 +18291,16 @@ private fun SearchSuggestionPanel(
         exit = fadeOut(tween(100)),
         modifier = modifier,
     ) {
-        SurfaceLiquidCapsule(
-            modifier = Modifier.fillMaxWidth(),
-            cornerRadius = 14.dp,
-            useMenuGlassStyle = true,
+        TransparentLiquidCapsule(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp)),
+            backdrop = backdrop,
+            surfaceColor = Color.White.copy(alpha = 0.2f),
+            borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
+            else Color.White.copy(alpha = 0.24f),
+            borderWidth = 0.75.dp,
+            frostedBlurRadius = 8.dp,
         ) {
             Column(
                 modifier = Modifier
@@ -19131,7 +19053,11 @@ private fun SearchScreen(
     val searchBarGap = SearchBarBottomGap
     val searchCompanionGap = SearchBarCompanionGap
     val searchFieldHeight = 44.dp
-    val searchBarBottom = SearchBottomBarClearance + searchBarGap
+    // The bottom capsule is lifted by navigationBarsPadding(); include that same
+    // inset when positioning the search field so its clearance is measured to the
+    // capsule itself, not to the physical screen edge.
+    val navigationBarBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    val searchBarBottom = SearchBottomBarClearance + navigationBarBottom + searchBarGap
     val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
     val imeTargetBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
     val imeInsetForLayout = maxOf(imeBottom, imeTargetBottom)
@@ -24009,28 +23935,6 @@ private fun ArticleReaderOverlay(
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun FullscreenForcedOrientationEffect(
-    orientation: ForcedVideoOrientation,
-    enabled: Boolean,
-) {
-    val context = LocalContext.current
-    val activity = context as? android.app.Activity
-    DisposableEffect(enabled, orientation, activity) {
-        if (!enabled || activity == null || orientation == ForcedVideoOrientation.None) {
-            return@DisposableEffect onDispose {}
-        }
-        activity.requestedOrientation = when (orientation) {
-            ForcedVideoOrientation.Landscape -> ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE
-            ForcedVideoOrientation.Portrait -> ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT
-            ForcedVideoOrientation.None -> ActivityInfo.SCREEN_ORIENTATION_USER
-        }
-        onDispose {
-            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
         }
     }
 }

@@ -4,7 +4,7 @@
 
 基于 Jetpack Compose 的第三方微博客户端，通过 WebView 登录态 + 微博 PC 端 `ajax` 接口读取数据，原生渲染信息流、详情、搜索与个人主页。
 
-**当前版本：20261001**（需 Android 16+）
+**当前版本：20261002**（需 Android 16+）
 
 <img src="https://github.com/user-attachments/assets/8b56791a-2c21-41d1-91fa-fe5223751c69" width="350" />
 <img src="https://github.com/user-attachments/assets/69e40c8b-a41d-4579-a1ef-b1a954a17aa6" width="350" />
@@ -57,6 +57,13 @@ app/src/main/java/com/example/myweibo/
 | 写微博 | 原生编辑界面，支持文字/表情/图片/@，草稿保留 |
 | 消息 | 嵌入 `m.weibo.cn/message`，与首页共用登录态 |
 | 媒体 | 图片全屏/保存/分享；视频内联/浮窗/全屏/画中画，过期地址自动重拉 |
+
+## 20261002 更新摘要
+
+- 版本号 `20261002`（versionCode 37）。
+- 清理 Android Lint 确认未使用的模板颜色/旧图标，以及静态引用检查确认无调用的旧封装、配置读取和 MP4 重封装/强制方向代码。
+- 微博超话链接优先通过原生路由打开官方微博客户端；无可用客户端时仍可回退网页。
+- 加深后微调话题蓝色，并完善搜索联想面板磨砂效果与搜索栏/底栏间距计算。
 
 ## 20261001 更新摘要
 

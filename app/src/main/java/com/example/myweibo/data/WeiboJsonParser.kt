@@ -351,6 +351,12 @@ object WeiboJsonParser {
                         shortUrl = shortUrl,
                         title = title,
                         url = targetUrl,
+                        nativeUrl = sequenceOf(
+                            entity.optNullableString("ori_url"),
+                            entity.optNullableString("scheme"),
+                            entity.optNullableString("page_id"),
+                            entity.optNullableString("containerid"),
+                        ).firstOrNull { !it.isNullOrBlank() },
                     ),
                 )
             }
@@ -1066,11 +1072,6 @@ object WeiboJsonParser {
 
     private fun looksLikeAlbumCoverUrl(value: String): Boolean =
         looksLikeImageUrl(value) || value.contains("sinaimg.cn", ignoreCase = true)
-
-    private fun parseAlbumPhotoList(
-        list: JSONArray?,
-        monthContext: AlbumMonthContext = AlbumMonthContext(),
-    ): List<FeedImage> = parseAlbumMediaList(list, monthContext)
 
     private fun parseAlbumPhotoItem(
         item: JSONObject?,

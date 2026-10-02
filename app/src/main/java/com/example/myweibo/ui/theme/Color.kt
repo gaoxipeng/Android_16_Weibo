@@ -10,7 +10,7 @@ val WeiboBlue40 = Color(0xFFFF90B8)
 val WeiboTeal40 = Color(0xFF4CAFB9)
 val WeiboCoral40 = Color(0xFFE9836F)
 
-val WeiboTopicBlue = Color(0xFF6CB4EE)
+val WeiboTopicBlue = Color(0xFF4A96CF)
 
 val TabMutedLight = Color(0xFF8E8E93)
 val TabMutedDark = Color(0xFF98989D)

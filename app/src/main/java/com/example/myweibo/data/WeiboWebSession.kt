@@ -1659,24 +1659,6 @@ class WeiboWebSession(context: Context) {
         }
     }
 
-    private suspend fun currentUserConfig(): JSONObject {
-        ensureOnWeiboOrigin()
-        waitForWeiboOrigin()
-        return evaluateJson(
-            """
-            (function() {
-              const config = window.${'$'}CONFIG || {};
-              const user = config.user || {};
-              return {
-                uid: String(config.uid || user.idstr || user.id || ''),
-                screen_name: String(config.nick || config.screen_name || user.screen_name || user.name || ''),
-                avatar: String(config.avatar || user.avatar_hd || user.profile_image_url || '')
-              };
-            })();
-            """.trimIndent()
-        )
-    }
-
     private suspend fun evaluateJson(script: String): JSONObject =
         withTimeout(WEBVIEW_EVALUATE_TIMEOUT_MS) {
             suspendCancellableCoroutine { continuation ->
