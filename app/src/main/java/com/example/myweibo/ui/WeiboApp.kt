@@ -1064,7 +1064,7 @@ private val VideoProgressLineWidth = 2.5.dp
 private val VideoControlBarHeight = 32.dp
 private val VideoControlBarBottomFullscreen = 26.dp
 private val VideoControlBarBottomInline = 8.dp
-private val VideoFullscreenTopControlInset = 18.dp
+private val VideoFullscreenTopControlInset = 28.dp
 private val VideoFullscreenHorizontalControlInset = 16.dp
 private const val VideoMaxWidthFraction = 1f
 private val VideoSpeedOptions = listOf(0.5f, 0.75f, 1f, 1.5f, 2f, 3f)
@@ -13876,7 +13876,9 @@ private fun WeiboVideoSurface(
     var holdSpeedBoostActive by remember(videoUrl) { mutableStateOf(false) }
     val holdSpeedBoostActiveState = rememberUpdatedState(holdSpeedBoostActive)
     val haptic = LocalHapticFeedback.current
-    val holdSpeedEnabled = (isFullscreen || isPeekPlayback) && playbackSpeedOverride == null
+    // Override mode is also used by a few floating handoff states; long press should
+    // still provide an explicit temporary 2x boost there and restore the override on release.
+    val holdSpeedEnabled = isFullscreen || isPeekPlayback
     val holdSpeedEnabledState = rememberUpdatedState(holdSpeedEnabled)
     var controlsVisible by remember(videoUrl, initialControlsVisible) {
         mutableStateOf(initialControlsVisible)
@@ -13890,11 +13892,12 @@ private fun WeiboVideoSurface(
     }
     val effectiveResizeMode = videoResizeMode
     val fullscreenPrimaryControlTop = if (isDevicePortrait) {
-        18.dp
+        VideoFullscreenTopControlInset
     } else {
         fullscreenTopInset + VideoFullscreenTopControlInset
     }
     val fullscreenFloatingButtonTop = fullscreenPrimaryControlTop
+    val resolvedVideoControlBarHeight = if (isFullscreen) 42.dp else VideoControlBarHeight
     val trackViewportPause = trackViewportPauseOverride ?: (
         !isFullscreen &&
             controlsEnabled &&
@@ -15115,6 +15118,53 @@ private fun WeiboVideoSurface(
         }
         }
 
+        AnimatedVisibility(
+            visible = holdSpeedBoostActive,
+            enter = fadeIn(tween(120)) + scaleIn(
+                initialScale = 0.9f,
+                animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+            ),
+            exit = fadeOut(tween(120)) + scaleOut(targetScale = 0.94f),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(
+                    top = when {
+                        isFullscreen && isDevicePortrait -> fullscreenPrimaryControlTop + 10.dp
+                        isFullscreen -> fullscreenPrimaryControlTop
+                        isDevicePortrait -> 20.dp
+                        else -> 10.dp
+                    },
+                )
+                .zIndex(15f),
+        ) {
+            TransparentLiquidCapsule(
+                modifier = Modifier
+                    .width(42.dp)
+                    .height(34.dp),
+                backdrop = videoControlBackdrop,
+                pill = true,
+                surfaceColor = Color.White.copy(alpha = 0.12f),
+                useLargeCapsuleEffect = true,
+                showShadow = false,
+                largeCapsuleRefractionHeight = 16.dp,
+                largeCapsuleRefractionAmount = 28.dp,
+            ) {
+                Text(
+                    text = "2×",
+                    modifier = Modifier.align(Alignment.Center),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge.copy(
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        shadow = Shadow(
+                            color = Color.Black.copy(alpha = 0.6f),
+                            offset = Offset(0f, 1f),
+                            blurRadius = 3f,
+                        ),
+                    ),
+                )
+            }
+        }
 
 
         AnimatedVisibility(
@@ -15340,7 +15390,7 @@ private fun WeiboVideoSurface(
                 },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(VideoControlBarHeight),
+                    .height(resolvedVideoControlBarHeight),
             )
         }
 
@@ -15348,6 +15398,7 @@ private fun WeiboVideoSurface(
     WeiboVideoSpeedPopup(
                 selectedSpeed = selectedSpeed,
                 backdrop = videoControlBackdrop,
+                controlBarHeight = resolvedVideoControlBarHeight,
                 onSpeedSelected = { speed ->
                     selectedSpeed = speed
                     displayedSpeed = speed
@@ -15364,7 +15415,7 @@ private fun WeiboVideoSurface(
                             if (isDevicePortrait) 49.dp else fullscreenBottomInset + VideoControlBarBottomFullscreen
                         } else {
                             VideoControlBarBottomInline
-                        }) + VideoControlBarHeight + 6.dp,
+                        }) + resolvedVideoControlBarHeight + 6.dp,
                     ),
             )
         }
@@ -15376,12 +15427,13 @@ private fun WeiboVideoSpeedPopup(
     selectedSpeed: Float,
     backdrop: Backdrop,
     onSpeedSelected: (Float) -> Unit,
+    controlBarHeight: Dp = VideoControlBarHeight,
     modifier: Modifier = Modifier,
 ) {
     TransparentLiquidCapsule(
         modifier = modifier
             .width(246.dp)
-            .height(VideoControlBarHeight),
+            .height(controlBarHeight),
         backdrop = backdrop,
         pill = true,
         surfaceColor = liquidLargeCapsuleSurfaceColor(isAppLightTheme()),
@@ -24550,14 +24602,29 @@ private object RemoteDiskBytesCache {
         val files = dir.listFiles()
             ?.filter { it.isFile && !it.name.endsWith(".pending") }
             ?: return
-        var totalBytes = files.sumOf { it.length() }
+        // Snapshot mutable filesystem metadata before sorting. Cache reads update lastModified()
+        // concurrently, so comparing live timestamps can make TimSort observe a non-transitive
+        // ordering and crash startup with "Comparison method violates its general contract".
+        val entries = files.map { file ->
+            CacheEntry(
+                file = file,
+                lastModified = file.lastModified(),
+                sizeBytes = file.length(),
+            )
+        }
+        var totalBytes = entries.sumOf { it.sizeBytes }
         if (totalBytes <= RemoteDiskBytesCacheMaxTotal) return
-        files.sortedBy { it.lastModified() }.forEach { file ->
+        entries.sortedBy { it.lastModified }.forEach { entry ->
             if (totalBytes <= RemoteDiskBytesCacheMaxTotal) return
-            val size = file.length()
-            if (file.delete()) totalBytes -= size
+            if (entry.file.delete()) totalBytes -= entry.sizeBytes
         }
     }
+
+    private data class CacheEntry(
+        val file: java.io.File,
+        val lastModified: Long,
+        val sizeBytes: Long,
+    )
 
     private fun cacheFileName(url: String): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
