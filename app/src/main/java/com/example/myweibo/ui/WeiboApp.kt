@@ -3251,6 +3251,7 @@ fun WeiboApp() {
     val searchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
+    val detailActionMenuController = remember { FeedCardActionMenuController() }
     val navTransitionCoordinator = remember { NavTransitionCoordinator() }
     val feedListScrollCoordinator = remember { FeedListScrollCoordinator() }
     val videoPeekController = remember { VideoPeekController() }
@@ -3317,6 +3318,7 @@ fun WeiboApp() {
         if (selectedItem != null) {
             feedCardActionMenuController.dismiss()
         }
+        detailActionMenuController.dismiss()
     }
 
     SideEffect {
@@ -5727,6 +5729,7 @@ fun WeiboApp() {
         val resolved = resolveFeedItem(item)
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
+        detailActionMenuController.dismiss()
         // Persist the viewer state that should be restored after returning from the
         // status detail. In particular, returning must not replay the source-open
         // animation after the large image was already visible.
@@ -7121,6 +7124,7 @@ fun WeiboApp() {
                             CompositionLocalProvider(
                                 LocalDetailInlineVideoPlayback provides true,
                                 LocalFeedListScrollCoordinator provides detailScrollCoordinator,
+                                LocalFeedCardActionMenuController provides detailActionMenuController,
                             ) {
                             DetailScreen(
                                 item = detailItem,
@@ -7419,6 +7423,17 @@ fun WeiboApp() {
             )
             FeedCardActionMenuOverlay(
                 controller = feedCardActionMenuController,
+                backdrop = menuGlassBackdrop,
+                currentUserId = mineProfile?.id ?: activeAccountId,
+                deletingStatusId = deletingStatusId,
+                favoriteOverrides = favoriteOverrides,
+                onToggleFavorite = ::toggleStatusFavorite,
+                onDelete = { item, anchor ->
+                    pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
+                },
+            )
+            FeedCardActionMenuOverlay(
+                controller = detailActionMenuController,
                 backdrop = menuGlassBackdrop,
                 currentUserId = mineProfile?.id ?: activeAccountId,
                 deletingStatusId = deletingStatusId,
@@ -9050,6 +9065,139 @@ private fun FeedCardActionMenu(
 }
 
 @Composable
+private fun DetailFeedCardActionMenu(
+    item: FeedItem,
+    favoriteOverrides: Map<String, Boolean>,
+    currentUserId: String?,
+    deletingStatusId: String?,
+    onToggleFavorite: (FeedItem, Boolean) -> Unit,
+    onDeleteStatus: ((FeedItem, Rect) -> Unit)?,
+) {
+    var anchorBounds by remember(item.actionMenuKey()) { mutableStateOf<Rect?>(null) }
+    var menuVisible by remember(item.actionMenuKey()) { mutableStateOf(false) }
+    val context = LocalContext.current
+    val shareUrl = remember(item.id) { WeiboStatusActions.weiboUrl(item) }
+    val canDelete = !currentUserId.isNullOrBlank() && item.authorId == currentUserId
+    val isFavorited = favoriteOverrides[item.actionMenuKey()] ?: item.favorited
+    val favoriteLabel = if (isFavorited) "取消收藏" else "收藏"
+    val labels = remember(canDelete, favoriteLabel) {
+        buildList {
+            add("跳转到微博")
+            add("分享")
+            add(favoriteLabel)
+            if (canDelete) add("删除微博")
+        }
+    }
+    val density = LocalDensity.current
+
+    Box(modifier = Modifier.size(32.dp), contentAlignment = Alignment.Center) {
+        Box(
+            modifier = Modifier
+                .size(52.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .onGloballyPositioned { coordinates ->
+                    if (coordinates.isAttached) anchorBounds = coordinates.boundsInRoot()
+                }
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                ) {
+                    menuVisible = !menuVisible
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            SettingsExpandIndicator(
+                modifier = Modifier.size(18.dp),
+                tint = weiboMetaTextColor(),
+            )
+        }
+    }
+
+    val anchor = anchorBounds
+    if (!menuVisible || anchor == null) return
+    BackHandler(enabled = true) { menuVisible = false }
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .zIndex(1000f),
+    ) {
+        val width = rememberActionMenuWidth(labels, maxWidth - 28.dp)
+        val placement = calculateFeedCardActionMenuOffsetPx(
+            anchorBounds = anchor,
+            screenWidthPx = with(density) { maxWidth.toPx() },
+            screenHeightPx = with(density) { maxHeight.toPx() },
+            menuWidthPx = with(density) { width.toPx() },
+            menuHeightPx = with(density) {
+                (if (canDelete) ActionMenuFourRowHeight else ActionMenuThreeRowHeight).toPx()
+            },
+            marginPx = with(density) { 14.dp.toPx() },
+            gapPx = with(density) { 6.dp.toPx() },
+        )
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                ) { menuVisible = false },
+        )
+        Column(
+            modifier = Modifier
+                .offset { placement.offset }
+                .width(width)
+                .clip(RoundedCornerShape(ActionMenuCornerRadius))
+                .background(actionMenuSurfaceColor())
+                .border(
+                    width = 0.75.dp,
+                    color = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
+                    else Color.White.copy(alpha = 0.24f),
+                    shape = RoundedCornerShape(ActionMenuCornerRadius),
+                )
+                .padding(ActionMenuCardInset),
+            verticalArrangement = Arrangement.spacedBy(ActionMenuItemGap),
+        ) {
+            ImageActionRow(
+                label = "跳转到微博",
+                enabled = shareUrl != null,
+                onClick = {
+                    menuVisible = false
+                    WeiboStatusActions.openInWeiboApp(context, item)
+                },
+            )
+            ImageActionRow(
+                label = "分享",
+                enabled = shareUrl != null,
+                separatorBefore = true,
+                onClick = {
+                    menuVisible = false
+                    WeiboStatusActions.shareLink(context, item)
+                },
+            )
+            ImageActionRow(
+                label = favoriteLabel,
+                enabled = deletingStatusId == null,
+                separatorBefore = true,
+                onClick = {
+                    menuVisible = false
+                    onToggleFavorite(item, !isFavorited)
+                },
+            )
+            if (canDelete) {
+                ImageActionRow(
+                    label = "删除微博",
+                    enabled = deletingStatusId == null,
+                    separatorBefore = true,
+                    onClick = {
+                        menuVisible = false
+                        onDeleteStatus?.invoke(item, anchor)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun FeedCardActionMenuOverlay(
     controller: FeedCardActionMenuController,
     backdrop: Backdrop,
@@ -9109,7 +9257,9 @@ private fun FeedCardActionMenuOverlay(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .zIndex(590f),
+            // The detail layer and its transition shield are composed later and can
+            // otherwise cover this root-level anchored menu.
+            .zIndex(620f),
     ) {
         val screenWidthPx = with(density) { maxWidth.toPx() }
         val screenHeightPx = with(density) { maxHeight.toPx() }
