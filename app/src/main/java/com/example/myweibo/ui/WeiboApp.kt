@@ -11167,7 +11167,7 @@ private fun VideoPeekOverlay(
         Animatable(if (dockImmediately) 1f else 0f)
     }
     val fullscreenExpandProgress = remember(playbackKey) {
-        Animatable(if (isFullscreenMode) 1f else 0f)
+        Animatable(if (isFullscreenMode || fromFullscreen) 1f else 0f)
     }
     var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
     var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
@@ -11627,7 +11627,7 @@ private fun VideoPeekOverlay(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black),
+                    .background(Color.Black.copy(alpha = expandProgress)),
             )
         } else if (!isDocked && !isInlineAnchored) {
             val scrimAlpha = 0.42f * layoutProgress
@@ -11765,9 +11765,28 @@ private fun VideoPeekOverlay(
             ) {
                 VideoPeekCard(
                     modifier = when {
-                        isFullscreenMode -> Modifier
-                            .fillMaxSize()
-                            .background(Color.Black)
+                        !useFloatingDismissMorph && (isFullscreenMode || fromFullscreen ||
+                            dismissReason == VideoPeekDismissReason.EnterFullscreen || inlineFullscreenProgress > 0f) -> {
+                            val startLeft = if (inlineHosted && !isFloating && !isFullscreenMode) hostedLeft else dockLeft
+                            val startTop = if (inlineHosted && !isFloating && !isFullscreenMode) hostedTop else dockTop
+                            val startWidth = if (inlineHosted && !isFloating && !isFullscreenMode) hostedWidth else dockWidth
+                            val startHeight = if (inlineHosted && !isFloating && !isFullscreenMode) hostedHeight else dockHeight
+                            Modifier
+                                .offset(
+                                    x = lerpDp(startLeft, 0.dp, inlineFullscreenProgress),
+                                    y = lerpDp(startTop, 0.dp, inlineFullscreenProgress),
+                                )
+                                .size(
+                                    width = lerpDp(startWidth, with(density) { maxWidthPx.toDp() }, inlineFullscreenProgress),
+                                    height = lerpDp(startHeight, effectiveMaxHeight, inlineFullscreenProgress),
+                                )
+                                .graphicsLayer {
+                                    shape = RoundedCornerShape(lerpDp(12.dp, 0.dp, inlineFullscreenProgress))
+                                    clip = true
+                                    shadowElevation = 8.dp.toPx() * (1f - inlineFullscreenProgress)
+                                }
+                                .background(Color.Black)
+                        }
                         inlineHosted && !useFloatingDismissMorph -> Modifier
                             .offset(
                                 x = lerpDp(hostedLeft, fullscreenVideoLeft, inlineFullscreenProgress),
@@ -19659,14 +19678,18 @@ private fun SearchScreen(
         val query = activeQuery ?: return
         if (!hasLoginCookie) return
         if (generation != searchGeneration) return
+        val retainVisibleResults = reset && searchPullRefreshing &&
+            (if (activeSearchMode == SearchMode.User) userResultItems.isNotEmpty() else resultItems.isNotEmpty())
         if (reset) {
             resultLoading = true
             resultError = null
-            resultNextPage = null
-            resultItems = emptyList()
-            userResultItems = emptyList()
-            initialResultsReady = false
-            runCatching { listState.scrollToItem(0) }
+            if (!retainVisibleResults) {
+                resultNextPage = null
+                resultItems = emptyList()
+                userResultItems = emptyList()
+                initialResultsReady = false
+                runCatching { listState.scrollToItem(0) }
+            }
         } else {
             val nextPage = resultNextPage?.toIntOrNull() ?: return
             if (resultLoading || resultLoadingMore || !initialResultsReady) return
@@ -19712,15 +19735,18 @@ private fun SearchScreen(
             }
             resultError = null
             initialResultsReady = true
+            if (retainVisibleResults) runCatching { listState.scrollToItem(0) }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             if (generation != searchGeneration) return
             if (reset) {
                 resultError = error.message ?: "搜索失败"
-                resultItems = emptyList()
-                userResultItems = emptyList()
-                resultNextPage = null
+                if (!retainVisibleResults) {
+                    resultItems = emptyList()
+                    userResultItems = emptyList()
+                    resultNextPage = null
+                }
                 initialResultsReady = true
             } else {
                 resultNextPage = null
