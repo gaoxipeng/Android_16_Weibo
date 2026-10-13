@@ -20110,7 +20110,7 @@ private fun SearchScreen(
                     }
                 } else {
                     when {
-                        resultLoading &&
+                        resultLoading && !searchPullRefreshing &&
                             (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
                             item {
                                 Box(
@@ -20194,7 +20194,7 @@ private fun SearchScreen(
                             }
                         }
                     }
-                    if (resultLoadingMore) {
+                    if (resultLoadingMore && !searchPullRefreshing) {
                         item { MineLoadingMoreIndicator() }
                     }
                 }
