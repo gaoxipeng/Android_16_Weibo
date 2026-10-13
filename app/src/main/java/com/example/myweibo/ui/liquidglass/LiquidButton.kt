@@ -366,6 +366,7 @@ fun TransparentLiquidCapsule(
     useLargeCapsuleEffect: Boolean = false,
     usePopupGlassEffect: Boolean = false,
     showShadow: Boolean = true,
+    drawTintAboveGlass: Boolean = false,
     largeCapsuleRefractionHeight: Dp = 24.dp,
     largeCapsuleRefractionAmount: Dp = 40.dp,
     content: @Composable BoxScope.() -> Unit,
@@ -411,12 +412,14 @@ fun TransparentLiquidCapsule(
                 },
                 onDrawSurface = {
                     drawRect(
-                        if (surfaceColor.isSpecified) surfaceColor
+                        if (drawTintAboveGlass) Color.Transparent
+                        else if (surfaceColor.isSpecified) surfaceColor
                         else if (useLargeCapsuleEffect) liquidLargeCapsuleSurfaceColor(isLightTheme)
                         else Color.Transparent,
                     )
                 },
             )
+            .then(if (drawTintAboveGlass && surfaceColor.isSpecified) Modifier.background(surfaceColor, shape) else Modifier)
             .border(borderWidth, resolvedBorderColor, shape),
         content = content,
     )

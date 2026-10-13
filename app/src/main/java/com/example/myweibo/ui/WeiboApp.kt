@@ -4257,6 +4257,10 @@ fun WeiboApp() {
     )
 
     fun applyDeferredNavRestore(state: NavRestoreState) {
+        // Navigation restores the saved bar state. The foreground-page effect
+        // must not immediately overwrite a hidden bar with its auto-show default.
+        suppressNextBottomBarAutoShow = true
+        bottomBarVisible = state.bottomBarVisible
         val retainedHomeList = state.selectedTab == MainTab.Feed && state.detail == null &&
             state.visitedProfile == null && selectedItem != null && visitedUserId == null
         mediaPreview = null
@@ -7475,6 +7479,7 @@ fun WeiboApp() {
                     onSwipeReturnCommit = {
                         hiddenFeedCardId = null
                         val previous = navStack.lastOrNull()
+                        if (previous != null) bottomBarVisible = previous.bottomBarVisible
                         detailSwipeReturningHome = previous != null && previous.detail == null &&
                             previous.visitedProfile == null && previous.selectedTab == MainTab.Feed
                     },
@@ -7643,27 +7648,6 @@ fun WeiboApp() {
                     )
                 }
 
-                likeUsersOverlay?.let { overlay ->
-                    val overlayItem = resolveFeedItem(overlay.item)
-                    Box(Modifier.fillMaxSize().zIndex(610f)) {
-                        LikeUsersOverlay(
-                            item = overlayItem,
-                            anchorBounds = overlay.anchorBounds,
-                            loading = likeUsersLoading,
-                            loadingMore = likeUsersLoadingMore,
-                            hasMore = likeUsersNextPage != null,
-                            users = likeUsers,
-                            error = likeUsersError,
-                            onDismiss = ::closeLikeUsers,
-                            onLoadMore = ::loadMoreLikeUsers,
-                            onToggleLike = { toggleStatusLike(overlayItem) },
-                            onUserClick = { uid ->
-                                closeLikeUsers()
-                                openUser(uid)
-                            },
-                        )
-                    }
-                }
             }
 
             HiddenSessionWebView(session)
@@ -7741,12 +7725,34 @@ fun WeiboApp() {
             val saveHintState = imageSaveHintController.activeHint
             val capsuleHintState = saveHintState?.let { null }
                 ?: operationCapsuleHint?.let {
-                    AppCapsuleHintState(message = it)
+                    AppCapsuleHintState(
+                        message = it,
+                        tone = if (it == "暂无点赞") CapsuleHintTone.Theme else CapsuleHintTone.Neutral,
+                    )
                 }
                 ?: feedCapsuleHint?.let {
                     AppCapsuleHintState(message = it, tone = CapsuleHintTone.Theme)
                 }
             val feedRefreshTopInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+            // Sample the completed page layer, never the layer containing this hint.
+            likeUsersOverlay?.let { overlay ->
+                val overlayItem = resolveFeedItem(overlay.item)
+                Box(Modifier.fillMaxSize().zIndex(610f)) {
+                    LikeUsersOverlay(
+                        item = overlayItem,
+                        anchorBounds = overlay.anchorBounds,
+                        loading = likeUsersLoading,
+                        loadingMore = likeUsersLoadingMore,
+                        hasMore = likeUsersNextPage != null,
+                        users = likeUsers,
+                        error = likeUsersError,
+                        onDismiss = ::closeLikeUsers,
+                        onLoadMore = ::loadMoreLikeUsers,
+                        onToggleLike = { toggleStatusLike(overlayItem) },
+                        onUserClick = { uid -> closeLikeUsers(); openUser(uid) },
+                    )
+                }
+            }
             AnimatedVisibility(
                 visible = capsuleHintState != null,
                 enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
@@ -8130,6 +8136,8 @@ private fun OpaqueHintCapsule(
             pill = true,
             surfaceColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.56f),
             useLargeCapsuleEffect = true,
+            showShadow = false,
+            drawTintAboveGlass = true,
             largeCapsuleRefractionHeight = 16.dp,
             largeCapsuleRefractionAmount = 28.dp,
         ) {
@@ -8318,6 +8326,8 @@ private fun ExitConfirmCapsule(
             pill = true,
             surfaceColor = Color(0xFFE00000).copy(alpha = 0.5f),
             useLargeCapsuleEffect = true,
+            showShadow = false,
+            drawTintAboveGlass = true,
             largeCapsuleRefractionHeight = 16.dp,
             largeCapsuleRefractionAmount = 28.dp,
         ) {
@@ -10439,6 +10449,7 @@ private fun ImageActionFrostedCard(
     hazeState: HazeState? = null,
     menuHeight: Dp? = null,
     useBackdrop: Boolean = true,
+    showBorder: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val cardModifier = modifier.then(
@@ -10481,7 +10492,7 @@ private fun ImageActionFrostedCard(
                 )
                 .border(
                     width = 0.75.dp,
-                    color = if (isLightTheme) Color.Black.copy(alpha = 0.16f)
+                    color = if (!showBorder) Color.Transparent else if (isLightTheme) Color.Black.copy(alpha = 0.16f)
                     else Color.White.copy(alpha = 0.24f),
                     shape = cardShape,
                 )
@@ -10509,13 +10520,13 @@ private fun ImageActionFrostedCard(
                     backdrop = resolvedBackdrop,
                     shape = { cardShape },
                     effects = { liquidRegularMenuGlassEffects() },
-                    highlight = { Highlight.Default.copy(alpha = 0.38f) },
+                    highlight = if (showBorder) ({ Highlight.Default.copy(alpha = 0.38f) }) else null,
                     shadow = null,
                     onDrawSurface = { drawRect(frostedTint) },
                 )
                 .border(
                     width = 0.75.dp,
-                    color = if (isLightTheme) Color.Black.copy(alpha = 0.16f)
+                    color = if (!showBorder) Color.Transparent else if (isLightTheme) Color.Black.copy(alpha = 0.16f)
                     else Color.White.copy(alpha = 0.24f),
                     shape = cardShape,
                 )
@@ -18303,8 +18314,7 @@ private fun LikeUsersOverlay(
             marginPx = with(density) { margin.toPx() },
             gapPx = with(density) { gap.toPx() },
         )
-        val cardShape = RoundedCornerShape(16.dp)
-        Surface(
+        ImageActionFrostedCard(
             modifier = Modifier
                 .offset { placement.offset }
                 .width(cardWidth)
@@ -18313,10 +18323,7 @@ private fun LikeUsersOverlay(
                     interactionSource = remember { MutableInteractionSource() },
                     onClick = {},
                 ),
-            shape = cardShape,
-            color = MaterialTheme.colorScheme.surface,
-            shadowElevation = 6.dp,
-            border = BorderStroke(1.dp, hintCapsuleBorderColor()),
+            showBorder = false,
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -20136,7 +20143,7 @@ private fun SearchScreen(
                     }
                 } else {
                     when {
-                        resultLoading && !searchPullRefreshing &&
+                        (resultLoading || !initialResultsReady) && !searchPullRefreshing &&
                             (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) -> {
                             item {
                                 Box(
@@ -20172,7 +20179,7 @@ private fun SearchScreen(
                             }
                         }
                         (if (activeSearchMode == SearchMode.User) userResultItems.isEmpty() else resultItems.isEmpty()) &&
-                            !resultLoading -> {
+                            initialResultsReady && !resultLoading && !searchPullRefreshing -> {
                             item {
                                 Text(
                                     text = "暂无相关内容",
