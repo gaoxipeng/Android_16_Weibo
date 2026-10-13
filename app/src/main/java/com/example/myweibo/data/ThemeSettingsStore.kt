@@ -25,6 +25,6 @@ class ThemeSettingsStore(context: Context) {
         const val PREFS_NAME = "weibo_app_prefs"
         const val KEY_THEME_COLOR = "theme_color"
         const val KEY_APPEARANCE_MODE = "appearance_mode"
-        const val DEFAULT_THEME_COLOR = "cobalt"
+        const val DEFAULT_THEME_COLOR = "wine_red"
     }
 }

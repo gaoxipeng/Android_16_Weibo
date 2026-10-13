@@ -1094,33 +1094,15 @@ private data class MorandiThemeColor(
 )
 
 private val MorandiThemeColors = listOf(
-    // 中性色
-    MorandiThemeColor("classic_black", "黑色", Color(0xFF202124), Color(0xFFE6E6E6), Color(0xFF4A4A4A)),
-    MorandiThemeColor("graphite", "石墨", Color(0xFF4E5965), Color(0xFFDDE2E7), Color(0xFF66717C)),
-    // 红粉
-    MorandiThemeColor("wine_red", "酒红", Color(0xFF9A4E5B), Color(0xFFEBD7DB), Color(0xFFA56B73)),
-    MorandiThemeColor("coral", "珊瑚", Color(0xFFC8665D), Color(0xFFF0D8D5), Color(0xFFB27771)),
-    MorandiThemeColor("ruby_red", "宝石红", Color(0xFFE03A56), Color(0xFFFCE3E8), Color(0xFFD24B63)),
-    MorandiThemeColor("rose_red", "玫红", Color(0xFFFF3B6F), Color(0xFFFFE3EC), Color(0xFFE03568)),
-    // 橙黄
-    MorandiThemeColor("clay", "陶土", Color(0xFFC08A72), Color(0xFFEEDDD5), Color(0xFFA98B7C)),
-    MorandiThemeColor("amber", "琥珀", Color(0xFFB07A39), Color(0xFFEADDCB), Color(0xFFA4865A)),
-    MorandiThemeColor("vivid_orange", "活力橙", Color(0xFFFF6D00), Color(0xFFFFE8D6), Color(0xFFE86200)),
-    // 绿色
-    MorandiThemeColor("sage", "鼠尾草", Color(0xFF86A08A), Color(0xFFDCE8DD), Color(0xFF8A9B82)),
-    MorandiThemeColor("emerald", "翠绿", Color(0xFF00A86B), Color(0xFFD4F5E6), Color(0xFF1A9B65)),
-    MorandiThemeColor("vivid_green", "草绿", Color(0xFF34C759), Color(0xFFE5F9E8), Color(0xFF2DB350)),
-    // 青色
-    MorandiThemeColor("smoky_teal", "烟青", Color(0xFF789E9B), Color(0xFFD7E5E3), Color(0xFF7F9996)),
-    MorandiThemeColor("cyan", "天青", Color(0xFF00BCD4), Color(0xFFD6F5F9), Color(0xFF00A8BA)),
-    // 蓝色
-    MorandiThemeColor("mist_blue", "雾蓝", Color(0xFF7F9CAF), Color(0xFFD8E4EA), Color(0xFF879BA7)),
-    MorandiThemeColor("ocean_blue", "海蓝", Color(0xFF4E7FA8), Color(0xFFD6E5F1), Color(0xFF668AA8)),
-    MorandiThemeColor("electric_blue", "电光蓝", Color(0xFF2B7CFF), Color(0xFFDFECFF), Color(0xFF4A90E8)),
-    MorandiThemeColor("cobalt", "钴蓝", Color(0xFF0057FF), Color(0xFFDDE8FF), Color(0xFF3366E6)),
-    // 紫色
-    MorandiThemeColor("iris", "鸢尾", Color(0xFF7367B2), Color(0xFFE0DDF2), Color(0xFF8279AF)),
-    MorandiThemeColor("violet", "紫罗兰", Color(0xFF8B5CF6), Color(0xFFECE8FE), Color(0xFF7C4FE8)),
+    MorandiThemeColor("wine_red", "酒红", Color(0xFFAF6060), Color(0xFFD49A9A), Color(0xFFAF6060)),
+    MorandiThemeColor("olive_green", "橄榄绿", Color(0xFF7A8A61), Color(0xFFB0B99C), Color(0xFF7A8A61)),
+    MorandiThemeColor("tea_brown", "茶棕", Color(0xFF8C6E5D), Color(0xFFB8A294), Color(0xFF8C6E5D)),
+    MorandiThemeColor("caramel", "焦糖", Color(0xFFC28866), Color(0xFFDDB89C), Color(0xFFC28866)),
+    MorandiThemeColor("mustard", "芥末黄", Color(0xFFCDA868), Color(0xFFE2C89F), Color(0xFFCDA868)),
+    MorandiThemeColor("forest_green", "墨绿", Color(0xFF597A6E), Color(0xFF94ACA2), Color(0xFF597A6E)),
+    MorandiThemeColor("gray_purple", "灰紫", Color(0xFF977C8C), Color(0xFFC0A987), Color(0xFF977C8C)),
+    MorandiThemeColor("navy", "藏蓝", Color(0xFF4F6887), Color(0xFF8A9BB3), Color(0xFF4F6887)),
+    MorandiThemeColor("brick_orange", "砖橘", Color(0xFFD1836B), Color(0xFFE5B09B), Color(0xFFD1836B)),
 )
 
 private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
@@ -21582,11 +21564,12 @@ private fun SettingsThemeColorGrid(
                 rowOptions.forEach { option ->
                     val isSelected = selected.storageValue == option.storageValue
                     val textColor = readableTextColor(option.primary)
+                    val swatchShape = RoundedCornerShape(10.dp)
                     Box(
                         modifier = Modifier
                             .width(cellWidth)
                             .height(30.dp)
-                            .clip(RoundedCornerShape(999.dp))
+                            .clip(swatchShape)
                             .border(
                                 width = if (isSelected) 1.5.dp else 1.dp,
                                 color = if (isSelected) {
@@ -21594,7 +21577,7 @@ private fun SettingsThemeColorGrid(
                                 } else {
                                     Color.White.copy(alpha = 0.55f)
                                 },
-                                shape = RoundedCornerShape(999.dp),
+                                shape = swatchShape,
                             )
                             .background(option.primary)
                             .clickable { onSelected(option) },
@@ -21790,7 +21773,7 @@ private fun SettingsThemeColorCard(
                         .padding(start = 8.dp, end = 8.dp, bottom = 12.dp),
                 ) {
                     val gap = 4.dp
-                    val columns = 4
+                    val columns = 3
                     val cellWidth = (maxWidth - gap * (columns - 1)) / columns
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         SettingsThemeColorGrid(
