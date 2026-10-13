@@ -4257,17 +4257,24 @@ fun WeiboApp() {
     )
 
     fun applyDeferredNavRestore(state: NavRestoreState) {
+        val retainedHomeList = state.selectedTab == MainTab.Feed && state.detail == null &&
+            state.visitedProfile == null && selectedItem != null && visitedUserId == null
         mediaPreview = null
         articleOverlay = null
         albumViewerState = null
 
         if (state.visitedProfile != null) {
             restoreVisitedProfileSnapshot(state.visitedProfile, incrementGeneration = false)
-        } else {
+        } else if (visitedUserId != null || visitedProfile != null) {
+            // A retained home/detail stack has no profile to clear. Clearing it
+            // anyway pauses the shared player and changes all video cards at the
+            // exact frame that the detail overlay disappears.
             clearVisitedProfileState()
         }
 
-        scrollLazyListState(feedListState, state.feedScroll)
+        // The home list stays mounted throughout a detail visit. Its live layout
+        // is the return destination, not a saved index restored after the animation.
+        if (!retainedHomeList) scrollLazyListState(feedListState, state.feedScroll)
         scrollLazyListState(minePostsListState, state.minePostsScroll)
         scrollLazyListState(mineAlbumListState, state.mineAlbumScroll)
         scrollLazyListState(searchListState, state.searchScroll)
@@ -9055,14 +9062,25 @@ private fun tokenWidthEm(token: String): Float =
         }
     }.toFloat()
 
+// Keep small inline emoji separate from large photo/video thumbnail eviction.
+// Disk-cache hits must also be present synchronously when Text recreates a child.
+private val EmoticonBitmapCache = object : android.util.LruCache<String, Bitmap>(4 * 1024 * 1024) {
+    override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+}
+
 @Composable
 private fun EmojiImage(url: String) {
     var bitmap by remember(url) {
-        mutableStateOf(FeedBitmapCache.get(url)?.takeIfDrawable())
+        mutableStateOf(EmoticonBitmapCache.get(url)?.takeIfDrawable()
+            ?: FeedBitmapCache.get(url)?.takeIfDrawable())
     }
     LaunchedEffect(url) {
-        if (bitmap != null) return@LaunchedEffect
+        bitmap?.let {
+            EmoticonBitmapCache.put(url, it)
+            return@LaunchedEffect
+        }
         FeedBitmapCache.get(url)?.takeIfDrawable()?.let {
+            EmoticonBitmapCache.put(url, it)
             bitmap = it
             return@LaunchedEffect
         }
@@ -9084,6 +9102,7 @@ private fun EmojiImage(url: String) {
             }
         }.onSuccess { decoded ->
             if (decoded != null) {
+                EmoticonBitmapCache.put(url, decoded)
                 bitmap = decoded
             }
         }
@@ -16770,7 +16789,7 @@ private fun DetailStickyAuthorHeader(
                     .fillMaxWidth()
                     .padding(horizontal = if (embeddedInCard) FeedCardContentHorizontalPadding else 26.dp)
                     .padding(
-                        top = if (embeddedInCard) 14.dp else topInset + 12.dp,
+                        top = if (embeddedInCard) 8.dp else topInset + 12.dp,
                         bottom = if (embeddedInCard) 6.dp else 10.dp,
                     ),
                 verticalAlignment = Alignment.Top,
@@ -18199,10 +18218,6 @@ private fun LikeUsersOverlay(
     val emptyMessage = error ?: "暂无点赞"
 
     if (showEmptyCapsule) {
-        LaunchedEffect(emptyMessage) {
-            delay(1800)
-            onDismiss()
-        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -18222,15 +18237,12 @@ private fun LikeUsersOverlay(
                 ),
                 exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.94f),
             ) {
-                OpaqueHintCapsule {
-                    Text(
-                        text = emptyMessage,
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = hintCapsuleTextColor(),
-                    )
-                }
+                FeedRefreshCapsuleHint(
+                    message = emptyMessage,
+                    tone = CapsuleHintTone.Theme,
+                    autoDismissMillis = 1800L,
+                    onDismiss = onDismiss,
+                )
             }
         }
         return
@@ -19983,7 +19995,7 @@ private fun SearchScreen(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             top = when {
-                                activeQuery != null -> searchHeaderHeight + 8.dp
+                                activeQuery != null -> searchHeaderHeight + 4.dp
                                 else -> topInset + 8.dp
                             },
                             start = if (activeQuery == null) 16.dp else 0.dp,
@@ -20197,12 +20209,12 @@ private fun SearchScreen(
                             searchHeaderHeight = with(density) { coordinates.size.height.toDp() }
                         }
                         .padding(
-                            top = topInset + 12.dp,
+                            top = topInset + 4.dp,
                             start = 16.dp,
                             end = 16.dp,
-                            bottom = 12.dp,
+                            bottom = 4.dp,
                         ),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     Text(
                         text = activeQuery.orEmpty(),
