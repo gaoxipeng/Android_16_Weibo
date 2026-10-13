@@ -33,6 +33,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateBounds
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
@@ -203,7 +204,7 @@ import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
 import dev.chrisbanes.haze.HazeTint
-import dev.chrisbanes.haze.haze
+import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.rememberHazeState
 import androidx.compose.ui.draw.clipToBounds
@@ -1147,6 +1148,7 @@ private fun <T> NavAnimatedOverlay(
     navKind: NavOverlayKind? = null,
     pendingEnterKind: NavOverlayKind? = null,
     pendingExitKind: NavOverlayKind? = null,
+    nestedDetailReturnAnimating: Boolean = false,
     onClearPendingEnter: () -> Unit = {},
     onClearPendingExit: () -> Unit = {},
     enter: EnterTransition = navStackEnterTransition(),
@@ -1157,6 +1159,8 @@ private fun <T> NavAnimatedOverlay(
 ) {
     val navTransitions = LocalNavTransitionCoordinator.current
     var displayed by remember { mutableStateOf<T?>(null) }
+    val detailContentByIdentity = remember { mutableStateMapOf<Any, T>() }
+    var previousDetailIdentity by remember { mutableStateOf<Any?>(null) }
     if (target != null) {
         displayed = target
     }
@@ -1164,6 +1168,27 @@ private fun <T> NavAnimatedOverlay(
     // 栈内仍挂载（target != null）但被上层盖住时，保持组合树不销毁，避免 LazyList 滚动位置丢失。
     val avVisible = target != null || overlayVisible
     val transitionIdentity = animationKey ?: target
+    if (navKind is NavOverlayKind.Detail && target != null && transitionIdentity != null) {
+        detailContentByIdentity[transitionIdentity] = target
+        if (detailContentByIdentity.size > 8) {
+            detailContentByIdentity.keys.firstOrNull { it != transitionIdentity }?.let(detailContentByIdentity::remove)
+        }
+    }
+    SideEffect {
+        if (navKind is NavOverlayKind.Detail && transitionIdentity != null) {
+            previousDetailIdentity = transitionIdentity
+        }
+    }
+    LaunchedEffect(nestedDetailReturnAnimating, pendingExitKind, transitionIdentity) {
+        if (
+            nestedDetailReturnAnimating &&
+            pendingExitKind is NavOverlayKind.Detail &&
+            transitionIdentity != null
+        ) {
+            delay(NavTransitionDurationMs.toLong())
+            onClearPendingExit()
+        }
+    }
     val enteredKeys = remember { mutableStateMapOf<Any, Boolean>() }
     val wantsEnterAnimation = stackAnimated &&
         overlayVisible &&
@@ -1183,7 +1208,10 @@ private fun <T> NavAnimatedOverlay(
         if (shouldAnimateExit) exit else ExitTransition.None
     }
     val effectiveExitHoldMillis = if (shouldAnimateExit) exitHoldMillis else 0L
-    val transitionState = remember(skipAnimationToken, transitionIdentity) {
+    // Keep one visibility transition for the detail layer. Re-keying this state for
+    // each detail disposes AnimatedContent's outgoing child before it can slide away.
+    val transitionStateKey: Any? = if (navKind is NavOverlayKind.Detail) "detail-overlay" else transitionIdentity
+    val transitionState = remember(skipAnimationToken, transitionStateKey) {
         MutableTransitionState(false)
     }
     SideEffect {
@@ -1236,7 +1264,44 @@ private fun <T> NavAnimatedOverlay(
         exit = effectiveExit,
         label = "nav-stack-overlay",
     ) {
-        displayed?.let { item -> content(item) }
+        if (navKind is NavOverlayKind.Detail && transitionIdentity != null) {
+            AnimatedContent(
+                targetState = transitionIdentity,
+                transitionSpec = {
+                    if (nestedDetailReturnAnimating && pendingExitKind is NavOverlayKind.Detail) {
+                        (EnterTransition.None togetherWith slideOutHorizontally(
+                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            targetOffsetX = { fullWidth -> fullWidth },
+                        )).apply {
+                            // The restored parent is opaque. Put it beneath the outgoing
+                            // child; AnimatedContent otherwise draws the new target on top
+                            // and completely conceals the child's rightward exit.
+                            targetContentZIndex = -1f
+                        }
+                    } else if (
+                        previousDetailIdentity != null &&
+                        pendingEnterKind is NavOverlayKind.Detail &&
+                        transitionIdentity != previousDetailIdentity
+                    ) {
+                        slideInHorizontally(
+                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            initialOffsetX = { fullWidth -> fullWidth },
+                        ) togetherWith slideOutHorizontally(
+                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            targetOffsetX = { fullWidth -> -fullWidth },
+                        )
+                    } else {
+                        EnterTransition.None togetherWith ExitTransition.None
+                    }
+                },
+                label = "nested-detail-content-transition",
+            ) { identity ->
+                val item = detailContentByIdentity[identity]
+                if (item != null) content(item)
+            }
+        } else {
+            displayed?.let { item -> content(item) }
+        }
     }
     if (!avVisible && displayed != null) {
         LaunchedEffect(displayed, transitionState.isIdle, target) {
@@ -2386,6 +2451,7 @@ private object FeedEmoticonLinkDispatcher {
     private val leadingAuthorClicks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
     private val inlineImagesByToken = java.util.concurrent.ConcurrentHashMap<String, List<FeedImage>>()
     private val urlEntitiesByToken = java.util.concurrent.ConcurrentHashMap<String, FeedUrlEntity>()
+    private val urlEntityCallbacksByToken = java.util.concurrent.ConcurrentHashMap<String, (FeedUrlEntity) -> Unit>()
 
     private val inlineImageCallbacks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
@@ -2446,6 +2512,7 @@ private object FeedEmoticonLinkDispatcher {
         inlineImagesByToken.keys.removeAll { it.startsWith(prefix) }
         inlineImageCallbacks.keys.removeAll { it.startsWith(prefix) }
         urlEntitiesByToken.keys.removeAll { it.startsWith(prefix) }
+        urlEntityCallbacksByToken.keys.removeAll { it.startsWith(prefix) }
     }
 
     fun registerInlineImage(
@@ -2463,15 +2530,22 @@ private object FeedEmoticonLinkDispatcher {
         inlineImageCallbacks[scopedKey(scopeKey, token)]?.invoke()
     }
 
-    fun registerUrlEntities(scopeKey: String, entities: Map<String, FeedUrlEntity>) {
+    fun registerUrlEntities(
+        scopeKey: String,
+        entities: Map<String, FeedUrlEntity>,
+        onClick: ((FeedUrlEntity) -> Unit)?,
+    ) {
         entities.forEach { (token, entity) ->
-            urlEntitiesByToken[scopedKey(scopeKey, token)] = entity
+            val key = scopedKey(scopeKey, token)
+            urlEntitiesByToken[key] = entity
+            if (onClick == null) urlEntityCallbacksByToken.remove(key) else urlEntityCallbacksByToken[key] = onClick
         }
     }
 
     fun urlEntityClick(scopeKey: String, token: String) {
-        urlEntitiesByToken[scopedKey(scopeKey, token)]?.let { entity ->
-            onUrlEntityClick?.invoke(entity)
+        val key = scopedKey(scopeKey, token)
+        urlEntitiesByToken[key]?.let { entity ->
+            (urlEntityCallbacksByToken[key] ?: onUrlEntityClick)?.invoke(entity)
         }
     }
 }
@@ -3311,6 +3385,7 @@ fun WeiboApp() {
     var navOverlayStack by remember { mutableStateOf<List<NavOverlayKind>>(emptyList()) }
     var navEnterPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var navExitPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
+    var nestedDetailReturnAnimating by remember { mutableStateOf(false) }
     var pendingDeferredNavRestore by remember { mutableStateOf<NavRestoreState?>(null) }
     var deferredNavRestoreGeneration by remember { mutableIntStateOf(0) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
@@ -3823,7 +3898,9 @@ fun WeiboApp() {
         repostsNextPage = snapshot.repostsNextPage
         repostsHasMore = snapshot.repostsHasMore
         albumViewerState = snapshot.albumViewerState
-        activeDetailInstanceKey = snapshot.instanceKey
+        // Treat a restored detail as a fresh visible transition. Reusing its old key
+        // makes NavAnimatedOverlay's entered-key cache skip the return animation.
+        activeDetailInstanceKey = maxOf(activeDetailInstanceKey, snapshot.instanceKey) + 1
         lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
         detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
         detailScrollRestoreToken += 1
@@ -4006,6 +4083,7 @@ fun WeiboApp() {
     }
 
     fun clearNavExitPendingKind() {
+        nestedDetailReturnAnimating = false
         navExitPendingKind = null
         flushDeferredNavRestore()
     }
@@ -4021,7 +4099,7 @@ fun WeiboApp() {
         bottomBarVisible = state.bottomBarVisible
         minePagerPage = state.minePagerPage
 
-        if (navExitPendingKind != null) {
+        if (navExitPendingKind != null && !nestedDetailReturnAnimating) {
             scheduleDeferredNavRestore(state)
         } else {
             pendingDeferredNavRestore = null
@@ -4031,6 +4109,7 @@ fun WeiboApp() {
     }
 
     fun pushNavigation(kind: NavOverlayKind, navigate: () -> Unit) {
+        nestedDetailReturnAnimating = false
         navStack = navStack + captureNavRestoreState()
         navOverlayStack = navOverlayStack + kind
         navEnterPendingKind = kind
@@ -4041,6 +4120,8 @@ fun WeiboApp() {
     fun popNavigation(): Boolean {
         if (navStack.isEmpty()) return false
         val exitingKind = navOverlayStack.lastOrNull()
+        nestedDetailReturnAnimating = exitingKind is NavOverlayKind.Detail &&
+            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
         // TabSwitch records the page to restore after opening a topic search, but it
         // has no NavAnimatedOverlay to finish an exit and clear this pending state.
         // Leaving it pending makes feedUiOnTop permanently false when returning home.
@@ -4709,8 +4790,15 @@ fun WeiboApp() {
         val requestedKind = timelineKind
         timelineLoadMoreJob = scope.launch {
             feedLoadingMore = true
-            runCatchingPreservingCancellation { session.loadTimeline(requestedKind, cursor) }
-                .onSuccess { page ->
+            runCatchingPreservingCancellation {
+                if (requestedKind == TimelineKind.Following) {
+                    val raw = session.loadTimelineRaw(requestedKind, cursor)
+                    withContext(Dispatchers.Default) { WeiboJsonParser.parseTimeline(raw) } to raw
+                } else {
+                    session.loadTimeline(requestedKind, cursor) to null
+                }
+            }
+                .onSuccess { (page, raw) ->
                     if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
                         return@onSuccess
                     }
@@ -4734,6 +4822,7 @@ fun WeiboApp() {
                         appended == 0 -> null
                         else -> page.nextCursor ?: page.items.lastOrNull()?.id
                     }
+                    if (raw != null) timelineCacheStore.appendFollowingTimeline(raw)
                 }
                 .onFailure { error ->
                     if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
@@ -5668,7 +5757,11 @@ fun WeiboApp() {
             }
             return
         }
-        val statusCandidates = WeiboLinkResolver.statusIdCandidates(entity.url, entity.shortUrl)
+        val statusCandidates = WeiboLinkResolver.statusIdCandidates(
+            entity.nativeUrl.orEmpty(),
+            entity.url,
+            entity.shortUrl,
+        )
         if (statusCandidates.isNotEmpty()) {
             scope.launch {
                 val item = statusCandidates.firstNotNullOfOrNull { candidate ->
@@ -5946,8 +6039,10 @@ fun WeiboApp() {
             items = sortFeedTimelineItems(page.items)
             nextCursor = page.nextCursor
             if (page.items.isNotEmpty()) {
+                val anchorId = timelineCacheStore.readFollowingAnchor()
+                val anchorIndex = items.indexOfFirst { it.id == anchorId }
                 feedInitialScrollTarget = ScrollRestore(
-                    initialFollowingScroll.first,
+                    anchorIndex.takeIf { it >= 0 } ?: initialFollowingScroll.first,
                     initialFollowingScroll.second,
                 )
             }
@@ -6202,12 +6297,31 @@ fun WeiboApp() {
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
+    // Save at rest as well as ON_STOP, so process removal cannot lose the last
+    // settled position. Do not let an empty, not-yet-restored list overwrite it.
+    LaunchedEffect(timelineKind, feedInitialScrollReconciled, items) {
+        if (timelineKind != TimelineKind.Following || !feedInitialScrollReconciled || items.isEmpty()) {
+            return@LaunchedEffect
+        }
+        snapshotFlow {
+            Triple(
+                feedListState.firstVisibleItemIndex,
+                feedListState.firstVisibleItemScrollOffset,
+                feedListState.isScrollInProgress,
+            )
+        }.distinctUntilChanged().collect { (index, offset, scrolling) ->
+            if (!scrolling && feedListState.layoutInfo.totalItemsCount > 0) {
+                timelineCacheStore.writeFollowingScroll(index, offset, items.getOrNull(index)?.id)
+            }
+        }
+    }
     DisposableEffect(
         lifecycleOwner,
         backgroundPlaybackEnabled,
         timelineKind,
         cacheLoaded,
         feedScrollRestoreApplied,
+        feedInitialScrollReconciled,
         selectedTab,
         selectedItem,
         hasLoginCookie,
@@ -6215,10 +6329,14 @@ fun WeiboApp() {
         items.isEmpty(),
     ) {
         fun persistFeedScrollNow() {
-            if (timelineKind == TimelineKind.Following && cacheLoaded && feedScrollRestoreApplied) {
+            if (timelineKind == TimelineKind.Following && cacheLoaded &&
+                feedInitialScrollReconciled && items.isNotEmpty() &&
+                feedListState.layoutInfo.totalItemsCount > 0
+            ) {
                 timelineCacheStore.writeFollowingScroll(
                     feedListState.firstVisibleItemIndex,
                     feedListState.firstVisibleItemScrollOffset,
+                    items.getOrNull(feedListState.firstVisibleItemIndex)?.id,
                 )
             }
         }
@@ -7044,10 +7162,19 @@ fun WeiboApp() {
                     navKind = detailNavKind,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
+                    nestedDetailReturnAnimating = nestedDetailReturnAnimating,
                     onClearPendingEnter = { navEnterPendingKind = null },
                     onClearPendingExit = ::clearNavExitPendingKind,
+                    enter = if (nestedDetailReturnAnimating && navExitPendingKind is NavOverlayKind.Detail) {
+                        EnterTransition.None
+                    } else {
+                        navStackEnterTransition()
+                    },
                 ) { detailItem ->
-                    key(detailItem.id, activeDetailInstanceKey) {
+                    // AnimatedContent retains the outgoing detail during nested pops.
+                    // Re-keying it with the global instance counter tears down that
+                    // outgoing subtree as soon as the parent snapshot is restored.
+                    key(detailItem.id) {
                         val detailListState = rememberLazyListState()
                         val detailScrollCoordinator = remember { FeedListScrollCoordinator() }
                         LaunchedEffect(detailListState, detailScrollCoordinator) {
@@ -7300,7 +7427,9 @@ fun WeiboApp() {
                     )
                 }
             }
-            val detailExiting = navExitPendingKind is NavOverlayKind.Detail
+            // A nested detail pop returns to another detail; it must not expose the
+            // main navigation bar during that in-layer transition.
+            val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
             val bottomBarNavVisible = (visitedUserId == null || profileIsExiting) &&
                 (selectedItem == null || detailExiting)
             if (selectedItem == null && visitedUserId == null) {
@@ -7860,10 +7989,10 @@ private fun ExitConfirmCapsule(
 }
 
 @Composable
-private fun Modifier.consumeTouchEvents(): Modifier = clickable(
+private fun Modifier.consumeTouchEvents(onClick: () -> Unit = {}): Modifier = clickable(
     indication = null,
     interactionSource = remember { MutableInteractionSource() },
-    onClick = {},
+    onClick = onClick,
 )
 
 private fun Modifier.blockHiddenTouches(visible: Boolean): Modifier =
@@ -8128,9 +8257,7 @@ private fun EmoticonText(
                 FeedEmoticonLinkDispatcher.unregisterLeadingAuthor(authorName)
             }
         }
-        if (urlEntities.isNotEmpty()) {
-            FeedEmoticonLinkDispatcher.registerUrlEntities(linkScopeKey, urlEntities)
-        }
+        FeedEmoticonLinkDispatcher.registerUrlEntities(linkScopeKey, urlEntities, onUrlEntityClick)
     }
     DisposableEffect(linkScopeKey) {
         onDispose {
@@ -8279,17 +8406,25 @@ private fun EmoticonText(
                 if (locationStart >= 0 && locationEnd != null && onLocationClick != null) {
                     Modifier.pointerInput(linkScopeKey, locationStart, locationEnd) {
                         awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                             val layout = locationLayoutState.value
                             val offset = layout?.getOffsetForPosition(down.position)
-                            if (offset == null || offset < locationStart || offset >= locationEnd) {
-                                return@awaitEachGesture
-                            }
+                            val isLocation = offset != null &&
+                                offset >= locationStart &&
+                                offset < locationEnd
+                            if (!isLocation) return@awaitEachGesture
                             down.consume()
-                            val up = waitForUpOrCancellation()
-                            if (up != null) {
+                            val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                            val upOffset = up?.let { event ->
+                                layout?.getOffsetForPosition(event.position)
+                            }
+                            if (up != null && upOffset != null &&
+                                upOffset >= locationStart && upOffset < (locationEnd ?: -1)
+                            ) {
                                 up.consume()
                                 locationClickState.value?.invoke()
+                            } else {
+                                up?.consume()
                             }
                         }
                     }
@@ -8394,14 +8529,18 @@ private fun buildEmoticonAnnotatedString(
                         fontWeight = FontWeight.Medium,
                         textDecoration = TextDecoration.None,
                     )
-                    withLink(
-                        LinkAnnotation.Clickable(
-                            tag = "url-entity:${entity.shortUrl}",
-                            linkInteractionListener = {
-                                FeedEmoticonLinkDispatcher.urlEntityClick(linkScopeKey, token)
-                            },
-                        ),
-                    ) {
+                    val urlLink = LinkAnnotation.Clickable(
+                        tag = "url-entity:${entity.shortUrl}",
+                        linkInteractionListener = {
+                            FeedEmoticonLinkDispatcher.urlEntityClick(linkScopeKey, token)
+                        },
+                    )
+                    if (entity.title.contains("微博正文")) {
+                        appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                        withLink(urlLink) {
+                            withStyle(linkStyle) { append(entity.title) }
+                        }
+                    } else withLink(urlLink) {
                         withStyle(linkStyle) {
                             appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                             append(entity.title)
@@ -8620,6 +8759,12 @@ private fun FeedCard(
     val urlEntityMap = remember(displayItem.urlEntities) {
         displayItem.urlEntities.associateBy { entity -> entity.shortUrl }
     }
+    // Only a link in this status' own text should disable the card-level text click.
+    // A repost's quoted status has its own click/link handling and must not suppress
+    // opening the outer status from its body text.
+    val hasExplicitWeiboPostLink = remember(displayItem.urlEntities) {
+        displayItem.urlEntities.any { it.title.contains("微博正文") }
+    }
     var inlineImagePreview by remember(displayItem.statusId) { mutableStateOf<InlineImagePreviewRequest?>(null) }
     val cardContainerColor = MaterialTheme.colorScheme.surface
     val contentVerticalPadding = when {
@@ -8677,10 +8822,16 @@ private fun FeedCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = FeedCardContentHorizontalPadding)
-                    .clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                        onClick = onClick,
+                    .then(
+                        if (hasExplicitWeiboPostLink) {
+                            Modifier
+                        } else {
+                            Modifier.clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() },
+                                onClick = onClick,
+                            )
+                        },
                     ),
                 verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
             ) {
@@ -8890,7 +9041,19 @@ private fun QuotedStatus(
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
     val quotedShape = RoundedCornerShape(8.dp)
     ElevatedCard(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (onClick != null) {
+                    Modifier.clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = onClick,
+                    )
+                } else {
+                    Modifier
+                },
+            ),
         shape = quotedShape,
         colors = CardDefaults.elevatedCardColors(
             containerColor = MaterialTheme.colorScheme.background,
@@ -8902,15 +9065,6 @@ private fun QuotedStatus(
             verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
         ) {
             Column(
-                modifier = if (onClick != null) {
-                    Modifier.clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                        onClick = onClick,
-                    )
-                } else {
-                    Modifier
-                },
                 verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
             ) {
                 StatusTextSection(
@@ -10359,7 +10513,7 @@ private fun ImageActionOverlay(
             Box(
                 Modifier
                     .fillMaxSize()
-                    .haze(previewHazeState)
+                .hazeSource(previewHazeState)
                     .layerBackdrop(previewMenuBackdrop),
             ) {
             Box(
@@ -11656,6 +11810,7 @@ private fun MediaStrip(
                         onDetailClick = onDetailClick,
                         autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                         showVideoTitle = showVideoTitle,
+                        animateCardAspectChange = true,
                     )
                 } else {
                     LookaheadScope {
@@ -13239,6 +13394,7 @@ private fun InlineVideoPlayer(
     showVideoTitle: Boolean = true,
     modifier: Modifier = Modifier,
     gridCell: Boolean = false,
+    animateCardAspectChange: Boolean = false,
 ) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
@@ -13285,6 +13441,26 @@ private fun InlineVideoPlayer(
                 height = measuredVideoHeight,
             )
         }
+    }
+    val animatedCardAspectRatio by animateFloatAsState(
+        targetValue = cardLayout.aspectRatio,
+        animationSpec = tween(durationMillis = 380, easing = FastOutSlowInEasing),
+        label = "inline-video-aspect-ratio",
+    )
+    val animatedCardWidthFraction by animateFloatAsState(
+        targetValue = cardLayout.widthFraction,
+        animationSpec = tween(durationMillis = 380, easing = FastOutSlowInEasing),
+        label = "inline-video-width-fraction",
+    )
+    val displayedCardAspectRatio = if (animateCardAspectChange && !gridCell) {
+        animatedCardAspectRatio
+    } else {
+        cardLayout.aspectRatio
+    }
+    val displayedCardWidthFraction = if (animateCardAspectChange && !gridCell) {
+        animatedCardWidthFraction
+    } else {
+        cardLayout.widthFraction
     }
     var actionOpen by remember(media.streamUrl) { mutableStateOf(false) }
     var peekActive by remember(media.streamUrl) { mutableStateOf(false) }
@@ -13593,8 +13769,8 @@ private fun InlineVideoPlayer(
                     } else {
                         Modifier
                             .align(Alignment.TopStart)
-                            .fillMaxWidth(cardLayout.widthFraction)
-                            .aspectRatio(cardLayout.aspectRatio)
+                            .fillMaxWidth(displayedCardWidthFraction)
+                            .aspectRatio(displayedCardAspectRatio)
                     },
                 )
                 .zIndex(if (actionOpen || peekActive) 10f else 0f)
@@ -15971,6 +16147,7 @@ private fun DetailScreen(
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
+    val scope = rememberCoroutineScope()
     val showingReposts = contentSection == DetailContentSection.Reposts
     val sectionItems = if (showingReposts) reposts else comments
     val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
@@ -16018,6 +16195,11 @@ private fun DetailScreen(
             DetailStickyAuthorHeader(
                 item = item,
                 onUserClick = onUserClick,
+                onBlankAreaClick = {
+                    scope.launch {
+                        runCatching { listState.animateScrollToItem(0) }
+                    }
+                },
             )
             LazyColumn(
                 state = listState,
@@ -16148,6 +16330,7 @@ private fun DetailScreen(
 private fun DetailStickyAuthorHeader(
     item: FeedItem,
     onUserClick: ((String) -> Unit)?,
+    onBlankAreaClick: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
@@ -16164,7 +16347,11 @@ private fun DetailStickyAuthorHeader(
                     .padding(top = topInset + 12.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.Top,
             ) {
-                Box(modifier = Modifier.weight(1f).consumeTouchEvents()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .consumeTouchEvents(onClick = onBlankAreaClick),
+                ) {
                     AuthorRow(
                         item = item,
                         onUserClick = onUserClick,
@@ -16912,7 +17099,7 @@ private fun ComposeWeiboScreen(
         Box(
             Modifier
                 .fillMaxSize()
-                .haze(visibilityPickerHazeState)
+                .hazeSource(visibilityPickerHazeState)
                 .layerBackdrop(visibilityPickerBackdrop),
         ) {
         Column(Modifier.fillMaxSize()) {
