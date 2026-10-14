@@ -327,18 +327,27 @@ class WeiboWebSession(context: Context) {
         existingLargeUrls: Set<String>,
     ): AlbumPage {
         var nextCursor = cursor
-        repeat(4) {
-            val page = loadUserAlbumImages(uid, nextCursor)
-            val newImages = page.images.filterNot { it.largeUrl in existingLargeUrls }
-            if (newImages.isNotEmpty() || page.nextCursor == null) {
-                return page.copy(images = newImages)
+        val seenUrls = existingLargeUrls.toMutableSet()
+        val collected = mutableListOf<FeedImage>()
+        val seenCursors = mutableSetOf<String?>()
+        // The server controls each page size. Batch up to six pages rather than
+        // inventing an unsupported count parameter or repeatedly hitting the end.
+        repeat(6) {
+            if (!seenCursors.add(nextCursor)) return AlbumPage(collected, null)
+            val page = try {
+                loadUserAlbumImages(uid, nextCursor)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (collected.isNotEmpty()) return AlbumPage(collected, nextCursor)
+                throw error
             }
-            if (page.nextCursor == nextCursor) {
-                return AlbumPage(emptyList(), null)
-            }
+            collected += page.images.filter { seenUrls.add(it.largeUrl) }
+            if (page.nextCursor == null || page.nextCursor == nextCursor) return AlbumPage(collected, null)
             nextCursor = page.nextCursor
+            if (collected.size >= 90) return AlbumPage(collected, nextCursor)
         }
-        return AlbumPage(emptyList(), nextCursor)
+        return AlbumPage(collected, nextCursor)
     }
 
     private suspend fun loadUserAlbumImageWall(

@@ -800,6 +800,7 @@ private suspend fun AwaitPointerEventScope.awaitMediaLongPress(
     viewConfiguration: ViewConfiguration,
     onHoldProgress: (Float) -> Unit,
     onHaptic: ((MediaPeekHapticStage) -> Unit)? = null,
+    consumeTap: Boolean = false,
 ): MediaLongPressResult {
     var cancelledByMoveBeforeLongPress = false
     var releasedBeforeLongPress = false
@@ -815,6 +816,9 @@ private suspend fun AwaitPointerEventScope.awaitMediaLongPress(
             val linearProgress = (elapsed.toFloat() / longPressTimeout).coerceIn(0f, 1f)
             onHoldProgress(linearProgress)
             if (!change.pressed) {
+                // A thumbnail tap must not also complete the enclosing repost
+                // card's clickable gesture underneath the full-screen viewer.
+                if (consumeTap) change.consume()
                 releasedBeforeLongPress = true
                 return@withTimeoutOrNull false
             }
@@ -1121,10 +1125,19 @@ private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
 private const val RemoteBytesAnimatedMaxRead = 64 * 1024 * 1024
 private const val RemoteDiskBytesCacheMaxTotal = 256 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
-private fun detailCardSpring() = spring<Float>(
-    dampingRatio = 0.81f,
-    stiffness = 2100f,
-    visibilityThreshold = 0.001f,
+private const val DetailTransitionDurationMs = 250
+private const val DetailReturnDurationMs = DetailTransitionDurationMs
+// Reach most of the travel early, leaving a gentler, longer deceleration tail.
+private val DetailMotionEasing = CubicBezierEasing(0.20f, 0.68f, 0.30f, 1f)
+private fun detailCardSpring() = androidx.compose.animation.core.keyframes<Float> {
+    durationMillis = DetailTransitionDurationMs
+    0f at 0 using DetailMotionEasing
+    1.004f at 206 using FastOutSlowInEasing
+    1f at DetailTransitionDurationMs
+}
+private fun detailCardReturnSpec() = tween<Float>(
+    durationMillis = DetailReturnDurationMs,
+    easing = DetailMotionEasing,
 )
 // ComponentCallbacks2.TRIM_MEMORY_* 在较新 SDK 中已标记 deprecated，数值仍稳定可用。
 private const val TrimMemoryRunningLow = 10
@@ -1181,6 +1194,7 @@ private fun <T> NavAnimatedOverlay(
     var swipeCardReturn by remember { mutableFloatStateOf(0f) }
     var overlayWidth by remember { mutableIntStateOf(1) }
     var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
+    val returnCardLayout = remember(animationKey) { mutableStateOf<Rect?>(null) }
     var displayed by remember { mutableStateOf<T?>(null) }
     val detailContentByIdentity = remember { mutableStateMapOf<Any, T>() }
     var previousDetailIdentity by remember { mutableStateOf<Any?>(null) }
@@ -1251,7 +1265,7 @@ private fun <T> NavAnimatedOverlay(
                         // system-back path does. Do not settle onto a screenshot
                         // and then replace it with a differently positioned card.
                         latestSwipeReturnCommit()
-                        animate(0f, 1f, animationSpec = detailCardSpring()) {
+                        animate(0f, 1f, animationSpec = detailCardReturnSpec()) {
                             value, _ -> swipeCardReturn = value
                         }
                         // Keep the returning card fully opaque until the original
@@ -1290,7 +1304,7 @@ private fun <T> NavAnimatedOverlay(
             pendingExitKind is NavOverlayKind.Detail &&
             transitionIdentity != null
         ) {
-            delay(NavTransitionDurationMs.toLong())
+            delay(DetailReturnDurationMs.toLong())
             onClearPendingExit()
         }
     }
@@ -1308,10 +1322,18 @@ private fun <T> NavAnimatedOverlay(
     // 进入/退出动画在 identity 或 pendingExit 生命周期内锁定，避免中途 effectiveEnter/Exit 变 None 导致动画被掐断。
     val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
         if (sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
+        else if (wantsEnterAnimation && navKind is NavOverlayKind.Detail) slideInHorizontally(
+            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
+            initialOffsetX = { it },
+        )
         else if (wantsEnterAnimation) enter else EnterTransition.None
     }
     val effectiveExit = remember(transitionIdentity, skipAnimationToken, pendingExitKind) {
         if (swipeCommitted || (sourceBounds != null && navKind is NavOverlayKind.Detail)) ExitTransition.None
+        else if (shouldAnimateExit && navKind is NavOverlayKind.Detail) slideOutHorizontally(
+            animationSpec = tween(DetailReturnDurationMs, easing = DetailMotionEasing),
+            targetOffsetX = { it },
+        )
         else if (shouldAnimateExit) exit else ExitTransition.None
     }
     val effectiveExitHoldMillis = if (shouldAnimateExit && !swipeCommitted && sourceBounds == null) exitHoldMillis else 0L
@@ -1351,12 +1373,15 @@ private fun <T> NavAnimatedOverlay(
         else -> layerBaseZIndex
     }
 
-    DisposableEffect(Unit) {
-        val unregister = navTransitions.registerSkipHandler { skipAnimationToken++ }
-        onDispose { unregister() }
+    DisposableEffect(navKind) {
+        // Album owns a Dialog and its own morph; it must never participate in
+        // the page transition shield or the global "skip all" re-key operation.
+        val unregister = if (navKind == NavOverlayKind.AlbumViewer) null
+            else navTransitions.registerSkipHandler { skipAnimationToken++ }
+        onDispose { unregister?.invoke() }
     }
-    DisposableEffect(isAnimating) {
-        if (isAnimating) {
+    DisposableEffect(isAnimating, navKind) {
+        if (isAnimating && navKind != NavOverlayKind.AlbumViewer) {
             navTransitions.onTransitionStart()
             onDispose { navTransitions.onTransitionEnd() }
         } else {
@@ -1364,6 +1389,17 @@ private fun <T> NavAnimatedOverlay(
         }
     }
 
+    // Album Dialog already completed its own shrink before popping navigation.
+    // Keeping it composed for the generic overlay exit leaves an invisible
+    // full-screen window intercepting the next thumbnail tap.
+    if (navKind == NavOverlayKind.AlbumViewer && !avVisible) {
+        if (displayed != null) LaunchedEffect(Unit) {
+            displayed = null
+            if (navOverlayKindsMatch(pendingExitKind, navKind)) onClearPendingExit()
+            onHidden()
+        }
+        return
+    }
     if (avVisible || displayed != null) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned { overlayOrigin = it.boundsInRoot().topLeft }) {
@@ -1385,14 +1421,21 @@ private fun <T> NavAnimatedOverlay(
         label = "nav-stack-overlay",
     ) {
         val revealProgress by transition.animateFloat(
-            transitionSpec = { detailCardSpring() },
+            transitionSpec = {
+                if (targetState == androidx.compose.animation.EnterExitState.PostExit) detailCardReturnSpec()
+                else detailCardSpring()
+            },
             label = "card-detail-reveal",
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
         val pageReveal = if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
         val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling
-        val sourceHandoff = if (sourceImage != null &&
-            (pendingExitKind is NavOverlayKind.Detail || swipeCardReturn > 0f)
-        ) ((0.25f - pageReveal) / 0.25f).coerceIn(0f, 1f) else 0f
+        // Keep the moving detail opaque. Cross-fading it over the already visible
+        // feed produces two displaced copies of the same text/images (ghosting).
+        val sourceHandoff = 0f
+        val returnSnapshot = remember(sourceImage) { sourceImage?.asImageBitmap() }
+        val useSourceLayout = returnSnapshot != null && sourceBounds != null && returningPage &&
+            !nestedDetailReturnAnimating && (swipeOffset > 0f || pageReveal < 0.95f)
+        val returnSurfaceColor = MaterialTheme.colorScheme.surface
         Box(Modifier.fillMaxSize().graphicsLayer {
             alpha = if (swipeCommitted) 0f else 1f
             val swipeProgress = (swipeOffset / overlayWidth).coerceIn(0f, 1f)
@@ -1401,32 +1444,54 @@ private fun <T> NavAnimatedOverlay(
                 // Return the entire viewport as one rigid card, including a page
                 // scrolled into comments. Never warp text or remove its contents.
                 transformOrigin = TransformOrigin(0f, 0f)
-                val amount = if (returningPage) (1f - pageReveal).coerceIn(0f, 1f) else 0f
+                val amount = if (returningPage) {
+                    if (pageReveal <= 0.001f) 1f else (1f - pageReveal).coerceIn(0f, 1f)
+                } else 0f
                 val width = bounds.width.coerceAtLeast(1f)
                 val height = bounds.height.coerceAtLeast(1f)
                 scaleX = 1f
                 scaleY = 1f
-                val targetX = bounds.left - overlayOrigin.x
-                val targetY = bounds.top - overlayOrigin.y
+                // Align the actual inset card, not the whole viewport. At the end:
+                // overlayOrigin + translation + cardInset == sourceBounds.topLeft.
+                val cardInset = returnCardLayout.value?.topLeft ?: Offset.Zero
+                val targetX = bounds.left - overlayOrigin.x - cardInset.x
+                val targetY = bounds.top - overlayOrigin.y - cardInset.y
                 translationX = swipeOffset * (1f - amount) + targetX * amount
                 translationY = 24.dp.toPx() * swipeProgress * (1f - amount) + targetY * amount
                 val cropWidth = size.width + (width - size.width) * amount
                 val cropHeight = size.height + (height - size.height) * amount
-                val radius = 12.dp.toPx() * max(swipeProgress, amount)
+                val cropLeft = cardInset.x * amount
+                val cropTop = cardInset.y * amount
+                val radius = 8.dp.toPx() * max(swipeProgress, amount)
                 shape = androidx.compose.foundation.shape.GenericShape { _, _ ->
                     addRoundRect(androidx.compose.ui.geometry.RoundRect(
-                        Rect(0f, 0f, cropWidth, cropHeight), androidx.compose.ui.geometry.CornerRadius(radius),
+                        Rect(cropLeft, cropTop, cropLeft + cropWidth, cropTop + cropHeight), androidx.compose.ui.geometry.CornerRadius(radius),
                     ))
                 }
-                alpha *= 1f - sourceHandoff
                 clip = true
             } else {
                 translationX = swipeOffset
                 shape = RoundedCornerShape((18f * swipeProgress).dp)
                 clip = swipeProgress > 0f
             }
+        }.drawWithContent {
+            if (useSourceLayout) {
+                // Replace the drawn contents early, inside the SAME moving/clipped
+                // layer. Keep the live composition mounted so cancellation restores
+                // its scroll/player state. No cross-fade or duplicate text layer.
+                drawRect(returnSurfaceColor)
+                val inset = returnCardLayout.value?.topLeft ?: Offset.Zero
+                val clippedSourceOffset = Offset(
+                    sourceBounds.left.coerceAtLeast(0f) - sourceBounds.left,
+                    sourceBounds.top.coerceAtLeast(0f) - sourceBounds.top,
+                )
+                drawImage(returnSnapshot, topLeft = inset + clippedSourceOffset)
+            } else {
+                drawContent()
+            }
         }) {
         CompositionLocalProvider(
+            LocalDetailReturnCardLayout provides returnCardLayout,
             LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling),
             LocalDetailPageReveal provides if (returningPage) 1f else pageReveal.coerceIn(0f, 1f),
             LocalDetailCardMotion provides sourceBounds?.takeUnless { returningPage }?.let {
@@ -1443,7 +1508,7 @@ private fun <T> NavAnimatedOverlay(
                         EnterTransition.None togetherWith ExitTransition.None
                     } else if (nestedDetailReturnAnimating && pendingExitKind is NavOverlayKind.Detail) {
                         (EnterTransition.None togetherWith slideOutHorizontally(
-                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            animationSpec = tween(DetailReturnDurationMs, easing = DetailMotionEasing),
                             targetOffsetX = { fullWidth -> fullWidth },
                         )).apply {
                             // The restored parent is opaque. Put it beneath the outgoing
@@ -1457,10 +1522,10 @@ private fun <T> NavAnimatedOverlay(
                         transitionIdentity != previousDetailIdentity
                     ) {
                         slideInHorizontally(
-                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
                             initialOffsetX = { fullWidth -> fullWidth },
                         ) togetherWith slideOutHorizontally(
-                            animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+                            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
                             targetOffsetX = { fullWidth -> -fullWidth },
                         )
                     } else {
@@ -1476,22 +1541,6 @@ private fun <T> NavAnimatedOverlay(
             displayed?.let { item -> content(item) }
         }
         }
-        }
-        if (sourceImage != null && sourceBounds != null && sourceHandoff > 0f &&
-            pendingExitKind !is NavOverlayKind.Detail && !swipeSettling) {
-            val density = LocalDensity.current
-            Image(
-                bitmap = sourceImage.asImageBitmap(),
-                contentDescription = null,
-                contentScale = ContentScale.None,
-                modifier = Modifier
-                    .offset { IntOffset(
-                        (sourceBounds.left.coerceAtLeast(0f) - overlayOrigin.x).roundToInt(),
-                        (sourceBounds.top.coerceAtLeast(0f) - overlayOrigin.y).roundToInt(),
-                    ) }
-                    .size(with(density) { sourceImage.width.toDp() }, with(density) { sourceImage.height.toDp() })
-                    .graphicsLayer { alpha = sourceHandoff },
-            )
         }
     }
     }
@@ -2584,6 +2633,7 @@ private val LocalNavTransitionCoordinator = staticCompositionLocalOf { NavTransi
 private val LocalPageSwipeBack = staticCompositionLocalOf<(() -> Unit)?> { null }
 private data class DetailCardMotion(val source: Rect, val progress: Float, val pageX: Float, val sourceHandoff: Float)
 private val LocalDetailCardMotion = staticCompositionLocalOf<DetailCardMotion?> { null }
+private val LocalDetailReturnCardLayout = staticCompositionLocalOf<androidx.compose.runtime.MutableState<Rect?>?> { null }
 private val LocalDetailPageReveal = staticCompositionLocalOf { 1f }
 private val LocalDetailExitStarted = staticCompositionLocalOf { false }
 private val LocalHiddenFeedCardId = staticCompositionLocalOf<String?> { null }
@@ -4269,6 +4319,13 @@ fun WeiboApp() {
         // must not immediately overwrite a hidden bar with its auto-show default.
         suppressNextBottomBarAutoShow = true
         bottomBarVisible = state.bottomBarVisible
+        if (state.albumViewerState != null && albumViewerState != null) {
+            // The large-image Dialog was restored before the detail exit. Keep
+            // it and the retained profile mounted instead of rebuilding the album.
+            if (state.detail != null) restoreDetailSnapshot(state.detail) else selectedItem = null
+            albumViewerState = state.albumViewerState.copy(animateOpenFromSource = false)
+            return
+        }
         val retainedHomeList = state.selectedTab == MainTab.Feed && state.detail == null &&
             state.visitedProfile == null && selectedItem != null && visitedUserId == null
         mediaPreview = null
@@ -4333,7 +4390,7 @@ fun WeiboApp() {
         val generation = deferredNavRestoreGeneration + 1
         deferredNavRestoreGeneration = generation
         scope.launch {
-            delay(NavTransitionDurationMs.toLong() + 32L)
+            delay(maxOf(NavTransitionDurationMs, DetailTransitionDurationMs).toLong() + 32L)
             if (deferredNavRestoreGeneration == generation && pendingDeferredNavRestore === state) {
                 flushDeferredNavRestore()
             }
@@ -4361,6 +4418,11 @@ fun WeiboApp() {
         selectedTab = state.selectedTab
         bottomBarVisible = state.bottomBarVisible
         minePagerPage = state.minePagerPage
+        if (state.albumViewerState != null) {
+            // Recreate the viewer underneath the outgoing detail, never after it
+            // has disappeared and exposed the white album for a frame.
+            albumViewerState = state.albumViewerState.copy(animateOpenFromSource = false)
+        }
 
         if (navExitPendingKind != null && !nestedDetailReturnAnimating) {
             scheduleDeferredNavRestore(state)
@@ -4526,7 +4588,7 @@ fun WeiboApp() {
     fun pushAlbumViewer(viewer: AlbumViewerState) {
         albumDismissScrollTarget = null
         pushNavigation(NavOverlayKind.AlbumViewer) {
-            albumOverlayInstanceKey = navStack.size
+            albumOverlayInstanceKey += 1
             albumViewerState = viewer
         }
     }
@@ -4636,7 +4698,18 @@ fun WeiboApp() {
             return
         }
         if (navOverlayStack.lastOrNull() == NavOverlayKind.AlbumViewer) {
-            popNavigation()
+            // The album/profile never left composition. Generic navigation restore
+            // reassigns profile data and issues stale scrollToItem calls, resetting
+            // the collapsed header and swallowing the next thumbnail tap.
+            navStack = navStack.dropLast(1)
+            navOverlayStack = navOverlayStack.dropLast(1)
+            albumViewerState = null
+            albumDismissScrollTarget = null
+            navEnterPendingKind = null
+            navExitPendingKind = null
+            nestedDetailReturnAnimating = false
+            pendingDeferredNavRestore = null
+            deferredNavRestoreGeneration += 1
             return
         }
         val viewer = albumViewerState ?: return
@@ -8055,15 +8128,26 @@ fun WeiboApp() {
                     selectedTab == MainTab.Mine -> minePosts
                     else -> emptyList()
                 }
+                key(albumOverlayInstanceKey) {
                 FullscreenImageViewer(
                     images = viewer.images,
                     initialIndex = viewer.initialIndex,
                     sourceBoundsByIndex = viewer.sourceBoundsByIndex,
                     animateOpenFromSource = viewer.animateOpenFromSource &&
                         viewer.sourceBoundsByIndex[viewer.initialIndex] != null,
-                    sourceCornerRadius = 8.dp,
+                    sourceCornerRadius = ThumbnailMorphCornerRadius,
                     avoidOpeningCropForExtremeAspect = true,
                     onDismiss = { dismissAlbumViewer() },
+                    onRetargetDuringClose = { index ->
+                        albumDismissScrollTarget = null
+                        val nextViewer = viewer.copy(initialIndex = index, animateOpenFromSource = true)
+                        if (navOverlayStack.lastOrNull() == NavOverlayKind.AlbumViewer) {
+                            albumViewerState = nextViewer
+                            albumOverlayInstanceKey += 1
+                        } else {
+                            pushAlbumViewer(nextViewer)
+                        }
+                    },
                     // onDismiss already performs the navigation pop. Calling the
                     // index callback as well would run dismissAlbumViewer twice
                     // and restore the album to its pre-viewer scroll position.
@@ -8090,6 +8174,7 @@ fun WeiboApp() {
                         )
                     },
                 )
+                }
             }
             NavAnimatedOverlay(
                 target = articleOverlay.takeIf { articleLayerActive },
@@ -10212,6 +10297,8 @@ private fun FeedImageCell(
     showLiveBadge: Boolean = true,
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
+    hiddenForViewer: Boolean = false,
+    openWhileScrolling: Boolean = false,
     onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
 ) {
@@ -10276,7 +10363,7 @@ private fun FeedImageCell(
             .graphicsLayer {
                 scaleX = holdScale
                 scaleY = holdScale
-                alpha = if (actionOpen) 0f else 1f
+                alpha = if (actionOpen || hiddenForViewer) 0f else 1f
             }
             .clip(RoundedCornerShape(cornerRadius))
             .background(
@@ -10286,7 +10373,8 @@ private fun FeedImageCell(
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
-                    if (cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)) {
+                    val stoppedScroll = cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)
+                    if (stoppedScroll && !openWhileScrolling) {
                         return@awaitEachGesture
                     }
                     var lastPosition = down.position
@@ -10296,6 +10384,7 @@ private fun FeedImageCell(
                         viewConfiguration = viewConfiguration,
                         onHoldProgress = { pressHoldProgress = it },
                         onHaptic = mediaHaptics::perform,
+                        consumeTap = true,
                     )
 
                     when (pressResult) {
@@ -11890,13 +11979,15 @@ private fun resolveFeedImageForViewer(
     image: FeedImage,
     imageOwner: FeedItem? = null,
     relatedPosts: List<FeedItem> = emptyList(),
+    preparedLookup: AlbumPostLookup? = null,
 ): FeedImage {
-    val owner = imageOwner ?: findPostForAlbumImage(relatedPosts, image)
+    val owner = imageOwner ?: if (preparedLookup != null) findPostForAlbumImage(preparedLookup, image)
+        else findPostForAlbumImage(relatedPosts, image)
     var resolved = enrichViewerFeedImage(image, owner)
     if (!resolved.isLivePhoto && relatedPosts.isNotEmpty()) {
         resolved = enrichAlbumImagesFromPosts(
             images = listOf(resolved),
-            lookup = buildAlbumPostLookup(relatedPosts),
+            lookup = preparedLookup ?: buildAlbumPostLookup(relatedPosts),
         ).first()
     }
     return resolved
@@ -12106,6 +12197,8 @@ private fun MediaStrip(
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
+    var viewerActiveIndex by remember { mutableStateOf(0) }
+    var viewerReturning by remember { mutableStateOf(false) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
@@ -12119,6 +12212,8 @@ private fun MediaStrip(
         onCloseStart: (() -> Unit)? = null,
     ) {
         viewerIndex = index
+        viewerActiveIndex = index
+        viewerReturning = false
         if (sourceBounds != null) {
             thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
         }
@@ -12153,6 +12248,7 @@ private fun MediaStrip(
                             allImages = images,
                             imageIndex = 0,
                             imageOwner = imageOwner,
+                            hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
@@ -12196,6 +12292,7 @@ private fun MediaStrip(
                                     allImages = images,
                                     imageIndex = cellIndex,
                                     imageOwner = imageOwner,
+                                    hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
@@ -12238,12 +12335,19 @@ private fun MediaStrip(
                 FullscreenImageViewer(
                     images = images,
                     initialIndex = viewerIndex,
+                    onPageChanged = { viewerActiveIndex = it },
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     animateOpenFromSource = viewerAnimateOpenFromSource,
-                    onCloseStart = viewerCloseHandoff,
+                    onCloseStart = {
+                        // Restore the real thumbnail BEFORE the dialog shrinks onto it.
+                        // The two windows cannot otherwise hand off in the same frame.
+                        viewerReturning = true
+                        viewerCloseHandoff?.invoke()
+                    },
                     imageOwner = imageOwner,
                     onDismiss = {
                         viewerOpen = false
+                        viewerReturning = false
                         viewerSourceBoundsByIndex = emptyMap()
                         viewerAnimateOpenFromSource = true
                         viewerCloseHandoff = null
@@ -12472,6 +12576,7 @@ private fun FullscreenImageViewer(
     images: List<FeedImage>,
     initialIndex: Int,
     onDismiss: () -> Unit,
+    onRetargetDuringClose: ((Int) -> Unit)? = null,
     onDismissWithIndex: ((Int) -> Unit)? = null,
     onPageChanged: (suspend (Int) -> Unit)? = null,
     onPrepareDismiss: (suspend (Int) -> Unit)? = null,
@@ -12488,19 +12593,32 @@ private fun FullscreenImageViewer(
     onOpenStatus: ((FeedItem, Int, Map<String, FeedItem>) -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
-    val viewerImages = remember(images, relatedPosts) {
-        if (relatedPosts.isEmpty()) {
-            images
-        } else {
-            enrichAlbumImagesFromPosts(images, buildAlbumPostLookup(relatedPosts))
-        }
+    val viewerImages = images
+    val viewerLookup = remember(relatedPosts) { buildAlbumPostLookup(relatedPosts) }
+    val resolvedPages = remember(images, viewerLookup, imageOwner) { mutableMapOf<Int, FeedImage>() }
+    fun viewerImageAt(index: Int): FeedImage = resolvedPages.getOrPut(index) {
+        resolveFeedImageForViewer(viewerImages[index], imageOwner, relatedPosts, viewerLookup)
     }
     val pagerState = rememberPagerState(pageCount = { viewerImages.size }, initialPage = initialIndex)
+    // Both the outer morph and inner image must use one fixed aspect ratio.
+    // A cropped preview bitmap must not redefine the destination mid-animation.
+    val viewerAspects = remember(images, viewerLookup) { mutableMapOf<Int, Float>() }
+    fun viewerAspectAt(index: Int): Float = viewerAspects.getOrPut(index) {
+            val resolved = viewerImageAt(index)
+            val preview = resolveFullscreenPreviewBitmap(resolved)
+            when {
+                (resolved.width ?: 0) > 0 && (resolved.height ?: 0) > 0 ->
+                    resolved.width!!.toFloat() / resolved.height!!
+                preview != null -> preview.width.toFloat() / preview.height.coerceAtLeast(1)
+                else -> 1f
+            }
+    }
     val transitionProgress = remember(initialIndex) {
         Animatable(if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) 0f else 1f)
     }
     var transitionClosing by remember { mutableStateOf(false) }
     var dismissPreparing by remember { mutableStateOf(false) }
+    var closeAnimationJob by remember { mutableStateOf<Job?>(null) }
     var dragDismissProgress by remember { mutableFloatStateOf(0f) }
     var closeStartBounds by remember { mutableStateOf<Rect?>(null) }
     var dismissBoundsProviders by remember { mutableStateOf<Map<Int, () -> Rect>>(emptyMap()) }
@@ -12522,7 +12640,7 @@ private fun FullscreenImageViewer(
                 closeStartBounds = startBounds ?: currentBoundsProvider?.invoke() ?: currentSourceBounds
                 transitionClosing = true
                 onCloseStart?.invoke()
-                scope.launch {
+                closeAnimationJob = scope.launch {
                     transitionProgress.animateTo(
                         targetValue = 0f,
                         animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
@@ -12556,7 +12674,7 @@ private fun FullscreenImageViewer(
     var blockPagerScroll by remember { mutableStateOf(false) }
     val showStatusCaption = onOpenStatus != null && session != null
     val currentPage = pagerState.currentPage
-    val currentImage = viewerImages.getOrNull(currentPage)
+    val currentImage = if (currentPage in viewerImages.indices) viewerImageAt(currentPage) else null
     LaunchedEffect(currentPage) {
         onPageChanged?.invoke(currentPage)
     }
@@ -12575,7 +12693,6 @@ private fun FullscreenImageViewer(
 
     LaunchedEffect(initialIndex, animateOpenFromSource) {
         if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) {
-            transitionProgress.snapTo(0f)
             transitionProgress.animateTo(
                 targetValue = 1f,
                 animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
@@ -12622,7 +12739,29 @@ private fun FullscreenImageViewer(
         }
         BackHandler { dismissViewer() }
         BoxWithConstraints(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().pointerInput(transitionClosing, dismissPreparing) {
+                if ((!transitionClosing && !dismissPreparing) || onRetargetDuringClose == null) return@pointerInput
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    val index = latestSourceBoundsByIndex.value.entries.filter {
+                        it.key != pagerState.currentPage && it.value.contains(down.position)
+                    }.minByOrNull { abs(it.key - pagerState.currentPage) }?.key ?: return@awaitEachGesture
+                    var tap = true
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) tap = false
+                        change.consume()
+                        if (!change.pressed) {
+                            if (tap) {
+                                closeAnimationJob?.cancel()
+                                onRetargetDuringClose(index)
+                            }
+                            break
+                        }
+                    }
+                }
+            },
         ) {
             val density = LocalDensity.current
             val containerWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
@@ -12638,12 +12777,7 @@ private fun FullscreenImageViewer(
             } else {
                 null
             }
-            val morphImage = viewerImages.getOrNull(morphPageIndex)
-            val imageAspect = morphImage?.let {
-                val width = (it.width ?: 1).coerceAtLeast(1)
-                val height = (it.height ?: 1).coerceAtLeast(1)
-                width.toFloat() / height.toFloat()
-            } ?: 1f
+            val imageAspect = if (morphPageIndex in viewerImages.indices) viewerAspectAt(morphPageIndex) else 1f
             val fitLayout = computeFitImageLayout(
                 containerWidthPx = containerWidthPx,
                 containerHeightPx = containerHeightPx,
@@ -12700,23 +12834,16 @@ private fun FullscreenImageViewer(
             val morphTop = morphCenterY - morphHeight / 2f
             val morphRight = morphCenterX + morphWidth / 2f
             val morphBottom = morphCenterY + morphHeight / 2f
-            // The pager content is rendered in the transformed layer, so its
-            // clip radius must be expressed in pre-transform coordinates. The
-            // scrim, however, is drawn in window coordinates and must use the
-            // original thumbnail radius directly. Sharing the former value with
-            // the scrim made the closing frame look like a tiny, overly-rounded
-            // image before the thumbnail appeared.
+            // morphRevealClip is OUTSIDE the transformed pager layer: both its
+            // rectangle and radius are window-space pixels. Dividing the radius
+            // by the image scale makes the final thumbnail much too rounded.
             val thumbnailCornerRadiusPx = with(density) {
                 sourceCornerRadius.toPx() * (1f - transition).coerceIn(0f, 1f)
             }
             val scrimCornerRadiusPx = thumbnailCornerRadiusPx.coerceAtMost(
                 minOf(morphWidth, morphHeight).coerceAtLeast(0f) / 2f,
             )
-            val morphCornerRadiusPx = (thumbnailCornerRadiusPx /
-                uniformScale.coerceAtLeast(0.01f)).coerceAtMost(
-                minOf(morphWidth, morphHeight).coerceAtLeast(0f) /
-                    (2f * uniformScale.coerceAtLeast(0.01f)),
-            )
+            val morphCornerRadiusPx = scrimCornerRadiusPx
             when {
                 activeMorph && transitionClosing -> {
                     MorphRevealScrim(
@@ -12776,12 +12903,19 @@ private fun FullscreenImageViewer(
                         }
                     },
             ) { page ->
-                val pageImage = viewerImages[page]
+                val pageImage = viewerImageAt(page)
                 ZoomableFullscreenImage(
                     image = pageImage,
                     allImages = viewerImages,
+                    layoutAspectRatio = viewerAspectAt(page),
+                    resolvedForViewer = true,
+                    imageTransitionRunning = activeMorph,
+                    transitionPreviewSize = if (activeMorph) androidx.compose.ui.geometry.Size(
+                        morphWidth / uniformScale.coerceAtLeast(0.01f),
+                        morphHeight / uniformScale.coerceAtLeast(0.01f),
+                    ) else null,
                     isActive = page == pagerState.currentPage,
-                    imageOwner = imageOwner ?: findPostForAlbumImage(relatedPosts, pageImage),
+                    imageOwner = imageOwner ?: findPostForAlbumImage(viewerLookup, pageImage),
                     relatedPosts = relatedPosts,
                     onDismiss = { dismissViewer() },
                     onDismissFromBounds = { bounds -> dismissViewer(bounds) },
@@ -12992,6 +13126,10 @@ private suspend fun flingPanOffset(
 private fun ZoomableFullscreenImage(
     image: FeedImage,
     allImages: List<FeedImage>,
+    layoutAspectRatio: Float? = null,
+    imageTransitionRunning: Boolean = false,
+    transitionPreviewSize: androidx.compose.ui.geometry.Size? = null,
+    resolvedForViewer: Boolean = false,
     onDismiss: () -> Unit,
     onDismissFromBounds: (Rect) -> Unit = { onDismiss() },
     onDismissBoundsProvider: (((() -> Rect) -> Unit))? = null,
@@ -13005,7 +13143,7 @@ private fun ZoomableFullscreenImage(
 ) {
     val context = LocalContext.current
     val resolvedImage = remember(image, imageOwner, relatedPosts) {
-        resolveFeedImageForViewer(image, imageOwner, relatedPosts)
+        if (resolvedForViewer) image else resolveFeedImageForViewer(image, imageOwner, relatedPosts)
     }
     var scale by remember(resolvedImage.largeUrl) { mutableFloatStateOf(1f) }
     var panOffsetX by remember(resolvedImage.largeUrl) { mutableFloatStateOf(0f) }
@@ -13056,23 +13194,37 @@ private fun ZoomableFullscreenImage(
         if (previewBitmap == null) {
             previewBitmap = withContext(Dispatchers.IO) { loadFullscreenPreviewBitmap(resolvedImage) }
         }
-        if (fullscreenBitmap?.isFullscreenQuality(resolvedImage) == true) {
-            return@LaunchedEffect
-        }
+    }
+
+    LaunchedEffect(isActive, resolvedImage.largeUrl, resolvedImage.downloadUrls, resolvedImage.width, resolvedImage.height) {
+        if (!isActive || fullscreenBitmap?.isFullscreenQuality(resolvedImage) == true) return@LaunchedEffect
         fullscreenLoading = true
-        val loaded = withContext(Dispatchers.IO) { loadFullscreenBitmap(resolvedImage) }
-        fullscreenLoading = false
-        loaded?.let { bitmap ->
-            fullscreenBitmap = bitmap
-            fullscreenCandidates.firstOrNull()?.let { url ->
-                FullscreenBitmapCache.put(url, bitmap)
-            } ?: FullscreenBitmapCache.putForImage(resolvedImage, bitmap)
+        try {
+            repeat(3) { attempt ->
+                if (attempt > 0) delay(if (attempt == 1) 500L else 1200L)
+                val loaded = withContext(Dispatchers.IO) {
+                    loadFullscreenBitmap(resolvedImage, forceNetwork = attempt > 0)
+                }
+                if (loaded != null && (fullscreenBitmap == null ||
+                        loaded.width.toLong() * loaded.height > fullscreenBitmap!!.width.toLong() * fullscreenBitmap!!.height)) {
+                    fullscreenBitmap = loaded
+                }
+                if (fullscreenBitmap?.isFullscreenQuality(resolvedImage) == true) return@LaunchedEffect
+            }
+        } finally {
+            fullscreenLoading = false
         }
     }
 
-    val displayBitmap = fullscreenBitmap?.takeIf { it.isFullscreenQuality(resolvedImage) }
-        ?: previewBitmap
-        ?: fullscreenBitmap
+    val candidateBitmap = listOfNotNull(fullscreenBitmap, previewBitmap)
+        .maxByOrNull { it.width.toLong() * it.height }
+    var openingBitmap by remember(resolvedImage.largeUrl) { mutableStateOf(candidateBitmap) }
+    LaunchedEffect(candidateBitmap, imageTransitionRunning) {
+        if (!imageTransitionRunning || openingBitmap == null) openingBitmap = candidateBitmap
+    }
+    // Finish the geometry animation with the same pixels it started with; upgrade
+    // resolution afterwards without changing the image's layout rectangle.
+    val displayBitmap = if (imageTransitionRunning) openingBitmap ?: candidateBitmap else candidateBitmap
     val showFullscreenLoading = fullscreenLoading &&
         displayBitmap != null &&
         fullscreenBitmap?.isFullscreenQuality(resolvedImage) != true
@@ -13109,8 +13261,8 @@ private fun ZoomableFullscreenImage(
             val height = maxHeight.value.coerceAtLeast(1f)
             width / height
         }
-        val imageAspect = remember(loadedBitmap.width, loadedBitmap.height) {
-            loadedBitmap.width.toFloat() / loadedBitmap.height.coerceAtLeast(1).toFloat()
+        val imageAspect = remember(layoutAspectRatio, loadedBitmap.width, loadedBitmap.height) {
+            layoutAspectRatio ?: (loadedBitmap.width.toFloat() / loadedBitmap.height.coerceAtLeast(1).toFloat())
         }
         val rawFillScreenScale = remember(containerAspect, imageAspect) {
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
@@ -13561,8 +13713,17 @@ private fun ZoomableFullscreenImage(
                     Image(
                         bitmap = loadedBitmap.asImageBitmap(),
                         contentDescription = null,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.align(Alignment.Center).size(
+                            with(density) {
+                                (transitionPreviewSize?.width?.takeIf { loadedBitmap !== fullscreenBitmap }
+                                    ?: layoutFor(1f).fitWidthPx).toDp()
+                            },
+                            with(density) {
+                                (transitionPreviewSize?.height?.takeIf { loadedBitmap !== fullscreenBitmap }
+                                    ?: layoutFor(1f).fitHeightPx).toDp()
+                            },
+                        ),
+                        contentScale = if (loadedBitmap === fullscreenBitmap) ContentScale.Fit else ContentScale.Crop,
                     )
                 }
                 if (resolvedImage.isLivePhoto) {
@@ -16663,6 +16824,7 @@ private fun DetailScreen(
     }
 
     val sharedCardMotion = LocalDetailCardMotion.current
+    val returnCardLayout = LocalDetailReturnCardLayout.current
     var sharedCardBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
     AppPullToRefreshBox(
         isRefreshing = pullRefreshing,
@@ -16676,7 +16838,13 @@ private fun DetailScreen(
         modifier = Modifier.fillMaxSize()
             .padding(top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp)
             .padding(horizontal = 8.dp, vertical = 0.dp)
-            .onGloballyPositioned { sharedCardBounds = it.boundsInRoot() }
+            .onGloballyPositioned {
+                sharedCardBounds = it.boundsInRoot()
+                // Parent-local layout coordinates exclude the outer return transform.
+                val inset = it.parentLayoutCoordinates?.localPositionOf(it, Offset.Zero) ?: Offset.Zero
+                returnCardLayout?.value = Rect(inset.x, inset.y,
+                    inset.x + it.size.width, inset.y + it.size.height)
+            }
             .graphicsLayer {
                 val target = sharedCardBounds
                 if (sharedCardMotion != null && target != null) {
@@ -20973,7 +21141,7 @@ private fun MineScreen(
             .distinctUntilChanged()
             .filter { (totalItems, lastVisibleIndex) ->
                 totalItems > 0 &&
-                    lastVisibleIndex >= totalItems - ListLoadMoreItemsFromBottom
+                    lastVisibleIndex >= totalItems - 12
             }
             .collect { onLoadMoreAlbum() }
     }
@@ -21283,6 +21451,7 @@ private fun MineScreen(
                         }
 
                         MineContentTab.Album -> {
+                            val albumPostLookup = remember(posts) { buildAlbumPostLookup(posts) }
                             val albumRows = remember(albumImages) {
                                 buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
                             }
@@ -21327,6 +21496,7 @@ private fun MineScreen(
                                                 rowImages = row.rowImages,
                                                 rowStartIndex = row.rowStartIndex,
                                                 relatedPosts = posts,
+                                                postLookup = albumPostLookup,
                                                 modifier = Modifier
                                                     .padding(horizontal = 12.dp)
                                                     .padding(bottom = 6.dp),
@@ -24404,6 +24574,7 @@ private fun MineAlbumGridRow(
     rowImages: List<FeedImage>,
     rowStartIndex: Int,
     relatedPosts: List<FeedItem>,
+    postLookup: AlbumPostLookup,
     onImageClick: (List<FeedImage>, Int, Rect?) -> Unit,
     onImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
     onVideoClick: (FeedMedia, String) -> Unit,
@@ -24435,6 +24606,7 @@ private fun MineAlbumGridRow(
                         allImages = monthImages,
                         imageIndex = imageIndex,
                         relatedPosts = relatedPosts,
+                        postLookup = postLookup,
                         onOpenViewer = { index, bounds, _, _ -> onImageClick(monthImages, index, bounds) },
                         onAnchorBoundsChanged = { bounds ->
                             onImageAnchorBoundsChanged(image.albumAnchorKey(), bounds)
@@ -24454,12 +24626,13 @@ private fun MineAlbumTile(
     allImages: List<FeedImage>,
     imageIndex: Int,
     relatedPosts: List<FeedItem>,
+    postLookup: AlbumPostLookup,
     onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
     onVideoClick: (FeedMedia, String) -> Unit,
 ) {
     val imageOwner = remember(image.id, image.largeUrl, relatedPosts) {
-        findPostForAlbumImage(relatedPosts, image)
+        findPostForAlbumImage(postLookup, image)
     }
     val albumMedia = remember(image.id, image.largeUrl, image.videoStreamUrl) {
         image.toAlbumFeedMedia()
@@ -24480,7 +24653,8 @@ private fun MineAlbumTile(
             imageIndex = imageIndex,
             imageOwner = imageOwner,
             modifier = Modifier.size(size),
-            cornerRadius = 8.dp,
+            cornerRadius = ThumbnailMorphCornerRadius,
+            openWhileScrolling = true,
             maxDecodeDimOverride = AlbumGridMaxDecodeDim,
             onOpenViewer = onOpenViewer,
             onAnchorBoundsChanged = onAnchorBoundsChanged,
@@ -24554,7 +24728,7 @@ private fun AlbumVideoTile(
                 scaleY = holdScale
                 alpha = if (actionOpen) 0f else 1f
             }
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(ThumbnailMorphCornerRadius))
             .pointerInput(media.streamUrl) {
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
@@ -25705,11 +25879,14 @@ private fun fetchRemoteBytes(
     connectTimeoutMs: Int,
     readTimeoutMs: Int,
     maxReadBytes: Int = RemoteBytesMaxCachedEntry,
+    forceNetwork: Boolean = false,
 ): ByteArray {
-    RemoteBytesCache.get(url)?.takeIf { it.size <= maxReadBytes }?.let { return it }
-    RemoteDiskBytesCache.get(url, maxReadBytes)?.let { bytes ->
-        RemoteBytesCache.put(url, bytes)
-        return bytes
+    if (!forceNetwork) {
+        RemoteBytesCache.get(url)?.takeIf { it.size <= maxReadBytes }?.let { return it }
+        RemoteDiskBytesCache.get(url, maxReadBytes)?.let { bytes ->
+            RemoteBytesCache.put(url, bytes)
+            return bytes
+        }
     }
     val request = weiboImageRequest(url)
     val call = WeiboImageHttpClient.newCall(request).apply {
@@ -25771,6 +25948,10 @@ private fun resolveFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
     FullscreenBitmapCache.get(fullscreenImageUrlCandidates(image))
         ?.takeIfDrawable()
         ?.let { return it }
+    FeedThumbnailQuality.entries.forEach { quality ->
+        val key = "${image.id.ifBlank { image.largeUrl }}:$quality:null"
+        StableFeedThumbnailCache.get(key)?.takeIfDrawable()?.let { return it }
+    }
     feedImageUrlCandidates(image).forEach { url ->
         FeedBitmapCache.get(url)?.takeIfDrawable()?.let { return it }
     }
@@ -25800,12 +25981,13 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
     return null
 }
 
-private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
+private fun loadFullscreenBitmap(image: FeedImage, forceNetwork: Boolean = false): android.graphics.Bitmap? {
     val candidates = fullscreenImageUrlCandidates(image)
     val decodeDim = fullscreenDecodeDim(image)
-    candidates.forEach { url ->
+    if (!forceNetwork) candidates.forEach { url ->
         FullscreenBitmapCache.get(url)?.takeIf { it.isFullscreenQuality(image) }?.let { return it }
     }
+    var best: Bitmap? = null
     candidates.forEach { url ->
         runCatching {
             val bytes = fetchRemoteBytes(
@@ -25813,14 +25995,16 @@ private fun loadFullscreenBitmap(image: FeedImage): android.graphics.Bitmap? {
                 connectTimeoutMs = 10_000,
                 readTimeoutMs = 20_000,
                 maxReadBytes = remoteReadLimitForDecodeDim(decodeDim),
+                forceNetwork = forceNetwork,
             )
             decodeBitmapFromBytes(bytes, decodeDim)
         }.getOrNull()?.let { bitmap ->
             FullscreenBitmapCache.put(url, bitmap)
-            return bitmap
+            if (bitmap.isFullscreenQuality(image)) return bitmap
+            if (best == null || bitmap.width.toLong() * bitmap.height > best!!.width.toLong() * best!!.height) best = bitmap
         }
     }
-    return null
+    return best
 }
 
 private fun buildVideoMediaSource(
