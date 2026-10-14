@@ -7345,7 +7345,10 @@ fun WeiboApp() {
                         .fillMaxSize()
                         .blockHiddenTouches(visitedProfileVisible && !profileIsExiting),
                     stackTop = visitedProfileVisible,
-                    layerBaseZIndex = 540f,
+                    // The transparent photo dialog must reveal the retained album,
+                    // not an older detail page (whose base layer is 570f).
+                    // Keep input disabled while the dialog owns the foreground.
+                    layerBaseZIndex = if (albumViewerVisible) 580f else 540f,
                     visible = visitedProfileVisible,
                     animationKey = visitedProfileLoadGeneration,
                     navKind = visitedProfileNavKind,
