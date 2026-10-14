@@ -668,6 +668,18 @@ class WeiboWebSession(context: Context) {
         WeiboJsonParser.assertMutationSuccess(raw, "评论发布失败")
     }
 
+    suspend fun repostStatus(item: FeedItem, text: String, alsoComment: Boolean, picId: String? = null) {
+        val id = item.id.ifBlank { item.statusId }
+        require(id.isNotBlank()) { "无效的微博 ID" }
+        val raw = postForm(
+            path = "/ajax/statuses/repost",
+            params = linkedMapOf("id" to id, "comment" to text.trim().ifBlank { "转发微博" },
+                "is_comment" to if (alsoComment) "1" else "0", "pic_id" to picId.orEmpty()),
+            referer = "https://weibo.com/detail/${item.statusId.ifBlank { id }}",
+        )
+        WeiboJsonParser.assertMutationSuccess(raw, "转发失败")
+    }
+
     suspend fun uploadCommentImage(uri: Uri): String =
         withTimeout(COMMENT_IMAGE_UPLOAD_TIMEOUT_MS) {
             val image = prepareCommentUploadImage(uri)

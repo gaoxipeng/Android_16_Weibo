@@ -88,6 +88,7 @@ import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -2027,15 +2028,16 @@ private data class LikeUsersOverlayState(
 private data class CommentComposeTarget(
     val status: FeedItem,
     val replyTo: CommentItem? = null,
+    val isRepost: Boolean = false,
 ) {
     val isReply: Boolean
         get() = replyTo != null
 
     val title: String
-        get() = if (isReply) "回复评论" else "发布评论"
+        get() = if (isRepost) "转发微博" else if (isReply) "回复评论" else "发布评论"
 
     val placeholder: String
-        get() = replyTo?.authorName?.let { "回复 @$it" } ?: "写评论..."
+        get() = if (isRepost) "写点什么" else replyTo?.authorName?.let { "回复 @$it" } ?: "写评论..."
 }
 
 private const val DETAIL_SECTION_HEADER_INDEX = 1
@@ -3514,6 +3516,7 @@ fun WeiboApp() {
         initialFirstVisibleItemIndex = initialFollowingScroll.first,
         initialFirstVisibleItemScrollOffset = initialFollowingScroll.second,
     )
+    val homeThumbnailStore = remember { HomeThumbnailStore() }
     val minePostsListState = rememberLazyListState()
     val mineAlbumListState = rememberLazyListState()
     val visitedPostsListState = rememberLazyListState()
@@ -3624,6 +3627,11 @@ fun WeiboApp() {
             }
     }
     var hiddenFeedCardId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(feedListState, selectedItem, navExitPendingKind) {
+        snapshotFlow { feedListState.isScrollInProgress }.collect { scrolling ->
+            if (scrolling && selectedItem == null && navExitPendingKind == null) homeThumbnailStore.releaseSnapshot()
+        }
+    }
     var albumOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var mediaOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var articleOverlayInstanceKey by remember { mutableIntStateOf(0) }
@@ -5353,6 +5361,12 @@ fun WeiboApp() {
         }
 
     fun applyExpandedItem(expanded: FeedItem) {
+        preservedFeedSourceItem = preservedFeedSourceItem?.let { source ->
+            if (source.statusId == expanded.statusId) source.copy(liked = expanded.liked, likesCount = expanded.likesCount)
+            else if (source.retweetedStatus?.statusId == expanded.statusId) source.copy(
+                retweetedStatus = source.retweetedStatus.copy(liked = expanded.liked, likesCount = expanded.likesCount),
+            ) else source
+        }
         expandedFeedItems = expandedFeedItems + (expanded.statusId to expanded)
         absorbDiscoveredEmoticons(expanded.collectEmoticons())
         items = items.map { mergeExpandedIntoItem(it, expanded) }
@@ -5806,7 +5820,8 @@ fun WeiboApp() {
                     val picId = photoUris.firstOrNull()?.let { uri ->
                         session.uploadCommentImage(uri)
                     }
-                    session.postStatusComment(
+                    if (target.isRepost) session.repostStatus(target.status, text, alsoRepost, picId)
+                    else session.postStatusComment(
                         item = target.status,
                         text = text,
                         replyToCommentId = target.replyTo?.id,
@@ -5815,15 +5830,16 @@ fun WeiboApp() {
                     )
                 }
                 commentComposeTarget = null
-                operationCapsuleHint = if (target.isReply) {
+                operationCapsuleHint = if (target.isRepost) "转发已发布" else if (target.isReply) {
                     "已回复 @${target.replyTo?.authorName}"
                 } else {
                     "评论已发布"
                 }
                 val updated = target.status.copy(
-                    commentsCount = WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1),
+                    commentsCount = if (!target.isRepost || alsoRepost) WeiboJsonParser.bumpDisplayCount(target.status.commentsCount, 1)
+                        else target.status.commentsCount,
                 ).let { status ->
-                    if (alsoRepost) {
+                    if (target.isRepost || alsoRepost) {
                         status.copy(
                             repostsCount = WeiboJsonParser.bumpDisplayCount(status.repostsCount, 1),
                         )
@@ -5833,7 +5849,7 @@ fun WeiboApp() {
                 }
                 applyExpandedItem(updated)
                 selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, updated) }
-                reloadComments()
+                if (!target.isRepost || alsoRepost) reloadComments()
             } catch (error: CancellationException) {
                 if (error is TimeoutCancellationException) {
                     operationCapsuleHint = commentFailureMessage(error)
@@ -5961,6 +5977,8 @@ fun WeiboApp() {
         initialSection: DetailContentSection,
         scrollToContentSection: Boolean,
     ) {
+        homeThumbnailStore.freezeVisible()
+        feedRefreshHint = null
         val resolved = resolveFeedItem(item)
         activeDetailSourceBounds = null
         activeDetailSourceImage = null
@@ -6897,6 +6915,9 @@ fun WeiboApp() {
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalPageSwipeBack provides { navigateBack() },
             LocalOpenRetweetCard provides ::openDetailFromSource,
+            LocalRepostComposer provides { status ->
+                commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), isRepost = true)
+            },
             LocalFeedListScrollCoordinator provides feedListScrollCoordinator,
             LocalImagePeekController provides imagePeekController,
             LocalImageSaveHint provides imageSaveHintController,
@@ -7106,8 +7127,10 @@ fun WeiboApp() {
                             .blockHiddenTouches(feedUiOnTop || composeWebVisible),
                     ) {
                         key(feedResumeGeneration) {
-                            CompositionLocalProvider(LocalHiddenFeedCardId provides
-                                hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail }) {
+                            CompositionLocalProvider(
+                                LocalHomeThumbnailStore provides homeThumbnailStore,
+                                LocalHiddenFeedCardId provides hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
+                            ) {
                             FollowFeedScreen(
                                 session = session,
                                 commentSort = commentSort,
@@ -7605,6 +7628,10 @@ fun WeiboApp() {
                                 commentsHasMore = detailSnapshot.commentsHasMore,
                                 repostsHasMore = detailSnapshot.repostsHasMore,
                                 onSelectContentSection = ::selectDetailContentSection,
+                                onRefreshComments = { reloadComments() },
+                                onPrepareContentSection = { section ->
+                                    if (section == DetailContentSection.Reposts && reposts.isEmpty() && !repostsLoading) reloadReposts()
+                                },
                                 listState = detailListState,
                                 onMediaClick = ::pushMediaPreview,
                                 emoticonMap = emoticonMap,
@@ -7727,7 +7754,7 @@ fun WeiboApp() {
                 ?: operationCapsuleHint?.let {
                     AppCapsuleHintState(
                         message = it,
-                        tone = if (it == "暂无点赞") CapsuleHintTone.Theme else CapsuleHintTone.Neutral,
+                        tone = CapsuleHintTone.Theme,
                     )
                 }
                 ?: feedCapsuleHint?.let {
@@ -9190,6 +9217,7 @@ private fun FeedCard(
                 .padding(
                     top = contentVerticalPadding,
                     bottom = when {
+                        sharedDetailCard -> 6.dp
                         insetRounded -> 14.dp
                         compactBottomSpacing -> 2.dp
                         else -> 10.dp
@@ -9294,7 +9322,7 @@ private fun FeedCard(
                     autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
-            TraceComposition("WeiboCard.Actions") {
+            if (!sharedDetailCard) TraceComposition("WeiboCard.Actions") {
                 StatusActions(
                     modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                     item = item,
@@ -10133,26 +10161,14 @@ private fun FeedImageThumbnailContent(
     maxDecodeDimOverride: Int? = null,
 ) {
     val thumbnailQuality = LocalFeedThumbnailQuality.current
-    val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     val feedCacheCandidates = remember(image, thumbnailQuality) {
         feedImageCacheCandidates(image, thumbnailQuality)
-    }
-    val cachedFeedBitmap = remember(image.id, image.largeUrl, thumbnailQuality, upgradeRevision) {
-        FeedBitmapCache.get(feedCacheCandidates)?.takeIfDrawable()
     }
     val displayUrl = remember(image, thumbnailQuality) { thumbnailQuality.displayUrl(image) }
     val fallbackUrl = remember(image, thumbnailQuality) { thumbnailQuality.fallbackUrl(image) }
     val decodeDim = maxDecodeDimOverride ?: thumbnailQuality.maxDecodeDim
 
-    if (maxDecodeDimOverride == null && cachedFeedBitmap != null) {
-        val imageBitmap = remember(cachedFeedBitmap) { cachedFeedBitmap.asImageBitmap() }
-        Image(
-            bitmap = imageBitmap,
-            contentDescription = null,
-            modifier = modifier,
-            contentScale = contentScale,
-        )
-    } else if (maxDecodeDimOverride != null) {
+    if (maxDecodeDimOverride != null) {
         AlbumGridRemoteImage(
             image = image,
             maxDecodeDim = maxDecodeDimOverride,
@@ -10163,6 +10179,7 @@ private fun FeedImageThumbnailContent(
     } else {
         RemoteImage(
             url = previewUrl ?: displayUrl,
+            stableThumbnailKey = "${image.id.ifBlank { image.largeUrl }}:$thumbnailQuality:$previewUrl",
             fallbackUrls = if (previewUrl != null) {
                 emptyList()
             } else {
@@ -10516,14 +10533,20 @@ private fun ImageActionFrostedCard(
         }
         Column(
             modifier = cardModifier
+                .clip(cardShape)
+                // Backdrop samples may have transparent edge pixels. An opaque
+                // underlay prevents the unblurred live page bleeding through
+                // those pixels; the blurred sample is drawn above this layer.
+                .background(if (isLightTheme) Color.White else Color(0xFF242424), cardShape)
                 .drawBackdrop(
                     backdrop = resolvedBackdrop,
                     shape = { cardShape },
                     effects = { liquidRegularMenuGlassEffects() },
                     highlight = if (showBorder) ({ Highlight.Default.copy(alpha = 0.38f) }) else null,
                     shadow = null,
-                    onDrawSurface = { drawRect(frostedTint) },
+                    onDrawSurface = { drawRect(Color.Transparent) },
                 )
+                .background(frostedTint, cardShape)
                 .border(
                     width = 0.75.dp,
                     color = if (!showBorder) Color.Transparent else if (isLightTheme) Color.Black.copy(alpha = 0.16f)
@@ -13326,6 +13349,7 @@ private fun ZoomableFullscreenImage(
                                             break
                                         }
                                         change.consume()
+                                        if (!change.pressed) break
                                         continue
                                     }
                                 }
@@ -15928,8 +15952,8 @@ private fun WeiboVideoSurface(
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isFullscreen && !isPeekPlayback && showFullscreenButton,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            enter = fadeIn(tween(200)),
+            exit = fadeOut(tween(180)),
             modifier = Modifier.align(Alignment.TopStart),
         ) {
             GlassTextButton(
@@ -15988,8 +16012,8 @@ private fun WeiboVideoSurface(
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isPeekPlayback &&
                 onEnterFloatingPlayback != null,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            enter = fadeIn(tween(200)),
+            exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .zIndex(if (isFullscreen) 20f else 0f),
@@ -16014,8 +16038,8 @@ private fun WeiboVideoSurface(
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && isFullscreen && !isLiveBroadcast,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            enter = fadeIn(tween(200)),
+            exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .zIndex(20f),
@@ -16069,8 +16093,8 @@ private fun WeiboVideoSurface(
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !isFullscreen && isPeekPlayback,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { -it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { -it },
+            enter = fadeIn(tween(200)),
+            exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .zIndex(10f),
@@ -16091,8 +16115,8 @@ private fun WeiboVideoSurface(
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !hideProgressControls,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(220)) { it },
-            exit = fadeOut(tween(180)) + slideOutVertically(tween(200)) { it },
+            enter = fadeIn(tween(200)),
+            exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(
@@ -16443,6 +16467,7 @@ private fun VideoControlCapsuleProgressBackground(
     }
 }
 
+private val LocalRepostComposer = staticCompositionLocalOf<((FeedItem) -> Unit)?> { null }
 private val StatusLikeColor = Color(0xFFE94326)
 
 @Composable
@@ -16459,6 +16484,7 @@ private fun StatusActions(
     val chipColor = actionColor
     val haptic = LocalHapticFeedback.current
     val likeLabelColor = if (item.liked) StatusLikeColor else chipColor
+    val repostComposer = LocalRepostComposer.current
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -16476,13 +16502,12 @@ private fun StatusActions(
                 .fillMaxHeight(),
             contentAlignment = Alignment.Center,
         ) {
-            AssistChip(
+            Box(Modifier.height(24.dp).clip(RoundedCornerShape(12.dp)).combinedClickable(
                 onClick = { onRepostClick?.invoke() },
-                modifier = Modifier.height(24.dp),
-                colors = AssistChipDefaults.assistChipColors(containerColor = Color.Transparent, labelColor = actionColor),
-                border = null,
-                label = { Text("转发 ${item.repostsCount}", fontSize = 11.sp, color = chipColor) },
-            )
+                onLongClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); repostComposer?.invoke(item) },
+            ).padding(horizontal = 8.dp), contentAlignment = Alignment.Center) {
+                Text("转发 ${item.repostsCount}", fontSize = 11.sp, color = chipColor)
+            }
         }
         Box(
             modifier = Modifier
@@ -16566,6 +16591,7 @@ private fun StatusActions(
 }
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun DetailScreen(
     item: FeedItem,
     contentSection: DetailContentSection,
@@ -16580,6 +16606,8 @@ private fun DetailScreen(
     onRefresh: () -> Unit,
     onCommentSortChange: (CommentSort) -> Unit,
     onSelectContentSection: (DetailContentSection) -> Unit,
+    onRefreshComments: () -> Unit = {},
+    onPrepareContentSection: (DetailContentSection) -> Unit = {},
     onMediaClick: (FeedMedia, String) -> Unit,
     emoticonMap: Map<String, String> = emptyMap(),
     onRetweetClick: ((FeedItem, FeedItem) -> Unit)? = null,
@@ -16599,39 +16627,39 @@ private fun DetailScreen(
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
     val scope = rememberCoroutineScope()
+    val detailPager = rememberPagerState(initialPage = if (contentSection == DetailContentSection.Reposts) 1 else 0, pageCount = { 2 })
+    val repostComposer = LocalRepostComposer.current
+    LaunchedEffect(contentSection) {
+        val target = if (contentSection == DetailContentSection.Reposts) 1 else 0
+        if (detailPager.currentPage != target && !detailPager.isScrollInProgress) detailPager.scrollToPage(target)
+    }
+    val visualTabProgress = (detailPager.currentPage + detailPager.currentPageOffsetFraction).coerceIn(0f, 1f)
+    fun selectPagerSection(section: DetailContentSection) {
+        if (section == DetailContentSection.Comments) onRefreshComments()
+        onPrepareContentSection(section)
+        scope.launch {
+            detailPager.animateScrollToPage(if (section == DetailContentSection.Reposts) 1 else 0,
+                animationSpec = tween(220, easing = FastOutSlowInEasing))
+            onSelectContentSection(section)
+        }
+    }
+    var commentTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
+    var repostTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
+    var commentTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
+    var repostTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
+    var sectionHeaderLeft by remember(item.id) { mutableFloatStateOf(0f) }
     val commentVisibility = Modifier
-    val showingReposts = contentSection == DetailContentSection.Reposts
-    val sectionItems = if (showingReposts) reposts else comments
+    val showingReposts = detailPager.currentPage == 1
     val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
-    val isLoadingMoreSection = if (showingReposts) isLoadingMoreReposts else isLoadingMoreComments
-    val sectionHasMore = if (showingReposts) repostsHasMore else commentsHasMore
-    val onLoadMoreSection = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
     var pullRefreshing by remember { mutableStateOf(false) }
     var detailVideoViewport by remember { mutableStateOf(DetailVideoViewport()) }
+    var sectionHeaderTop by remember(item.id) { mutableFloatStateOf(Float.MAX_VALUE) }
+    var sectionHeaderHeightPx by remember(item.id) { mutableIntStateOf(0) }
+    var detailLikeBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
     LaunchedEffect(isLoadingSection) {
         if (!isLoadingSection) {
             pullRefreshing = false
         }
-    }
-
-    LaunchedEffect(
-        listState,
-        contentSection,
-        sectionItems.size,
-        isLoadingSection,
-        sectionHasMore,
-    ) {
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-            info.totalItemsCount to last
-        }
-            .filter { (total, last) -> total > 0 && last >= total - 3 }
-            .collect {
-                if (sectionHasMore && !isLoadingSection) {
-                    onLoadMoreSection()
-                }
-            }
     }
 
     val sharedCardMotion = LocalDetailCardMotion.current
@@ -16675,6 +16703,57 @@ private fun DetailScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
+                    .pointerInput(contentSection, sectionHeaderTop, detailVideoViewport.headerBottomPx) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            if (down.position.y + detailVideoViewport.headerBottomPx < sectionHeaderTop) return@awaitEachGesture
+                            var horizontal = false
+                            var delta = 0f
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                val displacement = change.position - down.position
+                                if (!horizontal) {
+                                    if (abs(displacement.y) > viewConfiguration.touchSlop) break
+                                    if (abs(displacement.x) <= viewConfiguration.touchSlop) {
+                                        if (!change.pressed) break
+                                        continue
+                                    }
+                                    // At the first tab, rightward movement belongs to
+                                    // the existing page-back gesture, not tab switching.
+                                    if (contentSection == DetailContentSection.Comments && displacement.x > 0f) break
+                                    if (contentSection == DetailContentSection.Reposts && displacement.x < 0f) {
+                                        // Consume the terminal direction without moving either
+                                        // the list or indicator, and do not pass it to page-back.
+                                        change.consume()
+                                        if (!change.pressed) break
+                                        continue
+                                    }
+                                    horizontal = true
+                                    // Start fetching as soon as a valid page drag starts,
+                                    // before the finger is released and settling begins.
+                                    onPrepareContentSection(
+                                        if (displacement.x < 0f) DetailContentSection.Reposts else DetailContentSection.Comments,
+                                    )
+                                }
+                                change.consume()
+                                delta = displacement.x
+                                val step = change.previousPosition.x - change.position.x
+                                scope.launch { detailPager.scrollBy(step) }
+                                if (!change.pressed) {
+                                    val commitSection = abs(delta) > 24.dp.toPx()
+                                    scope.launch {
+                                        val target = if (commitSection) (if (delta < 0f) 1 else 0)
+                                            else if (contentSection == DetailContentSection.Reposts) 1 else 0
+                                        detailPager.animateScrollToPage(target, animationSpec = tween(
+                                            if (commitSection) 220 else 320, easing = FastOutSlowInEasing))
+                                        onSelectContentSection(if (target == 1) DetailContentSection.Reposts else DetailContentSection.Comments)
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
                     .onGloballyPositioned { coordinates ->
                         val bounds = coordinates.boundsInWindow()
                         val next = DetailVideoViewport(
@@ -16683,7 +16762,7 @@ private fun DetailScreen(
                         )
                         if (detailVideoViewport != next) detailVideoViewport = next
                     },
-                contentPadding = PaddingValues(bottom = 24.dp),
+                contentPadding = PaddingValues(0.dp),
             ) {
                 item(key = "detail-feed") {
                     CompositionLocalProvider(LocalDetailVideoViewport provides detailVideoViewport) {
@@ -16711,40 +16790,131 @@ private fun DetailScreen(
                         }
                     }
                 }
-                item(key = "detail-section-header") {
+                stickyHeader(key = "detail-section-header") {
+                    Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
                     Row(
                         modifier = Modifier
-                            .then(commentVisibility)
+                            .onGloballyPositioned {
+                                sectionHeaderTop = it.boundsInWindow().top
+                                sectionHeaderHeightPx = it.size.height
+                                sectionHeaderLeft = it.boundsInWindow().left
+                            }
                             .fillMaxWidth()
-                            .padding(start = CommentRowOuterStart, end = 8.dp, top = 12.dp, bottom = 12.dp),
+                            .background(MaterialTheme.colorScheme.surface)
+                            .padding(start = CommentRowOuterStart, end = 8.dp, top = 4.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
+                        DetailSectionTab("评论 ${item.commentsCount}", !showingReposts,
+                            onWidthChanged = { commentTabWidth = it },
+                            onLongClick = { onComposeComment?.invoke(item, null) },
+                            onCenterChanged = { commentTabCenter = it }) {
+                            selectPagerSection(DetailContentSection.Comments)
+                        }
+                        Spacer(Modifier.width(20.dp))
+                        DetailSectionTab("转发 ${item.repostsCount}", showingReposts,
+                            onLongClick = { repostComposer?.invoke(item) },
+                            onWidthChanged = { repostTabWidth = it },
+                            onCenterChanged = { repostTabCenter = it }) {
+                            selectPagerSection(DetailContentSection.Reposts)
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp),
+                            modifier = Modifier.padding(start = 20.dp, bottom = 2.dp)
+                                .onGloballyPositioned { detailLikeBounds = it.boundsInWindow() }
+                                .combinedClickable(
+                                    onClick = { detailLikeBounds?.let { onLikeClick?.invoke(item, it) } },
+                                    onLongClick = { onToggleLike?.invoke(item) },
+                                ),
+                        ) {
                         Text(
-                            text = if (showingReposts) {
-                                "转发 ${item.repostsCount}"
-                            } else {
-                                "评论 ${item.commentsCount}"
-                            },
-                            fontSize = CommentAuthorFontSize,
+                            text = "赞 ${item.likesCount}",
+                            color = if (item.liked) StatusLikeColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                         )
+                        if (item.liked) Icon(
+                            painter = painterResource(R.drawable.ic_status_like),
+                            contentDescription = "已点赞",
+                            tint = Color.Unspecified,
+                            modifier = Modifier.size(15.dp),
+                        )
+                        }
+                        Spacer(Modifier.weight(1f))
                         if (!showingReposts) {
+                            Box(Modifier.padding(bottom = 4.dp)) {
                             CommentSortToggle(
                                 selected = commentSort,
                                 onSelected = onCommentSortChange,
                             )
+                            }
                         }
+                    }
+                    val indicatorDensity = LocalDensity.current
+                    val indicatorWidthPx = lerp(commentTabWidth, repostTabWidth, visualTabProgress)
+                    Box(Modifier.align(Alignment.BottomStart)
+                        .offset { IntOffset(
+                            (lerp(commentTabCenter, repostTabCenter, visualTabProgress) - sectionHeaderLeft -
+                                indicatorWidthPx / 2f).roundToInt(),
+                            -with(indicatorDensity) { 7.dp.toPx() }.roundToInt(),
+                        ) }
+                        .width(with(indicatorDensity) { indicatorWidthPx.toDp() }).height(3.dp)
+                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50)))
                     }
                 }
 
+                item(key = "detail-section-pages") {
+                    val height = with(LocalDensity.current) {
+                        (detailVideoViewport.viewportBottomPx - detailVideoViewport.headerBottomPx - sectionHeaderHeightPx)
+                            .coerceAtLeast(0f).toDp()
+                    }.coerceAtLeast(1.dp)
+                    HorizontalPager(state = detailPager, userScrollEnabled = false,
+                        beyondViewportPageCount = 1, modifier = Modifier.fillMaxWidth().height(height)) { page ->
+                        val showingReposts = page == 1
+                        val sectionItems = if (showingReposts) reposts else comments
+                        val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
+                        val loadingMore = if (showingReposts) isLoadingMoreReposts else isLoadingMoreComments
+                        val hasMore = if (showingReposts) repostsHasMore else commentsHasMore
+                        val loadMore = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
+                        val pageList = rememberLazyListState()
+                        LaunchedEffect(pageList, sectionItems.size, isLoadingSection, loadingMore, hasMore) {
+                            snapshotFlow {
+                                val info = pageList.layoutInfo
+                                info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 3
+                            }.distinctUntilChanged().collect { nearEnd ->
+                                if (nearEnd && hasMore && !isLoadingSection && !loadingMore && sectionItems.isNotEmpty()) loadMore()
+                            }
+                        }
+                        val collapseBody = remember(listState) {
+                            object : NestedScrollConnection {
+                                override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                                    if (available.y < 0f && listState.firstVisibleItemIndex == 0) {
+                                        val remainingBody = listState.layoutInfo.visibleItemsInfo
+                                            .firstOrNull { it.key == "detail-section-header" }?.offset
+                                            ?.coerceAtLeast(0)?.toFloat() ?: -available.y
+                                        return Offset(0f, -listState.dispatchRawDelta(min(-available.y, remainingBody)))
+                                    }
+                                    return Offset.Zero
+                                }
+                            }
+                        }
+                        LazyColumn(state = pageList, modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
+                            contentPadding = PaddingValues(bottom = 24.dp)) {
+                if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing) {
+                    item(key = "section-refresh") {
+                        Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.TopCenter) {
+                            AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
+                        }
+                    }
+                }
                 if (sectionItems.isEmpty() && isLoadingSection && !pullRefreshing) {
-                    item {
+                    item(key = "detail-section-row-0") {
                         Box(
                             Modifier
                                 .fillMaxWidth()
                                 .padding(vertical = 12.dp).then(commentVisibility),
-                            contentAlignment = Alignment.Center,
+                            contentAlignment = Alignment.TopCenter,
                         ) {
                             AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
                         }
@@ -16752,11 +16922,12 @@ private fun DetailScreen(
                 }
 
                 if (sectionItems.isEmpty() && !isLoadingSection) {
-                    item {
+                    item(key = "detail-section-row-0") {
                         Text(
                             text = if (showingReposts) "暂无转发" else "暂无评论",
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .heightIn(min = LocalConfiguration.current.screenHeightDp.dp - 180.dp)
                                 .padding(vertical = 8.dp).then(commentVisibility),
                             fontSize = CommentAuthorFontSize,
                             fontWeight = FontWeight.SemiBold,
@@ -16768,7 +16939,10 @@ private fun DetailScreen(
 
                 itemsIndexed(
                     sectionItems,
-                    key = { _, entry -> entry.id },
+                    // Keep the viewport anchored by row position across the two
+                    // datasets. ID-based anchoring loses the visible comment on
+                    // a tab switch and scrolls back to the body at index zero.
+                    key = { index, _ -> "detail-section-row-$index" },
                     contentType = { _, _ -> "comment_row" },
                 ) { index, entry ->
                     Column(commentVisibility) {
@@ -16785,10 +16959,13 @@ private fun DetailScreen(
                     }
                 }
 
-                if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing) {
+                if (loadingMore && sectionItems.isNotEmpty() && !pullRefreshing) {
                     item {
                         Box(Modifier.fillMaxWidth().padding(16.dp).then(commentVisibility), contentAlignment = Alignment.Center) {
                             AppLoadingIndicator()
+                        }
+                    }
+                }
                         }
                     }
                 }
@@ -16796,6 +16973,26 @@ private fun DetailScreen(
         }
     }
     }
+    }
+}
+
+@Composable
+private fun DetailSectionTab(label: String, selected: Boolean, onWidthChanged: (Float) -> Unit,
+    onLongClick: (() -> Unit)? = null, onCenterChanged: (Float) -> Unit, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier.onGloballyPositioned {
+            onCenterChanged(it.boundsInWindow().center.x)
+            onWidthChanged(it.size.width.toFloat())
+        }.combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(vertical = 3.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = label,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(1.dp))
     }
 }
 
@@ -16931,7 +17128,7 @@ private fun CommentComposerDialog(
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
-    val canSubmit = (text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
+    val canSubmit = (target.isRepost || text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
     val sendColor = Color(0xFFFFB36B)
     val cardColor = if (isLightAppearance()) Color(0xFFFFFBFF) else MaterialTheme.colorScheme.surface
     val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest
@@ -17262,7 +17459,7 @@ private fun CommentComposerDialog(
                                 }
                             }
                             Text(
-                                text = "同时转发",
+                                text = if (target.isRepost) "同时评论" else "同时转发",
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -24974,6 +25171,7 @@ private fun RemoteImage(
     maxDecodeDim: Int = 480,
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
     limitConcurrency: Boolean = true,
+    stableThumbnailKey: String? = null,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -24996,14 +25194,28 @@ private fun RemoteImage(
         cacheCandidates.joinToString("|") + "@$maxDecodeDim"
     }
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
-    var bitmap by remember(loadKey) {
-        mutableStateOf(FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable())
+    val homeThumbnails = LocalHomeThumbnailStore.current
+    var bitmap by remember(stableThumbnailKey ?: loadKey) {
+        mutableStateOf(stableThumbnailKey?.let { homeThumbnails?.get(it) ?: StableFeedThumbnailCache.get(it) }?.takeIfDrawable()
+            ?: FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable())
+    }
+    DisposableEffect(homeThumbnails, stableThumbnailKey) {
+        if (stableThumbnailKey != null) homeThumbnails?.mount(stableThumbnailKey)
+        onDispose { if (stableThumbnailKey != null) homeThumbnails?.unmount(stableThumbnailKey) }
+    }
+    SideEffect {
+        if (stableThumbnailKey != null) bitmap?.takeIfDrawable()?.let { homeThumbnails?.put(stableThumbnailKey, it) }
     }
     var failed by remember(loadKey) { mutableStateOf(false) }
 
     LaunchedEffect(loadKey, upgradeRevision) {
+        if (stableThumbnailKey != null && bitmap?.takeIfDrawable() != null) {
+            StableFeedThumbnailCache.put(stableThumbnailKey, bitmap!!)
+            return@LaunchedEffect
+        }
         FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable()?.let {
             bitmap = it
+            stableThumbnailKey?.let { key -> StableFeedThumbnailCache.put(key, it) }
             failed = false
             return@LaunchedEffect
         }
@@ -25029,6 +25241,7 @@ private fun RemoteImage(
             if (loaded != null) {
                 bitmap = loaded
                 failed = false
+                stableThumbnailKey?.let { StableFeedThumbnailCache.put(it, loaded) }
                 FeedBitmapCache.put(candidateUrl, loaded)
                 return@LaunchedEffect
             }
@@ -25244,6 +25457,42 @@ private object AlbumThumbnailBitmapCache {
     fun trimToFraction(keepFraction: Float) {
         cache.trimToFraction(keepFraction)
     }
+}
+
+// Thumbnails are isolated from full-size/preview decodes that can evict the
+// shared cache while opening detail. Eviction never recycles a visible bitmap.
+private class HomeThumbnailStore {
+    private val mounted = mutableMapOf<String, Int>()
+    private val images = mutableMapOf<String, Bitmap>()
+    private val frozen = mutableSetOf<String>()
+    fun get(key: String): Bitmap? = images[key]?.takeIfDrawable()
+    fun mount(key: String) { mounted[key] = (mounted[key] ?: 0) + 1 }
+    fun put(key: String, bitmap: Bitmap) { if (key in mounted || key in frozen) images[key] = bitmap }
+    fun unmount(key: String) {
+        val count = (mounted[key] ?: 1) - 1
+        if (count > 0) mounted[key] = count else {
+            mounted.remove(key)
+            if (key !in frozen) images.remove(key)
+        }
+    }
+    fun freezeVisible() {
+        // Nested details must not discard the original home snapshot when its
+        // lazy rows have temporarily left composition behind the overlays.
+        frozen.addAll(mounted.keys)
+        images.keys.retainAll(frozen)
+    }
+    fun releaseSnapshot() {
+        frozen.clear()
+        images.keys.retainAll(mounted.keys)
+    }
+}
+
+private val LocalHomeThumbnailStore = staticCompositionLocalOf<HomeThumbnailStore?> { null }
+
+private object StableFeedThumbnailCache {
+    private val cache = BitmapByteCache(24 * 1024 * 1024)
+    fun get(key: String): Bitmap? = cache.get(key)
+    fun put(key: String, bitmap: Bitmap) = cache.put(key, bitmap)
 }
 
 private object FeedBitmapCache {

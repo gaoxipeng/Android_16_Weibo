@@ -113,7 +113,9 @@ internal fun BackdropEffectScope.liquidPopupGlassEffects() {
 
 internal fun BackdropEffectScope.liquidRegularMenuGlassEffects() {
     vibrancy()
-    blur(32.dp.toPx())
+    // Keep blur coverage at the right/bottom edge instead of fading the
+    // sampled pixels to transparent outside the source bounds.
+    blur(32.dp.toPx(), TileMode.Clamp)
 }
 
 internal val LocalHazeState = staticCompositionLocalOf<HazeState?> { null }
