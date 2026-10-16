@@ -469,7 +469,8 @@ private fun SearchWeiboSort.storageValue(): String =
 
 private enum class MineContentTab(val label: String) {
     Posts("\u5FAE\u535A"),
-    Album("\u76F8\u518C")
+    Album("\u76F8\u518C"),
+    Videos("视频")
 }
 
 private fun feedRefreshHintMessage(
@@ -2248,6 +2249,7 @@ private fun FeedImage.albumAnchorKey(): String =
 
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
+private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
@@ -4162,7 +4164,7 @@ fun WeiboApp() {
                                 visitedPostsPage = 1
                                 visitedPostsHasMore = page.nextCursor != null
                             }
-                        if (visitedMinePagerPage == MineContentTab.Album.ordinal) {
+                        if (visitedMinePagerPage != MineContentTab.Posts.ordinal) {
                             loadVisitedUserAlbum(profile.id, loadGeneration, force = true)
                         }
                     }
@@ -5301,7 +5303,7 @@ fun WeiboApp() {
                                 minePostsError = it.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u7528\u6237\u4E3B\u9875\u5FAE\u535A"
                             }
                         }
-                    if (minePagerPage == MineContentTab.Album.ordinal) {
+                    if (minePagerPage != MineContentTab.Posts.ordinal) {
                         loadMineAlbumFirstPage(force = true)
                     }
                 }
@@ -6176,6 +6178,32 @@ fun WeiboApp() {
         openDetailInternal(item, hostItem)
     }
 
+    fun openAlbumVideoDetail(media: FeedMedia, statusId: String, sourceBounds: Rect?) {
+        scope.launch {
+            try {
+                val item = session.loadStatusDetail(statusId)
+                    ?: error("未能获取该视频所属的微博")
+                val video = item.medias.firstOrNull {
+                    it.streamUrl == media.streamUrl ||
+                        (!it.coverUrl.isNullOrBlank() && it.coverUrl == media.coverUrl)
+                } ?: item.medias.firstOrNull { it.type == MediaType.Video }
+                openDetail(item)
+                // Preserve the album tile as the transition destination. Without
+                // an origin this path cannot use the detail card return motion.
+                activeDetailSourceBounds = sourceBounds
+                if (video != null) {
+                    val key = videoPlaybackKey(video, item.id)
+                    videoPlaybackCoordinator.beginDetailHandoff(key)
+                    videoPlaybackCoordinator.requestInlinePlayback(key)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                showMessage("打开微博失败", error.message.orEmpty())
+            }
+        }
+    }
+
     fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null) {
         if (detailSourceCapturePending) return
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
@@ -6501,7 +6529,7 @@ fun WeiboApp() {
                     minePosts,
                 )
                 mineAlbumNextCursor = page.nextCursor?.takeIf {
-                    it.startsWith("wall:") || it.startsWith("waterfall:cursor:")
+                    it.startsWith("wall:") || it.startsWith("album:")
                 }
                 mineAlbumHasMore = mineAlbumNextCursor != null
             }
@@ -6960,6 +6988,7 @@ fun WeiboApp() {
     ) {
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
+        LocalAlbumVideoDetailOpener provides ::openAlbumVideoDetail,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
         LocalTopicClickHandler provides ::openSearchTopic,
         LocalStaleVideoMediaRefresher provides ::refreshStaleVideoMedia,
@@ -21112,7 +21141,7 @@ private fun MineScreen(
             .distinctUntilChanged()
             .collect { page ->
                 onMinePagerPageChanged(page)
-                if (MineContentTab.entries[page] == MineContentTab.Album) {
+                if (MineContentTab.entries[page] != MineContentTab.Posts) {
                     onAlbumTabSelected()
                 }
             }
@@ -21221,10 +21250,14 @@ private fun MineScreen(
             .collect { onLoadMorePosts() }
     }
 
-    // Infinite scroll for Album
-    LaunchedEffect(albumListState) {
+    val videoAlbumListState = rememberLazyListState()
+    val photoAlbumListState = albumListState
+    val activeAlbumListState = if (pagerState.currentPage == MineContentTab.Videos.ordinal)
+        videoAlbumListState else albumListState
+    // Photos and videos keep independent scroll positions but share pagination.
+    LaunchedEffect(activeAlbumListState) {
         snapshotFlow {
-            val layoutInfo = albumListState.layoutInfo
+            val layoutInfo = activeAlbumListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             layoutInfo.totalItemsCount to lastVisibleIndex
         }
@@ -21262,6 +21295,7 @@ private fun MineScreen(
     }
     val activeListState = when (pagerState.currentPage) {
         MineContentTab.Posts.ordinal -> postsListState
+        MineContentTab.Videos.ordinal -> videoAlbumListState
         else -> albumListState
     }
     var headerCollapseOffsetPx by remember(profile?.id, collapseThresholdPx) {
@@ -21445,6 +21479,7 @@ private fun MineScreen(
                                         when (tab) {
                                             MineContentTab.Posts -> postsListState.animateScrollToTopSmooth()
                                             MineContentTab.Album -> albumListState.animateScrollToTopSmooth()
+                                            MineContentTab.Videos -> videoAlbumListState.animateScrollToTopSmooth()
                                         }
                                     }
                                 } else {
@@ -21540,10 +21575,15 @@ private fun MineScreen(
                             }
                         }
 
-                        MineContentTab.Album -> {
+                        MineContentTab.Album, MineContentTab.Videos -> {
+                            val videoPage = MineContentTab.entries[page] == MineContentTab.Videos
+                            val albumListState = if (videoPage) videoAlbumListState else photoAlbumListState
+                            val visibleMedia = remember(albumImages, videoPage) {
+                                albumImages.filter { it.isAlbumVideo == videoPage }
+                            }
                             val albumPostLookup = remember(posts) { buildAlbumPostLookup(posts) }
-                            val albumRows = remember(albumImages) {
-                                buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
+                            val albumRows = remember(visibleMedia) {
+                                buildAlbumGridRows(groupAlbumImagesByMonth(visibleMedia))
                             }
                             val stickyMonthLabel by remember(albumRows, albumListState) {
                                 derivedStateOf {
@@ -21564,13 +21604,13 @@ private fun MineScreen(
                                     if (albumRows.isEmpty()) {
                                         item(key = "album-empty") {
                                             EmptyState(
-                                                title = "\u6682\u672A\u8BFB\u5230\u76F8\u518C",
+                                                title = if (videoPage) "暂无视频" else "暂无照片",
                                                 body = when {
                                                     albumLoading || albumLoadingMore || isLoading ->
                                                         "\u6B63\u5728\u52A0\u8F7D\u76F8\u518C\u2026"
                                                     !albumError.isNullOrBlank() -> albumError
                                                     else ->
-                                                        "\u4E0B\u62C9\u5237\u65B0\u540E\u4F1A\u4ECE\u76F8\u518C\u63A5\u53E3\u52A0\u8F7D\u56FE\u7247\u4E0E\u89C6\u9891\u3002"
+                                                        ""
                                                 },
                                             )
                                         }
@@ -24728,13 +24768,16 @@ private fun MineAlbumTile(
         image.toAlbumFeedMedia()
     }
     val playbackOwnerId = image.statusId?.takeIf { it.isNotBlank() } ?: image.id
+    val openAlbumDetail = LocalAlbumVideoDetailOpener.current
+    var videoTileBounds by remember(image.id, image.largeUrl) { mutableStateOf<Rect?>(null) }
     if (albumMedia != null && image.isAlbumVideo) {
         AlbumVideoTile(
             image = image,
             media = albumMedia,
             size = size,
             playbackOwnerId = playbackOwnerId,
-            onVideoClick = { onVideoClick(albumMedia, playbackOwnerId) },
+            onVideoClick = { openAlbumDetail?.invoke(albumMedia, playbackOwnerId, videoTileBounds) },
+            onBoundsChanged = { videoTileBounds = it },
         )
     } else {
         FeedImageCell(
@@ -24759,6 +24802,7 @@ private fun AlbumVideoTile(
     size: androidx.compose.ui.unit.Dp,
     playbackOwnerId: String,
     onVideoClick: () -> Unit,
+    onBoundsChanged: (Rect) -> Unit = {},
 ) {
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
     val videoPeekController = LocalVideoPeekController.current
@@ -24812,6 +24856,7 @@ private fun AlbumVideoTile(
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
                 anchorHolder.coordinates = coordinates
+                onBoundsChanged(coordinates.boundsInRoot())
             }
             .graphicsLayer {
                 scaleX = holdScale

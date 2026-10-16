@@ -283,42 +283,40 @@ class WeiboWebSession(context: Context) {
         cursor: String? = null,
         onPageLoaded: ((List<FeedImage>) -> Unit)? = null,
     ): AlbumPage = albumLoadMutex.withLock {
-        if (cursor?.startsWith("waterfall:cursor:") == true) {
-            return@withLock loadUserAlbumWaterfall(
-                uid = uid,
-                cursor = cursor,
-                onPageLoaded = onPageLoaded,
-            )
-        }
-        if (cursor != null &&
-            !cursor.startsWith("wall:cursor:") &&
-            !cursor.startsWith("wall:")
-        ) {
-            return@withLock AlbumPage(images = emptyList(), nextCursor = null)
-        }
-        if (cursor == null) {
-            val wallPage = runCatching {
-                loadUserAlbumImageWall(uid, cursor, onPageLoaded)
-            }.getOrElse { error ->
-                if (error is CancellationException) throw error
-                null
+        val combined = cursor?.takeIf { it.startsWith("album:") }
+            ?.removePrefix("album:")?.let { runCatching { JSONObject(it) }.getOrNull() }
+        val firstPage = cursor == null
+        val wallCursor = if (firstPage) null else combined?.optString("wall")?.takeIf { it.isNotBlank() }
+            ?: cursor?.takeIf { it.startsWith("wall:") }
+        val videoCursor = if (firstPage) "0" else combined?.optString("video")?.takeIf { it.isNotBlank() }
+            ?: cursor?.takeIf { it.startsWith("waterfall:cursor:") }?.removePrefix("waterfall:cursor:")
+        coroutineScope {
+            suspend fun safePage(block: suspend () -> AlbumPage): Result<AlbumPage> = try {
+                Result.success(block())
+            } catch (cancelled: CancellationException) { throw cancelled
+            } catch (error: Exception) { Result.failure(error) }
+            val wallJob = async {
+                if (firstPage || wallCursor != null) safePage { loadUserAlbumImageWall(uid, wallCursor, null) }
+                else Result.success(AlbumPage(emptyList(), null))
             }
-            if (wallPage != null && wallPage.images.isNotEmpty()) {
-                return@withLock if (wallPage.nextCursor == null) {
-                    // Some accounts return exactly one 20-item image-wall page without a
-                    // continuation token even though the waterfall endpoint has more media.
-                    wallPage.copy(nextCursor = "waterfall:cursor:0")
-                } else {
-                    wallPage
-                }
+            val videoJob = async {
+                if (videoCursor != null) safePage { loadUserAlbumWaterfall(uid, videoCursor) }
+                else Result.success(AlbumPage(emptyList(), null))
             }
-            return@withLock loadUserAlbumWaterfall(
-                uid = uid,
-                cursor = null,
-                onPageLoaded = onPageLoaded,
-            )
+            val wall = wallJob.await()
+            val video = videoJob.await()
+            if (wall.isFailure && video.isFailure) wall.getOrThrow()
+            // Publish exactly one batch. Existing grid entries are never reordered
+            // when the second endpoint completes, including during pagination.
+            val images = (wall.getOrNull()?.images.orEmpty() + video.getOrNull()?.images.orEmpty())
+                .distinctByAlbumKey()
+            val nextWall = if (wall.isFailure) wallCursor ?: "wall:0" else wall.getOrNull()?.nextCursor
+            val nextVideo = if (video.isFailure) videoCursor else video.getOrNull()?.nextCursor
+            val next = if (nextWall == null && nextVideo == null) null else
+                "album:" + JSONObject().put("wall", nextWall.orEmpty()).put("video", nextVideo.orEmpty()).toString()
+            onPageLoaded?.invoke(images)
+            AlbumPage(images, next)
         }
-        loadUserAlbumImageWall(uid, cursor, onPageLoaded)
     }
 
     suspend fun loadMoreUserAlbumImages(
@@ -397,38 +395,13 @@ class WeiboWebSession(context: Context) {
         )
     }
 
-    private suspend fun loadUserAlbumWaterfall(
-        uid: String,
-        cursor: String?,
-        onPageLoaded: ((List<FeedImage>) -> Unit)?,
-    ): AlbumPage {
-        val referer = "https://weibo.com/u/$uid?tabtype=album"
-        val waterfallCursor = cursor
-            ?.removePrefix("waterfall:cursor:")
-            ?.ifBlank { "0" }
-            ?: "0"
-        val monthContext = WeiboJsonParser.AlbumMonthContext()
-        val params = linkedMapOf(
-            "uid" to uid,
-            "cursor" to waterfallCursor,
-        )
-        val raw = fetchJson(WeiboEndpoints.PROFILE_ALBUM_WATERFALL, params, referer)
-
-        val wall = WeiboJsonParser.parseImageWallPage(
-            raw = raw,
-            monthContext = monthContext,
-        )
-        val images = wall.images.distinctByAlbumKey()
-        onPageLoaded?.invoke(images)
-
-        val nextPageCursor = (wall.nextCursor ?: wall.nextSinceId)
-            ?.takeIf { it.isNotBlank() && it != "0" && it != "-1" }
-            ?.let { "waterfall:cursor:$it" }
-
-        return AlbumPage(
-            images = images,
-            nextCursor = nextPageCursor,
-        )
+    private suspend fun loadUserAlbumWaterfall(uid: String, cursor: String): AlbumPage {
+        val raw = fetchJson(WeiboEndpoints.PROFILE_ALBUM_WATERFALL,
+            linkedMapOf("uid" to uid, "cursor" to cursor), "https://weibo.com/u/$uid?tabtype=album")
+        val page = WeiboJsonParser.parseImageWallPage(raw)
+        val next = (page.nextCursor ?: page.nextSinceId)
+            ?.takeIf { it.isNotBlank() && it != "0" && it != "-1" && it != cursor }
+        return AlbumPage(page.images.distinctByAlbumKey(), next)
     }
 
     private fun List<FeedImage>.distinctByAlbumKey(): List<FeedImage> =

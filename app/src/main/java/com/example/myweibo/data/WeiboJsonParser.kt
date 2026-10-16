@@ -1031,7 +1031,9 @@ object WeiboJsonParser {
         monthContext: AlbumMonthContext = AlbumMonthContext(),
     ): FeedImage? {
         item ?: return null
-        val payload = item.optJSONObject("video_detail_vo") ?: item
+        val payload = item.optJSONObject("video_detail_vo")
+            ?: item.optJSONObject("pic_detail_vo")
+            ?: item.optJSONObject("photo_detail_vo") ?: item
         if (isAlbumVideoItem(payload)) {
             parseAlbumVideoItem(payload, monthContext)?.let { return it }
         }
@@ -1047,6 +1049,7 @@ object WeiboJsonParser {
         ) {
             return true
         }
+        if (item.optJSONObject("media_info") != null || item.optJSONObject("video_info") != null) return true
         val pageInfo = item.optJSONObject("page_info") ?: return false
         val objectType = pageInfo.optNullableString("object_type")
         if (objectType.equals("live", ignoreCase = true) ||
@@ -1064,7 +1067,15 @@ object WeiboJsonParser {
         item.optBlankString("timeline_month")?.let { monthContext.month = it.trim() }
         item.optBlankString("timeline_year")?.let { monthContext.year = it.trim() }
 
-        val media = parseMedia(item) ?: return null
+        val media = parseMedia(item) ?: run {
+            // Image-wall video entries may expose media_info directly instead
+            // of the full status/page_info structure used by the timeline.
+            val mediaInfo = item.optJSONObject("media_info")
+                ?: item.optJSONObject("video_info") ?: item
+            val normalized = JSONObject(item.toString()).put("page_info", JSONObject()
+                .put("object_type", "video").put("media_info", mediaInfo))
+            parseMedia(normalized)
+        } ?: return null
         if (!media.isStreamPlayable()) return null
         val cover = media.coverUrl?.let(::normalizeUrl)
             ?: item.optNullableString("pic")?.let(::normalizeUrl)
@@ -1121,9 +1132,14 @@ object WeiboJsonParser {
             ?: item.optNullableString("thumbnail")
             ?: item.optNullableString("bmiddle")
             ?: item.optNullableString("orj360")
+            ?: item.optJSONObject("pic_info")?.optJSONObject("large")?.optNullableString("url")
+            ?: item.optJSONObject("large")?.optNullableString("url")
+            ?: item.optNullableString("url")
             ?: pid?.let(::pidToLargeUrl)
             ?: return null
-        val large = item.optNullableString("largest")
+        val large = item.optJSONObject("pic_info")?.optJSONObject("largest")?.optNullableString("url")
+            ?: item.optJSONObject("large")?.optNullableString("url")
+            ?: item.optNullableString("largest")
             ?: item.optNullableString("original")
             ?: item.optNullableString("large")
             ?: item.optNullableString("mw2000")
