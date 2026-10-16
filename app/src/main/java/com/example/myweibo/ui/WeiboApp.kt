@@ -2248,6 +2248,15 @@ private fun FeedImage.albumAnchorKey(): String =
         ?: id
 
 private val LocalVideoPlaybackCoordinator = staticCompositionLocalOf { VideoPlaybackCoordinator() }
+private fun upgradeWeiboWebUrl(url: String): String {
+    val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return url
+    val host = uri.host.orEmpty().lowercase()
+    return if (uri.scheme.equals("http", true) &&
+        (host == "weibo.com" || host.endsWith(".weibo.com") || host == "t.cn")) {
+        uri.buildUpon().scheme("https").build().toString()
+    } else url
+}
+
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
@@ -3848,6 +3857,7 @@ fun WeiboApp() {
     }
 
     fun loadArticleIntoOverlay(entity: FeedUrlEntity) {
+        articleOverlayInstanceKey += 1
         val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
         articleOverlay = ArticleOverlayState(entity = entity, loading = articleId != null)
         if (articleId == null) return
@@ -6134,7 +6144,6 @@ fun WeiboApp() {
         val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
         if (articleId != null) {
             pushNavigation(NavOverlayKind.Article) {
-                articleOverlayInstanceKey = navStack.size
                 loadArticleIntoOverlay(entity)
             }
             return
@@ -6153,7 +6162,6 @@ fun WeiboApp() {
                     openDetailInternal(item)
                 } else {
                     pushNavigation(NavOverlayKind.Article) {
-                articleOverlayInstanceKey = navStack.size
                 loadArticleIntoOverlay(entity)
             }
                 }
@@ -25179,8 +25187,9 @@ private fun ArticleReaderOverlay(
 ) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val title = state.article?.title ?: state.entity.title
+    val notifyWebLink = LocalUiMessenger.current
     val htmlContent = state.article?.htmlContent
-    val fallbackUrl = state.entity.url.takeIf {
+    val fallbackUrl = upgradeWeiboWebUrl(state.entity.url).takeIf {
         state.article == null && !state.loading && state.error == null
     }
 
@@ -25281,12 +25290,65 @@ private fun ArticleReaderOverlay(
                                     settings.javaScriptEnabled = true
                                     settings.domStorageEnabled = true
                                     settings.loadsImagesAutomatically = true
+                                    webViewClient = object : WebViewClient() {
+                                        private var lastNativeUrl: String? = null
+                                        override fun shouldOverrideUrlLoading(view: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                                            val url = request?.url?.toString() ?: return false
+                                            val scheme = request.url.scheme.orEmpty().lowercase()
+                                            if (scheme == "sinaweibo") {
+                                                // Native mini-program links must never be
+                                                // handed to WebView as ordinary web pages.
+                                                if (!request.isForMainFrame || lastNativeUrl == url) return true
+                                                lastNativeUrl = url
+                                                val candidates = listOf(
+                                                    request.url,
+                                                    // wbox is an internal route on some
+                                                    // official builds, not an exported
+                                                    // deep-link activity. Let the official
+                                                    // browser handle the original H5 page.
+                                                    Uri.parse("sinaweibo://browser").buildUpon()
+                                                        .appendQueryParameter("url", fallbackUrl)
+                                                        .build(),
+                                                )
+                                                val opened = candidates.any { target ->
+                                                    runCatching {
+                                                        context.startActivity(Intent(Intent.ACTION_VIEW, target).apply {
+                                                            setPackage("com.sina.weibo")
+                                                            addCategory(Intent.CATEGORY_BROWSABLE)
+                                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                        })
+                                                    }.isSuccess
+                                                }
+                                                if (!opened) notifyWebLink("需要官方微博", "此链接为微博小程序，请安装官方微博后打开")
+                                                return true
+                                            }
+                                            if (scheme !in setOf("http", "https", "about", "data", "blob", "javascript")) {
+                                                if (request.isForMainFrame && request.hasGesture()) {
+                                                    notifyWebLink("无法在应用内打开", "此链接需要对应的官方应用")
+                                                }
+                                                return true
+                                            }
+                                            val secure = upgradeWeiboWebUrl(url)
+                                            if (request.isForMainFrame && secure != url) {
+                                                view?.loadUrl(secure)
+                                                return true
+                                            }
+                                            return false
+                                        }
+                                    }
                                 }
                             },
                             update = { webView ->
-                                if (webView.url != fallbackUrl) {
+                                // Redirects change webView.url; do not restart the
+                                // original URL on an unrelated recomposition.
+                                if (webView.tag != fallbackUrl) {
+                                    webView.tag = fallbackUrl
                                     webView.loadUrl(fallbackUrl)
                                 }
+                            },
+                            onRelease = { webView ->
+                                webView.stopLoading()
+                                webView.destroy()
                             },
                         )
                     }
