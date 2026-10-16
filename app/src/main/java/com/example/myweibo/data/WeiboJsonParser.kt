@@ -102,7 +102,7 @@ object WeiboJsonParser {
                         urlEntities = parseCommentUrlEntities(comment),
                         createdAt = comment.optNullableString("created_at"),
                         likesCount = formatCount(comment.opt("like_counts")),
-                        ipLocation = parseIpLocation(comment),
+                        ipLocation = parseCommentIpLocation(comment),
                         emoticons = extractEmoticonsFromHtml(htmlText),
                         images = images,
                         comments = parseNestedComments(comment.optJSONArray("comments")),
@@ -648,7 +648,7 @@ object WeiboJsonParser {
                         urlEntities = parseCommentUrlEntities(obj),
                         createdAt = obj.optNullableString("created_at"),
                         likesCount = formatCount(obj.opt("like_counts")),
-                        ipLocation = parseIpLocation(obj),
+                        ipLocation = parseCommentIpLocation(obj),
                         emoticons = extractEmoticonsFromHtml(htmlText),
                         images = images,
                         replyToAuthor = obj.optJSONObject("reply_comment")
@@ -2047,6 +2047,21 @@ object WeiboJsonParser {
             lower.contains(".jpeg") ||
             lower.contains(".png") ||
             lower.contains(".webp")
+    }
+
+    private fun parseCommentIpLocation(comment: JSONObject): String? {
+        // user.location is self-reported profile information, not the IP region
+        // of this comment. Never use it to manufacture a comment location.
+        val source = comment.optNullableString("source")?.let(::plainText)?.trim()
+        return sequenceOf(
+            comment.optNullableString("region_name"),
+            comment.optNullableString("status_region"),
+            comment.optNullableString("ip_location"),
+            comment.optJSONObject("region_info")?.optNullableString("region_name"),
+            comment.optJSONObject("region_info")?.optNullableString("name"),
+            source?.takeIf { it.startsWith("来自") || it.startsWith("发布于") || it.startsWith("IP属地") },
+        ).mapNotNull { raw -> normalizeUserIpLocation(raw?.let(::plainText)) }
+            .firstOrNull { it !in setOf("其他", "其它", "未知", "未知地区", "暂无", "不详", "null") }
     }
 
     private fun parseIpLocation(status: JSONObject): String? {

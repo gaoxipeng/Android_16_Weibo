@@ -12,6 +12,12 @@ class FeedDisplaySettingsStore(context: Context) {
         prefs.edit().putBoolean(KEY_HIDE_BOTTOM_BAR_ON_SCROLL, enabled).apply()
     }
 
+    fun readShowCommentLikeCount(): Boolean = prefs.getBoolean("show_comment_like_count", true)
+
+    fun writeShowCommentLikeCount(enabled: Boolean) {
+        prefs.edit().putBoolean("show_comment_like_count", enabled).apply()
+    }
+
     private companion object {
         const val PREFS_NAME = "weibo_app_prefs"
         const val KEY_HIDE_BOTTOM_BAR_ON_SCROLL = "feed_hide_bottom_bar_on_scroll"

@@ -2258,6 +2258,8 @@ private fun upgradeWeiboWebUrl(url: String): String {
 }
 
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
+private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
+private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
@@ -3579,6 +3581,7 @@ fun WeiboApp() {
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
     val feedDisplaySettingsStore = remember { FeedDisplaySettingsStore(context) }
+    var showCommentLikeCount by remember { mutableStateOf(feedDisplaySettingsStore.readShowCommentLikeCount()) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val searchHistoryStore = remember { SearchHistoryStore(context) }
     val playbackSettingsStore = remember { PlaybackSettingsStore(context) }
@@ -6996,6 +6999,11 @@ fun WeiboApp() {
     ) {
     CompositionLocalProvider(
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
+        LocalShowCommentLikeCount provides showCommentLikeCount,
+        LocalSetShowCommentLikeCount provides { enabled ->
+            showCommentLikeCount = enabled
+            feedDisplaySettingsStore.writeShowCommentLikeCount(enabled)
+        },
         LocalAlbumVideoDetailOpener provides ::openAlbumVideoDetail,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
         LocalTopicClickHandler provides ::openSearchTopic,
@@ -10211,17 +10219,17 @@ private fun AuthorRow(
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
                         text = "置顶",
-                        fontSize = 10.sp,
+                        fontSize = 9.sp,
                         fontWeight = FontWeight.Medium,
                         color = Color.White,
                         maxLines = 1,
-                        lineHeight = 12.sp,
+                        lineHeight = 10.sp,
                         modifier = Modifier
                             .background(
                                 color = Color(0xFFFF8200),
-                                shape = RoundedCornerShape(3.dp),
+                                shape = RoundedCornerShape(2.dp),
                             )
-                            .padding(horizontal = 3.dp, vertical = 0.dp),
+                            .padding(horizontal = 2.dp, vertical = 0.dp),
                     )
                 }
             }
@@ -17235,6 +17243,7 @@ private fun DetailScreen(
                     Column(commentVisibility) {
                     CommentRow(
                         comment = entry,
+                        statusAuthorId = item.authorId,
                         emoticonMap = emoticonMap,
                         onUrlEntityClick = onUrlEntityClick,
                         onUserClick = onUserClick,
@@ -19205,6 +19214,7 @@ private fun CommentComposerIconButton(
 @Composable
 private fun CommentRow(
     comment: CommentItem,
+    statusAuthorId: String = "",
     emoticonMap: Map<String, String> = emptyMap(),
     depth: Int = 0,
     onUserClick: ((String) -> Unit)? = null,
@@ -19273,6 +19283,20 @@ private fun CommentRow(
                             onClick = { onUserClick?.invoke(authorTarget) },
                         ),
                     )
+                    if (statusAuthorId.isNotBlank() && comment.authorId == statusAuthorId) {
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = "博主",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color.White,
+                            maxLines = 1,
+                            lineHeight = 10.sp,
+                            modifier = Modifier
+                                .background(Color(0xFFFF8200), RoundedCornerShape(2.dp))
+                                .padding(horizontal = 2.dp, vertical = 0.dp),
+                        )
+                    }
                     if (showReplyHeader) {
                         Text(
                             text = " 回复 ",
@@ -19317,7 +19341,7 @@ private fun CommentRow(
                     text = listOfNotNull(
                         formatWeiboTime(comment.createdAt),
                         comment.ipLocation?.let { "来自$it" },
-                        "\u8D5E ${comment.likesCount}",
+                        if (LocalShowCommentLikeCount.current) "\u8D5E ${comment.likesCount}" else null,
                     ).joinToString("  "),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.58f),
@@ -19327,6 +19351,7 @@ private fun CommentRow(
         sortNestedCommentsByTime(comment.comments).forEach { nested ->
             CommentRow(
                 comment = nested,
+                statusAuthorId = statusAuthorId,
                 emoticonMap = emoticonMap,
                 onUrlEntityClick = onUrlEntityClick,
                 depth = depth + 1,
@@ -21864,6 +21889,13 @@ private fun SettingsScreen(
                         onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
                     )
                 }
+                item { SettingsCommentLikeCountCard() }
+                item {
+                    SettingsPlaybackCard(
+                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
+                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
+                    )
+                }
                 item {
                     SettingsImageCard(
                         expanded = imageExpanded,
@@ -21898,12 +21930,6 @@ private fun SettingsScreen(
                         onExpandedChange = { themeExpanded = it },
                         selected = selectedThemeColor,
                         onSelected = onThemeColorChange,
-                    )
-                }
-                item {
-                    SettingsPlaybackCard(
-                        backgroundPlaybackEnabled = backgroundPlaybackEnabled,
-                        onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                     )
                 }
                 item {
@@ -22087,7 +22113,7 @@ private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             Text(
@@ -22110,7 +22136,7 @@ private fun SettingsAboutCard(versionName: String) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -22175,7 +22201,7 @@ private fun SettingsHelpSectionCard(section: HelpSection) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
@@ -22343,7 +22369,7 @@ private fun SettingsImageCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -22536,7 +22562,7 @@ private fun SettingsTypographyCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -22789,7 +22815,7 @@ private fun SettingsAppearanceCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -22884,7 +22910,7 @@ private fun SettingsThemeColorCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -22971,7 +22997,7 @@ private fun SettingsPlaybackCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -23013,7 +23039,7 @@ private fun SettingsFeedDisplayCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
+                .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
@@ -23036,6 +23062,28 @@ private fun SettingsFeedDisplayCard(
                 checked = hideBottomBarOnScroll,
                 onCheckedChange = onHideBottomBarOnScrollChange,
             )
+        }
+    }
+}
+
+@Composable
+private fun SettingsCommentLikeCountCard() {
+    val showCommentLikes = LocalShowCommentLikeCount.current
+    val setShowCommentLikes = LocalSetShowCommentLikeCount.current
+    SettingsPlainCard {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text("显示评论点赞数", style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold)
+                Text(if (showCommentLikes) "显示评论和回复的点赞数量" else "隐藏评论和回复的点赞数量",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Switch(checked = showCommentLikes, onCheckedChange = setShowCommentLikes)
         }
     }
 }
@@ -23094,7 +23142,7 @@ private fun SettingsAccountCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
@@ -23206,7 +23254,7 @@ private fun SettingsEmoticonCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable { onExpandedChange(!expanded) }
-                    .padding(16.dp),
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
             ) {
