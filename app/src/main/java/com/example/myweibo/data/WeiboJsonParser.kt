@@ -99,6 +99,7 @@ object WeiboJsonParser {
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
                         text = parseCommentText(comment, images),
+                        urlEntities = parseCommentUrlEntities(comment),
                         createdAt = comment.optNullableString("created_at"),
                         likesCount = formatCount(comment.opt("like_counts")),
                         ipLocation = parseIpLocation(comment),
@@ -280,7 +281,12 @@ object WeiboJsonParser {
         val raw = comment.optNullableString("text_raw")
             ?: comment.optNullableString("text")
             ?: ""
-        var text = plainText(raw)
+        val anchors = parseCommentUrlEntities(comment)
+        val htmlWithTargets = CommentAnchorRegex.replace(raw) { match ->
+            val target = plainText(match.groupValues[1])
+            if (anchors.any { it.shortUrl == target }) target else match.value
+        }
+        var text = plainText(htmlWithTargets)
         text = stripEntityTokens(
             text,
             imageUrlTokensFromUrlStruct(comment.optJSONArray("url_struct"), raw),
@@ -289,6 +295,33 @@ object WeiboJsonParser {
             text = stripOrphanMediaLinks(text)
         }
         return text
+    }
+
+    private val CommentAnchorRegex = Regex("""<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+
+    private fun parseCommentUrlEntities(comment: JSONObject): List<FeedUrlEntity> {
+        val html = comment.optNullableString("text").orEmpty()
+        val raw = comment.optNullableString("text_raw") ?: html
+        val entities = parseUrlEntities(comment, raw + html).toMutableList()
+        CommentAnchorRegex.findAll(html).forEach { match ->
+            val target = plainText(match.groupValues[1])
+            val label = plainText(match.groupValues[2]).trim()
+            // Mentions, topics and picture-comment links retain their own handlers.
+            if (target.startsWith("http", ignoreCase = true) &&
+                !label.startsWith("@") && !label.startsWith("#") &&
+                label != "查看图片" && label != "图片评论") {
+                entities.add(FeedUrlEntity(shortUrl = target,
+                    title = label.ifBlank { target }, url = target))
+            }
+        }
+        // A Weibo emoticon may immediately follow a URL without whitespace.
+        // Never absorb its [token] (or following Chinese prose) into the link.
+        Regex("""https?://[^\s<>"'\[\]\u4e00-\u9fff，。！？；（）【】]+""").findAll(plainText(raw)).forEach { match ->
+            val url = match.value.trimEnd('。', '，', '！', '？', ')', '）', ']', '】', ';', '；')
+            if (url.isNotBlank()) entities.add(FeedUrlEntity(shortUrl = url, title = url, url = url))
+        }
+        return entities.distinctBy { it.shortUrl }
     }
 
     private fun parseStatusText(
@@ -612,6 +645,7 @@ object WeiboJsonParser {
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
                         text = parseCommentText(obj, images),
+                        urlEntities = parseCommentUrlEntities(obj),
                         createdAt = obj.optNullableString("created_at"),
                         likesCount = formatCount(obj.opt("like_counts")),
                         ipLocation = parseIpLocation(obj),
@@ -2398,7 +2432,7 @@ object WeiboJsonParser {
         if (html.isBlank()) return emptyMap()
         val map = mutableMapOf<String, String>()
         val pattern = Regex(
-            """<img\b[^>]*\balt="(\[[^"\]]+\])"[^>]*\bsrc="([^"]+)"[^>]*>|<img\b[^>]*\bsrc="([^"]+)"[^>]*\balt="(\[[^"\]]+\])"[^>]*>""",
+            """<img\b[^>]*\balt=["'](\[[^"'\]]+\])["'][^>]*\bsrc=["']([^"']+)["'][^>]*>|<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*\balt=["'](\[[^"'\]]+\])["'][^>]*>""",
             RegexOption.IGNORE_CASE,
         )
         pattern.findAll(html).forEach { match ->

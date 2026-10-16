@@ -262,6 +262,7 @@ data class CommentItem(
     val replyToAuthorId: String? = null,
     val moreInfoText: String? = null,
     val nestedNextCursor: String? = null,
+    val urlEntities: List<FeedUrlEntity> = emptyList(),
 )
 
 data class RepostsPage(

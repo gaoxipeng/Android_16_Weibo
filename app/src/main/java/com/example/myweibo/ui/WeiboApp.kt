@@ -1174,6 +1174,7 @@ private fun <T> NavAnimatedOverlay(
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
     onSwipeBack: (() -> Unit)? = null,
+    interceptRightSwipe: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
     onClearPendingEnter: () -> Unit = {},
     onClearPendingExit: () -> Unit = {},
@@ -1192,6 +1193,8 @@ private fun <T> NavAnimatedOverlay(
     var swipeSettling by remember { mutableStateOf(false) }
     var swipeCommitted by remember { mutableStateOf(false) }
     var swipeCardReturn by remember { mutableFloatStateOf(0f) }
+    var swipeScrimAlpha by remember { mutableFloatStateOf(0f) }
+    var swipeCancelBackgroundProgress by remember { mutableFloatStateOf(0f) }
     var overlayWidth by remember { mutableIntStateOf(1) }
     var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
     val returnCardLayout = remember(animationKey) { mutableStateOf<Rect?>(null) }
@@ -1220,20 +1223,23 @@ private fun <T> NavAnimatedOverlay(
         swipeSettling = false
         swipeCommitted = false
         swipeCardReturn = 0f
+        swipeScrimAlpha = 0f
+        swipeCancelBackgroundProgress = 0f
     }
     val swipeEnabled = stackTop && overlayVisible && navKind != null && pageBack != null &&
         pendingEnterKind == null && pendingExitKind == null
-    val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity) {
+    val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity, interceptRightSwipe) {
         if (!swipeEnabled) return@pointerInput
         awaitEachGesture {
-            val down = awaitFirstDown(requireUnconsumed = false)
+            val gesturePass = if (interceptRightSwipe) PointerEventPass.Initial else PointerEventPass.Main
+            val down = awaitFirstDown(requireUnconsumed = false, pass = gesturePass)
             if (swipeSettling) return@awaitEachGesture
             val tracker = VelocityTracker()
             tracker.addPosition(down.uptimeMillis, down.position)
             var dragging = false
             var released = false
             while (true) {
-                val event = awaitPointerEvent()
+                val event = awaitPointerEvent(gesturePass)
                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                 tracker.addPosition(change.uptimeMillis, change.position)
                 if (!change.pressed) {
@@ -1253,6 +1259,7 @@ private fun <T> NavAnimatedOverlay(
                 }
                 change.consume()
                 swipeOffset = displacement.x.coerceIn(0f, overlayWidth.toFloat())
+                swipeScrimAlpha = (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f)
             }
             if (dragging) {
                 val velocity = tracker.calculateVelocity().x
@@ -1272,6 +1279,16 @@ private fun <T> NavAnimatedOverlay(
                         // replaces it in the same frame. Fading over a blank source
                         // makes it wash out to white and then snap back to full color.
                         swipeCardReturn = 1f
+                    } else if (!commit) {
+                        val startOffset = swipeOffset
+                        val startAlpha = swipeScrimAlpha
+                        animate(0f, 1f, animationSpec = tween(180, easing = FastOutSlowInEasing)) { value, _ ->
+                            swipeOffset = startOffset * (1f - value)
+                            // Return to the opaque detail background, not a clear
+                            // view of the feed underneath the rebounding card.
+                            swipeScrimAlpha = startAlpha + (1f - startAlpha) * value
+                            swipeCancelBackgroundProgress = value
+                        }
                     } else animate(
                         initialValue = swipeOffset,
                         targetValue = if (commit) overlayWidth.toFloat() else 0f,
@@ -1282,6 +1299,8 @@ private fun <T> NavAnimatedOverlay(
                         latestPageBack?.invoke()
                     } else {
                         swipeSettling = false
+                        swipeScrimAlpha = 0f
+                        swipeCancelBackgroundProgress = 0f
                     }
                 }
             }
@@ -1408,9 +1427,11 @@ private fun <T> NavAnimatedOverlay(
             Box(Modifier.fillMaxSize()) { content(parent) }
         }
     }
-    if (overlayVisible && swipeOffset > 0f) {
-        Box(Modifier.fillMaxSize().background(Color.White.copy(
-            alpha = 0.45f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f) * (1f - swipeCardReturn).coerceIn(0f, 1f),
+    if (overlayVisible && swipeScrimAlpha > 0f) {
+        Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.lerp(
+            Color.White, MaterialTheme.colorScheme.background, swipeCancelBackgroundProgress,
+        ).copy(
+            alpha = swipeScrimAlpha * (1f - swipeCardReturn).coerceIn(0f, 1f),
         )))
     }
     AnimatedVisibility(
@@ -1433,9 +1454,12 @@ private fun <T> NavAnimatedOverlay(
         // feed produces two displaced copies of the same text/images (ghosting).
         val sourceHandoff = 0f
         val returnSnapshot = remember(sourceImage) { sourceImage?.asImageBitmap() }
-        val useSourceLayout = returnSnapshot != null && sourceBounds != null && returningPage &&
-            !nestedDetailReturnAnimating && (swipeOffset > 0f || pageReveal < 0.95f)
-        val returnSurfaceColor = MaterialTheme.colorScheme.surface
+        // Keep the complete viewport (including comments) during interactive drag.
+        // Only hand off the source-card pixels once return has been committed.
+        val sourceLayoutHandoff = if (returningPage && !nestedDetailReturnAnimating &&
+            (pendingExitKind is NavOverlayKind.Detail || swipeCardReturn > 0f)) {
+            ((1f - pageReveal - 0.35f) / 0.50f).coerceIn(0f, 1f)
+        } else 0f
         Box(Modifier.fillMaxSize().graphicsLayer {
             alpha = if (swipeCommitted) 0f else 1f
             val swipeProgress = (swipeOffset / overlayWidth).coerceIn(0f, 1f)
@@ -1458,11 +1482,16 @@ private fun <T> NavAnimatedOverlay(
                 val targetY = bounds.top - overlayOrigin.y - cardInset.y
                 translationX = swipeOffset * (1f - amount) + targetX * amount
                 translationY = 24.dp.toPx() * swipeProgress * (1f - amount) + targetY * amount
-                val cropWidth = size.width + (width - size.width) * amount
-                val cropHeight = size.height + (height - size.height) * amount
-                val cropLeft = cardInset.x * amount
-                val cropTop = cardInset.y * amount
-                val radius = 8.dp.toPx() * max(swipeProgress, amount)
+                // Move only the measured rounded card, not the surrounding page
+                // surface or navigation-bar strip. Keep the final source alignment.
+                val cardRect = returnCardLayout.value
+                val initialWidth = if (returningPage) cardRect?.width ?: size.width else size.width
+                val initialHeight = if (returningPage) cardRect?.height ?: size.height else size.height
+                val cropWidth = initialWidth + (width - initialWidth) * amount
+                val cropHeight = initialHeight + (height - initialHeight) * amount
+                val cropLeft = if (returningPage) cardInset.x else cardInset.x * amount
+                val cropTop = if (returningPage) cardInset.y else cardInset.y * amount
+                val radius = 8.dp.toPx() * if (returningPage) 1f else max(swipeProgress, amount)
                 shape = androidx.compose.foundation.shape.GenericShape { _, _ ->
                     addRoundRect(androidx.compose.ui.geometry.RoundRect(
                         Rect(cropLeft, cropTop, cropLeft + cropWidth, cropTop + cropHeight), androidx.compose.ui.geometry.CornerRadius(radius),
@@ -1475,19 +1504,17 @@ private fun <T> NavAnimatedOverlay(
                 clip = swipeProgress > 0f
             }
         }.drawWithContent {
-            if (useSourceLayout) {
-                // Replace the drawn contents early, inside the SAME moving/clipped
-                // layer. Keep the live composition mounted so cancellation restores
-                // its scroll/player state. No cross-fade or duplicate text layer.
-                drawRect(returnSurfaceColor)
+            drawContent()
+            if (sourceLayoutHandoff > 0f && returnSnapshot != null && sourceBounds != null) {
+                // Never clear the rest of the detail card to white. The source
+                // occupies only its own bounds while the viewport crop contracts.
                 val inset = returnCardLayout.value?.topLeft ?: Offset.Zero
                 val clippedSourceOffset = Offset(
                     sourceBounds.left.coerceAtLeast(0f) - sourceBounds.left,
                     sourceBounds.top.coerceAtLeast(0f) - sourceBounds.top,
                 )
-                drawImage(returnSnapshot, topLeft = inset + clippedSourceOffset)
-            } else {
-                drawContent()
+                drawImage(returnSnapshot, topLeft = inset + clippedSourceOffset,
+                    alpha = sourceLayoutHandoff)
             }
         }) {
         CompositionLocalProvider(
@@ -2450,6 +2477,7 @@ private data class VideoPeekRequest(
     val onPlaybackEnded: () -> Unit,
     val onOpenFullscreenBehind: () -> Unit,
     val onEnterFullscreenHandoffComplete: () -> Unit = {},
+    val onVideoDimensions: ((Int, Int) -> Unit)? = null,
 )
 
 private class VideoPeekController {
@@ -7353,6 +7381,9 @@ fun WeiboApp() {
                     animationKey = visitedProfileLoadGeneration,
                     navKind = visitedProfileNavKind,
                     onSwipeBack = ::closeVisitedProfile,
+                    // On the first tab, reserve rightward dragging for page back;
+                    // the pager otherwise consumes it even though it cannot go left.
+                    interceptRightSwipe = visitedMinePagerPage == MineContentTab.Posts.ordinal,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     onClearPendingEnter = { navEnterPendingKind = null },
@@ -11691,6 +11722,9 @@ private fun VideoPeekOverlay(
                     onPlaybackEnded = onPlaybackEnded,
                     onAspectRatio = { width, height ->
                         aspectRatio = width.toFloat() / height.toFloat()
+                        videoPeekController.activeRequest?.takeIf {
+                            videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
+                        }?.onVideoDimensions?.invoke(width, height)
                     },
                     onFullscreen = { videoPeekController.enterFullscreen() },
                     onEnterFloatingPlayback = when {
@@ -14154,6 +14188,12 @@ private fun InlineVideoPlayer(
                     resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
                 },
                 inlineHosted = true,
+                onVideoDimensions = { width, height ->
+                    if (width > 0 && height > 0) {
+                        measuredVideoWidth = width
+                        measuredVideoHeight = height
+                    }
+                },
                 onCancel = {
                     videoCoordinator.clearAutoScrollFloating(playbackKey)
                     videoCoordinator.releasePeekPlayback(playbackKey)
@@ -15518,8 +15558,10 @@ private fun WeiboVideoSurface(
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 val width = videoSize.width.takeIf { it > 0 } ?: return
                 val height = videoSize.height.takeIf { it > 0 } ?: return
-                aspectRatio = width.toFloat() / height.toFloat()
-                onAspectRatio(width, height)
+                val displayWidth = (width * videoSize.pixelWidthHeightRatio)
+                    .roundToInt().coerceAtLeast(1)
+                aspectRatio = displayWidth.toFloat() / height.toFloat()
+                onAspectRatio(displayWidth, height)
             }
 
             override fun onRenderedFirstFrame() {
@@ -15552,6 +15594,10 @@ private fun WeiboVideoSurface(
             }
         }
         player.addListener(listener)
+        // A handed-off player may have reported its dimensions before this
+        // surface existed. Seed the new card immediately instead of retaining
+        // the cover's aspect ratio until another size-change event occurs.
+        listener.onVideoSizeChanged(player.videoSize)
         onDispose {
             // Handler registration has its own mode-keyed DisposableEffect. Do not clear
             // another surface's handler/ownership here: during card -> floating the old
@@ -16818,6 +16864,26 @@ private fun DetailScreen(
     var pullRefreshing by remember { mutableStateOf(false) }
     var detailVideoViewport by remember { mutableStateOf(DetailVideoViewport()) }
     var sectionHeaderTop by remember(item.id) { mutableFloatStateOf(Float.MAX_VALUE) }
+    val currentSectionHeaderTop by rememberUpdatedState(sectionHeaderTop)
+    val currentDetailViewport by rememberUpdatedState(detailVideoViewport)
+    val commentsScrollState = rememberLazyListState()
+    val repostsScrollState = rememberLazyListState()
+    val activeSectionScrollState by rememberUpdatedState(
+        if (detailPager.currentPage == 1) repostsScrollState else commentsScrollState,
+    )
+    val continueIntoComments = remember {
+        object : NestedScrollConnection {
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                // A gesture/fling begun on the body remains owned by the outer
+                // list. Forward its remaining delta in this same frame once the
+                // section header is pinned, rather than requiring another drag.
+                if (available.y < 0f && !listState.canScrollForward) {
+                    return Offset(0f, -activeSectionScrollState.dispatchRawDelta(-available.y))
+                }
+                return Offset.Zero
+            }
+        }
+    }
     var sectionHeaderHeightPx by remember(item.id) { mutableIntStateOf(0) }
     var detailLikeBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
     LaunchedEffect(isLoadingSection) {
@@ -16874,10 +16940,11 @@ private fun DetailScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .pointerInput(contentSection, sectionHeaderTop, detailVideoViewport.headerBottomPx) {
+                    .nestedScroll(continueIntoComments)
+                    .pointerInput(contentSection) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                            if (down.position.y + detailVideoViewport.headerBottomPx < sectionHeaderTop) return@awaitEachGesture
+                            if (down.position.y + currentDetailViewport.headerBottomPx < currentSectionHeaderTop) return@awaitEachGesture
                             var horizontal = false
                             var delta = 0f
                             while (true) {
@@ -17048,7 +17115,7 @@ private fun DetailScreen(
                         val loadingMore = if (showingReposts) isLoadingMoreReposts else isLoadingMoreComments
                         val hasMore = if (showingReposts) repostsHasMore else commentsHasMore
                         val loadMore = if (showingReposts) onLoadMoreReposts else onLoadMoreComments
-                        val pageList = rememberLazyListState()
+                        val pageList = if (page == 1) repostsScrollState else commentsScrollState
                         LaunchedEffect(pageList, sectionItems.size, isLoadingSection, loadingMore, hasMore) {
                             snapshotFlow {
                                 val info = pageList.layoutInfo
@@ -17057,9 +17124,14 @@ private fun DetailScreen(
                                 if (nearEnd && hasMore && !isLoadingSection && !loadingMore && sectionItems.isNotEmpty()) loadMore()
                             }
                         }
-                        val collapseBody = remember(listState) {
+                        val collapseBody = remember(listState, pageList) {
                             object : NestedScrollConnection {
                                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                                    // Downward motion belongs to the comment list until
+                                    // its first row is reached; only then reveal the body.
+                                    if (available.y > 0f && pageList.canScrollBackward) {
+                                        return Offset(0f, -pageList.dispatchRawDelta(-available.y))
+                                    }
                                     if (available.y < 0f && listState.firstVisibleItemIndex == 0) {
                                         val remainingBody = listState.layoutInfo.visibleItemsInfo
                                             .firstOrNull { it.key == "detail-section-header" }?.offset
@@ -17068,9 +17140,16 @@ private fun DetailScreen(
                                     }
                                     return Offset.Zero
                                 }
+                                override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                                    if (available.y > 0f && !pageList.canScrollBackward && listState.canScrollBackward) {
+                                        return Offset(0f, -listState.dispatchRawDelta(-available.y))
+                                    }
+                                    return Offset.Zero
+                                }
                             }
                         }
-                        LazyColumn(state = pageList, modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
+                        LazyColumn(state = pageList, flingBehavior = rememberWeiboListFlingBehavior(),
+                            modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
                             contentPadding = PaddingValues(bottom = 24.dp)) {
                 if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing) {
                     item(key = "section-refresh") {
@@ -17119,6 +17198,8 @@ private fun DetailScreen(
                     Column(commentVisibility) {
                     CommentRow(
                         comment = entry,
+                        emoticonMap = emoticonMap,
+                        onUrlEntityClick = onUrlEntityClick,
                         onUserClick = onUserClick,
                         onExpandNestedComments = if (showingReposts) null else onExpandNestedComments,
                         nestedCommentsLoadingIds = nestedCommentsLoadingIds,
@@ -17216,9 +17297,9 @@ private fun DetailStickyAuthorHeader(
     }
 }
 
-private val CommentRowOuterStart = 18.dp
+private val CommentRowOuterStart = 10.dp
 private val CommentAuthorFontSize = 13.sp
-private val CommentAvatarSize = 28.dp
+private val CommentAvatarSize = 34.dp
 private val CommentAvatarTextGap = 8.dp
 
 private fun commentTextContainsReplyTo(text: String, replyToAuthor: String?): Boolean {
@@ -19087,13 +19168,15 @@ private fun CommentComposerIconButton(
 @Composable
 private fun CommentRow(
     comment: CommentItem,
+    emoticonMap: Map<String, String> = emptyMap(),
     depth: Int = 0,
     onUserClick: ((String) -> Unit)? = null,
     onExpandNestedComments: ((String) -> Unit)? = null,
     nestedCommentsLoadingIds: Set<String> = emptySet(),
     onReplyClick: ((CommentItem) -> Unit)? = null,
+    onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
-    val resolvedMap = comment.emoticons.ifEmpty { emptyMap() }
+    val resolvedMap = resolveEmoticonMap(emoticonMap, comment.emoticons)
     val authorTarget = comment.authorId.takeIf { it.isNotBlank() } ?: comment.authorName
     val verticalPadding = if (depth == 0) 4.dp else 2.dp
     val rowStart = CommentRowOuterStart + (depth * 24).dp
@@ -19108,7 +19191,7 @@ private fun CommentRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = rowStart, end = 18.dp, top = verticalPadding, bottom = verticalPadding),
+                .padding(start = rowStart, end = 10.dp, top = verticalPadding, bottom = verticalPadding),
             verticalAlignment = Alignment.Top,
         ) {
             RemoteImage(
@@ -19175,6 +19258,8 @@ private fun CommentRow(
                 }
                 EmoticonText(
                     text = comment.text,
+                    urlEntities = comment.urlEntities.associateBy { it.shortUrl },
+                    onUrlEntityClick = onUrlEntityClick,
                     emoticonMap = resolvedMap,
                     style = feedBodyTextStyle(),
                     onUserClick = onUserClick,
@@ -19205,6 +19290,8 @@ private fun CommentRow(
         sortNestedCommentsByTime(comment.comments).forEach { nested ->
             CommentRow(
                 comment = nested,
+                emoticonMap = emoticonMap,
+                onUrlEntityClick = onUrlEntityClick,
                 depth = depth + 1,
                 onUserClick = onUserClick,
                 onExpandNestedComments = onExpandNestedComments,
