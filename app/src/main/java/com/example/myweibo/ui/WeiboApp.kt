@@ -1601,6 +1601,7 @@ private fun <T> NavAnimatedOverlay(
 
 private class VideoControlState(initiallyVisible: Boolean) {
     val visible = mutableStateOf(initiallyVisible)
+    val allowAutomaticReveal = mutableStateOf(true)
     val position = mutableStateOf(0L)
     val duration = mutableStateOf(0L)
 }
@@ -4757,7 +4758,7 @@ fun WeiboApp() {
             else -> emptyList()
         }
         val targetKey = image.albumAnchorKey()
-        return buildAlbumGridRows(groupAlbumImagesByMonth(albumImages))
+        return buildAlbumGridRows(groupAlbumImagesByMonth(profileAlbumMedia(albumImages)))
             .indexOfFirst { row -> row.rowImages.any { it.albumAnchorKey() == targetKey } }
             .takeIf { it >= 0 }
     }
@@ -4774,7 +4775,7 @@ fun WeiboApp() {
         val rowIndex = albumRowIndexForImage(image) ?: return
         val listState = albumListStateForViewer() ?: return
         val rowVisible = listState.layoutInfo.visibleItemsInfo.any { it.index == rowIndex }
-        if (rowVisible) return
+        if (!shouldRepositionAlbumViewer(viewer.initialIndex, index, rowVisible)) return
 
         val layoutInfo = listState.layoutInfo
         val viewportHeight = (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset).coerceAtLeast(1)
@@ -10482,7 +10483,6 @@ private fun FeedImageCell(
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
     hiddenForViewer: Boolean = false,
-    openWhileScrolling: Boolean = false,
     onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
 ) {
@@ -10557,8 +10557,9 @@ private fun FeedImageCell(
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    if (down.isConsumed) return@awaitEachGesture
                     val stoppedScroll = cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)
-                    if (stoppedScroll && !openWhileScrolling) {
+                    if (stoppedScroll) {
                         return@awaitEachGesture
                     }
                     var lastPosition = down.position
@@ -14360,6 +14361,10 @@ private fun InlineVideoPlayer(
 
     fun openAnchoredInlinePlayback() {
         resetPeekState()
+        videoCoordinator.controlsFor(playbackKey, false).apply {
+            visible.value = false
+            allowAutomaticReveal.value = false
+        }
         videoCoordinator.requestInlinePlayback(playbackKey)
     }
 
@@ -14657,11 +14662,7 @@ private fun InlineVideoPlayer(
                                 if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
                                     // 详情页直接锚定到被点中的宫格，避免先取得内联播放权、
                                     // 再由 LaunchedEffect 二次交接时卡片短暂失去视频 Surface。
-                                    if (isDetailInlinePlayback) {
-                                        openAnchoredInlinePlayback()
-                                    } else {
-                                        videoCoordinator.requestInlinePlayback(playbackKey)
-                                    }
+                                    openAnchoredInlinePlayback()
                                     return@awaitEachGesture
                                 }
                                 lastTapUptimeMs = tapUptime
@@ -14702,6 +14703,7 @@ private fun InlineVideoPlayer(
                 } else {
                     androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
                 },
+                initialControlsVisible = false,
                 onAspectRatio = { width, height ->
                     if (!gridCell && width > 0 && height > 0) {
                         measuredVideoWidth = width
@@ -14746,13 +14748,7 @@ private fun InlineVideoPlayer(
                 TransparentLiquidIconButton(
                     onClick = {
                         if (media.isStreamPlayable()) {
-                            if (gridCell && isDetailInlinePlayback) {
-                                openAnchoredInlinePlayback()
-                            } else if (gridCell || !isDetailInlinePlayback) {
-                                videoCoordinator.requestInlinePlayback(playbackKey)
-                            } else {
-                                openAnchoredInlinePlayback()
-                            }
+                            openAnchoredInlinePlayback()
                         } else {
                             onClick()
                         }
@@ -15059,11 +15055,13 @@ private fun WeiboVideoSurface(
     val pausedByViewportState = rememberUpdatedState(pausedByViewport)
 
     fun showControls() {
+        controlState.allowAutomaticReveal.value = true
         controlsVisible = true
         controlsHideSignal++
     }
 
     fun toggleControls() {
+        controlState.allowAutomaticReveal.value = true
         if (controlsVisible || showSpeedMenu) {
             showSpeedMenu = false
             controlsVisible = false
@@ -15079,6 +15077,7 @@ private fun WeiboVideoSurface(
         controlsHideSignal,
         isProgressBarScrubbing,
         showSpeedMenu,
+        controlState.allowAutomaticReveal.value,
     ) {
         if (playbackError != null) {
             controlsVisible = true
@@ -15088,7 +15087,7 @@ private fun WeiboVideoSurface(
             // A surface handoff briefly pauses/buffers the same player. Preserve
             // its controls instead of showing them for a single frame.
             delay(350)
-            controlsVisible = true
+            if (controlState.allowAutomaticReveal.value) controlsVisible = true
             return@LaunchedEffect
         }
         if (isProgressBarScrubbing || showSpeedMenu) {
@@ -16120,6 +16119,10 @@ private fun WeiboVideoSurface(
                         var pendingSingleTapJob: Job? = null
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
+                            // Cancel parent feed/repost card clicks immediately.
+                            // Vertical moves are still handed to the scrolling
+                            // list below once they exceed touch slop.
+                            down.consume()
                             val slop = viewConfiguration.touchSlop
                             // 长按 2 倍速允许轻微抖动手指，避免浮窗/全屏几乎无法触发。
                             val holdCancelSlop = max(slop * 3.5f, 42f)
@@ -16244,6 +16247,7 @@ private fun WeiboVideoSurface(
                                         }
                                     }
                                     if (!dragging && !peekDismissed && !wasHoldBoosted) {
+                                        change.consume()
                                         val upUptime = change.uptimeMillis
                                         pendingSingleTapJob?.cancel()
                                         if (
@@ -16338,6 +16342,48 @@ private fun WeiboVideoSurface(
             )
         }
         }
+
+            // Record the handoff frame in the same backdrop as live video.
+            // Otherwise glass controls sample a black, not-yet-attached view
+            // while the user sees this frame in a separate foreground layer.
+            AnimatedVisibility(
+                visible = !videoFrameReady &&
+                    playbackError == null &&
+                    !(seamlessOverlayPlayback && isFullscreen) &&
+                    (
+                        transitionFrame != null ||
+                            (
+                                !inlineWaitingForHandoff &&
+                                    !awaitingPeekHandoffSource &&
+                                    !awaitingPeekHandoffConsume &&
+                                    !videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) &&
+                                    !media.coverUrl.isNullOrBlank()
+                                )
+                        ),
+                enter = EnterTransition.None,
+                exit = fadeOut(tween(120)),
+                modifier = Modifier.matchParentSize(),
+            ) {
+                val frame = transitionFrame
+                if (frame != null && !frame.isRecycled) {
+                    Image(
+                        bitmap = frame.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black),
+                        contentScale = ContentScale.Fit,
+                    )
+                } else {
+                    RemoteImage(
+                        url = media.coverUrl.orEmpty(),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black),
+                        contentScale = ContentScale.Fit,
+                    )
+                }
+            }
         }
 
         AnimatedVisibility(
@@ -16390,64 +16436,37 @@ private fun WeiboVideoSurface(
 
 
         AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && !isFullscreen &&
-                (!isPeekPlayback || inlineControlLayout) && showFullscreenButton,
+            visible = controlsEnabled && controlsVisible &&
+                ((isFullscreen && !isLiveBroadcast) ||
+                    (!isFullscreen && (showFullscreenButton || isPeekPlayback))),
             enter = fadeIn(tween(200)),
             exit = fadeOut(tween(180)),
-            modifier = Modifier.align(Alignment.TopStart).zIndex(2f),
+            modifier = Modifier.align(Alignment.TopStart).zIndex(if (isFullscreen) 20f else 2f),
         ) {
             GlassTextButton(
-                text = "全屏",
+                text = if (isFullscreen) { if (downloading) "保存中" else "保存" } else "全屏",
                 backdrop = videoControlBackdrop,
                 modifier = Modifier
-                    .padding(10.dp)
-                    .width(54.dp)
+                    .padding(
+                        start = if (isFullscreen) VideoFullscreenHorizontalControlInset else 10.dp,
+                        top = if (isFullscreen) fullscreenPrimaryControlTop else 10.dp,
+                    )
+                    .width(if (isFullscreen && downloading) 66.dp else 54.dp)
                     .height(28.dp),
+                enabled = !isFullscreen || !downloading,
                 onClick = {
                     showControls()
-                    openFullscreenWithCurrentFrame()
+                    if (isFullscreen) {
+                        downloading = true
+                        scope.launch {
+                            saveHint.saveVideo(context, media)
+                            downloading = false
+                        }
+                    } else openFullscreenWithCurrentFrame()
                 },
             )
         }
 
-        AnimatedVisibility(
-            visible = !videoFrameReady &&
-                playbackError == null &&
-                !(seamlessOverlayPlayback && isFullscreen) &&
-                (
-                    transitionFrame != null ||
-                        (
-                            !inlineWaitingForHandoff &&
-                                !awaitingPeekHandoffSource &&
-                                !awaitingPeekHandoffConsume &&
-                                !videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) &&
-                                !media.coverUrl.isNullOrBlank()
-                            )
-                    ),
-            enter = EnterTransition.None,
-            exit = fadeOut(tween(120)),
-            modifier = Modifier.matchParentSize(),
-        ) {
-            val frame = transitionFrame
-            if (frame != null && !frame.isRecycled) {
-                Image(
-                    bitmap = frame.asImageBitmap(),
-                    contentDescription = null,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black),
-                    contentScale = ContentScale.Fit,
-                )
-            } else {
-                RemoteImage(
-                    url = media.coverUrl.orEmpty(),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(Color.Black),
-                    contentScale = ContentScale.Fit,
-                )
-            }
-        }
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && (!isPeekPlayback || inlineControlLayout) &&
@@ -16476,34 +16495,6 @@ private fun WeiboVideoSurface(
             )
         }
 
-        AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && isFullscreen && !isLiveBroadcast,
-            enter = fadeIn(tween(200)),
-            exit = fadeOut(tween(180)),
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .zIndex(20f),
-        ) {
-            GlassTextButton(
-                text = if (downloading) "保存中" else "保存",
-                backdrop = videoControlBackdrop,
-                modifier = Modifier
-                    .padding(
-                        start = VideoFullscreenHorizontalControlInset,
-                        top = fullscreenPrimaryControlTop,
-                    )
-                    .width(if (downloading) 66.dp else 54.dp)
-                    .height(28.dp),
-                enabled = !downloading,
-                onClick = {
-                    downloading = true
-                    scope.launch {
-                        saveHint.saveVideo(context, media)
-                        downloading = false
-                    }
-                },
-            )
-        }
 
         if (showBufferingIndicator && isBuffering && playbackError == null) {
             Box(
@@ -16531,27 +16522,6 @@ private fun WeiboVideoSurface(
             }
         }
 
-        AnimatedVisibility(
-            visible = controlsEnabled && controlsVisible && !isFullscreen && isPeekPlayback && !inlineControlLayout,
-            enter = fadeIn(tween(200)),
-            exit = fadeOut(tween(180)),
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .zIndex(10f),
-        ) {
-            GlassTextButton(
-                text = "全屏",
-                backdrop = videoControlBackdrop,
-                modifier = Modifier
-                    .padding(top = 8.dp, end = 8.dp)
-                    .width(54.dp)
-                    .height(28.dp),
-                onClick = {
-                    showControls()
-                    openFullscreenWithCurrentFrame()
-                },
-            )
-        }
 
         AnimatedVisibility(
             visible = controlsEnabled && controlsVisible && !hideProgressControls,
@@ -21798,7 +21768,7 @@ private fun MineScreen(
                             val videoPage = MineContentTab.entries[page] == MineContentTab.Videos
                             val albumListState = if (videoPage) videoAlbumListState else photoAlbumListState
                             val visibleMedia = remember(albumImages, videoPage) {
-                                albumImages.filter { it.isAlbumVideo == videoPage }
+                                profileAlbumMedia(albumImages, videos = videoPage)
                             }
                             val albumPostLookup = remember(posts) { buildAlbumPostLookup(posts) }
                             val albumRows = remember(visibleMedia) {
@@ -21817,7 +21787,25 @@ private fun MineScreen(
                                 LazyColumn(
                                     state = albumListState,
                                     flingBehavior = rememberWeiboListFlingBehavior(),
-                                    modifier = Modifier.fillMaxSize(),
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .pointerInput(albumListState) {
+                                            awaitEachGesture {
+                                                val down = awaitFirstDown(
+                                                    requireUnconsumed = false,
+                                                    pass = PointerEventPass.Initial,
+                                                )
+                                                if (!albumListState.isScrollInProgress) return@awaitEachGesture
+                                                down.consume()
+                                                coroutineScope.launch {
+                                                    albumListState.stopScroll(MutatePriority.UserInput)
+                                                }
+                                                do {
+                                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                    event.changes.forEach { it.consume() }
+                                                } while (event.changes.any { it.pressed })
+                                            }
+                                        },
                                     contentPadding = PaddingValues(bottom = 96.dp),
                                 ) {
                                     if (albumRows.isEmpty()) {
@@ -25029,7 +25017,6 @@ private fun MineAlbumTile(
             imageOwner = imageOwner,
             modifier = Modifier.size(size),
             cornerRadius = ThumbnailMorphCornerRadius,
-            openWhileScrolling = true,
             maxDecodeDimOverride = AlbumGridMaxDecodeDim,
             onOpenViewer = onOpenViewer,
             onAnchorBoundsChanged = onAnchorBoundsChanged,
