@@ -251,6 +251,7 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.hapticfeedback.HapticFeedback
@@ -1054,9 +1055,12 @@ private fun feedCardContentType(item: FeedItem): Int {
 
 private class LayoutAnchorHolder {
     var coordinates: LayoutCoordinates? = null
+    // Video anchors publish their position during placement, before the overlay
+    // is placed, rather than waiting for the next frame's polling coroutine.
+    var videoPlacementBounds by mutableStateOf<Rect?>(null)
 
     fun boundsInWindow(): Rect? =
-        coordinates?.takeIf { it.isAttached }?.boundsInWindow()
+        videoPlacementBounds ?: coordinates?.takeIf { it.isAttached }?.boundsInWindow()
 
     fun boundsInRoot(): Rect? =
         coordinates?.takeIf { it.isAttached }?.boundsInRoot()
@@ -11710,6 +11714,21 @@ private fun VideoPeekOverlay(
         val fullscreenVideoWidth = with(density) { fullscreenVideoWidthPx.toDp() }
         val fullscreenVideoHeight = with(density) { fullscreenVideoHeightPx.toDp() }
         val inlineFullscreenProgress = fullscreenExpandProgress.value.coerceIn(0f, 1f)
+        fun placedHostOffset(fallbackLeft: Dp, fallbackTop: Dp): IntOffset {
+            val followCard = inlineHosted && isInlineAnchored &&
+                inlineFullscreenProgress == 0f && !animateHostedBounds
+            if (followCard) {
+                // resolveAnchorBounds reads the card's placement state. Reading
+                // it here invalidates placement only, keeping scroll and video
+                // on the same frame without changing player ownership.
+                val bounds = resolveAnchorBounds()
+                return IntOffset(
+                    (bounds.left - overlayWindowOrigin.x).roundToInt(),
+                    (bounds.top - overlayWindowOrigin.y).roundToInt(),
+                )
+            }
+            return with(density) { IntOffset(fallbackLeft.roundToPx(), fallbackTop.roundToPx()) }
+        }
         val motion = computeMediaPeekGraphicsMotion(
             anchorBounds = anchorBounds,
             layoutOriginLeftPx = holdLeftPx,
@@ -12022,10 +12041,12 @@ private fun VideoPeekOverlay(
                             val startWidth = if (inlineHosted && !isFloating && !isFullscreenMode) hostedWidth else dockWidth
                             val startHeight = if (inlineHosted && !isFloating && !isFullscreenMode) hostedHeight else dockHeight
                             Modifier
-                                .offset(
-                                    x = lerpDp(startLeft, 0.dp, inlineFullscreenProgress),
-                                    y = lerpDp(startTop, 0.dp, inlineFullscreenProgress),
-                                )
+                                .offset {
+                                    placedHostOffset(
+                                        lerpDp(startLeft, 0.dp, inlineFullscreenProgress),
+                                        lerpDp(startTop, 0.dp, inlineFullscreenProgress),
+                                    )
+                                }
                                 .size(
                                     width = lerpDp(startWidth, with(density) { maxWidthPx.toDp() }, inlineFullscreenProgress),
                                     height = lerpDp(startHeight, effectiveMaxHeight, inlineFullscreenProgress),
@@ -12038,10 +12059,12 @@ private fun VideoPeekOverlay(
                                 .background(Color.Black)
                         }
                         inlineHosted && !useFloatingDismissMorph -> Modifier
-                            .offset(
-                                x = lerpDp(hostedLeft, fullscreenVideoLeft, inlineFullscreenProgress),
-                                y = lerpDp(hostedTop, fullscreenVideoTop, inlineFullscreenProgress),
-                            )
+                            .offset {
+                                placedHostOffset(
+                                    lerpDp(hostedLeft, fullscreenVideoLeft, inlineFullscreenProgress),
+                                    lerpDp(hostedTop, fullscreenVideoTop, inlineFullscreenProgress),
+                                )
+                            }
                             .size(
                                 width = lerpDp(hostedWidth, fullscreenVideoWidth, inlineFullscreenProgress),
                                 height = lerpDp(hostedHeight, fullscreenVideoHeight, inlineFullscreenProgress),
@@ -14243,6 +14266,9 @@ private fun InlineVideoPlayer(
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val detailVideoViewport = LocalDetailVideoViewport.current
+    var hasSeenVideoInDetailViewport by remember(playbackKey, isDetailInlinePlayback) {
+        mutableStateOf(false)
+    }
     val returnHysteresisPx = with(density) { CardAutoFloatReturnHysteresis.toPx() }
     val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
     val gestureScope = rememberCoroutineScope()
@@ -14260,6 +14286,37 @@ private fun InlineVideoPlayer(
         val bounds = anchorHolder.boundsInWindow() ?: return
         actionOpen = true
         peekActive = true
+        val existingHost = videoPeekController.activeRequest
+        if (existingHost?.inlineHosted == true && videoPeekController.isInlineAnchored &&
+            videoPlaybackKey(existingHost.media, existingHost.playbackOwnerId) == playbackKey) {
+            // Fullscreen returned to a feed anchor. Entering detail must rebind
+            // that same host to the detail card, without handing off its player.
+            videoPeekController.activeRequest = existingHost.copy(
+                anchorBounds = bounds,
+                pressOffset = bounds.center,
+                resolveAnchorBounds = {
+                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
+                },
+                returnToOriginalInline = false,
+                onVideoDimensions = { width, height ->
+                    if (width > 0 && height > 0) {
+                        measuredVideoWidth = width
+                        measuredVideoHeight = height
+                    }
+                },
+                onCancel = {
+                    videoCoordinator.clearAutoScrollFloating(playbackKey)
+                    videoCoordinator.releasePeekPlayback(playbackKey)
+                    resetPeekState()
+                },
+                onPlaybackEnded = {
+                    videoCoordinator.clearAutoScrollFloating(playbackKey)
+                    resetPeekState()
+                },
+                onEnterFullscreenHandoffComplete = {},
+            )
+            return
+        }
         // When detail inherited an already-playing instance from profile/feed, hand that
         // exact instance to the persistent host before hiding the old inline surface.
         if (inlinePlaying) {
@@ -14320,12 +14377,20 @@ private fun InlineVideoPlayer(
         videoPeekController.activeRequest,
         videoPeekController.isInlineAnchored,
         playbackKey,
+        anchorHolder.videoPlacementBounds,
     ) {
-        if (!isDetailInlinePlayback || !inlinePlaying) return@LaunchedEffect
+        if (!isDetailInlinePlayback) return@LaunchedEffect
         val hostAlreadyOwnsThisVideo = videoPeekController.activeRequest?.let {
             videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
         } == true
-        if (hostAlreadyOwnsThisVideo) return@LaunchedEffect
+        if (hostAlreadyOwnsThisVideo) {
+            if (videoPeekController.isInlineAnchored && !peekActive &&
+                anchorHolder.videoPlacementBounds != null) {
+                openAnchoredInlinePlayback()
+            }
+            return@LaunchedEffect
+        }
+        if (!inlinePlaying) return@LaunchedEffect
         // Profile/feed -> detail is the only remaining entry that can arrive with an old
         // inline surface. Adopt it once here; all later card/float/fullscreen movement stays
         // inside the same host and Surface.
@@ -14444,14 +14509,19 @@ private fun InlineVideoPlayer(
         isAutoScrollFloating,
         videoBoundsInWindow,
         detailVideoViewport.headerBottomPx,
+        detailVideoViewport.viewportBottomPx,
     ) {
         if (!autoFloatingOnScrollAway || !isDetailInlinePlayback) return@LaunchedEffect
         val bounds = videoBoundsInWindow ?: return@LaunchedEffect
         val threshold = detailVideoViewport.headerBottomPx
         if (threshold <= 0f) return@LaunchedEffect
+        val visibleInViewport = isDetailVideoInViewport(
+            bounds.top, bounds.bottom, threshold, detailVideoViewport.viewportBottomPx,
+        )
+        if (visibleInViewport) hasSeenVideoInDetailViewport = true
 
         if (isAutoScrollFloating) {
-            if (bounds.top > threshold + returnHysteresisPx) {
+            if (visibleInViewport && bounds.top > threshold + returnHysteresisPx) {
                 returnToInlineFromScrollFloating()
             }
         } else {
@@ -14462,8 +14532,11 @@ private fun InlineVideoPlayer(
             if ((!inlinePlaying && !anchoredHere) || !media.isStreamPlayable()) return@LaunchedEffect
             if (!anchoredHere && videoCoordinator.peekPlaybackKey == playbackKey) return@LaunchedEffect
             if (!anchoredHere && (actionOpen || peekActive)) return@LaunchedEffect
-            // 视频画面上边界接触头像/发布时间卡片底边的这一帧即开始交接。
-            if (bounds.top > threshold) return@LaunchedEffect
+            // A video below a long post has not left through the top. Only a
+            // previously visible video whose top reaches the viewport edge floats.
+            if (!shouldAutoFloatDetailVideo(
+                    hasSeenVideoInDetailViewport, bounds.top, bounds.bottom, threshold,
+                )) return@LaunchedEffect
             val center = Offset(
                 bounds.left + bounds.width / 2f,
                 bounds.top + bounds.height / 2f,
@@ -14550,12 +14623,16 @@ private fun InlineVideoPlayer(
                     },
                 )
                 .zIndex(if (actionOpen || peekActive) 10f else 0f)
+                .onPlaced { coordinates ->
+                    anchorHolder.coordinates = coordinates
+                    anchorHolder.videoPlacementBounds = resolveVideoAnchorBounds(coordinates, null)
+                }
                 .onGloballyPositioned { coordinates ->
                     anchorHolder.coordinates = coordinates
                     // 仅由真正启用自动浮窗的卡片跟踪位置；被遮罩的底层卡片即使
                     // isAutoScrollFloating 为 true 也不能参与缩回判断。
                     if (autoFloatingOnScrollAway) {
-                        val nextBounds = coordinates.boundsInWindow()
+                        val nextBounds = resolveVideoAnchorBounds(coordinates, null)
                         if (videoBoundsInWindow != nextBounds) videoBoundsInWindow = nextBounds
                     }
                 }
