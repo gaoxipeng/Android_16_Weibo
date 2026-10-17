@@ -1599,6 +1599,12 @@ private fun <T> NavAnimatedOverlay(
     }
 }
 
+private class VideoControlState(initiallyVisible: Boolean) {
+    val visible = mutableStateOf(initiallyVisible)
+    val position = mutableStateOf(0L)
+    val duration = mutableStateOf(0L)
+}
+
 private class VideoPlaybackCoordinator {
     var activeKey by mutableStateOf<String?>(null)
     var fullscreenKey by mutableStateOf<String?>(null)
@@ -1614,15 +1620,43 @@ private class VideoPlaybackCoordinator {
     var autoScrollFloatingKey by mutableStateOf<String?>(null)
     private val sharedPlayersByMediaKey = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
     private val handoffPlayers = mutableMapOf<String, androidx.media3.exoplayer.ExoPlayer>()
+    val surfaceOwnership = PlaybackSurfaceOwnership<androidx.media3.exoplayer.ExoPlayer, Any>()
+    private val outputViews = java.util.IdentityHashMap<androidx.media3.exoplayer.ExoPlayer, androidx.media3.ui.PlayerView>()
+
+    fun bindOutput(player: androidx.media3.exoplayer.ExoPlayer, owner: Any, view: androidx.media3.ui.PlayerView) {
+        if (!surfaceOwnership.bindView(player, owner, view)) return
+        val previous = outputViews[player]?.takeIf { it.player === player }
+        if (previous !== view || view.player !== player) {
+            androidx.media3.ui.PlayerView.switchTargetView(player, previous, view)
+        }
+        outputViews[player] = view
+        markPlayerSurfaceBound(player)
+    }
+
+    fun releaseOutput(player: androidx.media3.exoplayer.ExoPlayer, owner: Any, view: androidx.media3.ui.PlayerView) {
+        if (!surfaceOwnership.detachView(player, owner, view)) return
+        view.player = null
+        outputViews.remove(player)
+        markPlayerSurfaceUnbound(player)
+    }
+
+    fun releaseOutputHost(player: androidx.media3.exoplayer.ExoPlayer, owner: Any) {
+        if (!surfaceOwnership.owns(player, owner)) return
+        outputViews.remove(player)?.let { view ->
+            if (view.player === player) view.player = null
+        }
+        markPlayerSurfaceUnbound(player)
+        surfaceOwnership.release(player, owner)
+    }
     private val surfaceBoundPlayers = java.util.Collections.newSetFromMap(
         java.util.IdentityHashMap<androidx.media3.exoplayer.ExoPlayer, Boolean>(),
     )
     private val transitionFrames = mutableMapOf<String, Bitmap>()
-    private val controlVisibility = mutableMapOf<String, Boolean>()
-    fun controlsVisibleFor(key: String, default: Boolean): Boolean = controlVisibility[key] ?: default
-    fun rememberControlsVisible(key: String, visible: Boolean) {
-        controlVisibility[key] = visible
-        if (controlVisibility.size > 64) controlVisibility.remove(controlVisibility.keys.first())
+    private val controlStates = mutableMapOf<String, VideoControlState>()
+    fun controlsFor(key: String, default: Boolean): VideoControlState {
+        return controlStates.getOrPut(key) { VideoControlState(default) }.also {
+            if (controlStates.size > 64) controlStates.remove(controlStates.keys.first())
+        }
     }
     private val transitionFrameCaptures = mutableMapOf<String, () -> Unit>()
     fun registerTransitionFrameCapture(key: String, capture: () -> Unit) { transitionFrameCaptures[key] = capture }
@@ -1630,6 +1664,12 @@ private class VideoPlaybackCoordinator {
         if (transitionFrameCaptures[key] === capture) transitionFrameCaptures.remove(key)
     }
     fun captureTransitionFrame(key: String) { transitionFrameCaptures[key]?.invoke() }
+    private val inlineReturnSources = mutableMapOf<String, () -> Unit>()
+    fun registerInlineReturnSource(key: String, source: () -> Unit) { inlineReturnSources[key] = source }
+    fun unregisterInlineReturnSource(key: String, source: () -> Unit) {
+        if (inlineReturnSources[key] === source) inlineReturnSources.remove(key)
+    }
+    fun prepareInlineReturnSource(key: String) { inlineReturnSources[key]?.invoke() }
     private val inlinePauseHandlers = mutableMapOf<String, () -> Unit>()
     private val fullscreenPauseHandlers = mutableMapOf<String, () -> Unit>()
     private val peekPauseHandlers = mutableMapOf<String, () -> Unit>()
@@ -1975,20 +2015,17 @@ private class VideoPlaybackCoordinator {
         }
     }
 
-    fun unregisterPauseHandler(playbackKey: String, isFullscreen: Boolean) {
-        if (isFullscreen) {
-            fullscreenPauseHandlers.remove(playbackKey)
-        } else {
-            inlinePauseHandlers.remove(playbackKey)
-        }
+    fun unregisterPauseHandler(playbackKey: String, isFullscreen: Boolean, expected: (() -> Unit)? = null) {
+        val handlers = if (isFullscreen) fullscreenPauseHandlers else inlinePauseHandlers
+        if (expected == null || handlers[playbackKey] === expected) handlers.remove(playbackKey)
     }
 
     fun registerPeekPauseHandler(playbackKey: String, handler: () -> Unit) {
         peekPauseHandlers[playbackKey] = handler
     }
 
-    fun unregisterPeekPauseHandler(playbackKey: String) {
-        peekPauseHandlers.remove(playbackKey)
+    fun unregisterPeekPauseHandler(playbackKey: String, expected: (() -> Unit)? = null) {
+        if (expected == null || peekPauseHandlers[playbackKey] === expected) peekPauseHandlers.remove(playbackKey)
     }
 
     fun pausePeek(exceptKey: String? = null) {
@@ -2646,6 +2683,37 @@ private class VideoPeekController {
         isInlineAnchored = false
         activeRequest?.onEnterFullscreenHandoffComplete?.invoke()
     }
+
+    fun completeInlineReturn() {
+        val request = activeRequest
+        activeRequest = null
+        pendingDismiss = null
+        snapDismiss = false
+        isFloating = false
+        isFullscreenMode = false
+        isInlineAnchored = false
+        fingerDragOffset = Offset.Zero
+        // Clear the source card's hidden state, but do not run onCancel: that
+        // callback can cancel/release the player prepared for the destination.
+        request?.onEnterFullscreenHandoffComplete?.invoke()
+    }
+}
+
+private fun returnAnchoredVideoToCard(
+    controller: VideoPeekController,
+    coordinator: VideoPlaybackCoordinator,
+) {
+    val request = controller.activeRequest ?: return
+    if (!controller.isInlineAnchored || controller.pendingDismiss != null) return
+    val key = videoPlaybackKey(request.media, request.playbackOwnerId)
+    coordinator.captureTransitionFrame(key)
+    coordinator.beginInlineReturn(key)
+    coordinator.beginPeekHandoff(key)
+    coordinator.prepareInlineReturnSource(key)
+    controller.completeInlineReturn()
+    coordinator.clearAutoScrollFloating(key)
+    coordinator.releasePeekPlayback(key)
+    coordinator.requestInlinePlayback(key)
 }
 
 private data class FeedCardActionMenuRequest(
@@ -4960,6 +5028,9 @@ fun WeiboApp() {
     }
 
     fun prepareInlineVideoHandoffForDetail(item: FeedItem, hostItem: FeedItem? = null) {
+        // If navigation interrupts a fullscreen return, finish the explicit
+        // output transfer first instead of carrying a feed anchor into detail.
+        returnAnchoredVideoToCard(videoPeekController, videoPlaybackCoordinator)
         if (videoPlaybackCoordinator.peekPlaybackKey != null) return
         val activeKey = videoPlaybackCoordinator.activeKey ?: return
         val candidateKeys = buildSet {
@@ -11509,12 +11580,12 @@ private fun VideoPeekOverlay(
                     ),
                 )
             }
-            if (inlineHosted || dockImmediately) {
+            if (dockImmediately) {
                 enterProgress.snapTo(1f)
                 dockProgress.snapTo(1f)
             } else {
                 val directToFloatingSpec = tween<Float>(
-                    durationMillis = 220,
+                    durationMillis = 110,
                     easing = LinearEasing,
                 )
                 coroutineScope {
@@ -11528,11 +11599,14 @@ private fun VideoPeekOverlay(
             }
         } else if (isInlineAnchored) {
             enterProgress.snapTo(1f)
-            dockProgress.snapTo(0f)
             if (fullscreenExpandProgress.value > 0f) {
+                dockProgress.snapTo(0f)
                 fullscreenExpandProgress.animateTo(0f,
                     tween(NavTransitionDurationMs, easing = FastOutSlowInEasing))
+            } else if (hasEnteredFloating) {
+                dockProgress.animateTo(0f, tween(110, easing = FastOutSlowInEasing))
             }
+            returnAnchoredVideoToCard(videoPeekController, videoCoordinator)
         } else if (dismissReason == null) {
             dockProgress.snapTo(0f)
         }
@@ -11783,7 +11857,8 @@ private fun VideoPeekOverlay(
         // the transition. A layer transform is cheap and does not recreate its buffers.
         val directFloatingCardModifier = run {
             val progress = dockProgress.value.coerceIn(0f, 1f)
-            val source = anchorBounds.toOverlayLocal(overlayWindowOrigin)
+            val source = (if (isInlineAnchored) resolveAnchorBounds() else anchorBounds)
+                .toOverlayLocal(overlayWindowOrigin)
             val sourceCenterX = source.center.x
             val sourceCenterY = source.center.y
             val dockCenterX = dockLeftPx + dockWidthPx / 2f
@@ -12058,7 +12133,8 @@ private fun VideoPeekOverlay(
                                 }
                                 .background(Color.Black)
                         }
-                        inlineHosted && !useFloatingDismissMorph -> Modifier
+                        (isFloating || (isInlineAnchored && dockedProgress > 0f)) && !useFloatingDismissMorph -> directFloatingCardModifier
+                        (inlineHosted || isInlineAnchored) && !useFloatingDismissMorph -> Modifier
                             .offset {
                                 placedHostOffset(
                                     lerpDp(hostedLeft, fullscreenVideoLeft, inlineFullscreenProgress),
@@ -14283,118 +14359,16 @@ private fun InlineVideoPlayer(
     }
 
     fun openAnchoredInlinePlayback() {
-        val bounds = anchorHolder.boundsInWindow() ?: return
-        actionOpen = true
-        peekActive = true
-        val existingHost = videoPeekController.activeRequest
-        if (existingHost?.inlineHosted == true && videoPeekController.isInlineAnchored &&
-            videoPlaybackKey(existingHost.media, existingHost.playbackOwnerId) == playbackKey) {
-            // Fullscreen returned to a feed anchor. Entering detail must rebind
-            // that same host to the detail card, without handing off its player.
-            videoPeekController.activeRequest = existingHost.copy(
-                anchorBounds = bounds,
-                pressOffset = bounds.center,
-                resolveAnchorBounds = {
-                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
-                },
-                returnToOriginalInline = false,
-                onVideoDimensions = { width, height ->
-                    if (width > 0 && height > 0) {
-                        measuredVideoWidth = width
-                        measuredVideoHeight = height
-                    }
-                },
-                onCancel = {
-                    videoCoordinator.clearAutoScrollFloating(playbackKey)
-                    videoCoordinator.releasePeekPlayback(playbackKey)
-                    resetPeekState()
-                },
-                onPlaybackEnded = {
-                    videoCoordinator.clearAutoScrollFloating(playbackKey)
-                    resetPeekState()
-                },
-                onEnterFullscreenHandoffComplete = {},
-            )
-            return
-        }
-        // When detail inherited an already-playing instance from profile/feed, hand that
-        // exact instance to the persistent host before hiding the old inline surface.
-        if (inlinePlaying) {
-            videoCoordinator.beginPeekHandoff(playbackKey)
-            videoCoordinator.claimPeekPlaybackForScrollFloat(playbackKey)
-        } else {
-            videoCoordinator.claimPeekPlayback(playbackKey)
-        }
-        videoPeekController.openInline(
-            VideoPeekRequest(
-                media = media,
-                anchorBounds = bounds,
-                pressOffset = bounds.center,
-                playbackOwnerId = playbackOwnerId,
-                resolveAnchorBounds = {
-                    resolveVideoAnchorBounds(anchorHolder.coordinates, anchorHolder.boundsInWindow())
-                },
-                inlineHosted = true,
-                onVideoDimensions = { width, height ->
-                    if (width > 0 && height > 0) {
-                        measuredVideoWidth = width
-                        measuredVideoHeight = height
-                    }
-                },
-                onCancel = {
-                    videoCoordinator.clearAutoScrollFloating(playbackKey)
-                    videoCoordinator.releasePeekPlayback(playbackKey)
-                    resetPeekState()
-                },
-                onRelease = {},
-                onPlaybackEnded = {
-                    videoCoordinator.clearAutoScrollFloating(playbackKey)
-                    resetPeekState()
-                },
-                onOpenFullscreenBehind = {},
-            ),
-        )
+        resetPeekState()
+        videoCoordinator.requestInlinePlayback(playbackKey)
     }
 
     LaunchedEffect(isDetailInlinePlayback, videoPeekController.activeRequest, playbackKey) {
         if (!isDetailInlinePlayback || (!actionOpen && !peekActive)) return@LaunchedEffect
-        val hostedPlaybackKey = videoPeekController.activeRequest?.let {
+        val hostedKey = videoPeekController.activeRequest?.let {
             videoPlaybackKey(it.media, it.playbackOwnerId)
         }
-        // 切换详情页中的另一个视频时，旧卡片不再由锚定播放器覆盖。
-        // 清除旧卡片的隐藏态，否则它会缩回宫格后仍透明，但继续拦截触摸。
-        if (hostedPlaybackKey != playbackKey) {
-            actionOpen = false
-            peekActive = false
-            pressHoldProgress = 0f
-            videoPeekController.resetFingerDragOffset()
-        }
-    }
-
-    LaunchedEffect(
-        isDetailInlinePlayback,
-        inlinePlaying,
-        videoPeekController.activeRequest,
-        videoPeekController.isInlineAnchored,
-        playbackKey,
-        anchorHolder.videoPlacementBounds,
-    ) {
-        if (!isDetailInlinePlayback) return@LaunchedEffect
-        val hostAlreadyOwnsThisVideo = videoPeekController.activeRequest?.let {
-            videoPlaybackKey(it.media, it.playbackOwnerId) == playbackKey
-        } == true
-        if (hostAlreadyOwnsThisVideo) {
-            if (videoPeekController.isInlineAnchored && !peekActive &&
-                anchorHolder.videoPlacementBounds != null) {
-                openAnchoredInlinePlayback()
-            }
-            return@LaunchedEffect
-        }
-        if (!inlinePlaying) return@LaunchedEffect
-        // Profile/feed -> detail is the only remaining entry that can arrive with an old
-        // inline surface. Adopt it once here; all later card/float/fullscreen movement stays
-        // inside the same host and Surface.
-        openAnchoredInlinePlayback()
+        if (hostedKey != playbackKey) resetPeekState()
     }
 
     fun openVideoPeek(pressWindowOffset: Offset) {
@@ -14440,12 +14414,17 @@ private fun InlineVideoPlayer(
         actionOpen = true
         peekActive = true
         pressHoldProgress = 0f
-        videoCoordinator.beginPeekHandoff(playbackKey)
+        if (inlinePlaying || videoCoordinator.isPlaybackKeyActive(playbackKey)) {
+            videoCoordinator.beginPeekHandoff(playbackKey)
+        }
         if (fromAutoScroll) {
             videoCoordinator.claimPeekPlaybackForScrollFloat(playbackKey)
         } else {
             videoCoordinator.claimPeekPlayback(playbackKey)
         }
+        // Prepare synchronously so the first floating composition already has
+        // the player and controls, rather than a controls-free placeholder.
+        videoCoordinator.prepareInlineReturnSource(playbackKey)
         videoPeekController.openFloating(
             VideoPeekRequest(
                 media = media,
@@ -14457,6 +14436,7 @@ private fun InlineVideoPlayer(
                 },
                 // 从当前画面连续缩放到停靠位；播放器实例在两个 Surface 之间交接。
                 dockImmediately = false,
+                inlineHosted = true,
                 onCancel = {
                     val returningToInline = videoCoordinator.pendingPeekHandoffKey?.let { pending ->
                         videoCoordinator.matchesPlaybackKey(pending, playbackKey)
@@ -14563,6 +14543,7 @@ private fun InlineVideoPlayer(
         videoCoordinator.schedulePeekRestartIfAtEnd(playbackKey, videoDurationMs(media))
         videoCoordinator.beginFullscreenHandoff(playbackKey)
         videoCoordinator.claimPeekPlayback(playbackKey)
+        videoCoordinator.prepareInlineReturnSource(playbackKey)
         videoPeekController.open(
             VideoPeekRequest(
                 media = media,
@@ -15028,8 +15009,9 @@ private fun WeiboVideoSurface(
             isBuffering = false
         }
     }
-    var positionMs by remember(videoUrl) { mutableStateOf(0L) }
-    var durationMs by remember(videoUrl) { mutableStateOf(0L) }
+    val controlState = remember(playbackKey) { videoCoordinator.controlsFor(playbackKey, initialControlsVisible) }
+    var positionMs by controlState.position
+    var durationMs by controlState.duration
     var isPlaying by remember(videoUrl) { mutableStateOf(true) }
     var selectedSpeed by remember(videoUrl) { mutableStateOf(1f) }
     var displayedSpeed by remember(videoUrl) { mutableStateOf(1f) }
@@ -15042,10 +15024,7 @@ private fun WeiboVideoSurface(
     // still provide an explicit temporary 2x boost there and restore the override on release.
     val holdSpeedEnabled = isFullscreen || isPeekPlayback
     val holdSpeedEnabledState = rememberUpdatedState(holdSpeedEnabled)
-    var controlsVisible by remember(videoUrl, initialControlsVisible) {
-        mutableStateOf(videoCoordinator.controlsVisibleFor(playbackKey, initialControlsVisible))
-    }
-    SideEffect { videoCoordinator.rememberControlsVisible(playbackKey, controlsVisible) }
+    var controlsVisible by controlState.visible
     var controlsHideSignal by remember(videoUrl) { mutableIntStateOf(0) }
     var isScrubbing by remember(videoUrl) { mutableStateOf(false) }
     var isProgressBarScrubbing by remember(videoUrl) { mutableStateOf(false) }
@@ -15191,7 +15170,12 @@ private fun WeiboVideoSurface(
         }
 
     var inlinePlayer by remember(playbackKey, videoUrl) {
-        mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null)
+        val returningPlayer = if (isInlineFeedOrDetail && videoCoordinator.isInlineReturnPending(playbackKey)) {
+            videoCoordinator.consumeHandoffPlayer(playbackKey)?.also {
+                configureExistingPlayer(it, deferPlaybackUntilSurface = true)
+            }
+        } else null
+        mutableStateOf(returningPlayer)
     }
     var inlineWaitingForHandoff by remember(playbackKey) { mutableStateOf(false) }
 
@@ -15206,6 +15190,14 @@ private fun WeiboVideoSurface(
             videoCoordinator.activeKey,
             videoCoordinator.inlinePlaybackRequestVersion,
         ) {
+            if (isOutgoingInlineVideoHandoff(
+                    videoCoordinator.peekPlaybackKey?.let {
+                        videoCoordinator.matchesPlaybackKey(it, playbackKey)
+                    } == true,
+                    videoCoordinator.isPlaybackKeyHandoffPending(playbackKey),
+                    videoCoordinator.isFullscreenHandoffPending(playbackKey),
+                    videoCoordinator.isInlineReturnPending(playbackKey),
+                )) return@LaunchedEffect
             val existingInlinePlayer = inlinePlayer
             val handoffPendingForInline = videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
                 videoCoordinator.isFullscreenHandoffPending(playbackKey) ||
@@ -15335,25 +15327,20 @@ private fun WeiboVideoSurface(
         return createFreshPlayer()
     }
 
-    var handoffPlayerResolved by remember(playbackKey, videoUrl) { mutableStateOf(false) }
     val immediatePlayer = if (isInlineFeedOrDetail) {
         null
     } else {
         remember(
             playbackKey,
             videoUrl,
-            awaitingFullscreenHandoff,
-            awaitingPeekHandoffSource,
-            handoffPlayerResolved,
         ) {
             if (
-                handoffPlayerResolved ||
                 awaitingFullscreenHandoff ||
-                awaitingPeekHandoffSource
+                awaitingPeekHandoffSource || awaitingPeekHandoffConsume
             ) {
-                null
-            } else if (awaitingPeekHandoffConsume) {
-                null
+                videoCoordinator.consumeHandoffPlayer(playbackKey)?.also {
+                    configureExistingPlayer(it, deferPlaybackUntilSurface = true)
+                }
             } else {
                 resolveOverlayPlayer()
             }
@@ -15371,7 +15358,8 @@ private fun WeiboVideoSurface(
             playbackKey,
             videoUrl,
         ) {
-            if (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume) {
+            if (immediatePlayer != null ||
+                (!awaitingFullscreenHandoff && !awaitingPeekHandoffSource && !awaitingPeekHandoffConsume)) {
                 return@LaunchedEffect
             }
             // A handoff target must adopt the source instance. Never create a fallback
@@ -15381,7 +15369,6 @@ private fun WeiboVideoSurface(
                 videoCoordinator.consumeHandoffPlayer(playbackKey)?.let { handoff ->
                     configureExistingPlayer(handoff, deferPlaybackUntilSurface = true)
                     deferredPlayer = handoff
-                    handoffPlayerResolved = true
                     if (!isPeekPlayback && !isFullscreen) {
                         videoCoordinator.requestInlinePlayback(playbackKey)
                     }
@@ -15393,6 +15380,9 @@ private fun WeiboVideoSurface(
     }
 
     fun resumeInlineHandoffPlaybackIfNeeded(target: androidx.media3.exoplayer.ExoPlayer) {
+        if (videoCoordinator.peekPlaybackKey?.let {
+                videoCoordinator.matchesPlaybackKey(it, playbackKey)
+            } == true || videoCoordinator.isFullscreenHandoffPending(playbackKey)) return
         if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return
         if (!videoCoordinator.isPlaybackKeyActive(playbackKey)) return
         if (resumeAfterSurfaceAttach) return
@@ -15414,8 +15404,24 @@ private fun WeiboVideoSurface(
         else -> immediatePlayer ?: deferredPlayer
     }
     val playerViewHolder = remember { object { var view: androidx.media3.ui.PlayerView? = null } }
-    var stashedForHandoff by remember(playbackKey, videoUrl) { mutableStateOf(false) }
-    val stashedForHandoffState = rememberUpdatedState(stashedForHandoff)
+    val stashedForHandoffState = remember(playbackKey, videoUrl) { mutableStateOf(false) }
+    var stashedForHandoff by stashedForHandoffState
+    // Match the token to the player effect's lifetime. If acquisition briefly
+    // yields null and then the same player, late cleanup still belongs to the
+    // previous generation and must not invalidate the replacement binding.
+    val surfaceOwner = remember(player) { Any() }
+    remember(player) {
+        if (player != null && !stashedForHandoff) videoCoordinator.surfaceOwnership.claim(player, surfaceOwner)
+        player
+    }
+    fun ownsOutput(): Boolean = player != null && !stashedForHandoffState.value &&
+        videoCoordinator.surfaceOwnership.owns(player, surfaceOwner)
+    fun handingInlineOutputAway(): Boolean = isInlineFeedOrDetail && isOutgoingInlineVideoHandoff(
+        videoCoordinator.peekPlaybackKey?.let { videoCoordinator.matchesPlaybackKey(it, playbackKey) } == true,
+        videoCoordinator.isPlaybackKeyHandoffPending(playbackKey),
+        videoCoordinator.isFullscreenHandoffPending(playbackKey),
+        videoCoordinator.isInlineReturnPending(playbackKey),
+    )
     var transitionFrame by remember(playbackKey) {
         mutableStateOf(videoCoordinator.consumeTransitionFrame(playbackKey))
     }
@@ -15430,6 +15436,7 @@ private fun WeiboVideoSurface(
             resumeAfterSurfaceAttach,
         ) {
             val target = player ?: return@LaunchedEffect
+            if (!ownsOutput()) return@LaunchedEffect
             if (isFullscreen || isPeekPlayback || stashedForHandoff || resumeAfterSurfaceAttach) {
                 return@LaunchedEffect
             }
@@ -15449,6 +15456,7 @@ private fun WeiboVideoSurface(
             videoCoordinator.detailHandoffActive,
         ) {
             val target = player ?: return@LaunchedEffect
+            if (!ownsOutput()) return@LaunchedEffect
             if (stashedForHandoff) return@LaunchedEffect
             val handingToOverlay = videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
                 videoCoordinator.isFullscreenHandoffPending(playbackKey)
@@ -15473,22 +15481,18 @@ private fun WeiboVideoSurface(
     }
 
     fun attachPlayerToView(view: androidx.media3.ui.PlayerView) {
+        if (!ownsOutput() || handingInlineOutputAway()) return
         val target = player ?: return
         playerViewHolder.view = view
-        val needsForceRebind = resumeAfterSurfaceAttach && view.player === target
-        if (view.player !== target || needsForceRebind) {
-            if (needsForceRebind) {
-                view.player = null
-            }
-            view.player = target
-        }
-        videoCoordinator.markPlayerSurfaceBound(target)
+        videoCoordinator.bindOutput(target, surfaceOwner, view)
         val pendingDetailHandoffResume = isInlineFeedOrDetail &&
             isDetailInlinePlayback &&
+            videoCoordinator.detailHandoffActive &&
             videoCoordinator.shouldResumeInlineHandoff(playbackKey)
         val shouldResumeOnAttach = resumeAfterSurfaceAttach || pendingDetailHandoffResume
         if (!shouldResumeOnAttach) return
         fun resumePlayback() {
+            if (!ownsOutput() || handingInlineOutputAway() || playerViewHolder.view !== view) return
             // 浮窗本身就是本次交接的最终所有者。旧 Surface dispose/重组可能短暂清掉
             // peekPlaybackKey，不能因此拒绝恢复，否则会永久停在暂停态且播放按钮无效。
             if (isPeekPlayback && videoCoordinator.peekPlaybackKey?.let {
@@ -15514,10 +15518,7 @@ private fun WeiboVideoSurface(
                 if (!peekHandoffPending) return
             }
             if (playerViewHolder.view !== view) return
-            if (view.player !== target) {
-                view.player = target
-            }
-            videoCoordinator.markPlayerSurfaceBound(target)
+            videoCoordinator.bindOutput(target, surfaceOwner, view)
             // 卡片视口外禁止因 Surface 附着而提前出声。
             if (trackViewportPauseState.value && !isViewportVisibleState.value) {
                 pausedByViewport = true
@@ -15530,7 +15531,8 @@ private fun WeiboVideoSurface(
             target.play()
             resumeAfterSurfaceAttach = false
             pausedByViewport = false
-            if (isDetailInlinePlayback && videoCoordinator.shouldResumeInlineHandoff(playbackKey)) {
+            if (isDetailInlinePlayback && videoCoordinator.detailHandoffActive &&
+                videoCoordinator.shouldResumeInlineHandoff(playbackKey)) {
                 videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
             }
         }
@@ -15558,11 +15560,14 @@ private fun WeiboVideoSurface(
         videoCoordinator.pendingPeekHandoffKey,
     ) {
         if (!isInlineFeedOrDetail || !isDetailInlinePlayback || player == null) return@LaunchedEffect
+        if (!ownsOutput()) return@LaunchedEffect
+        if (!videoCoordinator.detailHandoffActive || handingInlineOutputAway()) return@LaunchedEffect
         if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
         if (!isViewportVisible || resumeAfterSurfaceAttach) return@LaunchedEffect
         player.playWhenReady = true
         player.play()
         playerViewHolder.view?.post {
+            if (!ownsOutput() || handingInlineOutputAway() || !videoCoordinator.detailHandoffActive) return@post
             player.playWhenReady = true
             player.play()
             videoCoordinator.completeDetailPlaybackHandoff(playbackKey)
@@ -15688,8 +15693,20 @@ private fun WeiboVideoSurface(
 
     DisposableEffect(player, playbackKey) {
         val capture = { captureHandoffTransitionFrame() }
+        val returnSource = {
+            if (ownsOutput()) {
+                captureHandoffTransitionFrame()
+                playerViewHolder.view?.let { videoCoordinator.releaseOutput(player, surfaceOwner, it) }
+                videoCoordinator.stashHandoffPlayer(playbackKey, player)
+                stashedForHandoffState.value = true
+            }
+        }
         videoCoordinator.registerTransitionFrameCapture(playbackKey, capture)
-        onDispose { videoCoordinator.unregisterTransitionFrameCapture(playbackKey, capture) }
+        videoCoordinator.registerInlineReturnSource(playbackKey, returnSource)
+        onDispose {
+            videoCoordinator.unregisterTransitionFrameCapture(playbackKey, capture)
+            videoCoordinator.unregisterInlineReturnSource(playbackKey, returnSource)
+        }
     }
 
     // The overlay keeps the same ExoPlayer while changing between peek and fullscreen.
@@ -15697,10 +15714,12 @@ private fun WeiboVideoSurface(
     // belongs to the mode that is currently visible.
     DisposableEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
         val pauseHandler = {
-            val currentPosition = player.currentPosition.coerceAtLeast(0L)
-            videoCoordinator.rememberPosition(playbackKey, currentPosition)
-            player.pause()
-            player.playWhenReady = false
+            if (ownsOutput()) {
+                val currentPosition = player.currentPosition.coerceAtLeast(0L)
+                videoCoordinator.rememberPosition(playbackKey, currentPosition)
+                player.pause()
+                player.playWhenReady = false
+            }
         }
         if (isPeekPlayback) {
             videoCoordinator.registerPeekPauseHandler(playbackKey, pauseHandler)
@@ -15709,9 +15728,9 @@ private fun WeiboVideoSurface(
         }
         onDispose {
             if (isPeekPlayback) {
-                videoCoordinator.unregisterPeekPauseHandler(playbackKey)
+                videoCoordinator.unregisterPeekPauseHandler(playbackKey, pauseHandler)
             } else {
-                videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen)
+                videoCoordinator.unregisterPauseHandler(playbackKey, isFullscreen, pauseHandler)
             }
         }
     }
@@ -15720,6 +15739,7 @@ private fun WeiboVideoSurface(
     val currentFullscreenMode = rememberUpdatedState(isFullscreen)
 
     LaunchedEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
+        if (!ownsOutput()) return@LaunchedEffect
         when {
             isFullscreen -> videoCoordinator.claimFullscreenPlayback(playbackKey)
             isPeekPlayback -> videoCoordinator.claimPeekPlayback(playbackKey)
@@ -15802,6 +15822,11 @@ private fun WeiboVideoSurface(
             // Handler registration has its own mode-keyed DisposableEffect. Do not clear
             // another surface's handler/ownership here: during card -> floating the old
             // inline surface is disposed after the floating surface has already claimed it.
+            if (!videoCoordinator.surfaceOwnership.owns(player, surfaceOwner) || stashedForHandoffState.value) {
+                player.removeListener(listener)
+                videoCoordinator.releaseOutputHost(player, surfaceOwner)
+                return@onDispose
+            }
             if (currentPeekMode.value) {
                 videoCoordinator.releasePeekPlayback(playbackKey)
             }
@@ -15879,10 +15904,12 @@ private fun WeiboVideoSurface(
                     player.release()
                 }
             }
+            videoCoordinator.releaseOutputHost(player, surfaceOwner)
         }
     }
 
     LaunchedEffect(isViewportVisible, trackViewportPause, player, autoEnterFloatingOnViewportHidden, resumeAfterSurfaceAttach) {
+        if (!ownsOutput() || handingInlineOutputAway()) return@LaunchedEffect
         if (videoCoordinator.shouldResumeInlineHandoff(playbackKey)) {
             if (
                 videoCoordinator.isPlaybackKeyActive(playbackKey) &&
@@ -15988,6 +16015,7 @@ private fun WeiboVideoSurface(
     val peekFingerDragResetState = rememberUpdatedState(onPeekFingerDragReset)
 
     LaunchedEffect(player, videoFrameReady, playbackKey, videoCoordinator.activeKey, resumeAfterSurfaceAttach, isViewportVisible) {
+        if (!ownsOutput() || handingInlineOutputAway()) return@LaunchedEffect
         if (!videoFrameReady || resumeAfterSurfaceAttach) return@LaunchedEffect
         if (trackViewportPause && !isViewportVisible) return@LaunchedEffect
         if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
@@ -16001,6 +16029,7 @@ private fun WeiboVideoSurface(
         if (!isDetailInlinePlayback) return@LaunchedEffect
         // 详情页首次开播后若仍无画面首帧，强制重绑 Surface（常见于 handoff/清 surface 竞态）。
         delay(180)
+        if (!ownsOutput() || handingInlineOutputAway()) return@LaunchedEffect
         if (videoFrameReady) return@LaunchedEffect
         if (!player.playWhenReady && !player.isPlaying && !resumeAfterSurfaceAttach) return@LaunchedEffect
         playerViewHolder.view?.let { view ->
@@ -16299,9 +16328,9 @@ private fun WeiboVideoSurface(
             },
             onRelease = { view ->
                 view.keepScreenOn = false
-                val releasedPlayer = view.player as? androidx.media3.exoplayer.ExoPlayer
-                view.player = null
-                releasedPlayer?.let(videoCoordinator::markPlayerSurfaceUnbound)
+                player?.let {
+                    videoCoordinator.releaseOutput(it, surfaceOwner, view)
+                }
                 if (playerViewHolder.view === view) {
                     playerViewHolder.view = null
                 }
@@ -16365,7 +16394,7 @@ private fun WeiboVideoSurface(
                 (!isPeekPlayback || inlineControlLayout) && showFullscreenButton,
             enter = fadeIn(tween(200)),
             exit = fadeOut(tween(180)),
-            modifier = Modifier.align(Alignment.TopStart),
+            modifier = Modifier.align(Alignment.TopStart).zIndex(2f),
         ) {
             GlassTextButton(
                 text = "全屏",
@@ -16427,7 +16456,7 @@ private fun WeiboVideoSurface(
             exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.TopEnd)
-                .zIndex(if (isFullscreen) 20f else 0f),
+                .zIndex(if (isFullscreen) 20f else 2f),
         ) {
             GlassTextButton(
                 text = "浮窗",
@@ -16530,6 +16559,7 @@ private fun WeiboVideoSurface(
             exit = fadeOut(tween(180)),
             modifier = Modifier
                 .align(Alignment.BottomCenter)
+                .zIndex(2f)
                 .padding(
                     start = if (isFullscreen) VideoFullscreenHorizontalControlInset else 6.dp,
                     end = if (isFullscreen) VideoFullscreenHorizontalControlInset else 6.dp,
