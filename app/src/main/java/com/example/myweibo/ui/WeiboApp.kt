@@ -6307,7 +6307,10 @@ fun WeiboApp() {
                 activeDetailSourceBounds = sourceBounds
                 if (video != null) {
                     val key = videoPlaybackKey(video, item.id)
-                    videoPlaybackCoordinator.beginDetailHandoff(key)
+                    // Album/video tiles do not own a playing Surface. This is a
+                    // fresh detail playback request, not a transfer from a source
+                    // player: a phantom pending handoff makes acquisition wait and
+                    // repeatedly reacquire its newly created player.
                     videoPlaybackCoordinator.requestInlinePlayback(key)
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
