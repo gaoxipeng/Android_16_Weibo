@@ -1439,7 +1439,8 @@ private fun <T> NavAnimatedOverlay(
     }
     if (overlayVisible && swipeScrimAlpha > 0f) {
         Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.lerp(
-            Color.White, MaterialTheme.colorScheme.background, swipeCancelBackgroundProgress,
+            if (isAppLightTheme()) Color.White else MaterialTheme.colorScheme.surface,
+            MaterialTheme.colorScheme.background, swipeCancelBackgroundProgress,
         ).copy(
             alpha = swipeScrimAlpha * (1f - swipeCardReturn).coerceIn(0f, 1f),
         )))
