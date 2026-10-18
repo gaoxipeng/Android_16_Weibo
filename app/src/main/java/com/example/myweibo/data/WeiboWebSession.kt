@@ -113,6 +113,18 @@ class WeiboWebSession(context: Context) {
         }
     }
 
+    suspend fun loadUserLikedTimeline(uid: String, page: Int = 1): TimelinePage {
+        require(uid.isNotBlank()) { "未读取到用户 UID" }
+        val raw = fetchJson(
+            WeiboEndpoints.LIKED_STATUSES,
+            linkedMapOf("uid" to uid, "relate" to "fans", "page" to page.toString()),
+            "https://weibo.com/u/$uid",
+        )
+        return withContext(Dispatchers.Default) {
+            WeiboJsonParser.parsePersonalFeed(raw, page)
+        }
+    }
+
     suspend fun loadHotSearch(): List<HotSearchItem> {
         val raw = fetchJson(
             WeiboEndpoints.SEARCH_BAND,

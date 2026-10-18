@@ -471,7 +471,8 @@ private fun SearchWeiboSort.storageValue(): String =
 private enum class MineContentTab(val label: String) {
     Posts("\u5FAE\u535A"),
     Album("\u76F8\u518C"),
-    Videos("视频")
+    Videos("视频"),
+    Likes("赞过")
 }
 
 private fun feedRefreshHintMessage(
@@ -21298,6 +21299,50 @@ private fun MineScreen(
         pageCount = { MineContentTab.entries.size },
     )
     val coroutineScope = rememberCoroutineScope()
+    val likesUid = profile?.id.orEmpty()
+    val likesListState = rememberLazyListState()
+    var likedPosts by remember(likesUid, activeAccountId) { mutableStateOf(emptyList<FeedItem>()) }
+    var likesLoaded by remember(likesUid, activeAccountId) { mutableStateOf(false) }
+    var likesLoading by remember(likesUid, activeAccountId) { mutableStateOf(false) }
+    var likesError by remember(likesUid, activeAccountId) { mutableStateOf<String?>(null) }
+    var likesCursor by remember(likesUid, activeAccountId) { mutableStateOf<String?>(null) }
+    var likesJob by remember(likesUid, activeAccountId) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    DisposableEffect(likesUid, activeAccountId) {
+        onDispose { likesJob?.cancel() }
+    }
+    fun loadLikes(refresh: Boolean) {
+        if (likesLoading || likesUid.isBlank()) return
+        if (!refresh && likesLoaded && likesCursor == null) return
+        likesLoading = true
+        likesError = null
+        val page = if (refresh) 1 else likesCursor?.toIntOrNull() ?: 1
+        likesJob = coroutineScope.launch {
+            try {
+                val result = session.loadUserLikedTimeline(likesUid, page)
+                likedPosts = (if (refresh) result.items else likedPosts + result.items)
+                    .distinctBy { it.id }
+                likesCursor = result.nextCursor
+                likesLoaded = true
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                likesError = error.message ?: "加载赞过的微博失败"
+            } finally {
+                likesLoading = false
+            }
+        }
+    }
+    LaunchedEffect(pagerState.currentPage, likesUid, activeAccountId) {
+        if (pagerState.currentPage == MineContentTab.Likes.ordinal && !likesLoaded) loadLikes(true)
+    }
+    LaunchedEffect(likesListState, likesUid, activeAccountId) {
+        snapshotFlow {
+            val layout = likesListState.layoutInfo
+            layout.totalItemsCount > 0 &&
+                (layout.visibleItemsInfo.lastOrNull()?.index ?: 0) >= layout.totalItemsCount - ListLoadMoreItemsFromBottom &&
+                !likesLoading && likesCursor != null && likesError == null
+        }.distinctUntilChanged().collect { if (it) loadLikes(false) }
+    }
     val albumAnchorBoundsByKey = remember(albumImages) {
         mutableStateMapOf<String, Rect>()
     }
@@ -21334,7 +21379,8 @@ private fun MineScreen(
             .distinctUntilChanged()
             .collect { page ->
                 onMinePagerPageChanged(page)
-                if (MineContentTab.entries[page] != MineContentTab.Posts) {
+                if (MineContentTab.entries[page] == MineContentTab.Album ||
+                    MineContentTab.entries[page] == MineContentTab.Videos) {
                     onAlbumTabSelected()
                 }
             }
@@ -21488,6 +21534,7 @@ private fun MineScreen(
     }
     val activeListState = when (pagerState.currentPage) {
         MineContentTab.Posts.ordinal -> postsListState
+        MineContentTab.Likes.ordinal -> likesListState
         MineContentTab.Videos.ordinal -> videoAlbumListState
         else -> albumListState
     }
@@ -21535,7 +21582,9 @@ private fun MineScreen(
     val videoPeekController = LocalVideoPeekController.current
     val blockMinePagerScroll = videoPeekController.activeRequest != null &&
         videoPeekController.pendingDismiss == null
-    val isPullRefreshing = showPullRefreshIndicator && isLoading && posts.isNotEmpty()
+    val likesPageSelected = pagerState.currentPage == MineContentTab.Likes.ordinal
+    val isPullRefreshing = if (likesPageSelected) likesLoading && likedPosts.isNotEmpty()
+        else showPullRefreshIndicator && isLoading && posts.isNotEmpty()
 
     Box(Modifier.fillMaxSize()) {
     Column(
@@ -21545,7 +21594,7 @@ private fun MineScreen(
     ) {
         AppPullToRefreshBox(
             isRefreshing = isPullRefreshing,
-            onRefresh = onRefresh,
+            onRefresh = { if (likesPageSelected) loadLikes(true) else onRefresh() },
             modifier = Modifier.fillMaxWidth().weight(1f),
         ) {
             Column(Modifier.fillMaxSize()) {
@@ -21673,6 +21722,7 @@ private fun MineScreen(
                                             MineContentTab.Posts -> postsListState.animateScrollToTopSmooth()
                                             MineContentTab.Album -> albumListState.animateScrollToTopSmooth()
                                             MineContentTab.Videos -> videoAlbumListState.animateScrollToTopSmooth()
+                                            MineContentTab.Likes -> likesListState.animateScrollToTopSmooth()
                                         }
                                     }
                                 } else {
@@ -21703,7 +21753,13 @@ private fun MineScreen(
                         beyondViewportPageCount = 0,
                     ) { page ->
                     when (MineContentTab.entries[page]) {
-                        MineContentTab.Posts -> {
+                        MineContentTab.Posts, MineContentTab.Likes -> {
+                            val likesPage = MineContentTab.entries[page] == MineContentTab.Likes
+                            val posts = if (likesPage) likedPosts else posts
+                            val postsListState = if (likesPage) likesListState else postsListState
+                            val isLoading = if (likesPage) likesLoading else isLoading
+                            val postsLoadingMore = if (likesPage) likesLoading else postsLoadingMore
+                            val postsHasMore = if (likesPage) likesCursor != null else postsHasMore
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
@@ -21719,6 +21775,11 @@ private fun MineScreen(
                                     item {
                                         if (hasLoginCookie && isLoading) {
                                             MineLoadingMoreIndicator()
+                                        } else if (likesPage) {
+                                            EmptyState(
+                                                title = if (likesError != null) "加载失败" else "暂无赞过的微博",
+                                                body = likesError ?: "该用户暂无公开可见的点赞微博。",
+                                            )
                                         } else if (!hasLoginCookie) {
                                             EmptyState(
                                                 title = "\u672A\u767B\u5F55",
