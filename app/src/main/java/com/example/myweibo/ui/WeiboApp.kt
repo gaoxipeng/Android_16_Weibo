@@ -20176,7 +20176,16 @@ private fun HotSearchRow(
                 Box(Modifier.size(14.dp), contentAlignment = Alignment.Center) {
                     Text(
                         text = item.label,
-                        style = MaterialTheme.typography.labelSmall,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            lineHeight = MaterialTheme.typography.labelSmall.fontSize,
+                            letterSpacing = 0.sp,
+                            platformStyle = PlatformTextStyle(includeFontPadding = false),
+                            lineHeightStyle = androidx.compose.ui.text.style.LineHeightStyle(
+                                alignment = androidx.compose.ui.text.style.LineHeightStyle.Alignment.Center,
+                                trim = androidx.compose.ui.text.style.LineHeightStyle.Trim.Both,
+                            ),
+                        ),
+                        textAlign = TextAlign.Center,
                         color = badgeColors.content,
                         maxLines = 1,
                     )
