@@ -20116,8 +20116,8 @@ private data class HotSearchBadgeColors(
 
 private fun hotSearchBadgeColors(label: String): HotSearchBadgeColors {
     val normalized = label.trim()
-    val content = when {
-        "爆" in normalized -> Color(0xFFFF3852)
+    val container = when {
+        "爆" in normalized -> Color(0xFFB71C1C)
         "沸" in normalized -> Color(0xFFFF6A00)
         "热" in normalized -> Color(0xFFFF8A00)
         "新" in normalized -> Color(0xFFFF4081)
@@ -20126,8 +20126,8 @@ private fun hotSearchBadgeColors(label: String): HotSearchBadgeColors {
         else -> Color(0xFFFF8A00)
     }
     return HotSearchBadgeColors(
-        container = content.copy(alpha = 0.12f),
-        content = content,
+        container = container,
+        content = Color.White,
     )
 }
 
@@ -20171,15 +20171,16 @@ private fun HotSearchRow(
             val badgeColors = hotSearchBadgeColors(item.label)
             Surface(
                 color = badgeColors.container,
-                shape = RoundedCornerShape(6.dp),
+                shape = RoundedCornerShape(4.dp),
             ) {
-                Text(
-                    text = item.label,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = badgeColors.content,
-                    maxLines = 1,
-                )
+                Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+                    Text(
+                        text = item.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = badgeColors.content,
+                        maxLines = 1,
+                    )
+                }
             }
         }
     }
