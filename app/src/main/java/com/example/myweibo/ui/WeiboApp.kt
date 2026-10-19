@@ -20173,7 +20173,7 @@ private fun HotSearchRow(
                 color = badgeColors.container,
                 shape = RoundedCornerShape(4.dp),
             ) {
-                Box(Modifier.size(22.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(18.dp), contentAlignment = Alignment.Center) {
                     Text(
                         text = item.label,
                         style = MaterialTheme.typography.labelSmall,

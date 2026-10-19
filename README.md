@@ -13,6 +13,7 @@
 ## 本版更新
 
 - 热搜状态标签改为白字、实心彩色圆角正方形，“爆”使用深红色。
+- 热搜标签外框缩小至 18dp，文字大小保持不变。
 - 按现有功能重新编写应用内使用说明与本 README。
 - 历史版本更新记录见 [Releases](https://github.com/gaoxipeng/Android_16_Weibo/releases)。
 
