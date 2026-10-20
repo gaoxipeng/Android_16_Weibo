@@ -1720,6 +1720,7 @@ class WeiboWebSession(context: Context) {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView() {
+        webView.useSafeWebRendering()
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
         webView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS

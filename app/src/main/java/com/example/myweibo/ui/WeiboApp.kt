@@ -27,6 +27,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.example.myweibo.data.useSafeWebRendering
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -7255,31 +7256,6 @@ fun WeiboApp() {
 
             Box(
                 Modifier
-                    .then(if (messagesWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
-                    .graphicsLayer {
-                        alpha = if (messagesWebVisible) 1f else 0f
-                        clip = true
-                        if (messagesWebVisible) {
-                            // 隔离 WebView 硬件合成层，避免干扰底部玻璃胶囊采样
-                            compositingStrategy = CompositingStrategy.Offscreen
-                        }
-                    }
-                    .zIndex(if (messagesWebVisible) 2f else -10f)
-                    .blockHiddenTouches(messagesWebVisible),
-            ) {
-                if (!hasLoginCookie) {
-                    WebTabLoginPlaceholder()
-                } else {
-                    key(messagesSessionKey) {
-                        MessagesScreen(
-                            onRootBack = ::handleRootBackPress,
-                            active = messagesWebVisible,
-                        )
-                    }
-                }
-            }
-            Box(
-                Modifier
                     .then(if (composeWebVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
                     .graphicsLayer {
                         alpha = if (composeWebVisible) 1f else 0f
@@ -7940,6 +7916,29 @@ fun WeiboApp() {
             }
 
             }
+            }
+            // WebView must draw directly to the window, never into the glass
+            // capture layer or an Offscreen RenderNode (Chromium drawVk crash).
+            val messagesOverlayVisible = selectedTab == MainTab.Messages &&
+                visitedUserId == null && selectedItem == null &&
+                navOverlayStack.isEmpty() && navExitPendingKind == null
+            Box(
+                Modifier
+                    .then(if (messagesOverlayVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
+                    .padding(innerPadding)
+                    .zIndex(if (messagesOverlayVisible) 2f else -10f)
+                    .blockHiddenTouches(messagesOverlayVisible),
+            ) {
+                if (!hasLoginCookie) {
+                    if (messagesOverlayVisible) WebTabLoginPlaceholder()
+                } else {
+                    key(messagesSessionKey) {
+                        MessagesScreen(
+                            onRootBack = ::handleRootBackPress,
+                            active = messagesOverlayVisible,
+                        )
+                    }
+                }
             }
             // Keep the search glass outside the layerBackdrop it samples. If it is inside
             // bottomBarBackdrop's captured subtree, it samples itself and can stall RenderThread.
@@ -21006,6 +21005,8 @@ private fun MobileWeiboWebScreen(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
+            // This WebView is hosted outside all backdrop/offscreen layers.
+            // Use window hardware rendering for responsive IME and scrolling.
             setLayerType(View.LAYER_TYPE_NONE, null)
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             CookieManager.getInstance().setAcceptCookie(true)
@@ -25357,7 +25358,7 @@ private fun AccountLoginWebView(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            useSafeWebRendering()
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             setBackgroundColor(android.graphics.Color.WHITE)
             CookieManager.getInstance().setAcceptCookie(true)
@@ -25521,6 +25522,7 @@ private fun ArticleReaderOverlay(
                                 modifier = Modifier.fillMaxSize(),
                                 factory = { context ->
                                     WebView(context).apply {
+                                        useSafeWebRendering()
                                         importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                         settings.javaScriptEnabled = false
                                         settings.domStorageEnabled = false
@@ -25546,6 +25548,7 @@ private fun ArticleReaderOverlay(
                             modifier = Modifier.fillMaxSize(),
                             factory = { context ->
                                 WebView(context).apply {
+                                    useSafeWebRendering()
                                     importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                     settings.javaScriptEnabled = true
                                     settings.domStorageEnabled = true
