@@ -6332,6 +6332,10 @@ fun WeiboApp() {
                 hiddenFeedCardId = item.id
                 preservedFeedSourceItem = hostItem ?: item
             }
+            if (sourceBounds != null && selectedItem == null &&
+                selectedTab == MainTab.Search && visitedUserId == null) {
+                hiddenFeedCardId = item.id
+            }
             openDetailInternal(item, hostItem)
             activeDetailSourceBounds = sourceBounds
             activeDetailSourceImage = image
@@ -7460,7 +7464,8 @@ fun WeiboApp() {
                             listState = searchListState,
                             resultsBackEnabled = searchUiOnTop,
                             onResultsNavigateBack = if (navStack.isNotEmpty()) ::navigateBack else null,
-                            onItemClick = { item, _ -> openDetailFromSource(item, null) },
+                            onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                            hiddenSourceCardId = hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
                             onMediaClick = ::pushMediaPreview,
                             onUserClick = ::openUser,
                             resolveFeedItem = ::resolveFeedItem,
@@ -7739,7 +7744,8 @@ fun WeiboApp() {
                         val previous = navStack.lastOrNull()
                         if (previous != null) bottomBarVisible = previous.bottomBarVisible
                         detailSwipeReturningHome = previous != null && previous.detail == null &&
-                            previous.visitedProfile == null && previous.selectedTab == MainTab.Feed
+                            previous.visitedProfile == null &&
+                            (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search)
                     },
                     onSwipeBack = {
                         closeDetail()
@@ -18186,7 +18192,6 @@ private fun ComposeWeiboScreen(
         }
     }
 
-    var hasAutoFocused by remember { mutableStateOf(false) }
     LaunchedEffect(active) {
         if (!active) {
             // Compose tab stays composed while hidden; drop focus so returning from the
@@ -18195,11 +18200,8 @@ private fun ComposeWeiboScreen(
             keyboard?.hide()
             return@LaunchedEffect
         }
-        if (hasAutoFocused) return@LaunchedEffect
-        hasAutoFocused = true
-        delay(150)
-        runCatching { focusRequester.requestFocus() }
-            .onSuccess { keyboard?.show() }
+        // Entering the composer is not an editing gesture. Let a tap on the
+        // text field (or an explicit @ action) acquire focus and show the IME.
     }
 
     val toolbarMutedColor = composeWeiboToolbarMutedColor()
@@ -19639,7 +19641,7 @@ private fun SearchModeToggle(
     selected: SearchMode,
     onSelected: (SearchMode) -> Unit,
 ) {
-    val metaColor = weiboMetaTextColor()
+    val metaColor = if (isAppLightTheme()) Color.Black else MaterialTheme.colorScheme.onSurface
     val nextMode = if (selected == SearchMode.Weibo) SearchMode.User else SearchMode.Weibo
 
     Row(
@@ -19779,7 +19781,9 @@ private fun SearchCapsuleField(
                 ) {
                     Text(
                         text = "清除",
-                        style = fieldTextStyle.copy(color = HintCapsulePlaceholder),
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = if (isAppLightTheme()) Color.Black else MaterialTheme.colorScheme.onSurface,
+                        ),
                     )
                 }
             }
@@ -20213,6 +20217,7 @@ private fun SearchScreen(
     resultsBackEnabled: Boolean,
     onResultsNavigateBack: (() -> Unit)?,
     onItemClick: (FeedItem, Rect?) -> Unit,
+    hiddenSourceCardId: String? = null,
     onMediaClick: (FeedMedia, String) -> Unit,
     onUserClick: (String) -> Unit,
     resolveFeedItem: (FeedItem) -> FeedItem,
@@ -20898,9 +20903,12 @@ private fun SearchScreen(
                         else -> {
                             items(resultItems, key = { it.id }, contentType = ::feedCardContentType) { item ->
                                 val resolved = resolveFeedItem(item)
+                                var cardBounds by remember(resolved.id) { mutableStateOf<Rect?>(null) }
+                                CompositionLocalProvider(LocalHiddenFeedCardId provides hiddenSourceCardId) {
                                 FeedCard(
                                     item = resolved,
-                                    onClick = { onItemClick(resolved, null) },
+                                    onClick = { onItemClick(resolved, cardBounds) },
+                                    onBoundsChanged = { cardBounds = it },
                                     onMediaClick = onMediaClick,
                                     emoticonMap = emoticonMap,
                                     onUserClick = onUserClick,
@@ -20911,6 +20919,7 @@ private fun SearchScreen(
                                     onUrlEntityClick = onUrlEntityClick,
                                     menuBackEnabled = resultsBackEnabled,
                                 )
+                                }
                             }
                         }
                     }
@@ -20919,7 +20928,9 @@ private fun SearchScreen(
                     }
                 }
             }
-            if (activeQuery != null && searchBarVisible) {
+            // Keep the result header laid out beneath detail while it returns.
+            // Hiding it with the search input causes a late header pop/reflow.
+            if (activeQuery != null) {
                 Column(
                     modifier = Modifier
                         .align(Alignment.TopCenter)
@@ -20967,27 +20978,22 @@ private fun SearchScreen(
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun MobileWeiboWebScreen(
     pageUrl: String,
     onRootBack: () -> Unit,
-    scrollToTopOnPageFinished: (String?) -> Boolean = { true },
     userAgent: String? = null,
     active: Boolean = true,
 ) {
     val context = LocalContext.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val bottomBarGap = LiquidBottomBarContentGap
-    val imeBottom = WindowInsets.ime.asPaddingValues().calculateBottomPadding()
-    val bottomInset = if (imeBottom > 0.dp) {
-        imeBottom + bottomBarGap
-    } else {
-        LiquidBottomBarReserve + bottomBarGap
-    }
-    val mobileUserAgent =
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 " +
-            "(KHTML, like Gecko) Mobile/15E148 Weibo (iPhone14,2__weibo__14.9.0__iphone__os16.0)"
+    // Lay out Chromium at the final IME size once, rather than reflowing the
+    // whole conversation DOM on every keyboard animation frame.
+    val imeBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
+    val bottomInset = maxOf(imeBottom, LiquidBottomBarReserve) + bottomBarGap
     val fileUploadBridge = remember { MobileWebFileUploadBridge() }
-    val viewportCoordinator = remember(pageUrl) { MobileWebViewportCoordinator() }
+    var messagePageLoaded by remember(pageUrl) { mutableStateOf(false) }
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -21008,6 +21014,15 @@ private fun MobileWeiboWebScreen(
             // This WebView is hosted outside all backdrop/offscreen layers.
             // Use window hardware rendering for responsive IME and scrolling.
             setLayerType(View.LAYER_TYPE_NONE, null)
+            isFocusable = true
+            isFocusableInTouchMode = true
+            setOnTouchListener { view, event ->
+                if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && !view.hasFocus()) {
+                    view.requestFocus()
+                }
+                // Deliver this same first touch to the page's input normally.
+                false
+            }
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             CookieManager.getInstance().setAcceptCookie(true)
             CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
@@ -21019,15 +21034,15 @@ private fun MobileWeiboWebScreen(
                 loadWithOverviewMode = false
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                userAgentString = userAgent ?: mobileUserAgent
+                // Do not impersonate the iPhone Weibo client: its site branch
+                // enables client-only focus and scrolling behavior.
+                userAgentString = userAgent ?: WebSettings.getDefaultUserAgent(context)
+                    .replace("; wv", "")
+                    .replace(" Version/4.0", "")
             }
-            webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    if (!viewportCoordinator.shouldFitOnPageFinished(url)) return
-                    view?.fitMobileWebViewport(scrollToTop = scrollToTopOnPageFinished(url))
-                }
-            }
-            loadUrl(pageUrl)
+            // Leave DOM focus entirely to the site/browser. Intercepting focus
+            // loses the user's first tap on the conversation composer.
+            webViewClient = WebViewClient()
         }
     }
 
@@ -21067,15 +21082,6 @@ private fun MobileWeiboWebScreen(
         }
     }
 
-    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-    LaunchedEffect(imeVisible, active) {
-        if (!active) return@LaunchedEffect
-        if (!viewportCoordinator.shouldFitOnImeChange(imeVisible)) return@LaunchedEffect
-        delay(120)
-        if (viewportCoordinator.debounceAllowed()) {
-            webView.fitMobileWebViewport(scrollToTop = false)
-        }
-    }
 
     BackHandler(enabled = active) {
         if (webView.canGoBack()) {
@@ -21091,10 +21097,26 @@ private fun MobileWeiboWebScreen(
             .padding(top = topInset, bottom = bottomInset),
     ) {
         AndroidView(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.fillMaxSize().onSizeChanged { size ->
+                if (active && size.width > 0 && size.height > 0 && !messagePageLoaded) {
+                    messagePageLoaded = true
+                    webView.loadUrl(pageUrl)
+                }
+            },
             factory = { webView },
             update = { view ->
                 view.visibility = if (active) View.VISIBLE else View.GONE
+                // A hidden, zero-sized WebView must not initialize the site's
+                // scroll container / infinite-list observer before first display.
+                if (active && !messagePageLoaded && view.width > 0 && view.height > 0) {
+                    view.post {
+                        if (view.visibility == View.VISIBLE && !messagePageLoaded &&
+                            view.width > 0 && view.height > 0) {
+                            messagePageLoaded = true
+                            view.loadUrl(pageUrl)
+                        }
+                    }
+                }
             },
         )
     }
@@ -21125,7 +21147,6 @@ private fun MessagesScreen(
     MobileWeiboWebScreen(
         pageUrl = "https://m.weibo.cn/message",
         onRootBack = onRootBack,
-        scrollToTopOnPageFinished = { url -> url?.contains("/message", ignoreCase = true) != true },
         active = active,
     )
 }
@@ -21159,59 +21180,6 @@ private class MobileWebFileUploadBridge {
     }
 }
 
-private class MobileWebViewportCoordinator {
-    private var lastFittedUrl: String? = null
-    private var lastImeVisible: Boolean? = null
-    private var lastFitAtMs: Long = 0L
-
-    fun shouldFitOnPageFinished(url: String?): Boolean {
-        val normalized = url.orEmpty()
-        if (normalized == lastFittedUrl) return false
-        lastFittedUrl = normalized
-        return true
-    }
-
-    fun shouldFitOnImeChange(imeVisible: Boolean): Boolean {
-        if (imeVisible == lastImeVisible) return false
-        lastImeVisible = imeVisible
-        return true
-    }
-
-    fun debounceAllowed(minIntervalMs: Long = 400L): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastFitAtMs < minIntervalMs) return false
-        lastFitAtMs = now
-        return true
-    }
-}
-
-private fun WebView.fitMobileWebViewport(scrollToTop: Boolean = true) {
-    evaluateJavascript(
-        """
-        (function() {
-            var meta = document.querySelector('meta[name="viewport"]');
-            if (!meta) {
-                meta = document.createElement('meta');
-                meta.name = 'viewport';
-                document.head.appendChild(meta);
-            }
-            var viewport = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover';
-            if (meta.content !== viewport) {
-                meta.content = viewport;
-            }
-            var height = window.innerHeight + 'px';
-            if (document.documentElement.style.height !== height) {
-                document.documentElement.style.height = height;
-            }
-            if (document.body.style.minHeight !== height) {
-                document.body.style.minHeight = height;
-            }
-            ${if (scrollToTop) "window.scrollTo(0, 0);" else ""}
-        })();
-        """.trimIndent(),
-        null,
-    )
-}
 
 @Composable
 private fun MineScreen(
