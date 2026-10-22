@@ -22093,7 +22093,9 @@ private fun SettingsScreen(
         } else {
             LazyColumn(
                 flingBehavior = rememberWeiboListFlingBehavior(),
-                modifier = Modifier.fillMaxSize().padding(bottom = SettingsBottomBarInset),
+                modifier = Modifier.fillMaxSize().padding(
+                    bottom = SettingsBottomBarInset + WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding(),
+                ),
                 contentPadding = PaddingValues(
                     start = 16.dp,
                     top = 12.dp,
