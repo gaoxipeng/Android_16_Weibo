@@ -24,7 +24,16 @@ internal fun isNewerRelease(local: String, remote: String): Boolean {
     return false
 }
 
-internal suspend fun latestWeiboReleaseVersion(): String = withContext(Dispatchers.IO) {
+internal data class WeiboReleaseInfo(val version: String, val versionCode: Long?)
+
+internal fun isWeiboUpdateAvailable(localVersion: String, localCode: Long, release: WeiboReleaseInfo): Boolean =
+    release.versionCode?.let { it > localCode } ?: isNewerRelease(localVersion, release.version)
+
+internal fun releaseVersionCode(body: String): Long? =
+    Regex("<!--\\s*versionCode:\\s*([0-9]+)\\s*-->").find(body)
+        ?.groupValues?.get(1)?.toLongOrNull()?.takeIf { it > 0 }
+
+internal suspend fun latestWeiboRelease(): WeiboReleaseInfo = withContext(Dispatchers.IO) {
     val connection = URL("https://api.github.com/repos/gaoxipeng/Android_16_Weibo/releases/latest")
         .openConnection() as HttpURLConnection
     try {
@@ -39,7 +48,8 @@ internal suspend fun latestWeiboReleaseVersion(): String = withContext(Dispatche
         }
         val release = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
         check(!release.optBoolean("draft") && !release.optBoolean("prerelease")) { "暂无正式发布版本" }
-        release.getString("tag_name").also { check(it.matches(Regex("[vV]?[0-9]+(?:\\.[0-9]+)*"))) { "无法识别发布版本号" } }
+        val version = release.getString("tag_name").also { check(it.matches(Regex("[vV]?[0-9]+(?:\\.[0-9]+)*"))) { "无法识别发布版本号" } }
+        WeiboReleaseInfo(version, releaseVersionCode(release.optString("body")))
     } finally {
         connection.disconnect()
     }

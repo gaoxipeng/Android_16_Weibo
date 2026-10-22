@@ -3,11 +3,22 @@ package com.example.myweibo
 import com.example.myweibo.data.findTimelineChannel
 import com.example.myweibo.data.webRecommendationChannel
 import com.example.myweibo.data.isNewerRelease
+import com.example.myweibo.data.WeiboReleaseInfo
+import com.example.myweibo.data.isWeiboUpdateAvailable
+import com.example.myweibo.data.releaseVersionCode
 import com.example.myweibo.data.WeiboJsonParser
 import org.junit.Assert.*
 import org.junit.Test
 
 class TimelineAndUpdateTest {
+    @Test fun sameDateUpdatesUseBuildCode() {
+        assertTrue(isWeiboUpdateAvailable("20261022", 47, WeiboReleaseInfo("v20261022", 49)))
+        assertTrue(isWeiboUpdateAvailable("20261022.1", 48, WeiboReleaseInfo("v20261022", 49)))
+        assertFalse(isWeiboUpdateAvailable("20261022", 49, WeiboReleaseInfo("v20261022", 49)))
+        assertFalse(isWeiboUpdateAvailable("20261022", 50, WeiboReleaseInfo("v20261022", 49)))
+        assertEquals(49L, releaseVersionCode("<!-- versionCode: 49 -->"))
+        assertNull(releaseVersionCode("ordinary release notes"))
+    }
     @Test fun recommendationEntryDoesNotRequireNamedCatalogueItem() {
         assertEquals("102803", webRecommendationChannel().groupId)
         assertEquals("102803", webRecommendationChannel().containerId)

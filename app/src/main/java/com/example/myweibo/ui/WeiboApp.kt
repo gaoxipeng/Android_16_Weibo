@@ -22093,12 +22093,12 @@ private fun SettingsScreen(
         } else {
             LazyColumn(
                 flingBehavior = rememberWeiboListFlingBehavior(),
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().padding(bottom = SettingsBottomBarInset),
                 contentPadding = PaddingValues(
                     start = 16.dp,
                     top = 12.dp,
                     end = 16.dp,
-                    bottom = SettingsBottomBarInset,
+                    bottom = 12.dp,
                 ),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
@@ -22399,7 +22399,7 @@ private fun SettingsAboutCard(versionName: String) {
             Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboGitHubUrl) }) { Text("GitHub 项目") }
+            TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboGitHubUrl) }) { Text("GitHub主页") }
             TextButton(
                 enabled = !checking,
                 onClick = {
@@ -22408,11 +22408,12 @@ private fun SettingsAboutCard(versionName: String) {
                     newerVersion = null
                     scope.launch {
                         try {
-                            val latest = com.example.myweibo.data.latestWeiboReleaseVersion()
-                            if (com.example.myweibo.data.isNewerRelease(versionName, latest)) {
-                                newerVersion = latest
-                                updateMessage = "发现新版本 $latest（当前 $versionName）"
-                            } else updateMessage = "当前已是最新版本（Release：$latest）"
+                            val latest = com.example.myweibo.data.latestWeiboRelease()
+                            val localCode = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+                            if (com.example.myweibo.data.isWeiboUpdateAvailable(versionName, localCode, latest)) {
+                                newerVersion = latest.version
+                                updateMessage = "发现新版本 ${latest.version}（${latest.versionCode ?: ""}），当前 $versionName（$localCode）"
+                            } else updateMessage = "当前已是最新版本（Release：${latest.version}）"
                         } catch (cancelled: kotlinx.coroutines.CancellationException) {
                             throw cancelled
                         } catch (error: Exception) {
