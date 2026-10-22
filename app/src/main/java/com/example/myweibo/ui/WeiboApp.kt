@@ -3730,6 +3730,7 @@ fun WeiboApp() {
 
     var selectedTab by remember { mutableStateOf(MainTab.Feed) }
     var bottomBarVisible by remember { mutableStateOf(true) }
+    var mineSettingsVisible by remember { mutableStateOf(false) }
     var hideBottomBarOnFeedScroll by remember {
         mutableStateOf(feedDisplaySettingsStore.readHideBottomBarOnScroll())
     }
@@ -3737,10 +3738,10 @@ fun WeiboApp() {
     // Gesture accumulation is not UI state. Making every pixel a mutableFloatState write
     // invalidates the WeiboApp root composition throughout a drag/fling.
     val bottomBarScrollDistance = remember { floatArrayOf(0f) }
-    val bottomBarScrollConnection = remember(selectedTab, hideBottomBarOnFeedScroll) {
+    val bottomBarScrollConnection = remember(selectedTab, hideBottomBarOnFeedScroll, mineSettingsVisible) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if (selectedTab == MainTab.Search ||
+                if ((selectedTab == MainTab.Mine && mineSettingsVisible) || selectedTab == MainTab.Search ||
                     ((selectedTab == MainTab.Feed || selectedTab == MainTab.Mine) && !hideBottomBarOnFeedScroll)
                 ) {
                     bottomBarVisible = true
@@ -7628,8 +7629,13 @@ fun WeiboApp() {
                     MineScreen(
                                 session = session,
                                 onSettingsOpened = {
-                                    bottomBarVisible = false
+                                    bottomBarVisible = true
                                     bottomBarScrollDistance[0] = 0f
+                                },
+                                onSettingsVisibilityChange = { visible ->
+                                    mineSettingsVisible = visible
+                                    bottomBarScrollDistance[0] = 0f
+                                    if (visible) bottomBarVisible = true
                                 },
                                 profile = mineProfile,
                                 profileHeaderHeight = profileHeaderHeights["mine-self"] ?: 0.dp,
@@ -21207,6 +21213,7 @@ private class MobileWebFileUploadBridge {
 private fun MineScreen(
     session: WeiboWebSession,
     onSettingsOpened: () -> Unit = {},
+    onSettingsVisibilityChange: (Boolean) -> Unit = {},
     profile: UserProfile?,
     profileHeaderHeight: Dp,
     onProfileHeaderHeightChange: (Dp) -> Unit,
@@ -21278,6 +21285,10 @@ private fun MineScreen(
     showPullRefreshIndicator: Boolean = true,
 ) {
     var showSettings by remember { mutableStateOf(false) }
+    DisposableEffect(showSettings) {
+        onSettingsVisibilityChange(showSettings)
+        onDispose { onSettingsVisibilityChange(false) }
+    }
     var showAccountManagement by remember { mutableStateOf(false) }
     var avatarViewerOpen by remember { mutableStateOf(false) }
     var avatarSourceBounds by remember { mutableStateOf<Rect?>(null) }
