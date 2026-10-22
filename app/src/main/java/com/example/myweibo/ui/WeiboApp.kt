@@ -75,6 +75,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.gestures.AnchoredDraggableDefaults
@@ -22340,6 +22342,16 @@ private fun SettingsAboutCard(versionName: String) {
     var checking by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
     var newerVersion by remember { mutableStateOf<String?>(null) }
+    val actionsBringIntoView = remember { BringIntoViewRequester() }
+    var actionsHeight by remember { mutableIntStateOf(0) }
+    LaunchedEffect(expanded, actionsHeight, updateMessage, newerVersion) {
+        if (expanded && actionsHeight > 0) {
+            // Wait for the expanded/result layout, then reveal the entire action
+            // area through the owning LazyColumn rather than requiring a new swipe.
+            withFrameNanos { }
+            actionsBringIntoView.bringIntoView()
+        }
+    }
     fun openGitHub(url: String) {
         runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
             .onFailure { updateMessage = "无法打开浏览器" }
@@ -22380,6 +22392,9 @@ private fun SettingsAboutCard(versionName: String) {
             SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
         }
         if (expanded) {
+        Column(Modifier.fillMaxWidth()
+            .bringIntoViewRequester(actionsBringIntoView)
+            .onSizeChanged { actionsHeight = it.height }) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -22415,6 +22430,7 @@ private fun SettingsAboutCard(versionName: String) {
         updateMessage?.let {
             Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         }
         }
         }

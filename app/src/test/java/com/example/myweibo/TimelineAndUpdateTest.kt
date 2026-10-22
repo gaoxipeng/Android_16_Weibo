@@ -20,6 +20,7 @@ class TimelineAndUpdateTest {
         assertNull(findTimelineChannel("""{"groups":[{"title":"热门","gid":"102803"}]}""", "推荐"))
     }
     @Test fun releaseVersionsAreComparedNumerically() {
+        assertTrue(isNewerRelease("20261022", "v20261022.1"))
         assertTrue(isNewerRelease("20261021", "v20261022"))
         assertFalse(isNewerRelease("20261021", "v20261021"))
         assertFalse(isNewerRelease("20261021", "v20261019"))
