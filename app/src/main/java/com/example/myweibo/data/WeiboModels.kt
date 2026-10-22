@@ -296,6 +296,8 @@ enum class TimelineKind(val label: String) {
     FriendsCircle("\u597D\u53CB\u5708"),
     Favorites("\u6211\u7684\u6536\u85CF"),
     Liked("\u6211\u7684\u8D5E"),
+    Hot("热门"),
+    Nearby("同城"),
 }
 
 data class WeiboEmoticon(

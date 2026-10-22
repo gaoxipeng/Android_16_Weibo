@@ -18,7 +18,8 @@ object WeiboJsonParser {
             ?: JSONArray()
         val items = buildList {
             for (index in 0 until statuses.length()) {
-                val status = statuses.optJSONObject(index) ?: continue
+                val entry = statuses.optJSONObject(index) ?: continue
+                val status = entry.optJSONObject("mblog") ?: entry
                 if (status.looksLikeAd()) continue
                 parseStatus(status, allowRetweeted = true)?.let(::add)
             }

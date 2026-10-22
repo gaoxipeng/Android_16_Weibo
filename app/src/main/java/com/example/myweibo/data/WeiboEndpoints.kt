@@ -4,6 +4,8 @@ object WeiboEndpoints {
     const val CONFIG = "/ajax/config"
     const val FOLLOWING = "/ajax/feed/friendstimeline"
     const val GROUP_TIMELINE = "/ajax/feed/groupstimeline"
+    const val HOT_TIMELINE = "/ajax/feed/hottimeline"
+    const val ALL_GROUPS = "/ajax/feed/allGroups"
     const val FAVORITES = "/ajax/favorites/all_fav"
     const val FAVORITE_CREATE = "/ajax/favorites/create"
     const val FAVORITE_DESTROY = "/ajax/favorites/destroy"
@@ -36,5 +38,6 @@ object WeiboEndpoints {
             TimelineKind.FriendsCircle -> GROUP_TIMELINE
             TimelineKind.Favorites -> FAVORITES
             TimelineKind.Liked -> LIKED_STATUSES
+            TimelineKind.Hot, TimelineKind.Nearby -> HOT_TIMELINE
         }
 }

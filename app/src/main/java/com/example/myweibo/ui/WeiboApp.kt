@@ -5167,7 +5167,9 @@ fun WeiboApp() {
                         if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
                             return@onSuccess
                         }
-                        items = sortFeedTimelineItems(page.items)
+                        items = if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                            sortFeedTimelineItems(page.items)
+                        } else page.items
                         reconcileFeedLikeState(page.items)
                         nextCursor = page.nextCursor
                         absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
@@ -5294,7 +5296,13 @@ fun WeiboApp() {
                     // \u907F\u514D\u5728\u5206\u9875\u89E6\u53D1\u5E27\u963B\u585E\u4E3B\u7EBF\u7A0B\u3002
                     val currentItems = items  // \u5728 Main \u4E0A\u5148\u62CD\u5FEB\u7167
                     val (merged, appended) = withContext(Dispatchers.Default) {
-                        mergeFeedTimelinePages(currentItems, page.items)
+                        if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                            mergeFeedTimelinePages(currentItems, page.items)
+                        } else {
+                            val existingIds = currentItems.mapTo(HashSet()) { it.id }
+                            val added = page.items.filter { existingIds.add(it.id) }
+                            (currentItems + added) to added.size
+                        }
                     }
                     if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
                         return@onSuccess
@@ -6240,6 +6248,12 @@ fun WeiboApp() {
     }
 
     fun openUrlEntity(entity: FeedUrlEntity) {
+        if (listOf(entity.url, entity.shortUrl).any {
+                com.example.myweibo.data.openWeiboShoppingCard(context, it)
+            }) return
+        if (listOf(entity.nativeUrl.orEmpty(), entity.url, entity.shortUrl).any {
+                com.example.myweibo.data.openShoppingApp(context, it)
+            }) return
         if (WeiboStatusActions.openSuperTopicInWeiboApp(
                 context,
                 entity.nativeUrl.orEmpty(),
@@ -7725,7 +7739,12 @@ fun WeiboApp() {
                 NavAnimatedOverlay(
                     target = detailOverlayItem?.let { currentDetailSnapshot()?.copy(item = it) }
                         .takeIf { detailLayerActive },
-                    parentTarget = navStack.lastOrNull()?.detail,
+                    // A saved detail is not necessarily the immediate previous
+                    // page: A -> profile -> B must reveal the retained profile,
+                    // never paint A inside B's higher-z-index transition layer.
+                    parentTarget = navStack.lastOrNull()?.detail.takeIf {
+                        navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
+                    },
                     modifier = Modifier
                         .fillMaxSize()
                         .blockHiddenTouches(detailOverlayVisible),
@@ -8092,10 +8111,11 @@ fun WeiboApp() {
                     )
                 }
             }
-            val timelineMenuKinds = remember { listOf(TimelineKind.Following, TimelineKind.FriendsCircle, TimelineKind.Favorites, TimelineKind.Liked) }
+            val timelineMenuKinds = remember { TimelineKind.entries.toList() }
             val timelineMenuLabels = remember { timelineMenuKinds.map(TimelineKind::label) }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
-            val timelineMenuHeight = ActionMenuFourRowHeight
+            val timelineMenuHeight = ActionMenuCardInset * 2 +
+                ActionMenuCapsuleHeight * timelineMenuKinds.size + ActionMenuItemGap * (timelineMenuKinds.size - 1)
             AnimatedVisibility(
                 visible = bottomBarNavVisible && bottomBarVisible,
                 enter = slideInVertically(tween(160)) { it },
@@ -22314,10 +22334,22 @@ private fun SettingsHelpEntryCard(onOpen: () -> Unit) {
 
 @Composable
 private fun SettingsAboutCard(versionName: String) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var expanded by remember { mutableStateOf(false) }
+    var checking by remember { mutableStateOf(false) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var newerVersion by remember { mutableStateOf<String?>(null) }
+    fun openGitHub(url: String) {
+        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { updateMessage = "无法打开浏览器" }
+    }
     SettingsPlainCard {
+        Column {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .clickable { expanded = !expanded }
                 .padding(horizontal = 16.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(14.dp),
@@ -22345,6 +22377,46 @@ private fun SettingsAboutCard(versionName: String) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+        }
+        if (expanded) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboGitHubUrl) }) { Text("GitHub 项目") }
+            TextButton(
+                enabled = !checking,
+                onClick = {
+                    checking = true
+                    updateMessage = null
+                    newerVersion = null
+                    scope.launch {
+                        try {
+                            val latest = com.example.myweibo.data.latestWeiboReleaseVersion()
+                            if (com.example.myweibo.data.isNewerRelease(versionName, latest)) {
+                                newerVersion = latest
+                                updateMessage = "发现新版本 $latest（当前 $versionName）"
+                            } else updateMessage = "当前已是最新版本（Release：$latest）"
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            updateMessage = error.message ?: "检查更新失败，请稍后重试"
+                        } finally { checking = false }
+                    }
+                },
+            ) { Text(if (checking) "检查中…" else "检查更新") }
+            if (newerVersion != null) {
+                TextButton(onClick = { openGitHub(com.example.myweibo.data.WeiboReleaseUrl) }) {
+                    Text("下载更新")
+                }
+            }
+        }
+        updateMessage?.let {
+            Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        }
         }
     }
 }
@@ -25418,6 +25490,9 @@ private fun ArticleReaderOverlay(
     val title = state.article?.title ?: state.entity.title
     val notifyWebLink = LocalUiMessenger.current
     val htmlContent = state.article?.htmlContent
+    val linkContext = LocalContext.current
+    var webLoading by remember(state.entity.url) { mutableStateOf(false) }
+    var webFailure by remember(state.entity.url) { mutableStateOf<String?>(null) }
     val fallbackUrl = upgradeWeiboWebUrl(state.entity.url).takeIf {
         state.article == null && !state.loading && state.error == null
     }
@@ -25463,6 +25538,16 @@ private fun ArticleReaderOverlay(
                 }
             }
             HorizontalDivider()
+            if (fallbackUrl != null) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = {
+                        runCatching { linkContext.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl))) }
+                            .onFailure { webFailure = "没有可以打开此链接的应用" }
+                    }) { Text("在浏览器中打开") }
+                    if (webLoading) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    webFailure?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                }
+            }
             Box(Modifier.fillMaxSize()) {
                 when {
                     state.loading -> {
@@ -25521,11 +25606,49 @@ private fun ArticleReaderOverlay(
                                     settings.javaScriptEnabled = true
                                     settings.domStorageEnabled = true
                                     settings.loadsImagesAutomatically = true
+                                    // Product landing pages often open a new window or
+                                    // use a hidden iframe to launch their shopping app.
+                                    settings.javaScriptCanOpenWindowsAutomatically = true
+                                    settings.setSupportMultipleWindows(false)
+                                    settings.userAgentString = WebSettings.getDefaultUserAgent(context)
+                                        .replace("; wv", "").replace("Version/4.0 ", "")
+                                    webChromeClient = WebChromeClient()
                                     webViewClient = object : WebViewClient() {
                                         private var lastNativeUrl: String? = null
+                                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                            webLoading = true
+                                            webFailure = null
+                                        }
+                                        override fun onPageFinished(view: WebView?, url: String?) {
+                                            webLoading = false
+                                        }
+                                        override fun onReceivedError(view: WebView?, request: android.webkit.WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                                            if (request?.isForMainFrame == true) {
+                                                webLoading = false
+                                                webFailure = "网页加载失败，可尝试浏览器打开"
+                                            }
+                                        }
                                         override fun shouldOverrideUrlLoading(view: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
                                             val url = request?.url?.toString() ?: return false
                                             val scheme = request.url.scheme.orEmpty().lowercase()
+                                            if (request.isForMainFrame && lastNativeUrl != url &&
+                                                com.example.myweibo.data.openWeiboShoppingCard(context, url)) {
+                                                lastNativeUrl = url
+                                                webLoading = false
+                                                return true
+                                            }
+                                            if ((request.isForMainFrame || scheme in setOf("taobao", "tmall", "openapp.jdmobile", "jdmobile", "intent")) && lastNativeUrl != url &&
+                                                com.example.myweibo.data.openShoppingApp(context, url)) {
+                                                lastNativeUrl = url
+                                                webLoading = false
+                                                return true
+                                            }
+                                            if (scheme == "intent" && request.isForMainFrame) {
+                                                com.example.myweibo.data.shoppingWebFallback(url)?.let {
+                                                    view?.loadUrl(it)
+                                                }
+                                                return true
+                                            }
                                             if (scheme == "sinaweibo") {
                                                 // Native mini-program links must never be
                                                 // handed to WebView as ordinary web pages.

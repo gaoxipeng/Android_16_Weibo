@@ -88,7 +88,8 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadTimeline(kind: TimelineKind, cursor: String? = null): TimelinePage {
         val raw = when (kind) {
-            TimelineKind.Following, TimelineKind.FriendsCircle -> loadTimelineRaw(kind, cursor)
+            TimelineKind.Following, TimelineKind.FriendsCircle,
+            TimelineKind.Hot, TimelineKind.Nearby -> loadTimelineRaw(kind, cursor)
             TimelineKind.Favorites, TimelineKind.Liked -> {
                 val uid = loadCurrentUserConfig().optString("uid")
                     .takeIf { it.isNotBlank() && it != "0" }
@@ -441,6 +442,25 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
+        if (kind == TimelineKind.Hot || kind == TimelineKind.Nearby) {
+            val channel = if (kind == TimelineKind.Hot) {
+                // The web recommendation feed has a fixed entry. allGroups is a
+                // channel catalogue and need not contain an item named 推荐.
+                webRecommendationChannel()
+            } else {
+                findTimelineChannel(fetchJson(WeiboEndpoints.ALL_GROUPS), kind.label)
+                    ?: error("微博未提供当前账号的${kind.label}频道，请尝试热门频道")
+            }
+            return fetchJson(
+                WeiboEndpoints.HOT_TIMELINE,
+                linkedMapOf(
+                    "group_id" to channel.groupId, "containerid" to channel.containerId,
+                    "extparam" to "discover|new_feed", "refresh" to "0", "count" to "20",
+                    "max_id" to (cursor ?: "0"),
+                ),
+                "https://weibo.com/hot/weibo/${channel.groupId}",
+            )
+        }
         val params = when (kind) {
             TimelineKind.Following -> linkedMapOf(
                 "list_id" to "110001768015440",
@@ -462,6 +482,7 @@ class WeiboWebSession(context: Context) {
             }
 
             TimelineKind.Favorites, TimelineKind.Liked -> error("\u8BE5\u9996\u9875\u7C7B\u578B\u4F7F\u7528\u4E2A\u4EBA\u4FE1\u606F\u6D41\u63A5\u53E3")
+            TimelineKind.Hot, TimelineKind.Nearby -> error("频道信息流应使用频道接口")
         }
 
         val referer = when (kind) {
