@@ -48,8 +48,11 @@ internal suspend fun latestWeiboRelease(): WeiboReleaseInfo = withContext(Dispat
         }
         val release = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
         check(!release.optBoolean("draft") && !release.optBoolean("prerelease")) { "暂无正式发布版本" }
-        val version = release.getString("tag_name").also { check(it.matches(Regex("[vV]?[0-9]+(?:\\.[0-9]+)*"))) { "无法识别发布版本号" } }
-        WeiboReleaseInfo(version, releaseVersionCode(release.optString("body")))
+        val body = release.optString("body")
+        val version = (Regex("<!--\\s*versionName:\\s*([0-9]+(?:\\.[0-9]+)*)\\s*-->")
+            .find(body)?.groupValues?.get(1) ?: release.getString("tag_name"))
+            .also { check(it.matches(Regex("[vV]?[0-9]+(?:\\.[0-9]+)*"))) { "无法识别发布版本号" } }
+        WeiboReleaseInfo(version, releaseVersionCode(body))
     } finally {
         connection.disconnect()
     }
