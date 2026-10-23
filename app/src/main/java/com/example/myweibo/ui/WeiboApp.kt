@@ -1187,6 +1187,8 @@ private fun <T> NavAnimatedOverlay(
     nestedDetailReturnAnimating: Boolean = false,
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
+    returnBackground: Bitmap? = null,
+    returnBackgroundProgress: (() -> Float?)? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
@@ -1231,7 +1233,7 @@ private fun <T> NavAnimatedOverlay(
     LaunchedEffect(transitionIdentity) {
         if (nestedCardEntry) nestedCardProgress.animateTo(1f, detailCardSpring())
     }
-    LaunchedEffect(transitionIdentity) {
+    LaunchedEffect(transitionIdentity, navKind, avVisible) {
         if (target == null) return@LaunchedEffect
         swipeOffset = 0f
         swipeSettling = false
@@ -1373,8 +1375,10 @@ private fun <T> NavAnimatedOverlay(
     // Keep one visibility transition for the detail layer. Re-keying this state for
     // each detail disposes AnimatedContent's outgoing child before it can slide away.
     val transitionStateKey: Any? = if (navKind is NavOverlayKind.Detail) "detail-overlay" else transitionIdentity
-    val transitionState = remember(skipAnimationToken, transitionStateKey) {
-        MutableTransitionState(false)
+    val transitionState = remember(skipAnimationToken, transitionStateKey, if (!stackAnimated) avVisible else null) {
+        // Non-animated hosts must be visible in their first composition. Waiting
+        // for SideEffect exposes the empty layer beneath for one frame.
+        MutableTransitionState(if (stackAnimated) false else avVisible)
     }
     SideEffect {
         transitionState.targetState = avVisible
@@ -1436,6 +1440,17 @@ private fun <T> NavAnimatedOverlay(
     if (avVisible || displayed != null) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned { overlayOrigin = it.boundsInRoot().topLeft }) {
+    returnBackground?.let { bitmap ->
+        Image(bitmap.asImageBitmap(), contentDescription = null,
+            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
+    }
+    returnBackgroundProgress?.let { progress ->
+        Box(Modifier.fillMaxSize().graphicsLayer {
+            alpha = (1f - (progress() ?: 1f)).coerceIn(0f, 1f)
+        }.background(
+            (if (isAppLightTheme()) Color.White else MaterialTheme.colorScheme.background)
+        ))
+    }
     if (navKind is NavOverlayKind.Detail && overlayVisible) {
         parentTarget?.let { parent ->
             Box(Modifier.fillMaxSize()) { content(parent) }
@@ -3720,6 +3735,7 @@ fun WeiboApp() {
     val followListFollowingListState = rememberLazyListState()
     val followListFansListState = rememberLazyListState()
     val searchListState = rememberLazyListState()
+    val hotSearchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
     val detailActionMenuController = remember { FeedCardActionMenuController() }
@@ -3868,6 +3884,11 @@ fun WeiboApp() {
     }
     var mediaPreview by remember { mutableStateOf<MediaPreviewRequest?>(null) }
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
+    var searchResultsBackAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var searchReturnBackground by remember { mutableStateOf<Bitmap?>(null) }
+    var searchSystemReturnProgress by remember { mutableStateOf<Float?>(null) }
+    var searchCapturePending by remember { mutableStateOf(false) }
+    var searchViewportBounds by remember { mutableStateOf<Rect?>(null) }
     var searchPendingMode by remember { mutableStateOf<SearchMode?>(null) }
     var searchMode by remember { mutableStateOf(storedSearchMode(searchSettingsStore.readMode())) }
     var searchWeiboSort by remember { mutableStateOf(storedSearchWeiboSort(searchSettingsStore.readWeiboSort())) }
@@ -4624,7 +4645,18 @@ fun WeiboApp() {
         if (exitingKind == NavOverlayKind.AlbumViewer) {
             albumDismissScrollTarget = null
         }
-        applyNavRestoreState(previous)
+        if (exitingKind == NavOverlayKind.TabSwitch &&
+            previous.detail?.instanceKey == currentDetailSnapshot()?.instanceKey &&
+            previous.visitedProfile?.userId == visitedUserId
+        ) {
+            // Topic search covers a retained source page. Do not restore/re-key
+            // that same detail: doing so replays its entry and rebuilds comments.
+            selectedTab = previous.selectedTab
+            bottomBarVisible = previous.bottomBarVisible
+            suppressNextBottomBarAutoShow = true
+        } else {
+            applyNavRestoreState(previous)
+        }
         return true
     }
 
@@ -4891,6 +4923,46 @@ fun WeiboApp() {
         navigateBack()
     }
 
+    fun captureSearchBackground(onReady: () -> Unit) {
+        if (searchCapturePending) return
+        val window = (context as? android.app.Activity)?.window
+        val view = detailCaptureView
+        if (window == null || view.width <= 0 || view.height <= 0) {
+            searchReturnBackground = null
+            onReady()
+            return
+        }
+        searchCapturePending = true
+        val origin = IntArray(2)
+        view.getLocationInWindow(origin)
+        // Capture precisely the viewport where this bitmap will be drawn. A full
+        // window capture scaled into inset content shifts the source on frame one.
+        val bounds = searchViewportBounds
+        val crop = if (bounds != null) android.graphics.Rect(
+            bounds.left.roundToInt(), bounds.top.roundToInt(),
+            bounds.right.roundToInt(), bounds.bottom.roundToInt(),
+        ) else android.graphics.Rect(origin[0], origin[1], origin[0] + view.width, origin[1] + view.height)
+        if (crop.width() <= 0 || crop.height() <= 0) {
+            searchCapturePending = false
+            searchReturnBackground = null
+            onReady()
+            return
+        }
+        runCatching {
+            val bitmap = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
+            android.view.PixelCopy.request(window, crop, bitmap, { result ->
+                searchCapturePending = false
+                searchReturnBackground = bitmap.takeIf { result == android.view.PixelCopy.SUCCESS }
+                if (result != android.view.PixelCopy.SUCCESS) bitmap.recycle()
+                onReady()
+            }, android.os.Handler(android.os.Looper.getMainLooper()))
+        }.onFailure {
+            searchCapturePending = false
+            searchReturnBackground = null
+            onReady()
+        }
+    }
+
     fun openSearchTopic(topic: String) {
         val bareTopic = topic.removePrefix("#").removeSuffix("#").trim()
         val normalized = if (bareTopic.isBlank()) "" else "#$bareTopic#"
@@ -4901,18 +4973,14 @@ fun WeiboApp() {
             bottomBarVisible = true
             return
         }
+        captureSearchBackground {
         pushNavigation(NavOverlayKind.TabSwitch) {
-            selectedItem = null
-            comments = emptyList()
-            commentsCursor = null
-            commentsHasMore = true
-            if (visitedUserId != null) {
-                clearVisitedProfileState()
-            }
+            // Leave the source detail/profile mounted behind the search overlay.
             searchPendingQuery = normalized
             searchPendingMode = SearchMode.Weibo
             selectedTab = MainTab.Search
             bottomBarVisible = true
+        }
         }
     }
 
@@ -6236,7 +6304,7 @@ fun WeiboApp() {
         }
     }
 
-    fun openDetailInternal(item: FeedItem, hostItem: FeedItem? = null) {
+    fun openDetailInternal(item: FeedItem, hostItem: FeedItem? = null, section: DetailContentSection? = null) {
         prepareInlineVideoHandoffForDetail(
             resolveFeedItem(item),
             hostItem?.let(::resolveFeedItem),
@@ -6244,8 +6312,8 @@ fun WeiboApp() {
         pushNavigation(NavOverlayKind.Detail(resolveFeedItem(item).id)) {
             openDetailPrepared(
                 item = item,
-                initialSection = DetailContentSection.Comments,
-                scrollToContentSection = false,
+                initialSection = section ?: DetailContentSection.Comments,
+                scrollToContentSection = section != null,
             )
         }
     }
@@ -6340,7 +6408,7 @@ fun WeiboApp() {
         }
     }
 
-    fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null) {
+    fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null, section: DetailContentSection? = null) {
         if (detailSourceCapturePending) return
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
         fun navigateWithSource(image: Bitmap?) {
@@ -6353,7 +6421,7 @@ fun WeiboApp() {
                 selectedTab == MainTab.Search && visitedUserId == null) {
                 hiddenFeedCardId = item.id
             }
-            openDetailInternal(item, hostItem)
+            openDetailInternal(item, hostItem, section = section)
             activeDetailSourceBounds = sourceBounds
             activeDetailSourceImage = image
         }
@@ -7237,7 +7305,8 @@ fun WeiboApp() {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .padding(innerPadding),
+                    .padding(innerPadding)
+                    .onGloballyPositioned { searchViewportBounds = it.boundsInWindow() },
             ) {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
@@ -7332,20 +7401,25 @@ fun WeiboApp() {
                 visitedUserId == null &&
                 !detailOverlayVisible &&
                 navExitPendingKind == null
-            val keepFeedAlive = selectedTab == MainTab.Feed && (
+            val retainFeedBehindSearch = selectedTab == MainTab.Search &&
+                navOverlayStack.any { it == NavOverlayKind.TabSwitch } &&
+                navStack.any { it.selectedTab == MainTab.Feed }
+            val keepFeedAlive = retainFeedBehindSearch || selectedTab == MainTab.Feed && (
                 (visitedUserId != null && detailOverlayItem == null) ||
                 detailOverlayItem != null ||
                 navExitPendingKind != null
             )
-            val feedLayerVisible = selectedTab == MainTab.Feed && (feedUiOnTop || keepFeedAlive)
+            val feedLayerVisible = (selectedTab == MainTab.Feed || retainFeedBehindSearch) && (feedUiOnTop || keepFeedAlive)
             val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
-            val searchUiOnTop = selectedTab == MainTab.Search &&
+            val topicSearchOnTop = selectedTab == MainTab.Search &&
+                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
+            val searchUiOnTop = selectedTab == MainTab.Search && (topicSearchOnTop || (
                 visitedUserId == null &&
                 detailOverlayItem == null &&
                 followListOverlay == null &&
                 articleOverlay == null &&
                 mediaPreview == null &&
-                albumViewerState == null
+                albumViewerState == null))
             val keepSearchAlive = selectedTab == MainTab.Search &&
                 (visitedUserId != null ||
                     detailOverlayItem != null ||
@@ -7406,10 +7480,14 @@ fun WeiboApp() {
                                 onRetweetCardClick = { retweeted, host, bounds ->
                                     openDetailFromSource(retweeted, bounds, host)
                                 },
-                                onCommentClick = { item -> openDetailToSection(item, DetailContentSection.Comments) },
+                                onCommentClick = { item, bounds ->
+                                    openDetailFromSource(item, bounds, section = DetailContentSection.Comments)
+                                },
                                 onCommentLongClick = { item -> openCommentComposer(item) },
                                 onReplyToComment = { item, comment -> openCommentComposer(item, comment) },
-                                onRepostClick = { item -> openDetailToSection(item, DetailContentSection.Reposts) },
+                                onRepostClick = { item, bounds ->
+                                    openDetailFromSource(item, bounds, section = DetailContentSection.Reposts)
+                                },
                                 onMediaClick = ::pushMediaPreview,
                                 resolveFeedItem = { feedItem ->
                                     preservedFeedSourceItem?.takeIf { it.id == feedItem.id }
@@ -7462,10 +7540,19 @@ fun WeiboApp() {
 
                 NavAnimatedOverlay(
                     target = MainTab.Search.takeIf { selectedTab == MainTab.Search && (searchUiOnTop || keepSearchAlive) },
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        alpha = if (selectedTab == MainTab.Search) 1f else 0f
+                    },
                     stackTop = searchUiOnTop,
                     visible = searchUiOnTop,
                     stackAnimated = false,
+                    // The callback changes when a query opens/closes. Using it as
+                    // identity disposes SearchScreen and loses that active query.
+                    animationKey = MainTab.Search,
+                    returnBackground = searchReturnBackground,
+                    returnBackgroundProgress = { searchSystemReturnProgress },
+                    navKind = NavOverlayKind.TabSwitch.takeIf { searchResultsBackAction != null },
+                    onSwipeBack = { searchResultsBackAction?.invoke() },
                 ) {
                     SearchScreen(
                             session = session,
@@ -7479,8 +7566,21 @@ fun WeiboApp() {
                             onPendingSearchModeConsumed = { searchPendingMode = null },
                             emoticonMap = emoticonMap,
                             listState = searchListState,
+                            hotListState = hotSearchListState,
                             resultsBackEnabled = searchUiOnTop,
-                            onResultsNavigateBack = if (navStack.isNotEmpty()) ::navigateBack else null,
+                            onResultsNavigateBack = if (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch) ::navigateBack else null,
+                            onResultsClosed = {
+                                searchReturnBackground = null
+                                searchSystemReturnProgress = null
+                                searchPendingQuery = null
+                                searchPendingMode = null
+                            },
+                            onResultsBackActionChange = { searchResultsBackAction = it },
+                            onCaptureResultsBackground = { ready ->
+                                if (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch) ready()
+                                else captureSearchBackground(ready)
+                            },
+                            onResultsReturnProgress = { searchSystemReturnProgress = it },
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                             hiddenSourceCardId = hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
                             onMediaClick = ::pushMediaPreview,
@@ -8097,8 +8197,11 @@ fun WeiboApp() {
             // A nested detail pop returns to another detail; it must not expose the
             // main navigation bar during that in-layer transition.
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
-            val bottomBarNavVisible = (visitedUserId == null || profileIsExiting) &&
-                (selectedItem == null || detailExiting || detailSwipeReturningHome)
+            val topicSearchForeground = selectedTab == MainTab.Search &&
+                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
+            val bottomBarNavVisible = topicSearchForeground ||
+                ((visitedUserId == null || profileIsExiting) &&
+                    (selectedItem == null || detailExiting || detailSwipeReturningHome))
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
                     withFrameNanos { }
@@ -8146,6 +8249,20 @@ fun WeiboApp() {
                     onTabChange = { tab ->
                         bottomBarVisible = true
                         bottomBarScrollDistance[0] = 0f
+                        if (tab != selectedTab && topicSearchForeground) {
+                            // Explicit tab navigation leaves the retained source
+                            // stack; only Back should return to its detail page.
+                            navStack = emptyList()
+                            navOverlayStack = emptyList()
+                            navEnterPendingKind = null
+                            navExitPendingKind = null
+                            selectedItem = null
+                            if (visitedUserId != null) clearVisitedProfileState()
+                            searchReturnBackground = null
+                            searchSystemReturnProgress = null
+                            searchPendingQuery = null
+                            searchPendingMode = null
+                        }
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {
@@ -8751,10 +8868,10 @@ private fun FollowFeedScreen(
     onItemClick: (FeedItem, Rect?) -> Unit,
     onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item, null) },
     onRetweetCardClick: ((FeedItem, FeedItem, Rect?) -> Unit)? = null,
-    onCommentClick: (FeedItem) -> Unit,
+    onCommentClick: (FeedItem, Rect?) -> Unit,
     onCommentLongClick: (FeedItem) -> Unit,
     onReplyToComment: (FeedItem, CommentItem) -> Unit,
-    onRepostClick: (FeedItem) -> Unit,
+    onRepostClick: (FeedItem, Rect?) -> Unit,
     onMediaClick: (FeedMedia, String) -> Unit,
     resolveFeedItem: (FeedItem) -> FeedItem = { it },
     isLongTextLoading: (FeedItem) -> Boolean = { false },
@@ -8838,9 +8955,9 @@ private fun FollowFeedScreen(
                     onToggleLike = onToggleLike,
                     onLikeClick = onLikeClick,
                     onUrlEntityClick = onUrlEntityClick,
-                    onCommentClick = { onCommentClick(resolved) },
+                    onCommentClick = { onCommentClick(resolved, cardBounds) },
                     onCommentLongClick = { onCommentLongClick(resolved) },
-                    onRepostClick = { onRepostClick(resolved) },
+                    onRepostClick = { onRepostClick(resolved, cardBounds) },
                     menuBackEnabled = feedUiOnTop,
                     showActionMenu = true,
                 )
@@ -20242,8 +20359,13 @@ private fun SearchScreen(
     onPendingSearchModeConsumed: () -> Unit,
     emoticonMap: Map<String, String>,
     listState: LazyListState,
+    hotListState: LazyListState,
     resultsBackEnabled: Boolean,
     onResultsNavigateBack: (() -> Unit)?,
+    onResultsClosed: () -> Unit,
+    onResultsBackActionChange: ((() -> Unit)?) -> Unit,
+    onCaptureResultsBackground: (() -> Unit) -> Unit,
+    onResultsReturnProgress: (Float?) -> Unit,
     onItemClick: (FeedItem, Rect?) -> Unit,
     hiddenSourceCardId: String? = null,
     onMediaClick: (FeedMedia, String) -> Unit,
@@ -20266,8 +20388,32 @@ private fun SearchScreen(
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    var activeQuery by remember { mutableStateOf<String?>(null) }
-    var activeSearchMode by remember { mutableStateOf(searchMode) }
+    val initialTopicQuery = remember { pendingQuery?.trim()?.takeIf { it.isNotBlank() } }
+    var activeQuery by remember { mutableStateOf(initialTopicQuery) }
+    val resultPageWidth = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() }
+    val resultPageOffset = remember { Animatable(if (initialTopicQuery != null) resultPageWidth else 0f) }
+    var preparedResultQuery by remember { mutableStateOf(initialTopicQuery) }
+    var resultReturnAnimating by remember { mutableStateOf(false) }
+    var resultLayoutHandoff by remember { mutableStateOf(false) }
+    LaunchedEffect(resultsBackEnabled) {
+        if (resultsBackEnabled && activeQuery == null) {
+            withFrameNanos { }
+            resultLayoutHandoff = false
+        }
+    }
+    LaunchedEffect(activeQuery) {
+        resultReturnAnimating = false
+        onResultsReturnProgress(null)
+        if (activeQuery == null) {
+            preparedResultQuery = null
+            resultPageOffset.snapTo(0f)
+        } else {
+            resultPageOffset.snapTo(resultPageWidth)
+            preparedResultQuery = activeQuery
+            resultPageOffset.animateTo(0f, tween(250, easing = DetailMotionEasing))
+        }
+    }
+    var activeSearchMode by remember { mutableStateOf(pendingSearchMode ?: searchMode) }
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
     var hotSearchLoading by remember { mutableStateOf(false) }
     var hotSearchError by remember { mutableStateOf<String?>(null) }
@@ -20288,7 +20434,7 @@ private fun SearchScreen(
     var suggestLoading by remember { mutableStateOf(false) }
     var suggestLoadingForQuery by remember { mutableStateOf("") }
     var suggestRequestGeneration by remember { mutableIntStateOf(0) }
-    var searchDraft by remember { mutableStateOf(searchBarOverlay.queryInput) }
+    var searchDraft by remember { mutableStateOf(initialTopicQuery?.let { TextFieldValue(it, TextRange(it.length)) } ?: searchBarOverlay.queryInput) }
     val latestSearchDraft by rememberUpdatedState(searchDraft)
     val searchDraftText = searchDraft.text
 
@@ -20344,22 +20490,53 @@ private fun SearchScreen(
         }
     }
 
-    fun clearSearchResults() {
+    fun clearSearchResults(notifyClosed: Boolean = true) {
         searchDraft = TextFieldValue("")
         searchBarOverlay.queryInput = TextFieldValue("")
         activeQuery = null
         activeSearchMode = searchMode
         resetSearchResults(clearActiveQuery = true)
-        scope.launch { runCatching { listState.scrollToItem(0) } }
+        if (notifyClosed) onResultsClosed()
     }
 
-    BackHandler(enabled = activeQuery != null && resultsBackEnabled) {
+    val returnFromResults: () -> Unit = {
         focusManager.clearFocus(force = true)
         keyboardController?.hide()
+        // Keep the source snapshot visible while the live list changes back to
+        // hot searches. Never expose that list when returning to the home feed.
+        resultLayoutHandoff = onResultsNavigateBack == null
+        clearSearchResults(notifyClosed = false)
         if (onResultsNavigateBack != null) {
             onResultsNavigateBack()
+            onResultsClosed()
         } else {
-            clearSearchResults()
+            scope.launch {
+                withFrameNanos { }
+                withFrameNanos { }
+                resultLayoutHandoff = false
+                onResultsClosed()
+            }
+        }
+    }
+    val latestReturnFromResults by rememberUpdatedState(returnFromResults)
+    DisposableEffect(activeQuery, resultsBackEnabled, resultReturnAnimating) {
+        onResultsBackActionChange(
+            if (activeQuery != null && resultsBackEnabled && !resultReturnAnimating) ({ latestReturnFromResults() }) else null,
+        )
+        onDispose { onResultsBackActionChange(null) }
+    }
+    BackHandler(enabled = activeQuery != null && resultsBackEnabled) {
+        if (!resultReturnAnimating) {
+            resultReturnAnimating = true
+            val returningQuery = activeQuery
+            scope.launch {
+                onResultsReturnProgress(0f)
+                resultPageOffset.animateTo(resultPageWidth, tween(250, easing = DetailMotionEasing)) {
+                    onResultsReturnProgress((value / resultPageWidth).coerceIn(0f, 1f))
+                }
+                if (activeQuery == returningQuery) latestReturnFromResults()
+                onResultsReturnProgress(null)
+            }
         }
     }
 
@@ -20369,12 +20546,15 @@ private fun SearchScreen(
     fun submitQuery(raw: String, modeOverride: SearchMode? = null) {
         val normalized = normalizeTopic(raw)
         if (normalized.isBlank()) return
+        val openResults = {
         searchHistory = searchHistoryStore.touch(normalized)
         searchDraft = TextFieldValue(normalized, TextRange(normalized.length))
         searchBarOverlay.queryInput = searchDraft
         resetSearchResults(clearActiveQuery = false)
         activeSearchMode = modeOverride ?: searchMode
         activeQuery = normalized
+        }
+        if (activeQuery == null) onCaptureResultsBackground(openResults) else openResults()
     }
 
     fun changeWeiboSort(sort: SearchWeiboSort) {
@@ -20495,7 +20675,11 @@ private fun SearchScreen(
 
     LaunchedEffect(pendingQuery, pendingSearchMode) {
         val pending = pendingQuery?.let(::normalizeTopic)?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
-        submitQuery(pending, modeOverride = pendingSearchMode)
+        if (activeQuery != pending) {
+            submitQuery(pending, modeOverride = pendingSearchMode)
+        } else {
+            searchHistory = searchHistoryStore.touch(pending)
+        }
         onPendingQueryConsumed()
         onPendingSearchModeConsumed()
     }
@@ -20568,14 +20752,14 @@ private fun SearchScreen(
         }
     }
 
-    LaunchedEffect(listState, activeQuery, searchBarVisible, searchDraftText) {
+    LaunchedEffect(hotListState, activeQuery, searchBarVisible, searchDraftText) {
         if (!searchBarVisible || activeQuery != null || searchDraftText.trim().isNotBlank()) {
             return@LaunchedEffect
         }
         var lastScrollTotal =
-            listState.firstVisibleItemIndex * 10_000 + listState.firstVisibleItemScrollOffset
+            hotListState.firstVisibleItemIndex * 10_000 + hotListState.firstVisibleItemScrollOffset
         snapshotFlow {
-            listState.firstVisibleItemIndex * 10_000 + listState.firstVisibleItemScrollOffset
+            hotListState.firstVisibleItemIndex * 10_000 + hotListState.firstVisibleItemScrollOffset
         }.collect { scrollTotal ->
             if (scrollTotal > lastScrollTotal + 8) {
                 focusManager.clearFocus(force = true)
@@ -20665,7 +20849,7 @@ private fun SearchScreen(
         }
         searchBarOverlay.onQueryInputChange = { value -> updateSearchDraft(value) }
         searchBarOverlay.onSearch = { submitQuery(latestSearchDraft.text) }
-        searchBarOverlay.onClear = ::clearSearchResults
+        searchBarOverlay.onClear = { clearSearchResults() }
         val currentSuggestTerm = searchDraftText.trim()
         searchBarOverlay.suggestions = if (suggestForQuery == currentSuggestTerm) {
             suggestResult
@@ -20704,6 +20888,16 @@ private fun SearchScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            .graphicsLayer {
+                // Keep the captured source page visible until the results are positioned
+                // offscreen; neither the landing page nor an unpositioned result may flash.
+                alpha = if (
+                    resultLayoutHandoff ||
+                    (activeQuery == null && !pendingQuery.isNullOrBlank()) ||
+                    (activeQuery != null && preparedResultQuery != activeQuery)
+                ) 0f else 1f
+                translationX = resultPageOffset.value
+            }
             .background(MaterialTheme.colorScheme.background),
     ) {
         if (!hasLoginCookie) {
@@ -20743,7 +20937,7 @@ private fun SearchScreen(
             ) {
                 Box(Modifier.fillMaxSize()) {
                     LazyColumn(
-                        state = listState,
+                        state = if (activeQuery == null) hotListState else listState,
                         flingBehavior = rememberWeiboListFlingBehavior(),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
