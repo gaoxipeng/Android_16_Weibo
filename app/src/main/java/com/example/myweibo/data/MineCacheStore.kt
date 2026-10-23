@@ -166,6 +166,7 @@ class MineCacheStore(context: Context) {
             .put("is_edited", isEdited)
             .put("edit_count", editCount)
             .put("is_pinned", isPinned)
+            .put("visibility", visibility?.apiValue)
             .put("images", images.toFeedImagesJsonArray())
             .put("medias", medias.toFeedMediasJsonArray())
             .put("media", media?.toJson())
@@ -203,6 +204,7 @@ class MineCacheStore(context: Context) {
             isEdited = optBoolean("is_edited"),
             editCount = optInt("edit_count"),
             isPinned = optBoolean("is_pinned"),
+            visibility = WeiboPostVisibility.fromApiValue(optInt("visibility", -1)),
             images = optJSONArray("images").toFeedImages(),
             medias = optJSONArray("medias").toFeedMedias()
                 .ifEmpty { optJSONObject("media")?.toFeedMedia()?.let(::listOf).orEmpty() },

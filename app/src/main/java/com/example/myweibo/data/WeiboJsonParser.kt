@@ -1447,6 +1447,10 @@ object WeiboJsonParser {
             isEdited = isEdited,
             editCount = editCount,
             isPinned = status.isPinnedStatus(),
+            visibility = WeiboPostVisibility.fromApiValue(
+                status.optJSONObject("visible")?.optInt("type", -1)
+                    ?: status.optInt("visible", status.optInt("visible_type", -1)),
+            ),
         )
         val embeddedLongText = status.optJSONObject("longText")
             ?.takeIf { hasLongTextPayload(it) }

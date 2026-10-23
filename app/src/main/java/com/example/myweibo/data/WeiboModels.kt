@@ -44,6 +44,8 @@ data class FeedItem(
     val editCount: Int = 0,
     /** 个人主页置顶微博（接口 isTop / title.text=置顶）。 */
     val isPinned: Boolean = false,
+    /** 服务端 visible.type；null 表示未提供，不猜测受限范围。 */
+    val visibility: WeiboPostVisibility? = null,
 ) {
     val media: FeedMedia?
         get() = medias.firstOrNull()

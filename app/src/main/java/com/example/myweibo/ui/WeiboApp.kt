@@ -2741,6 +2741,7 @@ private data class FeedCardActionMenuRequest(
     val item: FeedItem,
     val anchorBoundsInRoot: Rect,
     val backHandlerEnabled: Boolean,
+    val visibilityOnly: Boolean = false,
 )
 
 private data class DeleteStatusConfirmRequest(
@@ -2752,8 +2753,8 @@ private class FeedCardActionMenuController {
     var activeRequest by mutableStateOf<FeedCardActionMenuRequest?>(null)
     var menuRevealVisible by mutableStateOf(false)
 
-    fun open(item: FeedItem, anchorBoundsInRoot: Rect, backHandlerEnabled: Boolean) {
-        activeRequest = FeedCardActionMenuRequest(item, anchorBoundsInRoot, backHandlerEnabled)
+    fun open(item: FeedItem, anchorBoundsInRoot: Rect, backHandlerEnabled: Boolean, visibilityOnly: Boolean = false) {
+        activeRequest = FeedCardActionMenuRequest(item, anchorBoundsInRoot, backHandlerEnabled, visibilityOnly)
         menuRevealVisible = true
     }
 
@@ -2764,6 +2765,7 @@ private class FeedCardActionMenuController {
 }
 
 private val LocalFeedCardActionMenuController = staticCompositionLocalOf { FeedCardActionMenuController() }
+private val LocalWeiboCurrentUserId = staticCompositionLocalOf<String?> { null }
 
 private class NavTransitionCoordinator {
     var activeTransitions by mutableIntStateOf(0)
@@ -5998,6 +6000,7 @@ fun WeiboApp() {
                                 locationName = item.locationName,
                                 locationUrl = item.locationUrl,
                                 isPinned = item.isPinned,
+                                visibility = resolveFeedItem(item).visibility ?: expanded.visibility,
                             ),
                         )
                     } else {
@@ -6046,6 +6049,7 @@ fun WeiboApp() {
                             locationName = item.locationName,
                             locationUrl = item.locationUrl,
                             isPinned = item.isPinned,
+                            visibility = resolveFeedItem(item).visibility ?: expanded.visibility,
                         ),
                     )
                 }.onFailure {
@@ -6771,6 +6775,25 @@ fun WeiboApp() {
         }
     }
 
+    var changingVisibility by remember { mutableStateOf(false) }
+    fun changeStatusVisibility(item: FeedItem, visibility: WeiboPostVisibility) {
+        val currentUser = mineProfile?.id ?: activeAccountId
+        if (currentUser.isNullOrBlank() || item.authorId != currentUser || changingVisibility) return
+        changingVisibility = true
+        scope.launch {
+            try {
+                session.changeStatusVisibility(item, visibility)
+                applyExpandedItem(resolveFeedItem(item).copy(visibility = visibility))
+                operationCapsuleHint = "已设为${visibility.scopeLabel}"
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                showMessage("可见范围修改失败", error.message ?: "请稍后重试")
+            } finally {
+                changingVisibility = false
+            }
+        }
+    }
+
     LaunchedEffect(feedCacheLoaded, items.size, feedInitialScrollTarget) {
         if (!feedCacheLoaded || items.isEmpty() || feedInitialScrollReconciled) return@LaunchedEffect
         val target = feedInitialScrollTarget ?: return@LaunchedEffect
@@ -7255,6 +7278,7 @@ fun WeiboApp() {
             LocalHazeState provides hazeState,
             LocalLiquidMenuBackdrop provides menuGlassBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
+            LocalWeiboCurrentUserId provides (mineProfile?.id ?: activeAccountId),
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalPageSwipeBack provides { navigateBack() },
             LocalOpenRetweetCard provides ::openDetailFromSource,
@@ -8330,6 +8354,7 @@ fun WeiboApp() {
                 deletingStatusId = deletingStatusId,
                 favoriteOverrides = favoriteOverrides,
                 onToggleFavorite = ::toggleStatusFavorite,
+                onSetVisibility = ::changeStatusVisibility,
                 onDelete = { item, anchor ->
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
@@ -8341,6 +8366,7 @@ fun WeiboApp() {
                 deletingStatusId = deletingStatusId,
                 favoriteOverrides = favoriteOverrides,
                 onToggleFavorite = ::toggleStatusFavorite,
+                onSetVisibility = ::changeStatusVisibility,
                 onDelete = { item, anchor ->
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
@@ -9651,6 +9677,13 @@ private fun FeedCard(
             verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
         ) {
             if (showAuthorRow) {
+                Column(Modifier.fillMaxWidth()) {
+                StatusVisibilityBanner(
+                    item = item,
+                    showActionMenu = showActionMenu,
+                    backHandlerEnabled = menuBackEnabled,
+                    modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding).padding(bottom = 6.dp),
+                )
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -9674,12 +9707,13 @@ private fun FeedCard(
                             )
                         }
                     }
-                    if (showActionMenu) {
+                    if (showActionMenu && (item.visibility == null || item.visibility == WeiboPostVisibility.Public)) {
                         FeedCardActionMenu(
                             item = item,
                             backHandlerEnabled = menuBackEnabled,
                         )
                     }
+                }
                 }
             }
             Column(
@@ -10225,6 +10259,7 @@ private fun FeedCardActionMenuOverlay(
     deletingStatusId: String?,
     favoriteOverrides: Map<String, Boolean>,
     onToggleFavorite: (FeedItem, Boolean) -> Unit,
+    onSetVisibility: (FeedItem, WeiboPostVisibility) -> Unit,
     onDelete: (FeedItem, Rect) -> Unit,
 ) {
     val activeRequest = controller.activeRequest
@@ -10259,17 +10294,29 @@ private fun FeedCardActionMenuOverlay(
     }
 
     val canDelete = !currentUserId.isNullOrBlank() && request.item.authorId == currentUserId
+    var visibilityPicker by remember(request) { mutableStateOf(request.visibilityOnly && canDelete) }
+    val visibilityOptions = remember(request.item.visibility) {
+        WeiboPostVisibility.entries.filter { it != request.item.visibility }
+    }
     val isFavorited = favoriteOverrides[request.item.actionMenuKey()] ?: request.item.favorited
     val favoriteLabel = if (isFavorited) "取消收藏" else "收藏"
-    val menuLabels = remember(canDelete, favoriteLabel) {
+    val menuLabels = remember(canDelete, favoriteLabel, visibilityPicker, visibilityOptions) {
         buildList {
+            if (visibilityPicker) {
+                addAll(visibilityOptions.map { it.changeLabel })
+            } else {
             add("\u8df3\u8f6c\u5230\u5fae\u535a")
             add("\u5206\u4eab")
             add(favoriteLabel)
-            if (canDelete) add("删除微博")
+            if (canDelete) {
+                add("设置可见范围")
+                add("删除微博")
+            }
+            }
         }
     }
-    val menuHeight = if (canDelete) ActionMenuFourRowHeight else ActionMenuThreeRowHeight
+    val menuHeight = ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * menuLabels.size +
+        ActionMenuItemGap * (menuLabels.size - 1).coerceAtLeast(0)
     val gapFromButton = 6.dp
     val screenMargin = 14.dp
     val anchor = request.anchorBoundsInRoot
@@ -10328,6 +10375,19 @@ private fun FeedCardActionMenuOverlay(
                 modifier = Modifier.fillMaxSize(),
                 backdrop = backdrop,
             ) {
+                if (visibilityPicker) {
+                    visibilityOptions.forEachIndexed { index, visibility ->
+                        ImageActionRow(
+                            label = visibility.changeLabel,
+                            enabled = deletingStatusId == null,
+                            separatorBefore = index > 0,
+                            onClick = {
+                                dismissMenu()
+                                onSetVisibility(request.item, visibility)
+                            },
+                        )
+                    }
+                } else {
                 ImageActionRow(
                     label = "跳转到微博",
                     enabled = shareUrl != null,
@@ -10356,6 +10416,12 @@ private fun FeedCardActionMenuOverlay(
                 )
                 if (canDelete) {
                     ImageActionRow(
+                        label = "设置可见范围",
+                        enabled = deletingStatusId == null,
+                        separatorBefore = true,
+                        onClick = { visibilityPicker = true },
+                    )
+                    ImageActionRow(
                         label = "删除微博",
                         enabled = deletingStatusId == null,
                         separatorBefore = true,
@@ -10364,6 +10430,7 @@ private fun FeedCardActionMenuOverlay(
                             onDelete(request.item, request.anchorBoundsInRoot)
                         },
                     )
+                }
                 }
             }
         }
@@ -10430,6 +10497,32 @@ private fun DeleteStatusConfirmOverlay(
                 onClick = onDismiss,
             )
         }
+    }
+}
+
+@Composable
+private fun StatusVisibilityBanner(
+    item: FeedItem,
+    showActionMenu: Boolean = true,
+    backHandlerEnabled: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    val visibility = item.visibility?.takeUnless { it == WeiboPostVisibility.Public } ?: return
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.04f))
+            .padding(start = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = if (visibility == WeiboPostVisibility.Followers) "仅粉丝可见" else visibility.label,
+            modifier = Modifier.weight(1f).padding(vertical = 7.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        if (showActionMenu) FeedCardActionMenu(item, backHandlerEnabled)
     }
 }
 
@@ -17620,6 +17713,12 @@ private fun DetailStickyAuthorHeader(
         color = MaterialTheme.colorScheme.surface,
     ) {
         Column {
+            StatusVisibilityBanner(
+                item = item,
+                modifier = Modifier
+                    .padding(horizontal = if (embeddedInCard) FeedCardContentHorizontalPadding else 26.dp)
+                    .padding(top = if (embeddedInCard) 8.dp else topInset + 12.dp),
+            )
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -17641,7 +17740,7 @@ private fun DetailStickyAuthorHeader(
                         avatarClickable = true,
                     )
                 }
-                Box(Modifier.zIndex(1f)) {
+                if (item.visibility == null || item.visibility == WeiboPostVisibility.Public) Box(Modifier.zIndex(1f)) {
                     FeedCardActionMenu(item = item)
                 }
             }
@@ -24115,8 +24214,7 @@ private fun MineProfileHeader(
                                     text = profile?.screenName ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
                                     style = MaterialTheme.typography.headlineSmall,
                                     fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
+                                    softWrap = true,
                                 )
                                 val profileDescription = profile?.description?.takeIf { it.isNotBlank() }
                                     ?: if (!hasLoginCookie) "\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A" else null

@@ -736,6 +736,17 @@ class WeiboWebSession(context: Context) {
         assertMweiboMutationSuccess(raw, "微博发布失败")
     }
 
+    suspend fun changeStatusVisibility(item: FeedItem, visibility: WeiboPostVisibility) {
+        val id = item.id.ifBlank { item.statusId }
+        require(id.isNotBlank()) { "无效的微博 ID" }
+        val raw = postForm(
+            path = "/ajax/statuses/modifyVisible",
+            params = linkedMapOf("ids" to id, "visible" to visibility.modifyApiValue.toString()),
+            referer = "https://weibo.com/detail/${item.statusId.ifBlank { id }}",
+        )
+        WeiboJsonParser.assertMutationSuccess(raw, "可见范围修改失败")
+    }
+
     suspend fun deleteStatus(statusId: String) {
         val id = statusId.trim()
         require(id.isNotBlank()) { "微博 ID 不能为空" }
