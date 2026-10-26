@@ -171,6 +171,8 @@ data class MinePostsCache(
     val needsLinkRefresh: Boolean = false,
 )
 
+data class EditHistoryPage(val items: List<FeedItem>, val total: Int)
+
 @Immutable
 data class FeedMedia(
     val type: MediaType,

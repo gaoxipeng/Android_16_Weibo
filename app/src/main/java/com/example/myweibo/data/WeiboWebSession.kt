@@ -574,6 +574,12 @@ class WeiboWebSession(context: Context) {
         throw lastError ?: IllegalStateException("微博长文接口未返回内容")
     }
 
+    suspend fun loadEditHistory(item: FeedItem, page: Int): EditHistoryPage {
+        val raw = fetchJson("/ajax/statuses/editHistory",
+            linkedMapOf("mid" to item.id, "page" to page.toString()))
+        return WeiboJsonParser.parseEditHistory(raw, item)
+    }
+
     suspend fun loadStatusDetail(statusId: String): FeedItem? {
         val id = statusId.trim()
         if (id.isBlank()) return null

@@ -3751,6 +3751,7 @@ fun WeiboApp() {
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
     val detailActionMenuController = remember { FeedCardActionMenuController() }
+    var editHistoryItem by remember { mutableStateOf<FeedItem?>(null) }
     val navTransitionCoordinator = remember { NavTransitionCoordinator() }
     val feedListScrollCoordinator = remember { FeedListScrollCoordinator() }
     val videoPeekController = remember { VideoPeekController() }
@@ -8383,6 +8384,7 @@ fun WeiboApp() {
                 favoriteOverrides = favoriteOverrides,
                 onToggleFavorite = ::toggleStatusFavorite,
                 onSetVisibility = ::changeStatusVisibility,
+                onEditHistory = { editHistoryItem = it },
                 onDelete = { item, anchor ->
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
@@ -8395,10 +8397,14 @@ fun WeiboApp() {
                 favoriteOverrides = favoriteOverrides,
                 onToggleFavorite = ::toggleStatusFavorite,
                 onSetVisibility = ::changeStatusVisibility,
+                onEditHistory = { editHistoryItem = it },
                 onDelete = { item, anchor ->
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
             )
+            editHistoryItem?.let { item ->
+                EditHistoryViewer(item, session, emoticonMap, onDismiss = { editHistoryItem = null })
+            }
             pendingProfileFollowMenu?.let { request ->
                 DeleteStatusConfirmOverlay(
                     backdrop = menuGlassBackdrop,
@@ -10313,6 +10319,73 @@ private fun DetailFeedCardActionMenu(
 }
 
 @Composable
+private fun EditHistoryViewer(
+    original: FeedItem,
+    session: WeiboWebSession,
+    emoticonMap: Map<String, String>,
+    onDismiss: () -> Unit,
+) {
+    var revisions by remember(original.id) { mutableStateOf<List<FeedItem>>(emptyList()) }
+    var page by remember(original.id) { mutableIntStateOf(1) }
+    var retry by remember { mutableIntStateOf(0) }
+    var loading by remember { mutableStateOf(true) }
+    var hasMore by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(original.id, page, retry) {
+        loading = true
+        error = null
+        try {
+            val result = session.loadEditHistory(original, page)
+            revisions = if (page == 1) result.items else revisions + result.items
+            hasMore = result.items.isNotEmpty() && revisions.size < result.total
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            error = failure.message ?: "编辑历史加载失败"
+        } finally { loading = false }
+    }
+    Dialog(onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        BackHandler(onBack = onDismiss)
+        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding().navigationBarsPadding()) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onDismiss) { Text("返回") }
+                Text("编辑历史", style = MaterialTheme.typography.titleLarge)
+            }
+            CompositionLocalProvider(LocalHiddenFeedCardId provides null, LocalDetailCardMotion provides null) {
+                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
+                    items(revisions.size, key = { it }) { index ->
+                        Column(Modifier.padding(bottom = 8.dp)) {
+                            Text(if (index == 0) "最新版本" else "历史版本 ${index + 1}",
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.primary)
+                            FeedCard(item = revisions[index], onClick = {}, onMediaClick = { _, _ -> },
+                                emoticonMap = emoticonMap, showActionMenu = false, menuBackEnabled = false,
+                                insetRounded = true)
+                        }
+                    }
+                    item {
+                        Column(Modifier.fillMaxWidth().padding(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally) {
+                            if (loading) CircularProgressIndicator()
+                            else if (error != null) {
+                                Text(error.orEmpty())
+                                TextButton(onClick = { retry++ }) { Text("重试") }
+                            } else if (hasMore) {
+                                TextButton(onClick = { page++ }) { Text("加载更多编辑记录") }
+                            } else if (revisions.isEmpty()) Text("暂无可查看的编辑记录")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun FeedCardActionMenuOverlay(
     controller: FeedCardActionMenuController,
     backdrop: Backdrop,
@@ -10321,6 +10394,7 @@ private fun FeedCardActionMenuOverlay(
     favoriteOverrides: Map<String, Boolean>,
     onToggleFavorite: (FeedItem, Boolean) -> Unit,
     onSetVisibility: (FeedItem, WeiboPostVisibility) -> Unit,
+    onEditHistory: (FeedItem) -> Unit,
     onDelete: (FeedItem, Rect) -> Unit,
 ) {
     val activeRequest = controller.activeRequest
@@ -10361,7 +10435,7 @@ private fun FeedCardActionMenuOverlay(
     }
     val isFavorited = favoriteOverrides[request.item.actionMenuKey()] ?: request.item.favorited
     val favoriteLabel = if (isFavorited) "取消收藏" else "收藏"
-    val menuLabels = remember(canDelete, favoriteLabel, visibilityPicker, visibilityOptions) {
+    val menuLabels = remember(canDelete, favoriteLabel, visibilityPicker, visibilityOptions, request.item.isEdited) {
         buildList {
             if (visibilityPicker) {
                 addAll(visibilityOptions.map { it.changeLabel })
@@ -10369,6 +10443,7 @@ private fun FeedCardActionMenuOverlay(
             add("\u8df3\u8f6c\u5230\u5fae\u535a")
             add("\u5206\u4eab")
             add(favoriteLabel)
+            if (request.item.isEdited) add("查看编辑历史")
             if (canDelete) {
                 add("设置可见范围")
                 add("删除微博")
@@ -10475,6 +10550,12 @@ private fun FeedCardActionMenuOverlay(
                         onToggleFavorite(request.item, !isFavorited)
                     },
                 )
+                if (request.item.isEdited) {
+                    ImageActionRow(label = "查看编辑历史", enabled = true, separatorBefore = true, onClick = {
+                        dismissMenu()
+                        onEditHistory(request.item)
+                    })
+                }
                 if (canDelete) {
                     ImageActionRow(
                         label = "设置可见范围",
@@ -11806,6 +11887,10 @@ private fun VideoPeekOverlay(
     }
 
     ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
+    FullscreenVideoOrientationEffect(
+        enabled = isFullscreenMode || dismissReason == VideoPeekDismissReason.EnterFullscreen,
+        aspectRatio = aspectRatio,
+    )
 
     LaunchedEffect(inlineHosted, isFullscreenMode, resolveAnchorBounds) {
         // Keep the destination current even while the video is floating. Otherwise the
@@ -12550,18 +12635,28 @@ private fun ImageActionPreviewImage(
     val resolvedImage = remember(image, imageOwner, relatedPosts) {
         resolveFeedImageForViewer(image, imageOwner, relatedPosts)
     }
+    var originalBitmap by remember(resolvedImage) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(resolvedImage, isActive) {
+        if (isActive) originalBitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(resolvedImage) }
+    }
     var livePlaying by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
     LaunchedEffect(isActive, resolvedImage.isLivePhoto, resolvedImage.largeUrl) {
         livePlaying = isActive && resolvedImage.isLivePhoto
     }
+    Box(modifier) {
     FeedImagePreviewContent(
         image = resolvedImage,
         livePlaying = livePlaying,
         onLiveEnded = { livePlaying = false },
         isActive = isActive,
         isFullscreen = false,
-        modifier = modifier,
+        modifier = Modifier.fillMaxSize(),
     )
+    originalBitmap?.takeIf { !resolvedImage.isGif && !(resolvedImage.isLivePhoto && livePlaying) }?.let { bitmap ->
+        Image(bitmap = bitmap.asImageBitmap(), contentDescription = null,
+            contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+    }
+    }
 }
 
 private data class ActionMenuPlacement(
@@ -26221,6 +26316,18 @@ private fun ArticleReaderOverlay(
 }
 
 @Composable
+private fun FullscreenVideoOrientationEffect(enabled: Boolean, aspectRatio: Float) {
+    val activity = LocalContext.current as? android.app.Activity
+    val landscape = aspectRatio > 1f
+    DisposableEffect(activity, enabled, landscape) {
+        if (activity == null || !enabled || !landscape) return@DisposableEffect onDispose {}
+        val previous = activity.requestedOrientation
+        activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        onDispose { activity.requestedOrientation = previous }
+    }
+}
+
+@Composable
 private fun ImmersiveVideoChromeEffect(enabled: Boolean) {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
@@ -26278,6 +26385,8 @@ private fun FullscreenMediaPreview(
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
 
     ImmersiveVideoChromeEffect(enabled = true)
+    var fullscreenAspect by remember(media) { mutableFloatStateOf(feedVideoDisplayAspectRatio(media)) }
+    FullscreenVideoOrientationEffect(enabled = true, aspectRatio = fullscreenAspect)
 
     DisposableEffect(media, playbackOwnerId) {
         val key = videoPlaybackKey(media, playbackOwnerId)
@@ -26301,7 +26410,9 @@ private fun FullscreenMediaPreview(
             media = media,
             playbackOwnerId = playbackOwnerId,
             isFullscreen = true,
-            onAspectRatio = { _: Int, _: Int -> },
+            onAspectRatio = { width: Int, height: Int ->
+                if (width > 0 && height > 0) fullscreenAspect = width.toFloat() / height
+            },
             onFullscreen = onDismiss,
             onEnterFloatingPlayback = onEnterFloatingPlayback,
             modifier = Modifier.fillMaxSize(),

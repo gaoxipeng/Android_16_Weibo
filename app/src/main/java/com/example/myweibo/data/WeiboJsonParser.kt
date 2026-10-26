@@ -71,6 +71,29 @@ object WeiboJsonParser {
         return TimelinePage(items, (page + 1).toString().takeIf { more })
     }
 
+    fun parseEditHistory(raw: String, original: FeedItem): EditHistoryPage {
+        val root = JSONObject(raw)
+        if (root.has("ok") && root.optInt("ok") != 1) {
+            throw IllegalStateException(root.optString("message", root.optString("msg", "无法读取编辑历史")))
+        }
+        val data = root.optJSONObject("data") ?: root
+        val statuses = data.optJSONArray("statuses") ?: JSONArray()
+        val items = buildList {
+            for (index in 0 until statuses.length()) {
+                val revision = statuses.optJSONObject(index) ?: continue
+                val status = JSONObject(revision.toString())
+                    .put("idstr", original.id)
+                    .put("mblogid", original.statusId)
+                if (status.optJSONObject("user") == null) {
+                    status.put("user", JSONObject().put("idstr", original.authorId)
+                        .put("screen_name", original.authorName).put("avatar_hd", original.authorAvatarUrl))
+                }
+                parseStatus(status, allowRetweeted = true)?.let(::add)
+            }
+        }
+        return EditHistoryPage(items, data.optInt("total", items.size).coerceAtLeast(items.size))
+    }
+
     fun parseStatusDetail(raw: String): FeedItem? {
         val root = JSONObject(raw)
         val status = unwrapStatusDetailPayload(root) ?: return null
