@@ -7,8 +7,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-class MineCacheStore(context: Context) {
-    private val accountCacheDir = File(context.filesDir, "mine_account_cache")
+class MineCacheStore internal constructor(private val accountCacheDir: File) {
+    constructor(context: Context) : this(File(context.filesDir, "mine_account_cache"))
 
     suspend fun readProfile(accountId: String): UserProfile? =
         withContext(Dispatchers.IO) {
@@ -41,6 +41,7 @@ class MineCacheStore(context: Context) {
                     items = root.optJSONArray("items").toFeedItems(),
                     page = root.optInt("page", 1).coerceAtLeast(1),
                     hasMore = root.optBoolean("has_more", true),
+                    needsLinkRefresh = root.optInt("link_schema", 0) < 1,
                 )
             }.getOrNull()
         }
@@ -53,6 +54,7 @@ class MineCacheStore(context: Context) {
                 file.parentFile?.mkdirs()
                 file.writeText(
                     JSONObject()
+                        .put("link_schema", 1)
                         .put("page", cache.page)
                         .put("has_more", cache.hasMore)
                         .put("items", cache.items.toFeedItemsJsonArray())
@@ -165,6 +167,15 @@ class MineCacheStore(context: Context) {
             .put("is_long_text", isLongText)
             .put("requires_long_text_fetch", requiresLongTextFetch)
             .put("emoticons", JSONObject(emoticons))
+            .put("inline_image_links", JSONObject().also { links ->
+                inlineImageLinks.forEach { (url, images) -> links.put(url, images.toFeedImagesJsonArray()) }
+            })
+            .put("url_entities", JSONArray().also { links ->
+                urlEntities.forEach { entity ->
+                    links.put(JSONObject().put("short_url", entity.shortUrl).put("title", entity.title)
+                        .put("url", entity.url).put("native_url", entity.nativeUrl))
+                }
+            })
             .put("reposts_count", repostsCount)
             .put("comments_count", commentsCount)
             .put("likes_count", likesCount)
@@ -203,6 +214,24 @@ class MineCacheStore(context: Context) {
             isLongText = optBoolean("is_long_text"),
             requiresLongTextFetch = optBoolean("requires_long_text_fetch"),
             emoticons = optJSONObject("emoticons").toStringMap(),
+            inlineImageLinks = optJSONObject("inline_image_links")?.let { links ->
+                buildMap {
+                    val keys = links.keys()
+                    while (keys.hasNext()) {
+                        val url = keys.next()
+                        put(url, links.optJSONArray(url).toFeedImages())
+                    }
+                }
+            }.orEmpty(),
+            urlEntities = optJSONArray("url_entities")?.let { links ->
+                buildList {
+                    for (index in 0 until links.length()) {
+                        val link = links.optJSONObject(index) ?: continue
+                        add(FeedUrlEntity(link.optString("short_url"), link.optString("title"),
+                            link.optString("url"), link.optNullableString("native_url")))
+                    }
+                }
+            }.orEmpty(),
             repostsCount = optString("reposts_count", "0"),
             commentsCount = optString("comments_count", "0"),
             likesCount = optString("likes_count", "0"),

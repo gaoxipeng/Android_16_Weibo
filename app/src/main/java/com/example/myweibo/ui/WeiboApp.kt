@@ -385,6 +385,7 @@ import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.sortFeedTimelineItems
+import com.example.myweibo.data.completeBareUrlEntities
 import com.example.myweibo.ui.theme.MyWeiboTheme
 import com.example.myweibo.ui.theme.isAppLightTheme
 import com.example.myweibo.ui.theme.WeiboTopicBlue
@@ -6749,6 +6750,11 @@ fun WeiboApp() {
                 minePostsPage = cache.page
                 minePostsHasMore = cache.hasMore
                 minePostsError = null
+                if (cache.needsLinkRefresh) {
+                    // Old files discarded link metadata. Keep their visible content
+                    // while rehydrating it from the server once, without a manual pull.
+                    refreshMineProfile()
+                }
             }
             mineCacheStore.readAlbum(uid)?.let { page ->
                 val lookup = buildAlbumPostLookup(minePosts)
@@ -9074,7 +9080,7 @@ private fun buildStatusTokenRegex(
     val urlPattern = (inlineImageLinks.keys + urlEntities.keys)
         .sortedByDescending { it.length }
         .joinToString("|") { Regex.escape(it) }
-    val base = """#[^#\n]+#|@[\p{L}\p{N}_\-.·\u00B7\u30FB]+|\[[^\[\]]+\]"""
+    val base = """#[^#\n]+#|@[\p{L}\p{N}_\-.·\u00B7\u30FB]+|\[(?!https?://)[^\[\]]+\]"""
     val pattern = if (urlPattern.isNotEmpty()) "$base|$urlPattern" else base
     return Regex(pattern)
 }
@@ -9920,6 +9926,9 @@ private fun StatusTextSection(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
     val context = LocalContext.current
+    val resolvedUrlEntities = remember(item.text, urlEntities, inlineImageLinks) {
+        completeBareUrlEntities(item.text, urlEntities, inlineImageLinks.keys)
+    }
     val locationOpenUrl = remember(item.locationName, item.locationUrl) {
         resolveFeedLocationOpenUrl(item.locationName, item.locationUrl)
     }
@@ -9962,7 +9971,7 @@ private fun StatusTextSection(
         },
         inlineImageLinks = inlineImageLinks,
         onInlineImageClick = onInlineImageClick,
-        urlEntities = urlEntities,
+        urlEntities = resolvedUrlEntities,
         onUrlEntityClick = onUrlEntityClick,
     )
 }

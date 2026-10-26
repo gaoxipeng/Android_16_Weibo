@@ -168,6 +168,7 @@ data class MinePostsCache(
     val items: List<FeedItem>,
     val page: Int = 1,
     val hasMore: Boolean = true,
+    val needsLinkRefresh: Boolean = false,
 )
 
 @Immutable
