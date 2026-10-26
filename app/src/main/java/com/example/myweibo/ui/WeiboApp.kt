@@ -17317,6 +17317,11 @@ private fun DetailScreen(
     val currentDetailViewport by rememberUpdatedState(detailVideoViewport)
     val commentsScrollState = rememberLazyListState()
     val repostsScrollState = rememberLazyListState()
+    LaunchedEffect(item.id, commentSort) {
+        // A different ordering is a new comment list. Reset only its inner
+        // scroll position, keeping the body and pinned section header in place.
+        commentsScrollState.scrollToItem(0)
+    }
     val activeSectionScrollState by rememberUpdatedState(
         if (detailPager.currentPage == 1) repostsScrollState else commentsScrollState,
     )
