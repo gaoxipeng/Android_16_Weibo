@@ -9702,6 +9702,7 @@ private fun FeedCard(
     showAuthorRow: Boolean = true,
     menuBackEnabled: Boolean = true,
     showActionMenu: Boolean = menuBackEnabled,
+    showStatusActions: Boolean = true,
     insetRounded: Boolean = false,
     sharedDetailCard: Boolean = false,
     compactBottomSpacing: Boolean = false,
@@ -9845,7 +9846,7 @@ private fun FeedCard(
                     autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
-            if (!sharedDetailCard) TraceComposition("WeiboCard.Actions") {
+            if (showStatusActions && !sharedDetailCard) TraceComposition("WeiboCard.Actions") {
                 StatusActions(
                     modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
                     item = item,
@@ -10347,24 +10348,32 @@ private fun EditHistoryViewer(
     Dialog(onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         BackHandler(onBack = onDismiss)
+        val historyWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+        SideEffect {
+            historyWindow?.apply {
+                setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+                setDimAmount(0f)
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            }
+        }
+        NavAnimatedOverlay(
+            target = original,
+            modifier = Modifier.fillMaxSize(),
+            stackTop = true,
+            visible = true,
+            animationKey = "edit-history:${original.id}",
+            navKind = NavOverlayKind.Article,
+            onSwipeBack = onDismiss,
+        ) {
         Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
             .statusBarsPadding().navigationBarsPadding()) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = onDismiss) { Text("返回") }
-                Text("编辑历史", style = MaterialTheme.typography.titleLarge)
-            }
             CompositionLocalProvider(LocalHiddenFeedCardId provides null, LocalDetailCardMotion provides null) {
-                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 16.dp)) {
+                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp)) {
                     items(revisions.size, key = { it }) { index ->
                         Column(Modifier.padding(bottom = 8.dp)) {
-                            Text(if (index == 0) "最新版本" else "历史版本 ${index + 1}",
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary)
                             FeedCard(item = revisions[index], onClick = {}, onMediaClick = { _, _ -> },
                                 emoticonMap = emoticonMap, showActionMenu = false, menuBackEnabled = false,
-                                insetRounded = true)
+                                insetRounded = true, showStatusActions = false)
                         }
                     }
                     item {
@@ -10381,6 +10390,7 @@ private fun EditHistoryViewer(
                     }
                 }
             }
+        }
         }
     }
 }
@@ -26089,6 +26099,36 @@ private fun ArticleReaderOverlay(
     onBack: () -> Unit,
     onRetry: () -> Unit,
 ) {
+    // A separate window keeps Chromium functors outside the navigation/backdrop
+    // RenderNodes, so browsing can use hardware rendering without the drawVk crash.
+    val activityWindow = (LocalContext.current as? android.app.Activity)?.window
+    Dialog(onDismissRequest = onBack,
+        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        val readerWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+        SideEffect {
+            readerWindow?.apply {
+                setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+                setDimAmount(0f)
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
+                activityWindow?.attributes?.let { parent ->
+                    attributes = attributes.apply {
+                        preferredDisplayModeId = parent.preferredDisplayModeId
+                        preferredRefreshRate = parent.preferredRefreshRate
+                    }
+                }
+            }
+        }
+        ArticleReaderWindowContent(state, onBack, onRetry)
+    }
+}
+
+@Composable
+private fun ArticleReaderWindowContent(
+    state: ArticleOverlayState,
+    onBack: () -> Unit,
+    onRetry: () -> Unit,
+) {
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val title = state.article?.title ?: state.entity.title
     val notifyWebLink = LocalUiMessenger.current
@@ -26178,7 +26218,8 @@ private fun ArticleReaderOverlay(
                                 modifier = Modifier.fillMaxSize(),
                                 factory = { context ->
                                     WebView(context).apply {
-                                        useSafeWebRendering()
+                                        // Only safe in this standalone window, not inside captured glass layers.
+                                        setLayerType(View.LAYER_TYPE_NONE, null)
                                         importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                         settings.javaScriptEnabled = false
                                         settings.domStorageEnabled = false
@@ -26188,13 +26229,17 @@ private fun ArticleReaderOverlay(
                                 },
                                 update = { webView ->
                                     val baseUrl = state.article?.showUrl ?: "https://card.weibo.com/"
-                                    webView.loadDataWithBaseURL(
-                                        baseUrl,
-                                        wrapArticleHtml(htmlContent),
-                                        "text/html",
-                                        "UTF-8",
-                                        null,
-                                    )
+                                    val contentIdentity = baseUrl to htmlContent
+                                    if (webView.tag != contentIdentity) {
+                                        webView.tag = contentIdentity
+                                        webView.loadDataWithBaseURL(
+                                            baseUrl, wrapArticleHtml(htmlContent), "text/html", "UTF-8", null,
+                                        )
+                                    }
+                                },
+                                onRelease = { webView ->
+                                    webView.stopLoading()
+                                    webView.destroy()
                                 },
                             )
                         }
@@ -26204,7 +26249,7 @@ private fun ArticleReaderOverlay(
                             modifier = Modifier.fillMaxSize(),
                             factory = { context ->
                                 WebView(context).apply {
-                                    useSafeWebRendering()
+                                    setLayerType(View.LAYER_TYPE_NONE, null)
                                     importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
                                     settings.javaScriptEnabled = true
                                     settings.domStorageEnabled = true
