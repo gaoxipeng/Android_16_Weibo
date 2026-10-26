@@ -802,6 +802,7 @@ object WeiboJsonParser {
             coverUrls = parseProfileCoverUrls(user),
             following = user.optTruthy("following"),
             followMe = user.optTruthy("follow_me"),
+            specialFollowing = user.optTruthy("special_follow"),
         )
     }
 

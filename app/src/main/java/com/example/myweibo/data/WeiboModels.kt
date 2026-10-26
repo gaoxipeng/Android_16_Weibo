@@ -288,6 +288,7 @@ data class UserProfile(
     val coverUrls: List<String> = emptyList(),
     val following: Boolean = false,
     val followMe: Boolean = false,
+    val specialFollowing: Boolean = false,
 ) {
     val coverUrl: String?
         get() = coverUrls.firstOrNull()

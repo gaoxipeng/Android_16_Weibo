@@ -163,8 +163,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -372,6 +370,10 @@ import com.example.myweibo.data.WeiboStatusActions
 import com.example.myweibo.data.WeiboAccountStore
 import com.example.myweibo.data.WeiboJsonParser
 import com.example.myweibo.data.WeiboPostVisibility
+import com.example.myweibo.data.AppCacheCategory
+import com.example.myweibo.data.AppCacheFiles
+import com.example.myweibo.data.AppCacheSizes
+import com.example.myweibo.data.AppCacheClearResult
 import com.example.myweibo.data.WeiboWebSession
 import com.example.myweibo.data.WeiboArticle
 import com.example.myweibo.data.WeiboLinkResolver
@@ -2341,6 +2343,7 @@ private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
+private val LocalAppCacheClearAction = staticCompositionLocalOf<(suspend (AppCacheCategory?) -> AppCacheClearResult)?> { null }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
 private val LocalStaleVideoMediaRefresher =
@@ -2748,6 +2751,13 @@ private data class DeleteStatusConfirmRequest(
     val item: FeedItem,
     val anchorBoundsInRoot: Rect,
 )
+
+private data class ProfileFollowMenuRequest(
+    val profile: UserProfile,
+    val anchor: Rect,
+    val onUnfollow: () -> Unit,
+)
+private val LocalProfileFollowMenu = staticCompositionLocalOf<((Rect, () -> Unit) -> Unit)?> { null }
 
 private class FeedCardActionMenuController {
     var activeRequest by mutableStateOf<FeedCardActionMenuRequest?>(null)
@@ -3723,7 +3733,6 @@ fun WeiboApp() {
     }
     val scope = rememberCoroutineScope()
     val detailCaptureView = LocalView.current
-    val snackbarHostState = remember { SnackbarHostState() }
     val initialFollowingScroll = remember { timelineCacheStore.readFollowingScroll() }
     val feedListState = rememberLazyListState(
         initialFirstVisibleItemIndex = initialFollowingScroll.first,
@@ -3912,6 +3921,7 @@ fun WeiboApp() {
     val longTextAutoLoadSemaphore = remember { Semaphore(3) }
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var pendingDeleteStatus by remember { mutableStateOf<DeleteStatusConfirmRequest?>(null) }
+    var pendingProfileFollowMenu by remember { mutableStateOf<ProfileFollowMenuRequest?>(null) }
     var deletingStatusId by remember { mutableStateOf<String?>(null) }
     var likeUsersOverlay by remember { mutableStateOf<LikeUsersOverlayState?>(null) }
     var likeUsers by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
@@ -4018,7 +4028,7 @@ fun WeiboApp() {
 
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
-        scope.launch { snackbarHostState.showSnackbar("$title\uFF1A$detail") }
+        operationCapsuleHint = listOf(title, detail).filter { it.isNotBlank() }.joinToString("：")
     }
 
     fun absorbDiscoveredEmoticons(discovered: Map<String, String>) {
@@ -5250,7 +5260,11 @@ fun WeiboApp() {
                         persistLoginSession()
                         if (page.items.isEmpty()) {
                             feedRefreshHint = null
-                            showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
+                            if (requestedKind == TimelineKind.SpecialFollowing) {
+                                operationCapsuleHint = "暂无特别关注的微博"
+                            } else {
+                                showMessage("没有读取到微博", "请稍后刷新")
+                            }
                         } else if (showRefreshHint) {
                             feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                         } else {
@@ -7228,13 +7242,12 @@ fun WeiboApp() {
         },
         LocalAlbumVideoDetailOpener provides ::openAlbumVideoDetail,
         LocalUiMessenger provides { title, detail -> showMessage(title, detail) },
+        LocalAppCacheClearAction provides { category -> clearManagedAppCaches(context, session, category) },
         LocalTopicClickHandler provides ::openSearchTopic,
         LocalStaleVideoMediaRefresher provides ::refreshStaleVideoMedia,
     ) {
     MediaLongPressConfiguration {
-    MyWeiboScaffold(
-        snackbarHostState = snackbarHostState,
-    ) { innerPadding ->
+    MyWeiboScaffold { innerPadding ->
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
         val menuGlassBackdrop = bottomBarBackdrop
@@ -7278,8 +7291,15 @@ fun WeiboApp() {
         }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
+            LocalFullscreenPreviewStore provides homeThumbnailStore,
             LocalLiquidMenuBackdrop provides menuGlassBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
+            LocalProfileFollowMenu provides { anchor, unfollow ->
+                val profile = visitedProfile
+                if (profile != null && overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile) {
+                    pendingProfileFollowMenu = ProfileFollowMenuRequest(profile, anchor, unfollow)
+                } else unfollow()
+            },
             LocalWeiboCurrentUserId provides (mineProfile?.id ?: activeAccountId),
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalPageSwipeBack provides { navigateBack() },
@@ -8373,6 +8393,38 @@ fun WeiboApp() {
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
             )
+            pendingProfileFollowMenu?.let { request ->
+                DeleteStatusConfirmOverlay(
+                    backdrop = menuGlassBackdrop,
+                    anchorBoundsInRoot = request.anchor,
+                    deleting = visitedFollowLoading,
+                    destructiveLabel = "取消关注",
+                    secondaryLabel = if (request.profile.specialFollowing) "取消特别关注" else "特别关注",
+                    onConfirm = {
+                        pendingProfileFollowMenu = null
+                        request.onUnfollow()
+                    },
+                    onSecondaryAction = {
+                        pendingProfileFollowMenu = null
+                        scope.launch {
+                            val profile = request.profile
+                            visitedFollowLoading = true
+                            try {
+                                val next = !profile.specialFollowing
+                                session.setSpecialFollowing(profile.id, next)
+                                if (visitedProfile?.id == profile.id) visitedProfile = visitedProfile?.copy(specialFollowing = next)
+                                operationCapsuleHint = if (next) "已设为特别关注" else "已取消特别关注"
+                            } catch (error: Exception) {
+                                if (error is kotlinx.coroutines.CancellationException) throw error
+                                operationCapsuleHint = error.message ?: "设置特别关注失败"
+                            } finally {
+                                visitedFollowLoading = false
+                            }
+                        }
+                    },
+                    onDismiss = { pendingProfileFollowMenu = null },
+                )
+            }
             pendingDeleteStatus?.let { request ->
                 DeleteStatusConfirmOverlay(
                     backdrop = menuGlassBackdrop,
@@ -8590,12 +8642,10 @@ fun WeiboApp() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MyWeiboScaffold(
-    snackbarHostState: SnackbarHostState,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        snackbarHost = { SnackbarHost(snackbarHostState) },
         content = content,
     )
 }
@@ -10446,9 +10496,12 @@ private fun DeleteStatusConfirmOverlay(
     deleting: Boolean,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
+    destructiveLabel: String = "确认删除微博",
+    secondaryLabel: String = "取消",
+    onSecondaryAction: (() -> Unit)? = null,
 ) {
     BackHandler(enabled = !deleting, onBack = onDismiss)
-    val labels = remember { listOf("确认删除微博", "取消") }
+    val labels = remember(destructiveLabel, secondaryLabel) { listOf(destructiveLabel, secondaryLabel) }
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -10488,15 +10541,15 @@ private fun DeleteStatusConfirmOverlay(
             backdrop = backdrop,
         ) {
             ImageActionRow(
-                label = if (deleting) "正在删除…" else "确认删除微博",
+                label = if (deleting) "正在处理…" else destructiveLabel,
                 enabled = !deleting,
                 textColor = MaterialTheme.colorScheme.error,
                 onClick = onConfirm,
             )
             ImageActionRow(
-                label = "取消",
+                label = secondaryLabel,
                 enabled = !deleting,
-                onClick = onDismiss,
+                onClick = onSecondaryAction ?: onDismiss,
             )
         }
     }
@@ -13077,12 +13130,18 @@ private fun FullscreenImageViewer(
         resolveFeedImageForViewer(viewerImages[index], imageOwner, relatedPosts, viewerLookup)
     }
     val pagerState = rememberPagerState(pageCount = { viewerImages.size }, initialPage = initialIndex)
+    val openingPreviewStore = LocalFullscreenPreviewStore.current
+    var initialTransitionBitmap by remember(images, initialIndex) {
+        val image = viewerImageAt(initialIndex)
+        mutableStateOf(resolveFullscreenPreviewBitmap(image) ?: openingPreviewStore?.getForImage(image))
+    }
     // Both the outer morph and inner image must use one fixed aspect ratio.
     // A cropped preview bitmap must not redefine the destination mid-animation.
     val viewerAspects = remember(images, viewerLookup) { mutableMapOf<Int, Float>() }
     fun viewerAspectAt(index: Int): Float = viewerAspects.getOrPut(index) {
             val resolved = viewerImageAt(index)
-            val preview = resolveFullscreenPreviewBitmap(resolved)
+            val preview = initialTransitionBitmap?.takeIf { index == initialIndex }
+                ?: resolveFullscreenPreviewBitmap(resolved)
             when {
                 (resolved.width ?: 0) > 0 && (resolved.height ?: 0) > 0 ->
                     resolved.width!!.toFloat() / resolved.height!!
@@ -13170,6 +13229,19 @@ private fun FullscreenImageViewer(
 
     LaunchedEffect(initialIndex, animateOpenFromSource) {
         if (animateOpenFromSource && sourceBoundsByIndex[initialIndex] != null) {
+            // Never enlarge an empty pager: hold the source rectangle until an
+            // actual preview exists, then use that same bitmap for the whole morph.
+            if (initialTransitionBitmap == null) {
+                initialTransitionBitmap = withContext(Dispatchers.IO) {
+                    loadFullscreenPreviewBitmap(viewerImageAt(initialIndex))
+                }
+            }
+            if (initialTransitionBitmap == null) {
+                transitionProgress.snapTo(1f)
+                return@LaunchedEffect
+            }
+            viewerAspects.remove(initialIndex)
+            withFrameNanos { }
             transitionProgress.animateTo(
                 targetValue = 1f,
                 animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
@@ -13387,6 +13459,7 @@ private fun FullscreenImageViewer(
                     layoutAspectRatio = viewerAspectAt(page),
                     resolvedForViewer = true,
                     imageTransitionRunning = activeMorph,
+                    transitionPreviewBitmap = initialTransitionBitmap.takeIf { page == initialIndex },
                     transitionPreviewSize = if (activeMorph) androidx.compose.ui.geometry.Size(
                         morphWidth / uniformScale.coerceAtLeast(0.01f),
                         morphHeight / uniformScale.coerceAtLeast(0.01f),
@@ -13605,6 +13678,7 @@ private fun ZoomableFullscreenImage(
     allImages: List<FeedImage>,
     layoutAspectRatio: Float? = null,
     imageTransitionRunning: Boolean = false,
+    transitionPreviewBitmap: Bitmap? = null,
     transitionPreviewSize: androidx.compose.ui.geometry.Size? = null,
     resolvedForViewer: Boolean = false,
     onDismiss: () -> Unit,
@@ -13693,7 +13767,7 @@ private fun ZoomableFullscreenImage(
         }
     }
 
-    val candidateBitmap = listOfNotNull(fullscreenBitmap, previewBitmap)
+    val candidateBitmap = listOfNotNull(fullscreenBitmap, previewBitmap, transitionPreviewBitmap)
         .maxByOrNull { it.width.toLong() * it.height }
     var openingBitmap by remember(resolvedImage.largeUrl) { mutableStateOf(candidateBitmap) }
     LaunchedEffect(candidateBitmap, imageTransitionRunning) {
@@ -13701,7 +13775,7 @@ private fun ZoomableFullscreenImage(
     }
     // Finish the geometry animation with the same pixels it started with; upgrade
     // resolution afterwards without changing the image's layout rectangle.
-    val displayBitmap = if (imageTransitionRunning) openingBitmap ?: candidateBitmap else candidateBitmap
+    val displayBitmap = if (imageTransitionRunning) transitionPreviewBitmap ?: openingBitmap ?: candidateBitmap else candidateBitmap
     val showFullscreenLoading = fullscreenLoading &&
         displayBitmap != null &&
         fullscreenBitmap?.isFullscreenQuality(resolvedImage) != true
@@ -21962,6 +22036,7 @@ private fun MineScreen(
                                 ProfileFollowCapsuleButton(
                                     following = profile.following,
                                     followMe = profile.followMe,
+                                    specialFollowing = profile.specialFollowing,
                                     loading = followLoading,
                                     onClick = onFollowClick,
                                 )
@@ -22488,6 +22563,7 @@ private fun SettingsScreen(
                 item {
                     SettingsHelpEntryCard(onOpen = { showHelp = true })
                 }
+                item { SettingsCacheCard() }
                 item {
                     SettingsAboutCard(versionName = versionName)
                 }
@@ -22929,6 +23005,109 @@ private fun SettingsAccountRow(
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold,
                 )
+            }
+        }
+    }
+}
+
+private fun formatCacheBytes(bytes: Long): String = when {
+    bytes < 1024L -> "$bytes B"
+    bytes < 1024L * 1024 -> String.format(java.util.Locale.getDefault(), "%.1f KB", bytes / 1024.0)
+    bytes < 1024L * 1024 * 1024 -> String.format(java.util.Locale.getDefault(), "%.1f MB", bytes / (1024.0 * 1024))
+    else -> String.format(java.util.Locale.getDefault(), "%.2f GB", bytes / (1024.0 * 1024 * 1024))
+}
+
+@Composable
+private fun SettingsCacheCard() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val clearAction = LocalAppCacheClearAction.current ?: return
+    val showMessage = LocalUiMessenger.current
+    var expanded by remember { mutableStateOf(false) }
+    var sizes by remember { mutableStateOf<AppCacheSizes?>(null) }
+    var scanning by remember { mutableStateOf(true) }
+    var busy by remember { mutableStateOf<String?>(null) }
+    var resultText by remember { mutableStateOf<String?>(null) }
+    val reveal = remember { BringIntoViewRequester() }
+    var expandedHeight by remember { mutableIntStateOf(0) }
+
+    suspend fun refreshSizes() {
+        scanning = true
+        try {
+            sizes = withContext(Dispatchers.IO) { measureManagedAppCache(context) }
+        } finally { scanning = false }
+    }
+    LaunchedEffect(Unit) {
+        try { refreshSizes() } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            resultText = "暂时无法统计缓存，请重试"
+        }
+    }
+    LaunchedEffect(expanded, expandedHeight) {
+        if (expanded && expandedHeight > 0) {
+            withFrameNanos { }
+            reveal.bringIntoView()
+        }
+    }
+    fun clear(category: AppCacheCategory?) {
+        if (busy != null || scanning) return
+        busy = category?.label ?: "全部缓存"
+        scope.launch {
+            try {
+                val result = clearAction(category)
+                refreshSizes()
+                resultText = "已释放 ${formatCacheBytes(result.freedBytes)}" +
+                    if (result.failedFiles > 0 || result.remainingBytes > 0) "，部分正在使用或近期分享的缓存已保留" else ""
+                showMessage("缓存清理完成", resultText.orEmpty())
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                resultText = "清理未完成，请稍后重试"
+                showMessage("缓存清理未完成", error.message ?: "请稍后重试")
+            } finally { busy = null }
+        }
+    }
+
+    SettingsPlainCard {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text("清理缓存", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (scanning) "正在统计…" else sizes?.let { "缓存共 ${formatCacheBytes(it.total)}" } ?: "点击展开查看",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+            if (expanded) Column(
+                Modifier.fillMaxWidth().bringIntoViewRequester(reveal)
+                    .onSizeChanged { expandedHeight = it.height }.padding(horizontal = 16.dp, vertical = 4.dp),
+            ) {
+                AppCacheCategory.entries.forEach { category ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(category.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Text(sizes?.let { formatCacheBytes(it[category]) } ?: "—", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { clear(category) }, enabled = busy == null && !scanning && (sizes?.get(category) ?: 0) > 0) {
+                            Text(if (busy == category.label) "清理中…" else "清理")
+                        }
+                    }
+                }
+                Text("不删除账号、草稿、设置和相册文件；正在写入及近期分享的临时文件可能保留。",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                resultText?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { scope.launch { runCatching { refreshSizes() } } }, enabled = busy == null && !scanning) { Text("刷新大小") }
+                    TextButton(onClick = { clear(null) }, enabled = busy == null && !scanning && (sizes?.total ?: 0) > 0) {
+                        Text(if (busy == "全部缓存") "清理中…" else "清理全部")
+                    }
+                }
             }
         }
     }
@@ -24252,6 +24431,7 @@ private fun MineProfileHeader(
                                 ProfileFollowCapsuleButton(
                                     following = profile.following,
                                     followMe = profile.followMe,
+                                    specialFollowing = profile.specialFollowing,
                                     loading = followLoading,
                                     onClick = onFollowClick,
                                 )
@@ -24912,17 +25092,32 @@ private fun RelationUserRow(
 private fun ProfileFollowCapsuleButton(
     following: Boolean,
     followMe: Boolean = false,
+    specialFollowing: Boolean = false,
     loading: Boolean,
     onClick: () -> Unit,
 ) {
+    val followMenu = LocalProfileFollowMenu.current
+    var buttonBounds by remember { mutableStateOf<Rect?>(null) }
+    val followTextStyle = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium)
+    val textMeasurer = rememberTextMeasurer()
+    val followedWidth = with(LocalDensity.current) {
+        textMeasurer.measure(AnnotatedString("已关注"), style = followTextStyle).size.width.toDp()
+    } + 28.dp
     val mutual = following && followMe
     val label = when {
         !following -> "+\u5173\u6CE8"
+        specialFollowing -> "特别关注"
         mutual -> "\u4E92\u76F8\u5173\u6CE8"
         else -> "\u5DF2\u5173\u6CE8"
     }
     Surface(
-        onClick = onClick,
+        onClick = {
+            val bounds = buttonBounds
+            if (following && followMenu != null && bounds != null) followMenu(bounds, onClick) else onClick()
+        },
+        modifier = Modifier
+            .then(if (following) Modifier.width(followedWidth) else Modifier)
+            .onGloballyPositioned { buttonBounds = it.boundsInRoot() },
         enabled = !loading,
         shape = RoundedCornerShape(999.dp),
         color = if (following) MaterialTheme.colorScheme.surface else WeiboFollowOrange,
@@ -24934,7 +25129,7 @@ private fun ProfileFollowCapsuleButton(
     ) {
         Box(
             modifier = Modifier.padding(
-                horizontal = if (mutual) 10.dp else 14.dp,
+                horizontal = if (following) 0.dp else 14.dp,
                 vertical = 6.dp,
             ),
             contentAlignment = Alignment.Center,
@@ -24949,7 +25144,7 @@ private fun ProfileFollowCapsuleButton(
                 Text(
                     text = label,
                     style = MaterialTheme.typography.labelMedium,
-                    fontSize = if (mutual) 12.sp else MaterialTheme.typography.labelMedium.fontSize,
+                    fontSize = MaterialTheme.typography.labelMedium.fontSize,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     color = if (following) {
@@ -26520,6 +26715,10 @@ private class HomeThumbnailStore {
     private val images = mutableMapOf<String, Bitmap>()
     private val frozen = mutableSetOf<String>()
     fun get(key: String): Bitmap? = images[key]?.takeIfDrawable()
+    fun getForImage(image: FeedImage): Bitmap? {
+        val prefix = "${image.id.ifBlank { image.largeUrl }}:"
+        return images.entries.firstOrNull { it.key.startsWith(prefix) }?.value?.takeIfDrawable()
+    }
     fun mount(key: String) { mounted[key] = (mounted[key] ?: 0) + 1 }
     fun put(key: String, bitmap: Bitmap) { if (key in mounted || key in frozen) images[key] = bitmap }
     fun unmount(key: String) {
@@ -26542,6 +26741,7 @@ private class HomeThumbnailStore {
 }
 
 private val LocalHomeThumbnailStore = staticCompositionLocalOf<HomeThumbnailStore?> { null }
+private val LocalFullscreenPreviewStore = staticCompositionLocalOf<HomeThumbnailStore?> { null }
 
 private object StableFeedThumbnailCache {
     private val cache = BitmapByteCache(24 * 1024 * 1024)
@@ -26908,6 +27108,57 @@ private fun buildVideoMediaSource(
 
 private var videoCache: androidx.media3.datasource.cache.SimpleCache? = null
 private val videoCacheLock = Any()
+
+private fun measureManagedAppCache(context: android.content.Context): AppCacheSizes {
+    val base = AppCacheFiles.measure(context.cacheDir)
+    // Some WebView versions keep HTTP/code caches outside cacheDir. Measure
+    // only these allow-listed cache directories, never Cookies or Local Storage.
+    val webRoot = java.io.File(context.applicationInfo.dataDir, "app_webview")
+    val extraWebBytes = listOf(
+        "Default/Cache", "Default/HTTP Cache", "Default/Code Cache",
+        "Default/GPUCache", "GPUCache",
+    ).sumOf { relative -> AppCacheFiles.measure(java.io.File(webRoot, relative)).total }
+    return AppCacheSizes(base.bytes + (AppCacheCategory.Web to (base[AppCacheCategory.Web] + extraWebBytes)))
+}
+
+private suspend fun clearManagedAppCaches(
+    context: android.content.Context,
+    session: WeiboWebSession,
+    category: AppCacheCategory?,
+): AppCacheClearResult = withContext(Dispatchers.IO) {
+    val selected = category?.let { setOf(it) } ?: AppCacheCategory.entries.toSet()
+    val before = measureManagedAppCache(context)
+    var failures = 0
+    if (AppCacheCategory.Web in selected) {
+        // WebView HTTP cache only: never clear cookies, WebStorage or login data.
+        withContext(Dispatchers.Main) { session.webView.clearCache(true) }
+    }
+    // Let Chromium manage its open cache rather than unlinking its live files.
+    val diskCategories = selected - AppCacheCategory.Web - AppCacheCategory.Videos
+    if (AppCacheCategory.Videos in selected) {
+        synchronized(videoCacheLock) {
+            val cache = videoCache
+            if (cache != null) {
+                cache.keys.toList().forEach { key ->
+                    runCatching { cache.removeResource(key) }.onFailure { failures++ }
+                }
+                // Keep the open SimpleCache's index/lock files intact.
+            } else {
+                // Keep cache creation locked until deletion is complete, so a
+                // new player cannot open this directory midway through cleanup.
+                failures += AppCacheFiles.clearFiles(context.cacheDir, setOf(AppCacheCategory.Videos))
+            }
+        }
+    }
+    failures += AppCacheFiles.clearFiles(context.cacheDir, diskCategories)
+    if (AppCacheCategory.Images in selected) trimImageCaches(0f)
+    val after = measureManagedAppCache(context)
+    AppCacheClearResult(
+        freedBytes = (selected.sumOf { before[it] } - selected.sumOf { after[it] }).coerceAtLeast(0),
+        remainingBytes = selected.sumOf { after[it] },
+        failedFiles = failures,
+    )
+}
 
 private fun directorySizeBytes(directory: java.io.File): Long {
     if (!directory.exists()) return 0L

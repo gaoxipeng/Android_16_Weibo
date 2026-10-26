@@ -113,6 +113,9 @@ class MineCacheStore(context: Context) {
             .put("followers_count", followersCount)
             .put("statuses_count", statusesCount)
             .put("photos_count", photosCount)
+            .put("following", following)
+            .put("follow_me", followMe)
+            .put("special_follow", specialFollowing)
             .put("cover_urls", JSONArray(coverUrls))
             .put("cover_url", coverUrl)
 
@@ -136,6 +139,9 @@ class MineCacheStore(context: Context) {
             followersCount = json.optString("followers_count", "--"),
             statusesCount = json.optString("statuses_count", "--"),
             photosCount = json.optNullableString("photos_count"),
+            following = json.optBoolean("following"),
+            followMe = json.optBoolean("follow_me"),
+            specialFollowing = json.optBoolean("special_follow"),
             coverUrls = coverUrls,
         )
     }

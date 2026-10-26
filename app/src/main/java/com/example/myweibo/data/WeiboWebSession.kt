@@ -1009,7 +1009,17 @@ class WeiboWebSession(context: Context) {
             raw = raw,
             existing = current,
             expectedFollowing = false,
+        ).copy(specialFollowing = false)
+    }
+
+    suspend fun setSpecialFollowing(uid: String, enabled: Boolean) {
+        require(uid.isNotBlank()) { "无效的用户 UID" }
+        val raw = postForm(
+            path = if (enabled) "/ajax/friendships/specialAdd" else "/ajax/friendships/specialDestory",
+            params = linkedMapOf("touid" to uid),
+            referer = "https://weibo.com/u/$uid",
         )
+        WeiboJsonParser.assertMutationSuccess(raw, "设置特别关注失败")
     }
 
     suspend fun loadFriends(uid: String, page: Int, tab: FriendListTab): RelationPage {
