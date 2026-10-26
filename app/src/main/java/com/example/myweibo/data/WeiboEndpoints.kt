@@ -35,7 +35,7 @@ object WeiboEndpoints {
     fun timelinePath(kind: TimelineKind): String =
         when (kind) {
             TimelineKind.Following -> FOLLOWING
-            TimelineKind.FriendsCircle -> GROUP_TIMELINE
+            TimelineKind.FriendsCircle, TimelineKind.SpecialFollowing -> GROUP_TIMELINE
             TimelineKind.Favorites -> FAVORITES
             TimelineKind.Liked -> LIKED_STATUSES
             TimelineKind.Hot, TimelineKind.Nearby -> HOT_TIMELINE

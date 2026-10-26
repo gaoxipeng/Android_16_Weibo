@@ -296,10 +296,16 @@ data class UserProfile(
 enum class TimelineKind(val label: String) {
     Following("\u6700\u65B0\u5FAE\u535A"),
     FriendsCircle("\u597D\u53CB\u5708"),
+    SpecialFollowing("特别关注"),
     Favorites("\u6211\u7684\u6536\u85CF"),
     Liked("\u6211\u7684\u8D5E"),
     Hot("热门"),
     Nearby("同城"),
+    ;
+
+    companion object {
+        fun fromStorage(value: String?): TimelineKind = entries.firstOrNull { it.name == value } ?: Following
+    }
 }
 
 data class WeiboEmoticon(

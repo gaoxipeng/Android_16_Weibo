@@ -14,6 +14,12 @@ class FeedDisplaySettingsStore(context: Context) {
 
     fun readShowCommentLikeCount(): Boolean = prefs.getBoolean("show_comment_like_count", true)
 
+    fun readTimelineKind(): TimelineKind = TimelineKind.fromStorage(prefs.getString("home_timeline_kind", null))
+
+    fun writeTimelineKind(kind: TimelineKind) {
+        prefs.edit().putString("home_timeline_kind", kind.name).apply()
+    }
+
     fun writeShowCommentLikeCount(enabled: Boolean) {
         prefs.edit().putBoolean("show_comment_like_count", enabled).apply()
     }

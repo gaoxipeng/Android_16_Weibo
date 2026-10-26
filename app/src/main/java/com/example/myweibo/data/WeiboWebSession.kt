@@ -88,7 +88,7 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadTimeline(kind: TimelineKind, cursor: String? = null): TimelinePage {
         val raw = when (kind) {
-            TimelineKind.Following, TimelineKind.FriendsCircle,
+            TimelineKind.Following, TimelineKind.FriendsCircle, TimelineKind.SpecialFollowing,
             TimelineKind.Hot, TimelineKind.Nearby -> loadTimelineRaw(kind, cursor)
             TimelineKind.Favorites, TimelineKind.Liked -> {
                 val uid = loadCurrentUserConfig().optString("uid")
@@ -442,6 +442,17 @@ class WeiboWebSession(context: Context) {
     }
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
+        if (kind == TimelineKind.SpecialFollowing) {
+            val group = findTimelineChannel(fetchJson(WeiboEndpoints.ALL_GROUPS), kind.label)
+                ?: error("微博未提供当前账号的特别关注分组，请确认已设置特别关注")
+            return fetchJson(
+                WeiboEndpoints.GROUP_TIMELINE,
+                linkedMapOf("list_id" to group.groupId, "refresh" to "4", "count" to "25").apply {
+                    if (cursor != null) put("max_id", cursor)
+                },
+                "https://weibo.com/mygroups?gid=${group.groupId}",
+            )
+        }
         if (kind == TimelineKind.Hot || kind == TimelineKind.Nearby) {
             val channel = if (kind == TimelineKind.Hot) {
                 // The web recommendation feed has a fixed entry. allGroups is a
@@ -482,7 +493,7 @@ class WeiboWebSession(context: Context) {
             }
 
             TimelineKind.Favorites, TimelineKind.Liked -> error("\u8BE5\u9996\u9875\u7C7B\u578B\u4F7F\u7528\u4E2A\u4EBA\u4FE1\u606F\u6D41\u63A5\u53E3")
-            TimelineKind.Hot, TimelineKind.Nearby -> error("频道信息流应使用频道接口")
+            TimelineKind.Hot, TimelineKind.Nearby, TimelineKind.SpecialFollowing -> error("频道或特别关注应使用专用分支")
         }
 
         val referer = when (kind) {

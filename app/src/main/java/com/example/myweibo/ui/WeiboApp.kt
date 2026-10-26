@@ -3793,7 +3793,7 @@ fun WeiboApp() {
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
-    var timelineKind by remember { mutableStateOf(TimelineKind.Following) }
+    var timelineKind by remember { mutableStateOf(feedDisplaySettingsStore.readTimelineKind()) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -5340,6 +5340,7 @@ fun WeiboApp() {
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         timelineKind = kind
+        feedDisplaySettingsStore.writeTimelineKind(kind)
         items = emptyList()
         nextCursor = null
         feedRefreshHint = null
@@ -6691,7 +6692,8 @@ fun WeiboApp() {
     LaunchedEffect(Unit) {
         // Restore the home timeline before session/account/profile caches. Those reads can be
         // slower, but the persisted feed should be visible as soon as its own cache is ready.
-        timelineCacheStore.readFollowingTimeline()?.let { page ->
+        val cachedTimeline = if (timelineKind == TimelineKind.Following) timelineCacheStore.readFollowingTimeline() else null
+        cachedTimeline?.let { page ->
             items = sortFeedTimelineItems(page.items)
             nextCursor = page.nextCursor
             if (page.items.isNotEmpty()) {

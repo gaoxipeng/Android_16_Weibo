@@ -11,6 +11,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class TimelineAndUpdateTest {
+    @Test fun homeSelectionRoundTripsAndDefaultsSafely() {
+        com.example.myweibo.data.TimelineKind.entries.forEach { kind ->
+            assertEquals(kind, com.example.myweibo.data.TimelineKind.fromStorage(kind.name))
+        }
+        assertEquals(com.example.myweibo.data.TimelineKind.Following, com.example.myweibo.data.TimelineKind.fromStorage(null))
+        assertEquals(com.example.myweibo.data.TimelineKind.Following, com.example.myweibo.data.TimelineKind.fromStorage("removed-channel"))
+    }
+
+    @Test fun specialFollowingUsesAccountGroupRatherThanRecommendation() {
+        val raw = """{"groups":[{"title":"热门","gid":"102803"},{"title":"特别关注","gid":"account-special-group"}]}"""
+        assertEquals("account-special-group", findTimelineChannel(raw, "特别关注")?.groupId)
+        assertNull(findTimelineChannel("""{"groups":[{"title":"热门","gid":"102803"}]}""", "特别关注"))
+    }
     @Test fun sameDateUpdatesUseBuildCode() {
         assertTrue(isWeiboUpdateAvailable("20261022", 47, WeiboReleaseInfo("v20261022", 49)))
         assertTrue(isWeiboUpdateAvailable("20261022.1", 48, WeiboReleaseInfo("v20261022", 49)))
