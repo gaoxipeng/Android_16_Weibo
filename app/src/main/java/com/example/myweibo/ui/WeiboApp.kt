@@ -12778,7 +12778,7 @@ private fun MediaStrip(
                             allImages = images,
                             imageIndex = 0,
                             imageOwner = imageOwner,
-                            hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == 0,
+                            hiddenForViewer = false,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
@@ -12822,7 +12822,7 @@ private fun MediaStrip(
                                     allImages = images,
                                     imageIndex = cellIndex,
                                     imageOwner = imageOwner,
-                                    hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == cellIndex,
+                                    hiddenForViewer = false,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
@@ -13374,11 +13374,10 @@ private fun FullscreenImageViewer(
                 uniformScale = 1f
             }
             val activeMorph = morphSourceBounds != null && (transitionClosing || transition < 0.999f)
-            val effectiveBackdropAlpha = when {
-                activeMorph && transitionClosing -> (transition * backdropAlpha).coerceIn(0f, 1f)
-                sourceBoundsByIndex.isEmpty() -> (transition * backdropAlpha).coerceIn(0f, 1f)
-                else -> backdropAlpha
-            }
+            // Keep the source page intact underneath a single continuous scrim.
+            // Opening and closing use the same progress, without a black first
+            // frame or a transparent thumbnail-shaped hole in the backdrop.
+            val effectiveBackdropAlpha = (transition * backdropAlpha).coerceIn(0f, 1f)
             val morphLeft = morphCenterX - morphWidth / 2f
             val morphTop = morphCenterY - morphHeight / 2f
             val morphRight = morphCenterX + morphWidth / 2f
@@ -13393,35 +13392,11 @@ private fun FullscreenImageViewer(
                 minOf(morphWidth, morphHeight).coerceAtLeast(0f) / 2f,
             )
             val morphCornerRadiusPx = scrimCornerRadiusPx
-            when {
-                activeMorph && transitionClosing -> {
-                    MorphRevealScrim(
-                        morphLeft = morphLeft,
-                        morphTop = morphTop,
-                        morphRight = morphRight,
-                        morphBottom = morphBottom,
-                        cornerRadiusPx = scrimCornerRadiusPx,
-                        scrimColor = Color.Black.copy(alpha = effectiveBackdropAlpha),
-                    )
-                }
-                activeMorph -> {
-                    MorphRevealScrim(
-                        morphLeft = morphLeft,
-                        morphTop = morphTop,
-                        morphRight = morphRight,
-                        morphBottom = morphBottom,
-                        cornerRadiusPx = scrimCornerRadiusPx,
-                        scrimColor = Color.Black.copy(alpha = backdropAlpha),
-                    )
-                }
-                else -> {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color.Black.copy(alpha = effectiveBackdropAlpha)),
-                    )
-                }
-            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = effectiveBackdropAlpha)),
+            )
             HorizontalPager(
                 state = pagerState,
                 flingBehavior = pagerFling,
@@ -13474,7 +13449,9 @@ private fun FullscreenImageViewer(
                     },
                     hasMultipleImages = viewerImages.size > 1,
                     onBlockPagerScroll = { blockPagerScroll = it },
-                    onDragDismissProgress = { dragDismissProgress = it },
+                    onDragDismissProgress = {
+                        if (page == pagerState.currentPage && !transitionClosing) dragDismissProgress = it
+                    },
                     onRequestPageChange = { delta ->
                         scope.launch {
                             val next = (pagerState.currentPage + delta).coerceIn(0, viewerImages.lastIndex)
@@ -13865,8 +13842,10 @@ private fun ZoomableFullscreenImage(
             val dismissOffset = dismissTranslationY + dismissSnapAnim.value
             val currentScale = scale
             val layout = layoutFor(currentScale)
-            val displayedWidth = layout.fitWidthPx * currentScale
-            val displayedHeight = layout.fitHeightPx * currentScale
+            val dragProgress = (abs(dismissOffset) / (containerHeightPx * 0.48f)).coerceIn(0f, 1f)
+            val dragScale = 1f - 0.16f * FastOutSlowInEasing.transform(dragProgress)
+            val displayedWidth = layout.fitWidthPx * currentScale * dragScale
+            val displayedHeight = layout.fitHeightPx * currentScale * dragScale
             val centerX = containerWidthPx / 2f + panOffsetX
             val centerY = containerHeightPx / 2f + panOffsetY + dismissOffset
             return point.x in (centerX - displayedWidth / 2f)..(centerX + displayedWidth / 2f) &&
@@ -13877,8 +13856,10 @@ private fun ZoomableFullscreenImage(
             val currentScale = latestScaleState.value
             val layout = layoutFor(currentScale)
             val dismissOffset = dismissTranslationY + dismissSnapAnim.value
-            val displayedWidth = layout.fitWidthPx * currentScale
-            val displayedHeight = layout.fitHeightPx * currentScale
+            val dragProgress = (abs(dismissOffset) / (containerHeightPx * 0.48f)).coerceIn(0f, 1f)
+            val dragScale = 1f - 0.16f * FastOutSlowInEasing.transform(dragProgress)
+            val displayedWidth = layout.fitWidthPx * currentScale * dragScale
+            val displayedHeight = layout.fitHeightPx * currentScale * dragScale
             val centerX = containerWidthPx / 2f + latestPanOffsetXState.value
             val centerY = containerHeightPx / 2f + latestPanOffsetYState.value + dismissOffset
             return Rect(
@@ -13891,11 +13872,6 @@ private fun ZoomableFullscreenImage(
 
         fun dismissFromCurrentBounds() {
             val handoffBounds = readDisplayedBounds()
-            dismissTranslationY = 0f
-            panOffsetX = 0f
-            panOffsetY = 0f
-            scale = 1f
-            scope.launch { dismissSnapAnim.snapTo(0f) }
             onDismissFromBounds(handoffBounds)
         }
 
@@ -13911,11 +13887,8 @@ private fun ZoomableFullscreenImage(
                     .fillMaxSize()
                     .layerBackdrop(pageMenuBackdrop),
             ) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .background(Color.Black),
-                )
+                // The viewer owns the only black scrim. An opaque page-level
+                // background would hide its gesture-driven fade completely.
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -14117,16 +14090,18 @@ private fun ZoomableFullscreenImage(
                                     right = handoffCenterX + handoffWidth / 2f,
                                     bottom = handoffCenterY + handoffHeight / 2f,
                                 )
-                                dismissTranslationY = 0f
-                                panOffsetX = 0f
-                                panOffsetY = 0f
-                                scale = 1f
+                                // Keep the dragged pose while the album prepares
+                                // its target. The outer morph takes over atomically.
                                 onDismissFromBounds(handoffBounds)
                             } else {
                                 scope.launch {
                                     dismissSnapAnim.snapTo(dismissTranslationY)
                                     dismissTranslationY = 0f
-                                    dismissSnapAnim.animateTo(0f, tween(220))
+                                    dismissSnapAnim.animateTo(0f, tween(220)) {
+                                        onDragDismissProgress(
+                                            (abs(value) / (containerHeightPx * 0.48f)).coerceIn(0f, 1f),
+                                        )
+                                    }
                                     onDragDismissProgress(0f)
                                 }
                             }
@@ -14246,11 +14221,11 @@ private fun ZoomableFullscreenImage(
             val imageModifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    scaleX = currentScale * dragScale
-                    scaleY = currentScale * dragScale
-                    translationX = panOffsetX
-                    translationY = panOffsetY + dismissOffsetY
-                    alpha = dismissAlpha
+                    scaleX = if (imageTransitionRunning) 1f else currentScale * dragScale
+                    scaleY = if (imageTransitionRunning) 1f else currentScale * dragScale
+                    translationX = if (imageTransitionRunning) 0f else panOffsetX
+                    translationY = if (imageTransitionRunning) 0f else panOffsetY + dismissOffsetY
+                    alpha = if (imageTransitionRunning) 1f else dismissAlpha
                 }
             Box(modifier = imageModifier) {
                 if (resolvedImage.isGif) {
