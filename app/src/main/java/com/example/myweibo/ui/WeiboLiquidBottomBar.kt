@@ -19,7 +19,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -31,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
 import com.example.myweibo.data.TimelineKind
+import com.example.myweibo.ui.theme.isAppLightTheme
 import com.example.myweibo.ui.liquidglass.LiquidBottomTab
 import com.example.myweibo.ui.liquidglass.LiquidBottomTabs
 import com.example.myweibo.ui.liquidglass.LocalLiquidBottomTabPressProgress
@@ -44,6 +44,8 @@ internal fun WeiboLiquidBottomBar(
     selectedTab: MainTab,
     onTabChange: (MainTab) -> Unit,
     backdrop: Backdrop,
+    frostAmount: Float = 0f,
+    glassAmount: Float = 1f,
     timelineMenuExpanded: Boolean,
     onTimelineMenuExpandedChange: (Boolean) -> Unit,
     selectedTimelineKind: TimelineKind = TimelineKind.Following,
@@ -54,7 +56,8 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuGap: Dp = 4.dp,
     modifier: Modifier = Modifier,
 ) {
-    val tabContentColor = MaterialTheme.colorScheme.primary
+    val accentColor = MaterialTheme.colorScheme.primary
+    val tabContentColor = if (isAppLightTheme()) Color.Black else Color.White
     val density = LocalDensity.current
     val barHeight = 64.dp
     val tabs = MainTab.entries
@@ -81,6 +84,9 @@ internal fun WeiboLiquidBottomBar(
                     onTabChange(tabs[index])
                 },
                 backdrop = backdrop,
+                accentColor = accentColor,
+                frostAmount = frostAmount,
+                glassAmount = glassAmount,
                 tabsCount = tabs.size,
                 gestureController = tabsGestureController,
                 feedTabIndex = feedIndex,
@@ -91,7 +97,7 @@ internal fun WeiboLiquidBottomBar(
                 val pressProgress = LocalLiquidBottomTabPressProgress.current
                 tabs.forEachIndexed { index, tab ->
                     val coverage = tabCoverage(index)
-                    val tabColor = lerp(Color.Black, tabContentColor, coverage)
+                    val tabColor = tabContentColor
                     LiquidBottomTab(
                         onClick = { onTabChange(tab) },
                     ) {

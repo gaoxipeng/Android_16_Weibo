@@ -4,10 +4,15 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.EaseOut
 import androidx.compose.animation.core.spring
-import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import com.example.myweibo.ui.theme.isAppLightTheme
+import com.example.myweibo.data.bottomBarGlassBlurDp
+import com.example.myweibo.data.bottomBarGlassSurfaceAlpha
+import com.example.myweibo.data.bottomBarGlassRefractionHeightDp
+import com.example.myweibo.data.bottomBarGlassRefractionAmountDp
+import com.example.myweibo.data.bottomBarPressScale
+import com.example.myweibo.data.normalizeBottomBarGlassAmount
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
@@ -32,15 +37,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.TileMode
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
@@ -48,11 +55,14 @@ import androidx.compose.ui.util.fastRoundToInt
 import androidx.compose.ui.util.lerp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.Shadow
+import com.kyant.backdrop.shadow.InnerShadow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
@@ -71,7 +81,10 @@ fun LiquidBottomTabs(
     selectedTabIndex: () -> Int,
     onTabSelected: (index: Int) -> Unit,
     backdrop: Backdrop,
+    accentColor: Color = Color(0xFF0088FF),
     tabsCount: Int,
+    frostAmount: Float = 0f,
+    glassAmount: Float = 1f,
     modifier: Modifier = Modifier,
     gestureController: LiquidBottomTabsGestureController =
         rememberLiquidBottomTabsGestureController(),
@@ -80,11 +93,11 @@ fun LiquidBottomTabs(
     content: @Composable RowScope.() -> Unit,
 ) {
     val isLightTheme = isAppLightTheme()
-    val capsuleSurfaceColor = if (isLightTheme) {
-        Color.White.copy(alpha = 0.28f)
-    } else {
-        Color.White.copy(alpha = 0.18f)
-    }
+    val frost = normalizeBottomBarGlassAmount(frostAmount)
+    val glass = normalizeBottomBarGlassAmount(glassAmount)
+    val capsuleSurfaceColor = Color.White.copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+    val tabsBackdrop = rememberLayerBackdrop()
+    val indicatorBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
 
     BoxWithConstraints(
         modifier = modifier.graphicsLayer { clip = false },
@@ -294,7 +307,6 @@ fun LiquidBottomTabs(
         }
 
         val barShape = RoundedCornerShape(percent = 50)
-        val barBorderColor = liquidMenuBorderColor(isLightTheme)
         val glassMotionTarget by remember(density) {
             derivedStateOf {
                 val offsetThreshold = with(density) { 6.dp.toPx() }
@@ -331,66 +343,26 @@ fun LiquidBottomTabs(
                 .graphicsLayer {
                     clip = false
                     translationX = panelOffset
-                    val scale = lerp(
-                        1f,
-                        1f + 16.dp.toPx() / size.width,
-                        animatedPressProgress,
-                    )
+                    val scale = bottomBarPressScale(size.width, 16.dp.toPx(), animatedPressProgress)
                     scaleX = scale
                     scaleY = scale
                 }
                 .drawBackdrop(
                     backdrop = backdrop,
                     shape = { barShape },
-                    effects = { liquidLargeCapsuleGlassEffects() },
+                    effects = {
+                        if (frost > 0f) blur(bottomBarGlassBlurDp(frost).dp.toPx(), TileMode.Clamp)
+                        if (glass > 0f) lens(
+                            bottomBarGlassRefractionHeightDp(glass).dp.toPx(),
+                            bottomBarGlassRefractionAmountDp(glass).dp.toPx(),
+                        )
+                    },
                     highlight = { Highlight.Default },
                     shadow = { Shadow.Default },
                     onDrawSurface = { drawRect(capsuleSurfaceColor) },
                 )
-                .border(LiquidMenuBorderWidth, barBorderColor, barShape)
                 .height(64.dp)
                 .fillMaxWidth(),
-        )
-
-        Box(
-            Modifier
-                .padding(horizontal = 4.dp)
-                .graphicsLayer {
-                    clip = false
-                    transformOrigin = TransformOrigin.Center
-                    translationX = visualIndicatorValue * tabWidth + panelOffset
-                    scaleX = indicatorScaleX
-                    scaleY = indicatorScaleY
-                }
-                .drawBackdrop(
-                    backdrop = backdrop,
-                    shape = { RoundedCornerShape(percent = 50) },
-                    effects = {
-                        blur(8.dp.toPx() * (1f - animatedPressProgress), TileMode.Decal)
-                        lens(
-                            10.dp.toPx() * animatedPressProgress,
-                            14.dp.toPx() * animatedPressProgress,
-                            chromaticAberration = true,
-                        )
-                    },
-                    highlight = {
-                        Highlight.Default.copy(alpha = 0.2f + 0.6f * animatedPressProgress)
-                    },
-                    shadow = null,
-                    onDrawSurface = {
-                        drawRect(
-                            (if (isLightTheme) Color(0xFFB9BDC3) else Color(0xFF92979E)).copy(
-                                alpha = if (isLightTheme) {
-                                    lerp(0.32f, 0.015f, animatedPressProgress)
-                                } else {
-                                    lerp(0.22f, 0.01f, animatedPressProgress)
-                                },
-                            ),
-                        )
-                    },
-                )
-                .height(56.dp)
-                .fillMaxWidth(1f / tabsCount),
         )
 
         CompositionLocalProvider(
@@ -409,6 +381,9 @@ fun LiquidBottomTabs(
                     .graphicsLayer {
                         clip = false
                         translationX = panelOffset
+                        val scale = bottomBarPressScale(size.width, 16.dp.toPx(), animatedPressProgress)
+                        scaleX = scale
+                        scaleY = scale
                     }
                     .then(interactiveHighlight.modifier)
                     .height(64.dp)
@@ -416,6 +391,85 @@ fun LiquidBottomTabs(
                     .padding(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 content = content,
+            )
+
+            // Catalog's selected lens samples a separate, tinted tab layer.
+            // It is invisible and has no accessibility nodes or independent input;
+            // the existing gesture controller remains the only touch owner.
+            Row(
+                Modifier
+                    .clearAndSetSemantics { }
+                    .alpha(0f)
+                    .layerBackdrop(tabsBackdrop)
+                    .graphicsLayer {
+                        translationX = panelOffset
+                        val scale = bottomBarPressScale(size.width, 16.dp.toPx(), animatedPressProgress)
+                        scaleX = scale
+                        scaleY = scale
+                    }
+                    .drawBackdrop(
+                        backdrop = backdrop,
+                        shape = { barShape },
+                        effects = {
+                            if (frost > 0f) blur(bottomBarGlassBlurDp(frost).dp.toPx(), TileMode.Clamp)
+                            if (glass > 0f) lens(
+                                24.dp.toPx() * animatedPressProgress * glass,
+                                24.dp.toPx() * animatedPressProgress * glass,
+                            )
+                        },
+                        highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                        onDrawSurface = { drawRect(capsuleSurfaceColor) },
+                    )
+                    .height(56.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp)
+                    .graphicsLayer { colorFilter = ColorFilter.tint(accentColor) },
+                verticalAlignment = Alignment.CenterVertically,
+                content = content,
+            )
+
+            Box(
+                Modifier
+                    .padding(horizontal = 4.dp)
+                    .graphicsLayer {
+                        clip = false
+                        translationX = visualIndicatorValue * tabWidth + panelOffset
+                    }
+                    .drawBackdrop(
+                        backdrop = indicatorBackdrop,
+                        shape = { RoundedCornerShape(percent = 50) },
+                        effects = {
+                            // The selected capsule remains frosted independently of
+                            // the large bar's adjustable surface and refraction.
+                            blur(24.dp.toPx(), TileMode.Clamp)
+                            if (glass > 0f) lens(
+                                10.dp.toPx() * animatedPressProgress * glass,
+                                14.dp.toPx() * animatedPressProgress * glass,
+                                chromaticAberration = true,
+                            )
+                        },
+                        // The backdrop must receive the same centered scaling as
+                        // the visible capsule, otherwise its sampled pixels drift.
+                        layerBlock = {
+                            transformOrigin = TransformOrigin.Center
+                            scaleX = indicatorScaleX
+                            scaleY = indicatorScaleY
+                        },
+                        highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                        shadow = { Shadow(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
+                        innerShadow = {
+                            val press = animatedPressProgress.coerceIn(0f, 1f)
+                            InnerShadow(radius = 8.dp * press, alpha = press)
+                        },
+                        onDrawSurface = {
+                            val press = animatedPressProgress.coerceIn(0f, 1f)
+                            val gray = if (isLightTheme) Color.Black else Color.White
+                            drawRect(gray.copy(alpha = 0.10f))
+                            drawRect(Color.Black.copy(alpha = 0.03f * press))
+                        },
+                    )
+                    .height(56.dp)
+                    .fillMaxWidth(1f / tabsCount),
             )
 
         Box(

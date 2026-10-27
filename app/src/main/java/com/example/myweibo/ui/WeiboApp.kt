@@ -163,6 +163,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -3772,6 +3773,12 @@ fun WeiboApp() {
     var mineSettingsVisible by remember { mutableStateOf(false) }
     var hideBottomBarOnFeedScroll by remember {
         mutableStateOf(feedDisplaySettingsStore.readHideBottomBarOnScroll())
+    }
+    var bottomBarFrostAmount by remember {
+        mutableFloatStateOf(feedDisplaySettingsStore.readBottomBarFrostAmount())
+    }
+    var bottomBarGlassAmount by remember {
+        mutableFloatStateOf(feedDisplaySettingsStore.readBottomBarGlassAmount())
     }
     var suppressNextBottomBarAutoShow by remember { mutableStateOf(false) }
     // Gesture accumulation is not UI state. Making every pixel a mutableFloatState write
@@ -7955,6 +7962,16 @@ fun WeiboApp() {
                                         bottomBarScrollDistance[0] = 0f
                                     }
                                 },
+                                bottomBarFrostAmount = bottomBarFrostAmount,
+                                onBottomBarFrostAmountChange = { bottomBarFrostAmount = it },
+                                onBottomBarFrostAmountCommit = {
+                                    feedDisplaySettingsStore.writeBottomBarFrostAmount(bottomBarFrostAmount)
+                                },
+                                bottomBarGlassAmount = bottomBarGlassAmount,
+                                onBottomBarGlassAmountChange = { bottomBarGlassAmount = it },
+                                onBottomBarGlassAmountCommit = {
+                                    feedDisplaySettingsStore.writeBottomBarGlassAmount(bottomBarGlassAmount)
+                                },
                                 feedThumbnailQuality = feedThumbnailQuality,
                                 onFeedThumbnailQualityChange = { quality ->
                                     feedThumbnailQuality = quality
@@ -8390,6 +8407,8 @@ fun WeiboApp() {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
                     backdrop = bottomBarBackdrop,
+                    frostAmount = bottomBarFrostAmount,
+                    glassAmount = bottomBarGlassAmount,
                     timelineMenuExpanded = timelineMenuExpanded,
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
                     selectedTimelineKind = timelineKind,
@@ -21834,6 +21853,12 @@ private fun MineScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit = {},
     hideBottomBarOnFeedScroll: Boolean = true,
     onHideBottomBarOnFeedScrollChange: (Boolean) -> Unit = {},
+    bottomBarFrostAmount: Float = 0f,
+    onBottomBarFrostAmountChange: (Float) -> Unit = {},
+    onBottomBarFrostAmountCommit: () -> Unit = {},
+    bottomBarGlassAmount: Float = 1f,
+    onBottomBarGlassAmountChange: (Float) -> Unit = {},
+    onBottomBarGlassAmountCommit: () -> Unit = {},
     feedThumbnailQuality: FeedThumbnailQuality = FeedThumbnailQuality.Medium,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit = {},
     feedLineSpacing: FeedLineSpacing = FeedLineSpacing.Compact,
@@ -22021,6 +22046,12 @@ private fun MineScreen(
                 onBackgroundPlaybackChange = onBackgroundPlaybackChange,
                 hideBottomBarOnFeedScroll = hideBottomBarOnFeedScroll,
                 onHideBottomBarOnFeedScrollChange = onHideBottomBarOnFeedScrollChange,
+                bottomBarFrostAmount = bottomBarFrostAmount,
+                onBottomBarFrostAmountChange = onBottomBarFrostAmountChange,
+                onBottomBarFrostAmountCommit = onBottomBarFrostAmountCommit,
+                bottomBarGlassAmount = bottomBarGlassAmount,
+                onBottomBarGlassAmountChange = onBottomBarGlassAmountChange,
+                onBottomBarGlassAmountCommit = onBottomBarGlassAmountCommit,
                 feedThumbnailQuality = feedThumbnailQuality,
                 onFeedThumbnailQualityChange = onFeedThumbnailQualityChange,
                 feedLineSpacing = feedLineSpacing,
@@ -22629,6 +22660,12 @@ private fun SettingsScreen(
     onBackgroundPlaybackChange: (Boolean) -> Unit,
     hideBottomBarOnFeedScroll: Boolean,
     onHideBottomBarOnFeedScrollChange: (Boolean) -> Unit,
+    bottomBarFrostAmount: Float,
+    onBottomBarFrostAmountChange: (Float) -> Unit,
+    onBottomBarFrostAmountCommit: () -> Unit,
+    bottomBarGlassAmount: Float,
+    onBottomBarGlassAmountChange: (Float) -> Unit,
+    onBottomBarGlassAmountCommit: () -> Unit,
     feedThumbnailQuality: FeedThumbnailQuality,
     onFeedThumbnailQualityChange: (FeedThumbnailQuality) -> Unit,
     feedLineSpacing: FeedLineSpacing,
@@ -22710,6 +22747,16 @@ private fun SettingsScreen(
                     SettingsFeedDisplayCard(
                         hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
                         onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
+                    )
+                }
+                item {
+                    SettingsBottomBarGlassCard(
+                        frostAmount = bottomBarFrostAmount,
+                        onFrostChange = onBottomBarFrostAmountChange,
+                        onFrostCommit = onBottomBarFrostAmountCommit,
+                        glassAmount = bottomBarGlassAmount,
+                        onGlassChange = onBottomBarGlassAmountChange,
+                        onGlassCommit = onBottomBarGlassAmountCommit,
                     )
                 }
                 item { SettingsCommentLikeCountCard() }
@@ -23984,6 +24031,73 @@ private fun SettingsPlaybackCard(
                 onCheckedChange = onBackgroundPlaybackChange,
             )
         }
+    }
+}
+
+@Composable
+private fun SettingsBottomBarGlassCard(
+    frostAmount: Float,
+    onFrostChange: (Float) -> Unit,
+    onFrostCommit: () -> Unit,
+    glassAmount: Float,
+    onGlassChange: (Float) -> Unit,
+    onGlassCommit: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    SettingsPlainCard {
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "底栏 Liquid Glass",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
+            }
+            AnimatedVisibility(visible = expanded) {
+                Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
+                    SettingsGlassSlider("磨砂", frostAmount, onFrostChange, onFrostCommit, "透明", "白色磨砂")
+                    Spacer(Modifier.height(8.dp))
+                    SettingsGlassSlider("玻璃", glassAmount, onGlassChange, onGlassCommit, "无折射", "强折射")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsGlassSlider(
+    title: String,
+    amount: Float,
+    onAmountChange: (Float) -> Unit,
+    onAmountCommit: () -> Unit,
+    leftLabel: String,
+    rightLabel: String,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        Text(
+            "${(amount.coerceIn(0f, 1f) * 100).roundToInt()}%",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Slider(
+        value = amount.coerceIn(0f, 1f),
+        onValueChange = onAmountChange,
+        onValueChangeFinished = onAmountCommit,
+        valueRange = 0f..1f,
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(leftLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(rightLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -26143,11 +26257,13 @@ private fun AccountLoginWebView(
     val onLoginSuccessState = rememberUpdatedState(onLoginSuccess)
     val loginSuccessNotified = remember(reloadKey) { java.util.concurrent.atomic.AtomicBoolean(false) }
     val loginUrl = "https://passport.weibo.cn/signin/login"
-    val loginUserAgent =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    val loginUserAgent = remember(context) {
+        WebSettings.getDefaultUserAgent(context)
+            .replace("; wv", "")
+            .replace(" Version/4.0", "")
+    }
     val webView = remember(reloadKey) {
-        WebView(context.applicationContext).apply {
+        WebView(context).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -26162,7 +26278,7 @@ private fun AccountLoginWebView(
                 domStorageEnabled = true
                 loadsImagesAutomatically = true
                 useWideViewPort = true
-                loadWithOverviewMode = true
+                loadWithOverviewMode = false
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                 cacheMode = WebSettings.LOAD_DEFAULT
