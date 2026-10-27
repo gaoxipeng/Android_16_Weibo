@@ -1,6 +1,27 @@
 package com.example.myweibo.data
 
 object ImageUrlResolver {
+    private fun sinaImageId(url: String): String? {
+        val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return null
+        val host = uri.host?.lowercase() ?: return null
+        if (host != "sinaimg.cn" && !host.endsWith(".sinaimg.cn")) return null
+        return uri.path?.substringAfterLast('/')?.substringBeforeLast('.')?.takeIf { it.isNotBlank() }
+    }
+
+    // Feed/detail can represent the same photo by PID or by a different CDN URL.
+    fun thumbnailIdentity(image: FeedImage): String =
+        (listOf(image.largeUrl, image.thumbnailUrl) + image.downloadUrls)
+            .firstNotNullOfOrNull(::sinaImageId)
+            ?: image.id.takeIf { it.isNotBlank() && !it.startsWith("http") }
+            ?: image.largeUrl.ifBlank { image.thumbnailUrl }
+
+    fun thumbnailCacheKey(image: FeedImage, quality: FeedThumbnailQuality, previewUrl: String? = null): String =
+        "${thumbnailIdentity(image)}:$quality:$previewUrl"
+
+    fun videoCoverCacheKey(url: String?): String? = url?.takeIf { it.isNotBlank() }?.let {
+        "video-cover:${sinaImageId(it) ?: it}"
+    }
+
     private val SinaimgVariantPattern =
         Regex(
             """/(?:large|mw2000|woriginal|original|bmiddle|orj360|orj480|mw690|mw1024|thumbnail|thumb(?:180|300|150)?|small|wap360)/""",

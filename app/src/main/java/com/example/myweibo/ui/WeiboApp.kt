@@ -51,6 +51,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.MutableTransitionState
@@ -1149,12 +1150,21 @@ private val DetailMotionEasing = CubicBezierEasing(0.20f, 0.68f, 0.30f, 1f)
 private fun detailCardSpring() = androidx.compose.animation.core.keyframes<Float> {
     durationMillis = DetailTransitionDurationMs
     0f at 0 using DetailMotionEasing
-    1.004f at 206 using FastOutSlowInEasing
+    (1f + DetailCardOvershoot) at 206 using FastOutSlowInEasing
     1f at DetailTransitionDurationMs
+}
+private val DetailReturnEasing = Easing { fraction ->
+    val peak = 206f / DetailReturnDurationMs
+    if (fraction <= peak) {
+        (1f + DetailCardOvershoot) * DetailMotionEasing.transform(fraction / peak)
+    } else {
+        1f + DetailCardOvershoot *
+            (1f - FastOutSlowInEasing.transform((fraction - peak) / (1f - peak)))
+    }
 }
 private fun detailCardReturnSpec() = tween<Float>(
     durationMillis = DetailReturnDurationMs,
-    easing = DetailMotionEasing,
+    easing = DetailReturnEasing,
 )
 // ComponentCallbacks2.TRIM_MEMORY_* 在较新 SDK 中已标记 deprecated，数值仍稳定可用。
 private const val TrimMemoryRunningLow = 10
@@ -1228,6 +1238,7 @@ private fun <T> NavAnimatedOverlay(
     // 栈内仍挂载（target != null）但被上层盖住时，保持组合树不销毁，避免 LazyList 滚动位置丢失。
     val avVisible = target != null || overlayVisible
     val transitionIdentity = animationKey ?: target
+    var entrySnapshotProgress by remember(transitionIdentity) { mutableFloatStateOf(0f) }
     val nestedCardEntry = remember(transitionIdentity) {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
             pendingEnterKind is NavOverlayKind.Detail && previousDetailIdentity != null &&
@@ -1463,11 +1474,15 @@ private fun <T> NavAnimatedOverlay(
             label = "card-detail-reveal",
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
         val pageReveal = if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
+        SideEffect { entrySnapshotProgress = pageReveal }
         val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling
-        // Keep the moving detail opaque. Cross-fading it over the already visible
-        // feed produces two displaced copies of the same text/images (ghosting).
-        val sourceHandoff = 0f
         val returnSnapshot = remember(sourceImage) { sourceImage?.asImageBitmap() }
+        // The original feed card is hidden as navigation starts. Keep its
+        // captured pixels in place until the detail card is laid out, then hand
+        // off only the opening moments of the existing card motion.
+        val sourceHandoff = if (!returningPage && sourceBounds != null && returnSnapshot != null) {
+            detailEntrySnapshotAlpha(pageReveal, returnCardLayout.value != null)
+        } else 0f
         // Keep the complete viewport (including comments) during interactive drag.
         // Only hand off the source-card pixels once return has been committed.
         val sourceLayoutHandoff = if (returningPage && !nestedDetailReturnAnimating &&
@@ -1483,7 +1498,7 @@ private fun <T> NavAnimatedOverlay(
                 // scrolled into comments. Never warp text or remove its contents.
                 transformOrigin = TransformOrigin(0f, 0f)
                 val amount = if (returningPage) {
-                    if (pageReveal <= 0.001f) 1f else (1f - pageReveal).coerceIn(0f, 1f)
+                    detailCardReturnAmount(pageReveal)
                 } else 0f
                 val width = bounds.width.coerceAtLeast(1f)
                 val height = bounds.height.coerceAtLeast(1f)
@@ -1501,8 +1516,8 @@ private fun <T> NavAnimatedOverlay(
                 val cardRect = returnCardLayout.value
                 val initialWidth = if (returningPage) cardRect?.width ?: size.width else size.width
                 val initialHeight = if (returningPage) cardRect?.height ?: size.height else size.height
-                val cropWidth = initialWidth + (width - initialWidth) * amount
-                val cropHeight = initialHeight + (height - initialHeight) * amount
+                val cropWidth = (initialWidth + (width - initialWidth) * amount).coerceAtLeast(1f)
+                val cropHeight = (initialHeight + (height - initialHeight) * amount).coerceAtLeast(1f)
                 val cropLeft = if (returningPage) cardInset.x else cardInset.x * amount
                 val cropTop = if (returningPage) cardInset.y else cardInset.y * amount
                 val radius = 8.dp.toPx() * if (returningPage) 1f else max(swipeProgress, amount)
@@ -1582,6 +1597,20 @@ private fun <T> NavAnimatedOverlay(
             displayed?.let { item -> content(item) }
         }
         }
+        }
+    }
+    if (navKind is NavOverlayKind.Detail && overlayVisible &&
+        navOverlayKindsMatch(pendingEnterKind, navKind) &&
+        sourceBounds != null && sourceImage != null && !sourceImage.isRecycled) {
+        val handoff = detailEntrySnapshotAlpha(entrySnapshotProgress, returnCardLayout.value != null)
+        if (handoff > 0f) {
+            val capturedCard = remember(sourceImage) { sourceImage.asImageBitmap() }
+            Canvas(Modifier.matchParentSize()) {
+                drawImage(capturedCard, topLeft = Offset(
+                    sourceBounds.left.coerceAtLeast(0f) - overlayOrigin.x,
+                    sourceBounds.top.coerceAtLeast(0f) - overlayOrigin.y,
+                ), alpha = handoff)
+            }
         }
     }
     }
@@ -6509,6 +6538,7 @@ fun WeiboApp() {
         runCatching {
             val image = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
             android.view.PixelCopy.request(window, crop, image, { result ->
+                if (result != android.view.PixelCopy.SUCCESS) image.recycle()
                 navigateWithSource(image.takeIf { result == android.view.PixelCopy.SUCCESS })
             }, android.os.Handler(android.os.Looper.getMainLooper()))
         }.onFailure { navigateWithSource(null) }
@@ -7341,6 +7371,7 @@ fun WeiboApp() {
         }
         CompositionLocalProvider(
             LocalHazeState provides hazeState,
+            LocalHomeThumbnailStore provides homeThumbnailStore,
             LocalFullscreenPreviewStore provides homeThumbnailStore,
             LocalLiquidMenuBackdrop provides menuGlassBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
@@ -10923,7 +10954,7 @@ private fun FeedImageThumbnailContent(
     } else {
         RemoteImage(
             url = previewUrl ?: displayUrl,
-            stableThumbnailKey = "${image.id.ifBlank { image.largeUrl }}:$thumbnailQuality:$previewUrl",
+            stableThumbnailKey = ImageUrlResolver.thumbnailCacheKey(image, thumbnailQuality, previewUrl),
             fallbackUrls = if (previewUrl != null) {
                 emptyList()
             } else {
@@ -15221,6 +15252,7 @@ private fun InlineVideoPlayer(
             ) {
                 RemoteImage(
                     url = media.coverUrl,
+                    stableThumbnailKey = ImageUrlResolver.videoCoverCacheKey(media.coverUrl),
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
                 )
@@ -15441,6 +15473,7 @@ private fun WeiboVideoSurface(
                 )
                 RemoteImage(
                     url = media.coverUrl,
+                    stableThumbnailKey = ImageUrlResolver.videoCoverCacheKey(media.coverUrl),
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
                 )
@@ -16086,6 +16119,7 @@ private fun WeiboVideoSurface(
             } else if (!media.coverUrl.isNullOrBlank()) {
                 RemoteImage(
                     url = media.coverUrl.orEmpty(),
+                    stableThumbnailKey = ImageUrlResolver.videoCoverCacheKey(media.coverUrl),
                     modifier = Modifier.fillMaxSize(),
                     contentScale = if (awaitingFullscreenHandoff) {
                         ContentScale.Fit
@@ -16875,6 +16909,7 @@ private fun WeiboVideoSurface(
                 } else {
                     RemoteImage(
                         url = media.coverUrl.orEmpty(),
+                        stableThumbnailKey = ImageUrlResolver.videoCoverCacheKey(media.coverUrl),
                         modifier = Modifier
                             .fillMaxSize()
                             .background(Color.Black),
@@ -17607,10 +17642,12 @@ private fun DetailScreen(
             .graphicsLayer {
                 val target = sharedCardBounds
                 if (sharedCardMotion != null && target != null) {
+                    alpha = 1f - sharedCardMotion.sourceHandoff
                     val remaining = 1f - sharedCardMotion.progress.coerceIn(-0.05f, 1.05f)
                     translationX = (sharedCardMotion.source.left - target.left) * remaining
                     translationY = (sharedCardMotion.source.top - target.top) * remaining
                 }
+                else if (sharedCardMotion != null) alpha = 1f - sharedCardMotion.sourceHandoff
             },
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -26964,7 +27001,7 @@ private class HomeThumbnailStore {
     private val frozen = mutableSetOf<String>()
     fun get(key: String): Bitmap? = images[key]?.takeIfDrawable()
     fun getForImage(image: FeedImage): Bitmap? {
-        val prefix = "${image.id.ifBlank { image.largeUrl }}:"
+        val prefix = "${ImageUrlResolver.thumbnailIdentity(image)}:"
         return images.entries.firstOrNull { it.key.startsWith(prefix) }?.value?.takeIfDrawable()
     }
     fun mount(key: String) { mounted[key] = (mounted[key] ?: 0) + 1 }
@@ -27277,7 +27314,7 @@ private fun resolveFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
         ?.takeIfDrawable()
         ?.let { return it }
     FeedThumbnailQuality.entries.forEach { quality ->
-        val key = "${image.id.ifBlank { image.largeUrl }}:$quality:null"
+        val key = ImageUrlResolver.thumbnailCacheKey(image, quality)
         StableFeedThumbnailCache.get(key)?.takeIfDrawable()?.let { return it }
     }
     feedImageUrlCandidates(image).forEach { url ->
