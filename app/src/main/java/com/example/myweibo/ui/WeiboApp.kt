@@ -1184,6 +1184,7 @@ private fun <T> NavAnimatedOverlay(
     animationKey: Any? = null,
     visible: Boolean? = null,
     stackAnimated: Boolean = true,
+    immediateEnter: Boolean = false,
     navKind: NavOverlayKind? = null,
     pendingEnterKind: NavOverlayKind? = null,
     pendingExitKind: NavOverlayKind? = null,
@@ -1191,7 +1192,6 @@ private fun <T> NavAnimatedOverlay(
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
     returnBackground: Bitmap? = null,
-    returnBackgroundProgress: (() -> Float?)? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
@@ -1208,12 +1208,13 @@ private fun <T> NavAnimatedOverlay(
     val latestPageBack by rememberUpdatedState(pageBack)
     val latestSwipeReturnCommit by rememberUpdatedState(onSwipeReturnCommit)
     val swipeScope = rememberCoroutineScope()
-    var swipeOffset by remember { mutableFloatStateOf(0f) }
-    var swipeSettling by remember { mutableStateOf(false) }
-    var swipeCommitted by remember { mutableStateOf(false) }
-    var swipeCardReturn by remember { mutableFloatStateOf(0f) }
-    var swipeScrimAlpha by remember { mutableFloatStateOf(0f) }
-    var swipeCancelBackgroundProgress by remember { mutableFloatStateOf(0f) }
+    // A returning profile leaves gesture values in this retained host.
+    // Reset during composition, not in LaunchedEffect after its first draw.
+    val profileGestureIdentity = animationKey.takeIf { navKind is NavOverlayKind.VisitedProfile }
+    var swipeOffset by remember(profileGestureIdentity) { mutableFloatStateOf(0f) }
+    var swipeSettling by remember(profileGestureIdentity) { mutableStateOf(false) }
+    var swipeCommitted by remember(profileGestureIdentity) { mutableStateOf(false) }
+    var swipeCardReturn by remember(profileGestureIdentity) { mutableFloatStateOf(0f) }
     var overlayWidth by remember { mutableIntStateOf(1) }
     var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
     val returnCardLayout = remember(animationKey) { mutableStateOf<Rect?>(null) }
@@ -1242,8 +1243,6 @@ private fun <T> NavAnimatedOverlay(
         swipeSettling = false
         swipeCommitted = false
         swipeCardReturn = 0f
-        swipeScrimAlpha = 0f
-        swipeCancelBackgroundProgress = 0f
     }
     val swipeEnabled = stackTop && overlayVisible && navKind != null && pageBack != null &&
         pendingEnterKind == null && pendingExitKind == null
@@ -1278,7 +1277,6 @@ private fun <T> NavAnimatedOverlay(
                 }
                 change.consume()
                 swipeOffset = displacement.x.coerceIn(0f, overlayWidth.toFloat())
-                swipeScrimAlpha = (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f)
             }
             if (dragging) {
                 val velocity = tracker.calculateVelocity().x
@@ -1300,13 +1298,8 @@ private fun <T> NavAnimatedOverlay(
                         swipeCardReturn = 1f
                     } else if (!commit) {
                         val startOffset = swipeOffset
-                        val startAlpha = swipeScrimAlpha
                         animate(0f, 1f, animationSpec = tween(180, easing = FastOutSlowInEasing)) { value, _ ->
                             swipeOffset = startOffset * (1f - value)
-                            // Return to the opaque detail background, not a clear
-                            // view of the feed underneath the rebounding card.
-                            swipeScrimAlpha = startAlpha + (1f - startAlpha) * value
-                            swipeCancelBackgroundProgress = value
                         }
                     } else animate(
                         initialValue = swipeOffset,
@@ -1318,8 +1311,6 @@ private fun <T> NavAnimatedOverlay(
                         latestPageBack?.invoke()
                     } else {
                         swipeSettling = false
-                        swipeScrimAlpha = 0f
-                        swipeCancelBackgroundProgress = 0f
                     }
                 }
             }
@@ -1359,7 +1350,7 @@ private fun <T> NavAnimatedOverlay(
     var skipAnimationToken by remember { mutableIntStateOf(0) }
     // 进入/退出动画在 identity 或 pendingExit 生命周期内锁定，避免中途 effectiveEnter/Exit 变 None 导致动画被掐断。
     val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
-        if (sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
+        if (immediateEnter || sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
         else if (wantsEnterAnimation && navKind is NavOverlayKind.Detail) slideInHorizontally(
             animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
             initialOffsetX = { it },
@@ -1374,14 +1365,17 @@ private fun <T> NavAnimatedOverlay(
         )
         else if (shouldAnimateExit) exit else ExitTransition.None
     }
-    val effectiveExitHoldMillis = if (shouldAnimateExit && !swipeCommitted && sourceBounds == null) exitHoldMillis else 0L
+    // Detail's visibility/reveal transition already owns the entire exit. A
+    // second hold leaves an invisible full-screen pointer blocker over the feed.
+    val effectiveExitHoldMillis = if (shouldAnimateExit && !swipeCommitted && sourceBounds == null &&
+        navKind !is NavOverlayKind.Detail) exitHoldMillis else 0L
     // Keep one visibility transition for the detail layer. Re-keying this state for
     // each detail disposes AnimatedContent's outgoing child before it can slide away.
     val transitionStateKey: Any? = if (navKind is NavOverlayKind.Detail) "detail-overlay" else transitionIdentity
     val transitionState = remember(skipAnimationToken, transitionStateKey, if (!stackAnimated) avVisible else null) {
         // Non-animated hosts must be visible in their first composition. Waiting
         // for SideEffect exposes the empty layer beneath for one frame.
-        MutableTransitionState(if (stackAnimated) false else avVisible)
+        MutableTransitionState(if (!stackAnimated || immediateEnter) avVisible else false)
     }
     SideEffect {
         transitionState.targetState = avVisible
@@ -1440,32 +1434,19 @@ private fun <T> NavAnimatedOverlay(
         }
         return
     }
-    if (avVisible || displayed != null) {
+    // Keep pixels/input only while a page is visible or actually animating.
+    // `displayed` may outlive the visual exit for deferred navigation cleanup.
+    if (avVisible || transitionState.currentState || !transitionState.isIdle) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned { overlayOrigin = it.boundsInRoot().topLeft }) {
     returnBackground?.let { bitmap ->
         Image(bitmap.asImageBitmap(), contentDescription = null,
             modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
     }
-    returnBackgroundProgress?.let { progress ->
-        Box(Modifier.fillMaxSize().graphicsLayer {
-            alpha = (1f - (progress() ?: 1f)).coerceIn(0f, 1f)
-        }.background(
-            (if (isAppLightTheme()) Color.White else MaterialTheme.colorScheme.background)
-        ))
-    }
     if (navKind is NavOverlayKind.Detail && overlayVisible) {
         parentTarget?.let { parent ->
             Box(Modifier.fillMaxSize()) { content(parent) }
         }
-    }
-    if (overlayVisible && swipeScrimAlpha > 0f) {
-        Box(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.lerp(
-            if (isAppLightTheme()) Color.White else MaterialTheme.colorScheme.surface,
-            MaterialTheme.colorScheme.background, swipeCancelBackgroundProgress,
-        ).copy(
-            alpha = swipeScrimAlpha * (1f - swipeCardReturn).coerceIn(0f, 1f),
-        )))
     }
     AnimatedVisibility(
         visibleState = transitionState,
@@ -3865,6 +3846,7 @@ fun WeiboApp() {
     var albumDismissScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
+    var commentsSortLoading by remember { mutableStateOf(false) }
     var commentsLoadingMore by remember { mutableStateOf(false) }
     var commentsRequestJob by remember { mutableStateOf<Job?>(null) }
     var commentsCursor by remember { mutableStateOf<String?>(null) }
@@ -3899,7 +3881,6 @@ fun WeiboApp() {
     var searchPendingQuery by remember { mutableStateOf<String?>(null) }
     var searchResultsBackAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     var searchReturnBackground by remember { mutableStateOf<Bitmap?>(null) }
-    var searchSystemReturnProgress by remember { mutableStateOf<Float?>(null) }
     var searchCapturePending by remember { mutableStateOf(false) }
     var searchViewportBounds by remember { mutableStateOf<Rect?>(null) }
     var searchPendingMode by remember { mutableStateOf<SearchMode?>(null) }
@@ -3973,6 +3954,11 @@ fun WeiboApp() {
     var visitedAlbumJob by remember { mutableStateOf<Job?>(null) }
     var visitedFollowLoading by remember { mutableStateOf(false) }
     var visitedProfileLoadGeneration by remember { mutableIntStateOf(0) }
+    val profilePreviewCache = remember(activeAccountId) { mutableMapOf<String, UserProfile>() }
+    var profileOpeningJob by remember { mutableStateOf<Job?>(null) }
+    // One clock moves the incoming page and the outgoing navigation bar.
+    val profileEnterOffset = remember(visitedProfileLoadGeneration) { Animatable(1f) }
+    var profileEntryLaidOut by remember(visitedProfileLoadGeneration) { mutableStateOf(false) }
     var visitedListScrollResetGeneration by remember { mutableIntStateOf(-1) }
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
     var exitHintVisible by remember { mutableStateOf(false) }
@@ -4263,7 +4249,14 @@ fun WeiboApp() {
         loadVisitedUserAlbum(uid, visitedProfileLoadGeneration)
     }
 
-    fun loadVisitedUserProfile(lookup: ProfileLookup, keepContent: Boolean = false) {
+    fun loadVisitedUserProfile(
+        lookup: ProfileLookup,
+        keepContent: Boolean = false,
+        preparedProfile: UserProfile? = null,
+        preparedPosts: com.example.myweibo.data.TimelinePage? = null,
+        refreshPrepared: Boolean = false,
+        reloadProfile: Boolean = true,
+    ) {
         visitedAlbumJob?.cancel()
         val loadGeneration = if (keepContent) {
             visitedProfileLoadGeneration
@@ -4300,14 +4293,39 @@ fun WeiboApp() {
             }
         }
 
+        if (preparedProfile != null) {
+            visitedProfile = preparedProfile
+            if (preparedProfile.id.isNotBlank()) visitedUserId = preparedProfile.id
+            visitedUserScreenName = preparedProfile.screenName
+            if (preparedPosts != null) {
+                visitedPosts = preparedPosts.items
+                visitedPostsPage = 1
+                visitedPostsHasMore = preparedPosts.nextCursor != null
+                if (!refreshPrepared) {
+                    visitedProfileLoading = false
+                    return
+                }
+            }
+        }
         visitedProfileLoading = true
 
         scope.launch {
             try {
-                runCatching { session.loadUserProfile(lookup) }
+                runCatching {
+                    if (!reloadProfile && preparedProfile != null) preparedProfile
+                    else session.loadUserProfile(lookup)
+                }
                     .onSuccess { profile ->
+                        // Keep the entry frame's layout while it is moving. Apply
+                        // fetched metadata after entry, not midway through it.
+                        if (preparedProfile != null && refreshPrepared) {
+                            delay(NavTransitionDurationMs.toLong())
+                        }
                         if (loadGeneration != visitedProfileLoadGeneration) return@onSuccess
                         visitedProfile = profile
+                        profilePreviewCache[profile.id] = profile
+                        profilePreviewCache[profile.screenName] = profile
+                        while (profilePreviewCache.size > 48) profilePreviewCache.remove(profilePreviewCache.keys.first())
                         visitedUserId = profile.id
                         visitedUserScreenName = profile.screenName
                         runCatching { session.loadUserTimeline(profile.id) }
@@ -4323,7 +4341,7 @@ fun WeiboApp() {
                     }
                     .onFailure {
                         if (loadGeneration != visitedProfileLoadGeneration) return@onFailure
-                        if (!keepContent) {
+                        if (!keepContent && preparedProfile == null) {
                             visitedProfile = null
                         }
                         showMessage("主页加载失败", "无法读取该用户资料，请稍后重试")
@@ -5010,6 +5028,18 @@ fun WeiboApp() {
         }
         if (isCurrentUser) return
 
+        val lookup = if (value.all { it.isDigit() }) ProfileLookup.Uid(value) else ProfileLookup.ScreenName(value)
+        val knownPosts = buildList<FeedItem> {
+            fun collect(item: FeedItem) {
+                add(item)
+                item.retweetedStatus?.let(::collect)
+            }
+            (listOfNotNull(selectedItem) + items + minePosts + visitedPosts).forEach(::collect)
+        }.distinctBy { it.id }
+        fun openPreparedUser(preparedProfile: UserProfile) {
+        val preparedPosts = com.example.myweibo.data.TimelinePage(knownPosts.filter {
+            it.authorId == preparedProfile.id
+        })
         val leavingDetailForProfile = selectedItem != null
         if (leavingDetailForProfile) {
             // The detail player can be hosted by the persistent peek layer even while it
@@ -5032,12 +5062,34 @@ fun WeiboApp() {
                 commentsHasMore = true
             }
             loadVisitedUserProfile(
-                if (value.all { it.isDigit() }) {
-                    ProfileLookup.Uid(value)
-                } else {
-                    ProfileLookup.ScreenName(value)
-                },
+                lookup,
+                preparedProfile = preparedProfile,
+                preparedPosts = preparedPosts,
+                refreshPrepared = true,
+                reloadProfile = false,
             )
+        }
+        }
+        profileOpeningJob?.cancel()
+        val cached = profilePreviewCache[value]
+        if (cached != null) {
+            openPreparedUser(cached)
+        } else {
+            val sourceStack = navOverlayStack
+            val sourceTab = selectedTab
+            val sourceAccount = activeAccountId
+            profileOpeningJob = scope.launch {
+                try {
+                    val profile = session.loadUserProfile(lookup)
+                    if (sourceStack != navOverlayStack || sourceTab != selectedTab || sourceAccount != activeAccountId) return@launch
+                    profilePreviewCache[profile.id] = profile
+                    profilePreviewCache[profile.screenName] = profile
+                    openPreparedUser(profile)
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    showMessage("主页加载失败", "无法读取该用户资料，请稍后重试")
+                }
+            }
         }
     }
 
@@ -5055,20 +5107,7 @@ fun WeiboApp() {
             closeFollowList()
             return
         }
-        pushNavigation(NavOverlayKind.VisitedProfile(value)) {
-            if (selectedItem == null) {
-                comments = emptyList()
-                commentsCursor = null
-                commentsHasMore = true
-            }
-            loadVisitedUserProfile(
-                if (value.all { it.isDigit() }) {
-                    ProfileLookup.Uid(value)
-                } else {
-                    ProfileLookup.ScreenName(value)
-                },
-            )
-        }
+        openUser(value)
     }
 
     fun closeDetail() {
@@ -6079,12 +6118,13 @@ fun WeiboApp() {
         }
     }
 
-    fun reloadComments() {
+    fun reloadComments(showLoadingIndicator: Boolean = true) {
         val item = selectedItem ?: return
         commentsRequestJob?.cancel()
         val requestGeneration = detailRequestGeneration
         val requestedItemId = item.id
         val requestedSort = commentSort
+        commentsSortLoading = !showLoadingIndicator
         commentsRequestJob = scope.launch {
             commentsLoading = true
             commentsLoadingMore = false
@@ -6121,6 +6161,7 @@ fun WeiboApp() {
                 commentSort == requestedSort
             ) {
                 commentsLoading = false
+                commentsSortLoading = false
                 commentsRequestJob = null
             }
         }
@@ -6515,6 +6556,8 @@ fun WeiboApp() {
                 }
             }.onSuccess { updated ->
                 visitedProfile = updated
+                profilePreviewCache[updated.id] = updated
+                profilePreviewCache[updated.screenName] = updated
             }.onFailure { error ->
                 visitedProfile = profile.copy(following = wasFollowing)
                 showMessage("\u5173\u6CE8\u64CD\u4F5C\u5931\u8D25", error.message ?: "\u8BF7\u7A0D\u540E\u91CD\u8BD5")
@@ -6527,7 +6570,7 @@ fun WeiboApp() {
         if (sort == commentSort) return
         commentSort = sort
         commentSortStore.write(sort)
-        reloadComments()
+        reloadComments(showLoadingIndicator = false)
     }
 
     fun loadMoreComments() {
@@ -7334,9 +7377,9 @@ fun WeiboApp() {
             val profileLayerActive = navOverlayStack.any { it is NavOverlayKind.VisitedProfile } && visitedUserId != null
             val visitedProfileVisible = overlayTop == OverlayTop.VisitedProfile && profileLayerActive
             val profileIsExiting = navExitPendingKind is NavOverlayKind.VisitedProfile
-            val visitedProfileNavKind = visitedUserId
-                ?.takeIf { profileLayerActive }
-                ?.let { NavOverlayKind.VisitedProfile(it) }
+            val visitedProfileNavKind = (navOverlayStack.lastOrNull {
+                it is NavOverlayKind.VisitedProfile
+            } as? NavOverlayKind.VisitedProfile)?.takeIf { profileLayerActive }
                 ?: (navExitPendingKind as? NavOverlayKind.VisitedProfile)
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
                 followListOverlay != null
@@ -7453,7 +7496,7 @@ fun WeiboApp() {
             val feedUiOnTop = selectedTab == MainTab.Feed &&
                 visitedUserId == null &&
                 !detailOverlayVisible &&
-                navExitPendingKind == null
+                (navExitPendingKind == null || navExitPendingKind is NavOverlayKind.Detail && !detailLayerActive)
             val retainFeedBehindSearch = selectedTab == MainTab.Search &&
                 navOverlayStack.any { it == NavOverlayKind.TabSwitch } &&
                 navStack.any { it.selectedTab == MainTab.Feed }
@@ -7488,8 +7531,8 @@ fun WeiboApp() {
                 mediaPreview == null &&
                 albumViewerState == null
             val keepMineAlive = selectedTab == MainTab.Mine &&
-                visitedUserId == null &&
-                (detailOverlayItem != null ||
+                (visitedUserId != null ||
+                    detailOverlayItem != null ||
                     followListOverlay != null ||
                     articleOverlay != null ||
                     mediaPreview != null ||
@@ -7603,7 +7646,6 @@ fun WeiboApp() {
                     // identity disposes SearchScreen and loses that active query.
                     animationKey = MainTab.Search,
                     returnBackground = searchReturnBackground,
-                    returnBackgroundProgress = { searchSystemReturnProgress },
                     navKind = NavOverlayKind.TabSwitch.takeIf { searchResultsBackAction != null },
                     onSwipeBack = { searchResultsBackAction?.invoke() },
                 ) {
@@ -7624,7 +7666,6 @@ fun WeiboApp() {
                             onResultsNavigateBack = if (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch) ::navigateBack else null,
                             onResultsClosed = {
                                 searchReturnBackground = null
-                                searchSystemReturnProgress = null
                                 searchPendingQuery = null
                                 searchPendingMode = null
                             },
@@ -7633,7 +7674,6 @@ fun WeiboApp() {
                                 if (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch) ready()
                                 else captureSearchBackground(ready)
                             },
-                            onResultsReturnProgress = { searchSystemReturnProgress = it },
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                             hiddenSourceCardId = hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
                             onMediaClick = ::pushMediaPreview,
@@ -7659,7 +7699,22 @@ fun WeiboApp() {
                         )
                 }
 
-                val visitedProfileNavTarget = visitedUserId.takeIf { profileLayerActive }
+                // The route is stable even when a screen name resolves to a numeric UID.
+                // Do not replace the animated content midway through its entry.
+                val visitedProfileNavTarget = visitedProfileNavKind?.uid.takeIf { profileLayerActive }
+                LaunchedEffect(visitedProfileLoadGeneration, profileEntryLaidOut) {
+                    if (!profileEntryLaidOut || visitedProfileNavTarget == null) return@LaunchedEffect
+                    navTransitionCoordinator.onTransitionStart()
+                    try {
+                        // The incoming page has been laid out offscreen; keep the
+                        // original page visible until that frame is drawable.
+                        withFrameNanos { }
+                        profileEnterOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = FastOutSlowInEasing))
+                        if (navOverlayKindsMatch(navEnterPendingKind, visitedProfileNavKind)) navEnterPendingKind = null
+                    } finally {
+                        navTransitionCoordinator.onTransitionEnd()
+                    }
+                }
                 if (visitedProfileNavTarget != null && visitedProfileVisible) {
                     LaunchedEffect(visitedProfileLoadGeneration) {
                         if (visitedListScrollResetGeneration == visitedProfileLoadGeneration) return@LaunchedEffect
@@ -7683,17 +7738,20 @@ fun WeiboApp() {
                     visible = visitedProfileVisible,
                     animationKey = visitedProfileLoadGeneration,
                     navKind = visitedProfileNavKind,
+                    immediateEnter = true,
                     onSwipeBack = ::closeVisitedProfile,
                     // On the first tab, reserve rightward dragging for page back;
                     // the pager otherwise consumes it even though it cannot go left.
                     interceptRightSwipe = visitedMinePagerPage == MineContentTab.Posts.ordinal,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
-                    onClearPendingEnter = { navEnterPendingKind = null },
+                    onClearPendingEnter = {}, // The page/bar motion owns entry completion.
                     onClearPendingExit = ::finishVisitedProfileExit,
                 ) { uid ->
-                    key(uid) {
-                        Box(Modifier.fillMaxSize()) {
+                    key(visitedProfileLoadGeneration) {
+                        Box(Modifier.fillMaxSize()
+                            .onGloballyPositioned { profileEntryLaidOut = true }
+                            .graphicsLayer { translationX = size.width * profileEnterOffset.value }) {
                             BackHandler(
                                 enabled = visitedProfileVisible,
                                 onBack = ::closeVisitedProfile,
@@ -7764,7 +7822,7 @@ fun WeiboApp() {
 
                 NavAnimatedOverlay(
                     target = MainTab.Mine.takeIf {
-                        visitedUserId == null && selectedTab == MainTab.Mine && (mineUiOnTop || keepMineAlive)
+                        selectedTab == MainTab.Mine && (mineUiOnTop || keepMineAlive)
                     },
                     modifier = Modifier
                         .fillMaxSize()
@@ -8034,6 +8092,7 @@ fun WeiboApp() {
                                 reposts = detailSnapshot.reposts,
                                 commentSort = detailSnapshot.commentSort,
                                 isLoadingComments = detailIsActive && commentsLoading,
+                                showCommentsLoadingIndicator = !commentsSortLoading,
                                 isLoadingReposts = detailIsActive && repostsLoading,
                                 isLoadingMoreComments = detailIsActive && commentsLoadingMore,
                                 isLoadingMoreReposts = detailIsActive && repostsLoadingMore,
@@ -8252,7 +8311,11 @@ fun WeiboApp() {
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
             val topicSearchForeground = selectedTab == MainTab.Search &&
                 navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
-            val bottomBarNavVisible = topicSearchForeground ||
+            // Keep the source bar intact until the incoming profile has covered
+            // it. Its own exit must not precede the page's first animated frame.
+            val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
+                navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
+            val bottomBarNavVisible = topicSearchForeground || profileEnteringFromMain ||
                 ((visitedUserId == null || profileIsExiting) &&
                     (selectedItem == null || detailExiting || detailSwipeReturningHome))
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
@@ -8283,9 +8346,14 @@ fun WeiboApp() {
             AnimatedVisibility(
                 visible = bottomBarNavVisible && bottomBarVisible,
                 enter = slideInVertically(tween(160)) { it },
-                exit = slideOutVertically(tween(160)) { it },
+                exit = if (profileLayerActive) ExitTransition.None else slideOutVertically(tween(160)) { it },
                 modifier = Modifier
                     .align(Alignment.BottomStart)
+                    .graphicsLayer {
+                        if (profileLayerActive && navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true) {
+                            translationY = size.height * (1f - profileEnterOffset.value)
+                        }
+                    }
                     .zIndex(91f),
             ) {
                 WeiboLiquidBottomBar(
@@ -8312,7 +8380,6 @@ fun WeiboApp() {
                             selectedItem = null
                             if (visitedUserId != null) clearVisitedProfileState()
                             searchReturnBackground = null
-                            searchSystemReturnProgress = null
                             searchPendingQuery = null
                             searchPendingMode = null
                         }
@@ -8425,6 +8492,9 @@ fun WeiboApp() {
                                 val next = !profile.specialFollowing
                                 session.setSpecialFollowing(profile.id, next)
                                 if (visitedProfile?.id == profile.id) visitedProfile = visitedProfile?.copy(specialFollowing = next)
+                                val updated = profile.copy(specialFollowing = next)
+                                profilePreviewCache[updated.id] = updated
+                                profilePreviewCache[updated.screenName] = updated
                                 operationCapsuleHint = if (next) "已设为特别关注" else "已取消特别关注"
                             } catch (error: Exception) {
                                 if (error is kotlinx.coroutines.CancellationException) throw error
@@ -10699,6 +10769,7 @@ private fun AuthorRow(
     Row(verticalAlignment = Alignment.CenterVertically) {
         RemoteImage(
             url = item.authorAvatarUrl,
+            imageIdentity = "avatar:$userTarget",
             modifier = Modifier
                 .size(42.dp)
                 .clip(CircleShape)
@@ -15289,6 +15360,7 @@ private fun WeiboVideoSurface(
     ) {
         videoPlaybackKey(media, playbackOwnerId)
     }
+    var userPaused by remember(playbackKey) { mutableStateOf(false) }
     val videoCandidates = remember(media.streamUrl, media.replayUrl, media.liveStatus, media.downloadUrl, media.type) {
         when {
             isLiveReplay -> listOfNotNull(
@@ -15542,7 +15614,10 @@ private fun WeiboVideoSurface(
                 abs(option - currentSpeed)
             } ?: 1f
         }
-        if (deferPlaybackUntilSurface) {
+        if (userPaused) {
+            resumeAfterSurfaceAttach = false
+            target.pause()
+        } else if (deferPlaybackUntilSurface) {
             resumeAfterSurfaceAttach = true
             target.playWhenReady = false
             target.pause()
@@ -15620,6 +15695,7 @@ private fun WeiboVideoSurface(
                 existingInlinePlayer.playbackState != androidx.media3.common.Player.STATE_IDLE
             ) {
                 if (videoCoordinator.isPlaybackKeyActive(playbackKey) &&
+                    !userPaused &&
                     !existingInlinePlayer.isPlaying &&
                     existingInlinePlayer.playbackState != androidx.media3.common.Player.STATE_BUFFERING &&
                     !resumeAfterSurfaceAttach
@@ -15792,6 +15868,7 @@ private fun WeiboVideoSurface(
     }
 
     fun resumeInlineHandoffPlaybackIfNeeded(target: androidx.media3.exoplayer.ExoPlayer) {
+        if (userPaused) return
         if (videoCoordinator.peekPlaybackKey?.let {
                 videoCoordinator.matchesPlaybackKey(it, playbackKey)
             } == true || videoCoordinator.isFullscreenHandoffPending(playbackKey)) return
@@ -15901,9 +15978,10 @@ private fun WeiboVideoSurface(
             isDetailInlinePlayback &&
             videoCoordinator.detailHandoffActive &&
             videoCoordinator.shouldResumeInlineHandoff(playbackKey)
-        val shouldResumeOnAttach = resumeAfterSurfaceAttach || pendingDetailHandoffResume
+        val shouldResumeOnAttach = !userPaused && (resumeAfterSurfaceAttach || pendingDetailHandoffResume)
         if (!shouldResumeOnAttach) return
         fun resumePlayback() {
+            if (userPaused) return
             if (!ownsOutput() || handingInlineOutputAway() || playerViewHolder.view !== view) return
             // 浮窗本身就是本次交接的最终所有者。旧 Surface dispose/重组可能短暂清掉
             // peekPlaybackKey，不能因此拒绝恢复，否则会永久停在暂停态且播放按钮无效。
@@ -15971,7 +16049,7 @@ private fun WeiboVideoSurface(
         resumeAfterSurfaceAttach,
         videoCoordinator.pendingPeekHandoffKey,
     ) {
-        if (!isInlineFeedOrDetail || !isDetailInlinePlayback || player == null) return@LaunchedEffect
+        if (userPaused || !isInlineFeedOrDetail || !isDetailInlinePlayback || player == null) return@LaunchedEffect
         if (!ownsOutput()) return@LaunchedEffect
         if (!videoCoordinator.detailHandoffActive || handingInlineOutputAway()) return@LaunchedEffect
         if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
@@ -15979,6 +16057,7 @@ private fun WeiboVideoSurface(
         player.playWhenReady = true
         player.play()
         playerViewHolder.view?.post {
+            if (userPaused) return@post
             if (!ownsOutput() || handingInlineOutputAway() || !videoCoordinator.detailHandoffActive) return@post
             player.playWhenReady = true
             player.play()
@@ -16159,8 +16238,10 @@ private fun WeiboVideoSurface(
         }
         // Ownership changes can pause the same handed-off instance through the old mode's
         // handler. Resume only after all other owners have been stopped.
-        player.playWhenReady = true
-        player.play()
+        if (!userPaused) {
+            player.playWhenReady = true
+            player.play()
+        }
     }
 
     DisposableEffect(player) {
@@ -16365,7 +16446,7 @@ private fun WeiboVideoSurface(
         }
         // 滚回可见：仅恢复「因视口暂停」或仍挂着的 active 内联播放，避免未入屏就出声。
         if (resumeAfterSurfaceAttach) return@LaunchedEffect
-        val shouldResume = pausedByViewportState.value &&
+        val shouldResume = !userPaused && pausedByViewportState.value &&
             videoCoordinator.isPlaybackKeyActive(playbackKey)
         if (!shouldResume) return@LaunchedEffect
         player.playWhenReady = true
@@ -16387,10 +16468,14 @@ private fun WeiboVideoSurface(
 
     fun togglePlayPause() {
         showControls()
-        if (player.isPlaying) {
+        if (player.isPlaying || player.playWhenReady) {
+            userPaused = true
+            resumeAfterSurfaceAttach = false
+            videoCoordinator.clearInlineHandoffResume(playbackKey)
             player.pause()
             pausedByViewport = false
         } else {
+            userPaused = false
             if (
                 player.playbackState == androidx.media3.common.Player.STATE_ENDED ||
                 (durationMs > 0 && positionMs >= durationMs - 500)
@@ -16451,7 +16536,7 @@ private fun WeiboVideoSurface(
             val stillOwned = videoCoordinator.isPlaybackKeyActive(playbackKey) ||
                 resumeAfterSurfaceAttach ||
                 videoCoordinator.isPlaybackKeyHandoffPending(playbackKey)
-            if (stillOwned) {
+            if (stillOwned && !userPaused) {
                 player.playWhenReady = true
                 player.play()
                 resumeAfterSurfaceAttach = false
@@ -16964,22 +17049,7 @@ private fun WeiboVideoSurface(
                 durationMs = durationMs,
                 speed = displayedSpeed,
                 backdrop = videoControlBackdrop,
-                onPlayPause = {
-                    showControls()
-                    if (player.isPlaying) {
-                        player.pause()
-                        pausedByViewport = false
-                    } else {
-                        if (durationMs > 0 && positionMs >= durationMs - 500) {
-                            player.seekTo(0)
-                        }
-                        ensurePlaybackOwnership()
-                        pausedByViewport = false
-                        player.playWhenReady = true
-                        player.play()
-                    }
-                    isPlaying = player.isPlaying
-                },
+                onPlayPause = { togglePlayPause() },
                 onSeek = { target ->
                     showControls()
                     positionMs = target
@@ -17423,6 +17493,7 @@ private fun DetailScreen(
     reposts: List<CommentItem>,
     commentSort: CommentSort,
     isLoadingComments: Boolean,
+    showCommentsLoadingIndicator: Boolean = true,
     isLoadingReposts: Boolean,
     isLoadingMoreComments: Boolean = false,
     isLoadingMoreReposts: Boolean = false,
@@ -17770,14 +17841,16 @@ private fun DetailScreen(
                         LazyColumn(state = pageList, flingBehavior = rememberWeiboListFlingBehavior(),
                             modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
                             contentPadding = PaddingValues(bottom = 24.dp)) {
-                if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing) {
+                if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing &&
+                    (showingReposts || showCommentsLoadingIndicator)) {
                     item(key = "section-refresh") {
                         Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.TopCenter) {
                             AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
                         }
                     }
                 }
-                if (sectionItems.isEmpty() && isLoadingSection && !pullRefreshing) {
+                if (sectionItems.isEmpty() && isLoadingSection && !pullRefreshing &&
+                    (showingReposts || showCommentsLoadingIndicator)) {
                     item(key = "detail-section-row-0") {
                         Box(
                             Modifier
@@ -20634,7 +20707,6 @@ private fun SearchScreen(
     onResultsClosed: () -> Unit,
     onResultsBackActionChange: ((() -> Unit)?) -> Unit,
     onCaptureResultsBackground: (() -> Unit) -> Unit,
-    onResultsReturnProgress: (Float?) -> Unit,
     onItemClick: (FeedItem, Rect?) -> Unit,
     hiddenSourceCardId: String? = null,
     onMediaClick: (FeedMedia, String) -> Unit,
@@ -20672,7 +20744,6 @@ private fun SearchScreen(
     }
     LaunchedEffect(activeQuery) {
         resultReturnAnimating = false
-        onResultsReturnProgress(null)
         if (activeQuery == null) {
             preparedResultQuery = null
             resultPageOffset.snapTo(0f)
@@ -20799,12 +20870,8 @@ private fun SearchScreen(
             resultReturnAnimating = true
             val returningQuery = activeQuery
             scope.launch {
-                onResultsReturnProgress(0f)
-                resultPageOffset.animateTo(resultPageWidth, tween(250, easing = DetailMotionEasing)) {
-                    onResultsReturnProgress((value / resultPageWidth).coerceIn(0f, 1f))
-                }
+                resultPageOffset.animateTo(resultPageWidth, tween(250, easing = DetailMotionEasing))
                 if (activeQuery == returningQuery) latestReturnFromResults()
-                onResultsReturnProgress(null)
             }
         }
     }
@@ -22161,7 +22228,8 @@ private fun MineScreen(
                                 }
                             },
                     ) {
-                    key(profile?.id, profile?.description) {
+                    // Metadata arriving must not dispose the avatar/image state.
+                    key(profile?.id) {
                         MineProfileHeader(
                             profile = profile,
                             hasLoginCookie = hasLoginCookie,
@@ -22250,7 +22318,8 @@ private fun MineScreen(
                                 if (posts.isEmpty()) {
                                     item {
                                         if (hasLoginCookie && isLoading) {
-                                            MineLoadingMoreIndicator()
+                                            if (showFollowActions) ProfilePostsLoadingPlaceholder()
+                                            else MineLoadingMoreIndicator()
                                         } else if (likesPage) {
                                             EmptyState(
                                                 title = if (likesError != null) "加载失败" else "暂无赞过的微博",
@@ -23188,11 +23257,10 @@ private fun SettingsCacheCard() {
                         }
                     }
                 }
-                Text("不删除账号、草稿、设置和相册文件；正在写入及近期分享的临时文件可能保留。",
+                Text("应用启动或初始化视频缓存时，若缓存目录超过 1GB，会自动清理缓存。不删除账号、草稿、设置和已保存到相册的文件；手动清理时，正在写入及近期分享的临时文件可能保留。",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 resultText?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = { scope.launch { runCatching { refreshSizes() } } }, enabled = busy == null && !scanning) { Text("刷新大小") }
                     TextButton(onClick = { clear(null) }, enabled = busy == null && !scanning && (sizes?.total ?: 0) > 0) {
                         Text(if (busy == "全部缓存") "清理中…" else "清理全部")
                     }
@@ -24085,6 +24153,19 @@ private fun SettingsEmoticonCard(
     emoticonSyncing: Boolean,
     onSyncEmoticons: () -> Unit,
 ) {
+    val scrollBoundary = remember {
+        object : NestedScrollConnection {
+            // The bounded emoticon list owns gestures started inside it, even
+            // when it reaches an edge. Do not scroll the settings behind it.
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
+                Offset(0f, available.y)
+
+            override suspend fun onPostFling(
+                consumed: androidx.compose.ui.unit.Velocity,
+                available: androidx.compose.ui.unit.Velocity,
+            ): androidx.compose.ui.unit.Velocity = androidx.compose.ui.unit.Velocity(0f, available.y)
+        }
+    }
     val emoticonCount = emoticonMap.size
     val sortedEmoticons = remember(emoticonMap) {
         emoticonMap.entries.sortedBy { it.key }
@@ -24173,6 +24254,7 @@ private fun SettingsEmoticonCard(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(max = 360.dp)
+                                .nestedScroll(scrollBoundary)
                                 .verticalScroll(rememberScrollState()),
                         ) {
                             val gap = 6.dp
@@ -24544,6 +24626,8 @@ private fun MineProfileHeader(
             ) {
                 RemoteImage(
                     url = profile?.avatarUrl,
+                    retainPreviousImage = true,
+                    imageIdentity = profile?.id?.takeIf { it.isNotBlank() }?.let { "avatar:$it" },
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(ProfileHeaderAvatarInset)
@@ -25375,6 +25459,26 @@ private fun MineContentTabs(
                     .clip(RoundedCornerShape(999.dp))
                     .background(accent),
             )
+        }
+    }
+}
+
+@Composable
+private fun ProfilePostsLoadingPlaceholder() {
+    val fill = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+    Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        repeat(3) {
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surface).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Box(Modifier.size(40.dp).clip(CircleShape).background(fill))
+                    Box(Modifier.width(100.dp).height(12.dp).clip(RoundedCornerShape(6.dp)).background(fill))
+                }
+                Box(Modifier.fillMaxWidth().height(12.dp).clip(RoundedCornerShape(6.dp)).background(fill))
+                Box(Modifier.fillMaxWidth(0.7f).height(12.dp).clip(RoundedCornerShape(6.dp)).background(fill))
+            }
         }
     }
 }
@@ -26561,6 +26665,8 @@ private fun RemoteImage(
     placeholderBackground: Color = MaterialTheme.colorScheme.surfaceContainerHighest,
     limitConcurrency: Boolean = true,
     stableThumbnailKey: String? = null,
+    retainPreviousImage: Boolean = false,
+    imageIdentity: String? = null,
 ) {
     if (animated) {
         AnimatedRemoteImage(
@@ -26584,8 +26690,9 @@ private fun RemoteImage(
     }
     val upgradeRevision = LocalFeedImageUpgradeNotifier.current.revision
     val homeThumbnails = LocalHomeThumbnailStore.current
-    var bitmap by remember(stableThumbnailKey ?: loadKey) {
+    var bitmap by remember(stableThumbnailKey ?: imageIdentity ?: if (retainPreviousImage) "retained-image" else loadKey) {
         mutableStateOf(stableThumbnailKey?.let { homeThumbnails?.get(it) ?: StableFeedThumbnailCache.get(it) }?.takeIfDrawable()
+            ?: imageIdentity?.let { FeedBitmapCache.get(it)?.takeIfDrawable() }
             ?: FeedBitmapCache.get(cacheCandidates)?.takeIfDrawable())
     }
     DisposableEffect(homeThumbnails, stableThumbnailKey) {
@@ -26594,6 +26701,7 @@ private fun RemoteImage(
     }
     SideEffect {
         if (stableThumbnailKey != null) bitmap?.takeIfDrawable()?.let { homeThumbnails?.put(stableThumbnailKey, it) }
+        if (imageIdentity != null) bitmap?.takeIfDrawable()?.let { FeedBitmapCache.put(imageIdentity, it) }
     }
     var failed by remember(loadKey) { mutableStateOf(false) }
 
@@ -26608,7 +26716,7 @@ private fun RemoteImage(
             failed = false
             return@LaunchedEffect
         }
-        if (bitmap?.takeIfDrawable() != null) return@LaunchedEffect
+        if (!retainPreviousImage && imageIdentity == null && bitmap?.takeIfDrawable() != null) return@LaunchedEffect
         for (candidateUrl in candidates) {
             val loaded = runCatching {
                 withContext(Dispatchers.IO) {
