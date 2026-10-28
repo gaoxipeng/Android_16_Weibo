@@ -16,6 +16,7 @@ class CachedPostLinksTest {
             ))
             val image = FeedImage("pic", "https://example.com/s.jpg", "https://example.com/l.jpg")
             val item = base.copy(
+                verification = UserVerification.Gold,
                 inlineImageLinks = mapOf("http://t.cn/photo" to listOf(image)),
                 urlEntities = listOf(FeedUrlEntity("http://t.cn/page", "网页", "https://example.com", "sinaweibo://browser")),
             )
@@ -23,6 +24,8 @@ class CachedPostLinksTest {
             store.writePosts("42", MinePostsCache(listOf(item.copy(retweetedStatus = item))))
             val cached = requireNotNull(store.readPosts("42"))
             assertFalse(cached.needsLinkRefresh)
+            assertEquals(UserVerification.Gold, cached.items.single().verification)
+            assertEquals(UserVerification.Gold, cached.items.single().retweetedStatus!!.verification)
             assertEquals(item.inlineImageLinks, cached.items.single().inlineImageLinks)
             assertEquals(item.urlEntities, cached.items.single().urlEntities)
             assertEquals(item.inlineImageLinks, cached.items.single().retweetedStatus!!.inlineImageLinks)

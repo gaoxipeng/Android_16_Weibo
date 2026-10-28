@@ -30,6 +30,34 @@ object WeiboJsonParser {
         return TimelinePage(items = items, nextCursor = nextCursor)
     }
 
+    fun parseUserSearchTimeline(raw: String, uid: String, page: Int): TimelinePage {
+        val root = JSONObject(raw)
+        if (root.has("ok") && root.optInt("ok", -1) != 1) {
+            throw IllegalStateException(root.optString("message").ifBlank {
+                root.optString("msg").ifBlank { "用户微博搜索接口拒绝请求（ok=${root.opt("ok")}）" }
+            })
+        }
+        val data = root.optJSONObject("data")
+        val entries = data?.optJSONArray("list") ?: data?.optJSONArray("statuses")
+            ?: root.optJSONArray("data") ?: root.optJSONArray("list") ?: root.optJSONArray("statuses")
+            ?: throw IllegalStateException("用户微博搜索响应结构不支持：${root.keys().asSequence().joinToString()}")
+        val statuses = JSONArray()
+        for (index in 0 until entries.length()) {
+            val entry = entries.optJSONObject(index) ?: continue
+            val status = entry.optJSONObject("mblog") ?: entry.optJSONObject("status") ?: entry
+            // This endpoint already scopes results by UID; some responses omit the owner object.
+            if (status.optJSONObject("user") == null) {
+                status.put("user", JSONObject().put("idstr", uid))
+            }
+            statuses.put(status)
+        }
+        val parsed = parseTimeline(JSONObject().put("statuses", statuses).toString())
+        if (entries.length() > 0 && parsed.items.isEmpty()) {
+            throw IllegalStateException("用户微博搜索返回了 ${entries.length()} 条数据，但卡片解析失败")
+        }
+        return parsed.copy(nextCursor = (page + 1).toString().takeIf { parsed.items.isNotEmpty() })
+    }
+
     fun parseUserTimeline(raw: String, uid: String, pageForCursor: Int? = null): TimelinePage {
         val expectedUid = uid.trim()
         val timelinePage = parseTimeline(raw)
@@ -123,6 +151,7 @@ object WeiboJsonParser {
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
                         text = parseCommentText(comment, images),
+                        verification = parseUserVerification(user),
                         urlEntities = parseCommentUrlEntities(comment),
                         createdAt = comment.optNullableString("created_at"),
                         likesCount = formatCount(comment.opt("like_counts")),
@@ -181,6 +210,7 @@ object WeiboJsonParser {
                             ?: "微博用户",
                         avatarUrl = user.optNullableString("profile_image_url")
                             ?: user.optNullableString("avatar_hd"),
+                        verification = parseUserVerification(user),
                     ),
                 )
             }
@@ -275,6 +305,7 @@ object WeiboJsonParser {
                 ?: user?.optNullableString("profile_image_url"),
             text = text,
             createdAt = normalized.optNullableString("created_at"),
+            verification = parseUserVerification(user),
             likesCount = formatCount(normalized.opt("like_counts")),
             emoticons = extractEmoticonsFromHtml(htmlText),
             images = images,
@@ -669,6 +700,7 @@ object WeiboJsonParser {
                         authorAvatarUrl = user?.optNullableString("avatar_hd")
                             ?: user?.optNullableString("profile_image_url"),
                         text = parseCommentText(obj, images),
+                        verification = parseUserVerification(user),
                         urlEntities = parseCommentUrlEntities(obj),
                         createdAt = obj.optNullableString("created_at"),
                         likesCount = formatCount(obj.opt("like_counts")),
@@ -826,6 +858,8 @@ object WeiboJsonParser {
             following = user.optTruthy("following"),
             followMe = user.optTruthy("follow_me"),
             specialFollowing = user.optTruthy("special_follow"),
+            gender = user.optNullableString("gender"),
+            verification = parseUserVerification(user),
         )
     }
 
@@ -905,6 +939,7 @@ object WeiboJsonParser {
                         following = user.optBoolean("following"),
                         followMe = user.optBoolean("follow_me"),
                         verified = user.optBoolean("verified"),
+                        verification = parseUserVerification(user),
                         verifiedReason = user.optNullableString("verified_reason"),
                         location = user.optNullableString("location"),
                     ),
@@ -1468,6 +1503,8 @@ object WeiboJsonParser {
             inlineImageLinks = inlineImageLinks,
             urlEntities = urlEntities,
             retweetedStatus = retweeted,
+            poll = parseFeedPoll(status, urlEntities),
+            verification = parseUserVerification(user),
             isEdited = isEdited,
             editCount = editCount,
             isPinned = status.isPinnedStatus(),
@@ -2909,6 +2946,7 @@ object WeiboJsonParser {
                         name = user.optNullableString("name") ?: user.optNullableString("screen_name").orEmpty(),
                         avatarUrl = user.optNullableString("avatar_large")
                             ?: user.optNullableString("profile_image_url"),
+                        verification = parseUserVerification(user),
                         description = plainText(user.optNullableString("description").orEmpty()),
                         followersCount = user.optNullableString("followers_count_str")
                             ?: formatCount(user.opt("followers_count")),
@@ -3051,6 +3089,7 @@ object WeiboJsonParser {
             description = description,
             followersCount = followers,
             followText = followText,
+            verification = parseHtmlUserVerification(card),
         )
     }
 

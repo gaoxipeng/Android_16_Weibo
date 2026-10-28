@@ -46,10 +46,30 @@ data class FeedItem(
     val isPinned: Boolean = false,
     /** 服务端 visible.type；null 表示未提供，不猜测受限范围。 */
     val visibility: WeiboPostVisibility? = null,
+    val poll: FeedPoll? = null,
+    val verification: UserVerification? = null,
 ) {
     val media: FeedMedia?
         get() = medias.firstOrNull()
 }
+
+@Immutable
+data class FeedPoll(
+    val title: String,
+    val options: List<FeedPollOption> = emptyList(),
+    val participantCount: Long? = null,
+    val endTime: String? = null,
+    val url: String? = null,
+    val id: String? = null,
+    val isEnded: Boolean = false,
+    val hasVoted: Boolean = false,
+    val maximum: Int = 1,
+    val minimum: Int = 1,
+)
+
+@Immutable
+data class FeedPollOption(val text: String, val count: Long? = null, val selected: Boolean = false, val id: String? = null,
+    val countText: String? = null)
 
 @Immutable
 data class FeedImage(
@@ -268,6 +288,7 @@ data class CommentItem(
     val moreInfoText: String? = null,
     val nestedNextCursor: String? = null,
     val urlEntities: List<FeedUrlEntity> = emptyList(),
+    val verification: UserVerification? = null,
 )
 
 data class RepostsPage(
@@ -292,7 +313,15 @@ data class UserProfile(
     val following: Boolean = false,
     val followMe: Boolean = false,
     val specialFollowing: Boolean = false,
+    val gender: String? = null,
+    val verification: UserVerification? = null,
 ) {
+    val postSearchPlaceholder: String
+        get() = when (gender?.lowercase()) {
+            "f" -> "搜索她的微博"
+            "m" -> "搜索他的微博"
+            else -> "搜索TA的微博"
+        }
     val coverUrl: String?
         get() = coverUrls.firstOrNull()
 }
@@ -321,6 +350,7 @@ data class MentionCandidate(
     val id: String,
     val name: String,
     val avatarUrl: String?,
+    val verification: UserVerification? = null,
 )
 
 data class MentionCandidateBundle(
@@ -358,6 +388,7 @@ data class SearchUserItem(
     val description: String,
     val followersCount: String,
     val followText: String = "",
+    val verification: UserVerification? = null,
 )
 
 data class SearchSuggestResult(

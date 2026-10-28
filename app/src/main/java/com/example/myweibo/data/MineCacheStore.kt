@@ -111,6 +111,7 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             .put("location", location)
             .put("ip_location", ipLocation)
             .put("verified_reason", verifiedReason)
+            .put("verification", verification?.name)
             .put("following_count", followingCount)
             .put("followers_count", followersCount)
             .put("statuses_count", statusesCount)
@@ -137,6 +138,7 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             location = json.optNullableString("location"),
             ipLocation = json.optNullableString("ip_location"),
             verifiedReason = json.optNullableString("verified_reason"),
+            verification = UserVerification.entries.firstOrNull { it.name == json.optString("verification") },
             followingCount = json.optString("following_count", "--"),
             followersCount = json.optString("followers_count", "--"),
             statusesCount = json.optString("statuses_count", "--"),
@@ -158,6 +160,7 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             .put("author_id", authorId)
             .put("author_name", authorName)
             .put("author_avatar_url", authorAvatarUrl)
+            .put("verification", verification?.name)
             .put("created_at", createdAt)
             .put("source", source)
             .put("ip_location", ipLocation)
@@ -205,6 +208,7 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             authorId = optString("author_id"),
             authorName = optString("author_name", "\u5FAE\u535A\u7528\u6237"),
             authorAvatarUrl = optNullableString("author_avatar_url"),
+            verification = UserVerification.entries.firstOrNull { it.name == optString("verification") },
             createdAt = optNullableString("created_at"),
             source = optNullableString("source"),
             ipLocation = optNullableString("ip_location"),

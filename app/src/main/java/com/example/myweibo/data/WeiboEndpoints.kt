@@ -21,6 +21,7 @@ object WeiboEndpoints {
     const val PROFILE_INFO = "/ajax/profile/info"
     const val PROFILE_DETAIL = "/ajax/profile/detail"
     const val USER_TIMELINE = "/ajax/statuses/mymblog"
+    const val USER_SEARCH_BLOG = "/ajax/profile/searchblog"
     const val PROFILE_IMAGE_WALL = "/ajax/profile/getImageWall"
     const val PROFILE_ALBUM_WATERFALL = "/ajax/profile/getWaterFallContent"
     const val FOLLOW_CREATE = "/ajax/friendships/create"

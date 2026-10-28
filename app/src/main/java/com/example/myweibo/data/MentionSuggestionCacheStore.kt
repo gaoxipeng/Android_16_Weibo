@@ -50,7 +50,8 @@ class MentionSuggestionCacheStore(context: Context) {
                     JSONObject()
                         .put("id", candidate.id)
                         .put("name", candidate.name)
-                        .put("avatar_url", candidate.avatarUrl),
+                        .put("avatar_url", candidate.avatarUrl)
+                        .put("verification", candidate.verification?.name),
                 )
             }
         }
@@ -77,6 +78,7 @@ class MentionSuggestionCacheStore(context: Context) {
                         id = item.optString("id").trim(),
                         name = name,
                         avatarUrl = item.optNullableString("avatar_url"),
+                        verification = UserVerification.entries.firstOrNull { it.name == item.optString("verification") },
                     ),
                 )
             }

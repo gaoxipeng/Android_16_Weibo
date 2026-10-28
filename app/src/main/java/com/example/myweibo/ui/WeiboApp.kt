@@ -36,6 +36,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.animateBounds
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
@@ -148,7 +150,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.LocationOn
 import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -162,6 +166,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Scaffold
@@ -324,6 +329,7 @@ import com.example.myweibo.data.FeedDisplaySettingsStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.MentionSuggestionCacheStore
 import com.example.myweibo.data.SearchHistoryStore
+import com.example.myweibo.data.SearchHistoryEntry
 import com.example.myweibo.data.SearchSettingsStore
 import com.example.myweibo.data.SearchSuggestResult
 import com.example.myweibo.data.SearchUserItem
@@ -2254,6 +2260,7 @@ private data class FollowListOverlayState(
     val description: String?,
     val tab: FriendListTab,
     val instanceKey: Int = 0,
+    val verification: com.example.myweibo.data.UserVerification? = null,
 )
 
 private data class ScrollRestore(
@@ -2282,6 +2289,7 @@ private data class NavRestoreState(
 private sealed interface NavOverlayKind {
     data class Detail(val itemId: String) : NavOverlayKind
     data class VisitedProfile(val uid: String) : NavOverlayKind
+    data class UserPostsSearch(val uid: String) : NavOverlayKind
     data class FollowList(val uid: String) : NavOverlayKind
     data object AlbumViewer : NavOverlayKind
     data object MediaPreview : NavOverlayKind
@@ -2293,6 +2301,7 @@ private enum class OverlayTop {
     None,
     Detail,
     VisitedProfile,
+    UserPostsSearch,
     FollowList,
     AlbumViewer,
     MediaPreview,
@@ -2302,6 +2311,7 @@ private enum class OverlayTop {
 private fun overlayTopKind(stack: List<NavOverlayKind>): OverlayTop = when (stack.lastOrNull()) {
     is NavOverlayKind.Detail -> OverlayTop.Detail
     is NavOverlayKind.VisitedProfile -> OverlayTop.VisitedProfile
+    is NavOverlayKind.UserPostsSearch -> OverlayTop.UserPostsSearch
     is NavOverlayKind.FollowList -> OverlayTop.FollowList
     NavOverlayKind.AlbumViewer -> OverlayTop.AlbumViewer
     NavOverlayKind.MediaPreview -> OverlayTop.MediaPreview
@@ -2314,6 +2324,7 @@ private fun navOverlayKindsMatch(a: NavOverlayKind?, b: NavOverlayKind?): Boolea
     return when {
         a is NavOverlayKind.Detail && b is NavOverlayKind.Detail -> true
         a is NavOverlayKind.VisitedProfile && b is NavOverlayKind.VisitedProfile -> true
+        a is NavOverlayKind.UserPostsSearch && b is NavOverlayKind.UserPostsSearch -> true
         a is NavOverlayKind.FollowList && b is NavOverlayKind.FollowList -> true
         else -> a == b
     }
@@ -2355,6 +2366,25 @@ private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
 private val LocalUiMessenger = staticCompositionLocalOf<(String, String) -> Unit> { { _, _ -> } }
+private class PollUiController(val session: WeiboWebSession) {
+    val polls = mutableStateMapOf<String, com.example.myweibo.data.FeedPoll>()
+    val busy = mutableStateMapOf<String, Boolean>()
+    val errors = mutableStateMapOf<String, String>()
+    suspend fun refresh(id: String) {
+        if (busy[id] == true) return
+        busy[id] = true
+        try {
+            polls[id] = session.loadVotePoll(id)
+            android.util.Log.i("WeiboVote", "refresh options=${polls[id]?.options?.size} voted=${polls[id]?.hasVoted}")
+            errors.remove(id)
+        } catch (cancelled: CancellationException) { throw cancelled
+        } catch (error: Exception) {
+            errors[id] = error.message ?: "投票状态刷新失败"
+            android.util.Log.i("WeiboVote", "refresh failed: ${errors[id]}")
+        } finally { busy[id] = false }
+    }
+}
+private val LocalPollController = staticCompositionLocalOf<PollUiController?> { null }
 private val LocalAppCacheClearAction = staticCompositionLocalOf<(suspend (AppCacheCategory?) -> AppCacheClearResult)?> { null }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
@@ -2770,6 +2800,8 @@ private data class ProfileFollowMenuRequest(
     val onUnfollow: () -> Unit,
 )
 private val LocalProfileFollowMenu = staticCompositionLocalOf<((Rect, () -> Unit) -> Unit)?> { null }
+private data class UnfollowConfirmRequest(val anchor: Rect, val onConfirm: () -> Unit)
+private val LocalUnfollowConfirm = staticCompositionLocalOf<((Rect, () -> Unit) -> Unit)?> { null }
 
 private class FeedCardActionMenuController {
     var activeRequest by mutableStateOf<FeedCardActionMenuRequest?>(null)
@@ -3762,6 +3794,9 @@ fun WeiboApp() {
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
     val detailActionMenuController = remember { FeedCardActionMenuController() }
+    val visitedProfileActionMenuController = remember { FeedCardActionMenuController() }
+    var userPostsSearchProfile by remember { mutableStateOf<UserProfile?>(null) }
+    var userPostsSearchQuery by remember { mutableStateOf("") }
     var editHistoryItem by remember { mutableStateOf<FeedItem?>(null) }
     val navTransitionCoordinator = remember { NavTransitionCoordinator() }
     val feedListScrollCoordinator = remember { FeedListScrollCoordinator() }
@@ -3941,6 +3976,7 @@ fun WeiboApp() {
     var likeLoadingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var pendingDeleteStatus by remember { mutableStateOf<DeleteStatusConfirmRequest?>(null) }
     var pendingProfileFollowMenu by remember { mutableStateOf<ProfileFollowMenuRequest?>(null) }
+    var pendingUnfollowConfirm by remember { mutableStateOf<UnfollowConfirmRequest?>(null) }
     var deletingStatusId by remember { mutableStateOf<String?>(null) }
     var likeUsersOverlay by remember { mutableStateOf<LikeUsersOverlayState?>(null) }
     var likeUsers by remember { mutableStateOf<List<MentionCandidate>>(emptyList()) }
@@ -4766,6 +4802,7 @@ fun WeiboApp() {
                 description = description,
                 tab = tab,
                 instanceKey = followListOverlayInstanceKey,
+                verification = (visitedProfile?.takeIf { it.id == uid } ?: mineProfile?.takeIf { it.id == uid })?.verification,
             )
         }
     }
@@ -5049,6 +5086,24 @@ fun WeiboApp() {
             selectedTab = MainTab.Search
             bottomBarVisible = true
         }
+        }
+    }
+
+    fun openUserPostsSearch(profile: UserProfile, query: String) {
+        val uid = profile.id.trim()
+        if (uid.isBlank()) return
+        visitedProfileActionMenuController.dismiss()
+        userPostsSearchProfile = profile
+        userPostsSearchQuery = query.trim()
+        pushNavigation(NavOverlayKind.UserPostsSearch(uid)) {
+            bottomBarVisible = false
+        }
+    }
+
+    fun finishUserPostsSearchExit() {
+        if (navExitPendingKind is NavOverlayKind.UserPostsSearch) {
+            navExitPendingKind = null
+            flushDeferredNavRestore()
         }
     }
 
@@ -7189,6 +7244,8 @@ fun WeiboApp() {
         navOverlayStack,
     ) {
         val foregroundOverlay = overlayTopKind(navOverlayStack)
+        val userPostsSearchInlinePlaybackActive = foregroundOverlay == OverlayTop.UserPostsSearch &&
+            mediaPreview == null && articleOverlay == null && albumViewerState == null
         val homeFeedOnTop = selectedTab == MainTab.Feed &&
             visitedUserId == null &&
             selectedItem == null &&
@@ -7286,7 +7343,7 @@ fun WeiboApp() {
                         }
                     }
                 }
-                searchInlinePlaybackActive ||
+                userPostsSearchInlinePlaybackActive || searchInlinePlaybackActive ||
                     mineInlinePlaybackActive -> {
                     val preserveKey = videoPlaybackCoordinator.activeKey
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
@@ -7320,7 +7377,9 @@ fun WeiboApp() {
         colorScheme = themedColorScheme,
         typography = MaterialTheme.typography,
     ) {
+    val pollController = remember(session, activeAccountId) { PollUiController(session) }
     CompositionLocalProvider(
+        LocalPollController provides pollController,
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
@@ -7382,6 +7441,9 @@ fun WeiboApp() {
             LocalFullscreenPreviewStore provides homeThumbnailStore,
             LocalLiquidMenuBackdrop provides menuGlassBackdrop,
             LocalFeedCardActionMenuController provides feedCardActionMenuController,
+            LocalUnfollowConfirm provides { anchor, confirm ->
+                pendingUnfollowConfirm = UnfollowConfirmRequest(anchor, confirm)
+            },
             LocalProfileFollowMenu provides { anchor, unfollow ->
                 val profile = visitedProfile
                 if (profile != null && overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile) {
@@ -7419,6 +7481,13 @@ fun WeiboApp() {
                 it is NavOverlayKind.VisitedProfile
             } as? NavOverlayKind.VisitedProfile)?.takeIf { profileLayerActive }
                 ?: (navExitPendingKind as? NavOverlayKind.VisitedProfile)
+            val userPostsSearchLayerActive = navOverlayStack.any { it is NavOverlayKind.UserPostsSearch } &&
+                userPostsSearchProfile != null
+            val userPostsSearchVisible = overlayTop == OverlayTop.UserPostsSearch && userPostsSearchLayerActive
+            val userPostsSearchNavKind = (navOverlayStack.lastOrNull {
+                it is NavOverlayKind.UserPostsSearch
+            } as? NavOverlayKind.UserPostsSearch)?.takeIf { userPostsSearchLayerActive }
+                ?: (navExitPendingKind as? NavOverlayKind.UserPostsSearch)
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
                 followListOverlay != null
             val followListUiOnTop = overlayTop == OverlayTop.FollowList && followListLayerActive
@@ -7494,6 +7563,7 @@ fun WeiboApp() {
                         loggedIn = hasLoginCookie,
                         screenName = composeDisplayName,
                         avatarUrl = composeAvatarUrl,
+                        verification = mineProfile?.takeIf { it.id == activeAccountId }?.verification,
                         submitting = composeSubmitting,
                         emoticonMap = emoticonMap,
                         recentEmoticons = recentCommentEmoticons,
@@ -7562,6 +7632,7 @@ fun WeiboApp() {
                     mediaPreview != null ||
                     albumViewerState != null)
             val mineUiOnTop = selectedTab == MainTab.Mine &&
+                !userPostsSearchLayerActive &&
                 visitedUserId == null &&
                 detailOverlayItem == null &&
                 followListOverlay == null &&
@@ -7569,7 +7640,7 @@ fun WeiboApp() {
                 mediaPreview == null &&
                 albumViewerState == null
             val keepMineAlive = selectedTab == MainTab.Mine &&
-                (visitedUserId != null ||
+                (userPostsSearchLayerActive || visitedUserId != null ||
                     detailOverlayItem != null ||
                     followListOverlay != null ||
                     articleOverlay != null ||
@@ -7794,6 +7865,9 @@ fun WeiboApp() {
                                 enabled = visitedProfileVisible,
                                 onBack = ::closeVisitedProfile,
                             )
+                            CompositionLocalProvider(
+                                LocalFeedCardActionMenuController provides visitedProfileActionMenuController,
+                            ) {
                             VisitedUserProfileContent(
                                     session = session,
                                     profile = visitedProfile,
@@ -7847,6 +7921,9 @@ fun WeiboApp() {
                                     onToggleLike = ::toggleStatusLike,
                                     onLikeClick = ::openLikeUsers,
                                     onUrlEntityClick = ::openUrlEntity,
+                                    onSearchUserPosts = { profile, query ->
+                                        openUserPostsSearch(profile, query)
+                                    },
                                     onOpenFollowList = ::openFollowList,
                                     showFollowActions = hasLoginCookie &&
                                         visitedProfile?.id?.isNotBlank() == true &&
@@ -7854,8 +7931,46 @@ fun WeiboApp() {
                                     followLoading = visitedFollowLoading,
                                     onFollowClick = { toggleVisitedFollow() },
                                 )
+                            }
                         }
                     }
+                }
+
+                NavAnimatedOverlay(
+                    target = userPostsSearchNavKind.takeIf { userPostsSearchLayerActive },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .blockHiddenTouches(userPostsSearchVisible),
+                    stackTop = userPostsSearchVisible,
+                    layerBaseZIndex = 550f,
+                    visible = userPostsSearchVisible,
+                    animationKey = userPostsSearchNavKind?.uid,
+                    navKind = userPostsSearchNavKind,
+                    pendingEnterKind = navEnterPendingKind,
+                    pendingExitKind = navExitPendingKind,
+                    onSwipeBack = ::navigateBack,
+                    onClearPendingEnter = {
+                        if (navOverlayKindsMatch(navEnterPendingKind, userPostsSearchNavKind)) {
+                            navEnterPendingKind = null
+                        }
+                    },
+                    onClearPendingExit = ::finishUserPostsSearchExit,
+                ) { kind ->
+                    val owner = userPostsSearchProfile?.takeIf { it.id == kind.uid } ?: return@NavAnimatedOverlay
+                    BackHandler(enabled = userPostsSearchVisible, onBack = ::navigateBack)
+                    UserPostsSearchScreen(
+                        profile = owner,
+                        initialQuery = userPostsSearchQuery,
+                        session = session,
+                        emoticonMap = emoticonMap,
+                        onBack = ::navigateBack,
+                        onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                        onMediaClick = ::pushMediaPreview,
+                        isLongTextLoading = { it.statusId in longTextLoadingIds },
+                        onLoadLongText = ::loadLongText,
+                        resolveFeedItem = ::resolveFeedItem,
+                        onUrlEntityClick = ::openUrlEntity,
+                    )
                 }
 
                 NavAnimatedOverlay(
@@ -7887,6 +8002,7 @@ fun WeiboApp() {
                                     if (visible) bottomBarVisible = true
                                 },
                                 profile = mineProfile,
+                                onSearchUserPosts = ::openUserPostsSearch,
                                 profileHeaderHeight = profileHeaderHeights["mine-self"] ?: 0.dp,
                                 onProfileHeaderHeightChange = { height ->
                                     profileHeaderHeights["mine-self"] = height
@@ -8182,6 +8298,7 @@ fun WeiboApp() {
                     CommentComposerDialog(
                         target = target,
                         avatarUrl = mineProfile?.avatarUrl ?: activeAvatarUrl,
+                        verification = mineProfile?.takeIf { it.id == activeAccountId }?.verification,
                         submitting = commentSubmitting,
                         emoticonMap = emoticonMap,
                         recentEmoticons = recentCommentEmoticons,
@@ -8363,9 +8480,9 @@ fun WeiboApp() {
             // it. Its own exit must not precede the page's first animated frame.
             val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
                 navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
-            val bottomBarNavVisible = topicSearchForeground || profileEnteringFromMain ||
+            val bottomBarNavVisible = !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
                 ((visitedUserId == null || profileIsExiting) &&
-                    (selectedItem == null || detailExiting || detailSwipeReturningHome))
+                    (selectedItem == null || detailExiting || detailSwipeReturningHome)))
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
                     withFrameNanos { }
@@ -8519,8 +8636,35 @@ fun WeiboApp() {
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
             )
+            FeedCardActionMenuOverlay(
+                controller = visitedProfileActionMenuController,
+                backdrop = menuGlassBackdrop,
+                currentUserId = mineProfile?.id ?: activeAccountId,
+                deletingStatusId = deletingStatusId,
+                favoriteOverrides = favoriteOverrides,
+                onToggleFavorite = ::toggleStatusFavorite,
+                onSetVisibility = ::changeStatusVisibility,
+                onEditHistory = { editHistoryItem = it },
+                onDelete = { item, anchor ->
+                    pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
+                },
+            )
             editHistoryItem?.let { item ->
                 EditHistoryViewer(item, session, emoticonMap, onDismiss = { editHistoryItem = null })
+            }
+            pendingUnfollowConfirm?.let { request ->
+                DeleteStatusConfirmOverlay(
+                    backdrop = menuGlassBackdrop,
+                    anchorBoundsInRoot = request.anchor,
+                    deleting = false,
+                    destructiveLabel = "确认取消关注",
+                    secondaryLabel = "取消",
+                    onConfirm = {
+                        pendingUnfollowConfirm = null
+                        request.onConfirm()
+                    },
+                    onDismiss = { pendingUnfollowConfirm = null },
+                )
             }
             pendingProfileFollowMenu?.let { request ->
                 DeleteStatusConfirmOverlay(
@@ -9854,12 +9998,12 @@ private fun FeedCard(
                     top = contentVerticalPadding,
                     bottom = when {
                         sharedDetailCard -> 6.dp
-                        insetRounded -> 14.dp
+                        insetRounded -> if (showStatusActions) 10.dp else 14.dp
                         compactBottomSpacing -> 2.dp
-                        else -> 10.dp
+                        else -> if (showStatusActions) 6.dp else 10.dp
                     },
                 ),
-            verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             if (showAuthorRow) {
                 Column(Modifier.fillMaxWidth()) {
@@ -9966,6 +10110,11 @@ private fun FeedCard(
                     autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
+            FeedPollCard(displayItem, onUrlEntityClick, Modifier.padding(horizontal = FeedCardContentHorizontalPadding))
+            FeedLocationCapsule(
+                item = displayItem,
+                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
+            )
             if (showStatusActions && !sharedDetailCard) TraceComposition("WeiboCard.Actions") {
                 StatusActions(
                     modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
@@ -10052,23 +10201,17 @@ private fun StatusTextSection(
     urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
 ) {
-    val context = LocalContext.current
-    val resolvedUrlEntities = remember(item.text, urlEntities, inlineImageLinks) {
-        completeBareUrlEntities(item.text, urlEntities, inlineImageLinks.keys)
+    val bodyText = remember(item.text, item.locationName, item.urlEntities) {
+        item.urlEntities.filter { entity ->
+            !item.locationName.isNullOrBlank() && entity.title.trim() == item.locationName.trim()
+        }.fold(item.text) { text, entity -> text.replace(entity.shortUrl, "") }.trimEnd()
     }
-    val locationOpenUrl = remember(item.locationName, item.locationUrl) {
-        resolveFeedLocationOpenUrl(item.locationName, item.locationUrl)
-    }
-    val trailingLocation = remember(item.text, item.locationName, item.urlEntities) {
-        item.locationName?.takeUnless { location ->
-            item.text.contains(location) || item.urlEntities.any { entity ->
-                entity.title.trim() == location.trim() && item.text.contains(entity.shortUrl)
-            }
-        }
+    val resolvedUrlEntities = remember(bodyText, urlEntities, inlineImageLinks) {
+        completeBareUrlEntities(bodyText, urlEntities, inlineImageLinks.keys)
     }
     EmoticonText(
         modifier = Modifier.fillMaxWidth(),
-        text = item.text,
+        text = bodyText,
         contentKey = item.statusId.ifBlank { item.id },
         emoticonMap = emoticonMap,
         style = style,
@@ -10081,20 +10224,10 @@ private fun StatusTextSection(
         } else {
             null
         },
-        trailingLocation = trailingLocation,
         onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
             { onLoadLongText(item) }
         } else {
             null
-        },
-        onLocationClick = locationOpenUrl?.let { url ->
-            {
-                WeiboStatusActions.openExternalUrl(
-                    context = context,
-                    rawUrl = url,
-                    failureMessage = "无法打开地理位置",
-                )
-            }
         },
         inlineImageLinks = inlineImageLinks,
         onInlineImageClick = onInlineImageClick,
@@ -10107,6 +10240,133 @@ private fun resolveFeedLocationOpenUrl(locationName: String?, locationUrl: Strin
     locationUrl?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
     val name = locationName?.trim()?.takeIf { it.isNotBlank() } ?: return null
     return "https://s.weibo.com/weibo?q=" + java.net.URLEncoder.encode(name, Charsets.UTF_8.name())
+}
+
+@Composable
+private fun FeedPollCard(item: FeedItem, onUrlEntityClick: ((FeedUrlEntity) -> Unit)?, modifier: Modifier = Modifier) {
+    val initial = item.poll ?: return
+    val controller = LocalPollController.current
+    val voteId = initial.id
+    val poll = voteId?.let { controller?.polls?.get(it) } ?: initial
+    val scope = rememberCoroutineScope()
+    val messenger = LocalUiMessenger.current
+    var draftIds by remember(voteId) { mutableStateOf<List<String>>(emptyList()) }
+    val busy = voteId?.let { controller?.busy?.get(it) } == true
+    val fresh = voteId != null && controller?.polls?.containsKey(voteId) == true
+    LaunchedEffect(controller, voteId) { if (voteId != null) controller?.refresh(voteId) }
+    fun execute(cancel: Boolean, ids: List<String>) {
+        if (controller == null || voteId == null || controller.busy[voteId] == true) return
+        controller.busy[voteId] = true
+        scope.launch {
+            try {
+                controller.polls[voteId] = controller.session.submitPoll(voteId, ids, cancel)
+                controller.errors.remove(voteId)
+                draftIds = emptyList()
+                messenger(if (cancel) "已取消投票" else "投票成功", "")
+            } catch (cancelled: CancellationException) { throw cancelled
+            } catch (error: Exception) {
+                messenger("投票操作失败", error.message ?: "请刷新后确认状态")
+                // Read only: a timed-out POST might have succeeded. Never retry it automatically.
+                runCatching { controller.session.loadVotePoll(voteId) }.getOrNull()?.let { controller.polls[voteId] = it }
+            } finally { controller.busy[voteId] = false }
+        }
+    }
+    val context = LocalContext.current
+    val url = poll.url ?: WeiboStatusActions.weiboUrl(item)
+    Column(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.background).padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(poll.title, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+        poll.options.forEach { option ->
+            val highlighted = option.selected || option.id in draftIds
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
+                    .background(if (highlighted) {
+                        if (isAppLightTheme()) Color(0xFFDDEBFC) else Color(0xFF293C56)
+                    } else MaterialTheme.colorScheme.surface)
+                    .border(0.5.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f), RoundedCornerShape(6.dp))
+                    .clickable(enabled = fresh && !busy && !poll.isEnded && option.id != null) {
+                        val id = option.id ?: return@clickable
+                        when {
+                            poll.hasVoted && option.selected -> execute(true, emptyList())
+                            poll.hasVoted -> messenger("请先取消原投票", "点击已投选项即可取消")
+                            poll.maximum > 1 -> {
+                                draftIds = if (id in draftIds) draftIds - id
+                                    else if (draftIds.size < poll.maximum) draftIds + id else draftIds
+                            }
+                            else -> execute(false, listOf(id))
+                        }
+                    }
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(option.text, Modifier.weight(1f), fontSize = 14.sp)
+                val votes = option.count?.toString() ?: option.countText
+                votes?.let {
+                    Text(if (it.endsWith("票")) it else "${it}票", modifier = Modifier.padding(start = 8.dp),
+                        fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        val deadline = remember(poll.endTime) {
+            val raw = poll.endTime
+            val epoch = raw?.toLongOrNull()
+            when {
+                epoch != null && epoch >= 1_000_000_000L -> java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.CHINA).apply {
+                    timeZone = java.util.TimeZone.getTimeZone("Asia/Shanghai")
+                }.format(java.util.Date(if (epoch > 100_000_000_000L) epoch else epoch * 1000L))
+                epoch != null -> null
+                else -> raw
+            }
+        }
+        val summary = listOfNotNull(poll.participantCount?.let { "${it}人参与" }, deadline).joinToString("  ")
+        if (summary.isNotEmpty()) Text(summary, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
+        voteId?.let { controller?.errors?.get(it) }?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.error, fontSize = 12.sp,
+                modifier = Modifier.clickable { voteId?.let { scope.launch { controller?.refresh(it) } } })
+        }
+        if (!poll.hasVoted && poll.maximum > 1 && !poll.isEnded) {
+            TextButton(onClick = { execute(false, draftIds) }, enabled = fresh && !busy && draftIds.size in poll.minimum..poll.maximum) {
+                Text("投票（${draftIds.size}）")
+            }
+        }
+        if (poll.options.isEmpty()) Text("进入投票页查看选项和结果", fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.clickable(enabled = url != null) {
+                url?.let { target ->
+                    if (onUrlEntityClick != null) onUrlEntityClick(FeedUrlEntity(target, poll.title, target))
+                    else WeiboStatusActions.openExternalUrl(context, target, "无法打开投票")
+                }
+            })
+    }
+}
+
+@Composable
+private fun FeedLocationCapsule(item: FeedItem, modifier: Modifier = Modifier) {
+    val name = item.locationName?.trim()?.takeIf { it.isNotEmpty() } ?: return
+    val context = LocalContext.current
+    val url = remember(name, item.locationUrl) { resolveFeedLocationOpenUrl(name, item.locationUrl) }
+    Row(
+        modifier = modifier
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surface)
+            .border(0.75.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), CircleShape)
+            .clickable(enabled = url != null) {
+                url?.let { WeiboStatusActions.openExternalUrl(context, it, "无法打开地理位置") }
+            }
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Icon(Icons.Rounded.LocationOn, contentDescription = null, tint = Color(0xFF579CF4), modifier = Modifier.size(15.dp))
+        Text(name, fontSize = 12.sp, lineHeight = 16.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false))
+    }
 }
 
 @Composable
@@ -10166,8 +10426,8 @@ private fun QuotedStatus(
         elevation = CardDefaults.elevatedCardElevation(defaultElevation = 0.dp),
     ) {
         Column(
-            Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
+            Modifier.padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Column(
                 verticalArrangement = Arrangement.spacedBy(FeedCardSectionSpacing),
@@ -10202,6 +10462,8 @@ private fun QuotedStatus(
                 autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 showVideoTitle = false,
             )
+            FeedPollCard(displayItem, onUrlEntityClick)
+            FeedLocationCapsule(item = displayItem)
         }
     }
 }
@@ -10261,6 +10523,7 @@ private fun FeedItem.actionMenuKey(): String = statusId.ifBlank { id }
 private fun FeedCardActionMenu(
     item: FeedItem,
     backHandlerEnabled: Boolean = true,
+    buttonSize: Dp = 48.dp,
 ) {
     val controller = LocalFeedCardActionMenuController.current
     val menuKey = item.actionMenuKey()
@@ -10274,12 +10537,12 @@ private fun FeedCardActionMenu(
     }
 
     Box(
-        modifier = Modifier.size(32.dp),
+        modifier = Modifier.size(buttonSize).zIndex(2f),
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .size(52.dp)
+                .size(buttonSize)
                 .clip(RoundedCornerShape(8.dp))
                 .onGloballyPositioned { coordinates ->
                     anchorHolder.coordinates = coordinates
@@ -10446,6 +10709,7 @@ private fun EditHistoryViewer(
     emoticonMap: Map<String, String>,
     onDismiss: () -> Unit,
 ) {
+    var closing by remember(original.id) { mutableStateOf(false) }
     var revisions by remember(original.id) { mutableStateOf<List<FeedItem>>(emptyList()) }
     var page by remember(original.id) { mutableIntStateOf(1) }
     var retry by remember { mutableIntStateOf(0) }
@@ -10465,9 +10729,9 @@ private fun EditHistoryViewer(
             error = failure.message ?: "编辑历史加载失败"
         } finally { loading = false }
     }
-    Dialog(onDismissRequest = onDismiss,
+    Dialog(onDismissRequest = { closing = true },
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-        BackHandler(onBack = onDismiss)
+        BackHandler(onBack = { closing = true })
         val historyWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
         SideEffect {
             historyWindow?.apply {
@@ -10477,13 +10741,16 @@ private fun EditHistoryViewer(
             }
         }
         NavAnimatedOverlay(
-            target = original,
+            target = original.takeUnless { closing },
             modifier = Modifier.fillMaxSize(),
-            stackTop = true,
-            visible = true,
+            stackTop = !closing,
+            visible = !closing,
             animationKey = "edit-history:${original.id}",
             navKind = NavOverlayKind.Article,
-            onSwipeBack = onDismiss,
+            pendingExitKind = NavOverlayKind.Article.takeIf { closing },
+            onSwipeBack = { closing = true },
+            onClearPendingExit = { if (closing) onDismiss() },
+            onHidden = { if (closing) onDismiss() },
         ) {
         Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
             .statusBarsPadding().navigationBarsPadding()) {
@@ -10786,18 +11053,49 @@ private fun StatusVisibilityBanner(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
+            .clip(CircleShape)
             .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.04f))
             .padding(start = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text = if (visibility == WeiboPostVisibility.Followers) "仅粉丝可见" else visibility.label,
-            modifier = Modifier.weight(1f).padding(vertical = 7.dp),
+            modifier = Modifier.weight(1f).padding(vertical = 4.dp),
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.primary,
         )
-        if (showActionMenu) FeedCardActionMenu(item, backHandlerEnabled)
+        if (showActionMenu) FeedCardActionMenu(item, backHandlerEnabled, buttonSize = 32.dp)
+    }
+}
+
+@Composable
+private fun VerifiedAvatar(
+    verification: com.example.myweibo.data.UserVerification?,
+    modifier: Modifier = Modifier,
+    badgeSize: Dp = 14.dp,
+    badgeOffset: Dp = 0.dp,
+    content: @Composable () -> Unit,
+) {
+    Box(modifier) {
+        content()
+        verification?.let { type ->
+            val drawable = when (type) {
+                com.example.myweibo.data.UserVerification.Red -> com.example.myweibo.R.drawable.ic_verified_red
+                com.example.myweibo.data.UserVerification.Orange -> com.example.myweibo.R.drawable.ic_verified_orange
+                com.example.myweibo.data.UserVerification.Blue -> com.example.myweibo.R.drawable.ic_verified_blue
+                com.example.myweibo.data.UserVerification.Yellow -> com.example.myweibo.R.drawable.ic_verified_yellow
+                com.example.myweibo.data.UserVerification.Gold -> com.example.myweibo.R.drawable.ic_verified_gold
+                com.example.myweibo.data.UserVerification.Grey -> com.example.myweibo.R.drawable.ic_verified_grey
+            }
+            Image(painterResource(drawable), contentDescription = when (type) {
+                com.example.myweibo.data.UserVerification.Red -> "微博官方组织认证"
+                com.example.myweibo.data.UserVerification.Orange -> "微博优质创作者"
+                com.example.myweibo.data.UserVerification.Blue -> "机构认证"
+                com.example.myweibo.data.UserVerification.Yellow -> "微博认证作者"
+                com.example.myweibo.data.UserVerification.Gold -> "微博高影响力创作者"
+                com.example.myweibo.data.UserVerification.Grey -> "过期微博官方组织认证"
+            }, modifier = Modifier.align(Alignment.BottomEnd).offset(x = badgeOffset, y = badgeOffset).size(badgeSize))
+        }
     }
 }
 
@@ -10817,6 +11115,7 @@ private fun AuthorRow(
     val uid = item.authorId
     val userTarget = uid.takeIf { it.isNotBlank() } ?: item.authorName
     Row(verticalAlignment = Alignment.CenterVertically) {
+        VerifiedAvatar(item.verification) {
         RemoteImage(
             url = item.authorAvatarUrl,
             imageIdentity = "avatar:$userTarget",
@@ -10829,6 +11128,7 @@ private fun AuthorRow(
                 ),
             contentScale = ContentScale.Crop,
         )
+        }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -18118,6 +18418,7 @@ private fun CommentDivider() {
 private fun CommentComposerDialog(
     target: CommentComposeTarget,
     avatarUrl: String?,
+    verification: com.example.myweibo.data.UserVerification? = null,
     submitting: Boolean,
     emoticonMap: Map<String, String>,
     recentEmoticons: List<String>,
@@ -18322,6 +18623,7 @@ private fun CommentComposerDialog(
                         verticalAlignment = Alignment.Top,
                         horizontalArrangement = Arrangement.spacedBy(9.dp),
                     ) {
+                        VerifiedAvatar(verification, badgeSize = 12.dp) {
                         RemoteImage(
                             url = avatarUrl,
                             modifier = Modifier
@@ -18336,6 +18638,7 @@ private fun CommentComposerDialog(
                             contentScale = ContentScale.Crop,
                             maxDecodeDim = 96,
                         )
+                        }
                         BasicTextField(
                             value = text,
                             onValueChange = { value ->
@@ -18596,6 +18899,7 @@ private fun ComposeWeiboScreen(
     loggedIn: Boolean,
     screenName: String,
     avatarUrl: String?,
+    verification: com.example.myweibo.data.UserVerification? = null,
     submitting: Boolean,
     emoticonMap: Map<String, String>,
     recentEmoticons: List<String>,
@@ -18791,6 +19095,7 @@ private fun ComposeWeiboScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    VerifiedAvatar(verification, badgeSize = 14.dp) {
                     RemoteImage(
                         url = avatarUrl,
                         modifier = Modifier
@@ -18799,6 +19104,7 @@ private fun ComposeWeiboScreen(
                         contentScale = ContentScale.Crop,
                         maxDecodeDim = 96,
                     )
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
                         Text(
                             text = screenName,
@@ -19689,6 +19995,7 @@ private fun MentionSuggestionAvatarTile(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        VerifiedAvatar(user.verification, badgeSize = 13.dp) {
         RemoteImage(
             url = user.avatarUrl,
             modifier = Modifier
@@ -19697,6 +20004,7 @@ private fun MentionSuggestionAvatarTile(
             contentScale = ContentScale.Crop,
             maxDecodeDim = 96,
         )
+        }
         Text(
             text = user.name,
             fontSize = 11.sp,
@@ -19724,6 +20032,7 @@ private fun MentionSuggestionRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        VerifiedAvatar(user.verification, badgeSize = 12.dp) {
         RemoteImage(
             url = user.avatarUrl,
             modifier = Modifier
@@ -19732,6 +20041,7 @@ private fun MentionSuggestionRow(
             contentScale = ContentScale.Crop,
             maxDecodeDim = 96,
         )
+        }
         Text(
             text = user.name,
             style = MaterialTheme.typography.bodyMedium,
@@ -19946,6 +20256,7 @@ private fun CommentRow(
                 .padding(start = rowStart, end = 10.dp, top = verticalPadding, bottom = verticalPadding),
             verticalAlignment = Alignment.Top,
         ) {
+            VerifiedAvatar(comment.verification, badgeOffset = 2.dp) {
             RemoteImage(
                 url = comment.authorAvatarUrl,
                 modifier = Modifier
@@ -19957,6 +20268,7 @@ private fun CommentRow(
                     ),
                 contentScale = ContentScale.Crop,
             )
+            }
             Spacer(Modifier.width(CommentAvatarTextGap))
             Column(
                 modifier = Modifier
@@ -20242,6 +20554,21 @@ private fun SearchWeiboSortToggle(
 }
 
 @Composable
+private fun UserSearchIcon(modifier: Modifier = Modifier, tint: Color = MaterialTheme.colorScheme.onSurfaceVariant) {
+    Canvas(modifier) {
+        val unit = size.minDimension
+        val path = Path().apply {
+            addOval(Rect(Offset(unit * 0.14f, unit * 0.14f), Size(unit * 0.54f, unit * 0.54f)))
+            moveTo(unit * 0.601f, unit * 0.601f)
+            lineTo(unit * 0.86f, unit * 0.86f)
+        }
+        drawPath(path, tint, style = Stroke(width = unit * 0.095f,
+            cap = androidx.compose.ui.graphics.StrokeCap.Round,
+            join = androidx.compose.ui.graphics.StrokeJoin.Round))
+    }
+}
+
+@Composable
 private fun SearchCapsuleField(
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
@@ -20252,8 +20579,19 @@ private fun SearchCapsuleField(
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
+    userSearch: Boolean = false,
+    autoFocus: Boolean = false,
+    fixedPrefix: String = "",
 ) {
     val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(autoFocus) {
+        if (autoFocus) {
+            withFrameNanos { }
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }
+    }
     val fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
         color = MaterialTheme.colorScheme.onSurface,
         fontSize = 15.sp,
@@ -20264,7 +20602,9 @@ private fun SearchCapsuleField(
         modifier = modifier,
         backdrop = backdrop,
         pill = true,
-        surfaceColor = Color.White.copy(alpha = 0.2f),
+        surfaceColor = if (userSearch) {
+            if (isAppLightTheme()) Color(0xFFF2F2F2) else Color(0xFF303030)
+        } else Color.White.copy(alpha = 0.2f),
         borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
         else Color.White.copy(alpha = 0.24f),
         borderWidth = 0.75.dp,
@@ -20277,11 +20617,24 @@ private fun SearchCapsuleField(
                 .padding(start = 16.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            SearchModeToggle(
+            if (userSearch) UserSearchIcon(
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(22.dp),
+            ) else SearchModeToggle(
                 selected = mode,
                 onSelected = onModeChange,
             )
             Spacer(Modifier.width(8.dp))
+            if (fixedPrefix.isNotEmpty()) {
+                Text(
+                    text = fixedPrefix,
+                    color = hintCapsulePlaceholderColor(),
+                    fontSize = 15.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 160.dp),
+                )
+            }
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -20436,6 +20789,7 @@ private fun SearchSuggestionUserRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        VerifiedAvatar(user.verification, badgeSize = 11.dp) {
         RemoteImage(
             url = user.avatarUrl,
             modifier = Modifier
@@ -20443,6 +20797,7 @@ private fun SearchSuggestionUserRow(
                 .clip(CircleShape),
             contentScale = ContentScale.Crop,
         )
+        }
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = user.screenName.ifBlank { user.name },
@@ -20474,11 +20829,11 @@ private val SearchHistoryTitleToChipsGap = 2.dp
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SearchHistoryChipFlow(
-    queries: List<String>,
+    queries: List<SearchHistoryEntry>,
     maxLines: Int,
     deleteHistoryQuery: String?,
     onDeleteHistoryQueryChange: (String?) -> Unit,
-    onHistoryClick: (String) -> Unit,
+    onHistoryClick: (SearchHistoryEntry) -> Unit,
     onHistoryDelete: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -20488,19 +20843,19 @@ private fun SearchHistoryChipFlow(
         verticalArrangement = Arrangement.spacedBy(8.dp),
         maxLines = maxLines,
     ) {
-        queries.forEach { query ->
-            key(query) {
+        queries.forEach { entry ->
+            key(entry.key) {
                 SearchHistoryChip(
-                    query = query,
-                    showDelete = deleteHistoryQuery == query,
+                    entry = entry,
+                    showDelete = deleteHistoryQuery == entry.key,
                     onClick = {
                         onDeleteHistoryQueryChange(null)
-                        onHistoryClick(query)
+                        onHistoryClick(entry)
                     },
-                    onLongClick = { onDeleteHistoryQueryChange(query) },
+                    onLongClick = { onDeleteHistoryQueryChange(entry.key) },
                     onDelete = {
                         onDeleteHistoryQueryChange(null)
-                        onHistoryDelete(query)
+                        onHistoryDelete(entry.key)
                     },
                 )
             }
@@ -20511,11 +20866,11 @@ private fun SearchHistoryChipFlow(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SearchHistoryChipsSection(
-    searchHistory: List<String>,
+    searchHistory: List<SearchHistoryEntry>,
     searchHistoryExpanded: Boolean,
     deleteHistoryQuery: String?,
     onDeleteHistoryQueryChange: (String?) -> Unit,
-    onHistoryClick: (String) -> Unit,
+    onHistoryClick: (SearchHistoryEntry) -> Unit,
     onHistoryDelete: (String) -> Unit,
     onHistoryExpandToggle: () -> Unit,
 ) {
@@ -20594,7 +20949,7 @@ private fun SearchHistoryChipsSection(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SearchHistoryChip(
-    query: String,
+    entry: SearchHistoryEntry,
     showDelete: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -20615,19 +20970,32 @@ private fun SearchHistoryChip(
                 onLongClick = onLongClick,
             ),
     ) {
-        Text(
-            text = query,
+        Row(
             modifier = Modifier.padding(
                 start = 12.dp,
                 end = if (showDelete) 26.dp else 12.dp,
                 top = 8.dp,
                 bottom = 8.dp,
             ),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+        if (entry.userId != null) VerifiedAvatar(entry.verification, badgeSize = 8.dp) {
+        RemoteImage(
+            url = entry.avatarUrl,
+            imageIdentity = "avatar:${entry.userId}",
+            modifier = Modifier.size(22.dp).clip(CircleShape),
+            contentScale = ContentScale.Crop,
+        )
+        }
+        Text(
+            text = entry.query,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+        }
         if (showDelete) {
             Box(
                 modifier = Modifier
@@ -20745,6 +21113,241 @@ private const val SearchImeFollowDurationMillis = 120
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
+private fun UserPostsSearchScreen(
+    profile: UserProfile,
+    initialQuery: String,
+    session: WeiboWebSession,
+    emoticonMap: Map<String, String>,
+    onBack: () -> Unit,
+    onItemClick: (FeedItem, Rect?) -> Unit,
+    onMediaClick: (FeedMedia, String) -> Unit,
+    isLongTextLoading: (FeedItem) -> Boolean,
+    onLoadLongText: (FeedItem) -> Unit,
+    resolveFeedItem: (FeedItem) -> FeedItem,
+    onUrlEntityClick: (FeedUrlEntity) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val listState = rememberLazyListState()
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    var draft by remember(profile.id) { mutableStateOf(TextFieldValue(initialQuery, TextRange(initialQuery.length))) }
+    val searchBackdrop = rememberLayerBackdrop()
+    var editing by remember(profile.id) { mutableStateOf(false) }
+    var activeQuery by remember(profile.id) { mutableStateOf("") }
+    var posts by remember(profile.id) { mutableStateOf<List<FeedItem>>(emptyList()) }
+    var nextPage by remember(profile.id) { mutableIntStateOf(1) }
+    var hasMore by remember(profile.id) { mutableStateOf(false) }
+    var loading by remember(profile.id) { mutableStateOf(false) }
+    var loadingMore by remember(profile.id) { mutableStateOf(false) }
+    var error by remember(profile.id) { mutableStateOf<String?>(null) }
+    var requestToken by remember(profile.id) { mutableIntStateOf(0) }
+
+    fun search(query: String) {
+        val normalized = query.trim()
+        if (normalized.isBlank()) return
+        activeQuery = normalized
+        posts = emptyList()
+        nextPage = 1
+        hasMore = true
+        error = null
+        requestToken += 1
+        val token = requestToken
+        loading = true
+        loadingMore = false
+        focusManager.clearFocus()
+        keyboard?.hide()
+        editing = false
+        scope.launch {
+            try {
+                val result = session.searchUserTimeline(profile.id, normalized, page = 1)
+                if (token != requestToken) return@launch
+                posts = result.items
+                nextPage = result.nextCursor?.toIntOrNull() ?: 2
+                hasMore = result.nextCursor != null
+                // The loading branch has removed LazyColumn from composition. A suspending
+                // scrollToItem waits for its layout and prevents finally from clearing loading.
+                listState.requestScrollToItem(0)
+            } catch (exception: Exception) {
+                if (token == requestToken) error = exception.message ?: "搜索失败，请稍后重试"
+            } finally {
+                if (token == requestToken) loading = false
+            }
+        }
+    }
+
+    fun loadMore() {
+        if (loading || loadingMore || !hasMore || activeQuery.isBlank()) return
+        val token = requestToken
+        loadingMore = true
+        error = null
+        scope.launch {
+            try {
+                val result = session.searchUserTimeline(profile.id, activeQuery, page = nextPage)
+                if (token != requestToken) return@launch
+                val merged = (posts + result.items).distinctBy { it.id }
+                hasMore = result.nextCursor != null && merged.size > posts.size
+                posts = merged
+                nextPage = result.nextCursor?.toIntOrNull() ?: (nextPage + 1)
+            } catch (exception: Exception) {
+                if (token == requestToken) error = exception.message ?: "加载更多失败"
+            } finally {
+                if (token == requestToken) loadingMore = false
+            }
+        }
+    }
+
+    LaunchedEffect(profile.id, initialQuery) { search(initialQuery) }
+    LaunchedEffect(listState, posts.size, loading, loadingMore, hasMore, error) {
+        snapshotFlow {
+            listState.isScrollInProgress to (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1)
+        }.collect { (scrolling, lastVisible) ->
+            if (scrolling) {
+                if (editing) editing = false
+                focusManager.clearFocus()
+                keyboard?.hide()
+                if (posts.isNotEmpty() && lastVisible >= posts.lastIndex - 2 && error == null) loadMore()
+            }
+        }
+    }
+    BackHandler(enabled = editing) {
+            editing = false
+            focusManager.clearFocus()
+            keyboard?.hide()
+    }
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .layerBackdrop(searchBackdrop)
+            .statusBarsPadding(),
+    ) {
+        if (loading) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+        AnimatedVisibility(
+            visible = activeQuery.isNotBlank() && !loading,
+            enter = EnterTransition.None,
+            exit = ExitTransition.None,
+        ) {
+        when {
+            posts.isEmpty() && !hasMore -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(error ?: "没有找到匹配的微博", color = if (error == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error)
+            }
+            else -> LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 88.dp),
+            ) {
+                if (posts.isEmpty() && hasMore) item {
+                    Text(
+                        text = error ?: "当前页没有匹配内容，可以继续搜索更早的微博",
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp),
+                        color = if (error == null) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                items(posts, key = { it.id }, contentType = ::feedCardContentType) { item ->
+                    val resolved = resolveFeedItem(item)
+                    LaunchedEffect(resolved.statusId, resolved.requiresLongTextFetch,
+                        resolved.retweetedStatus?.statusId, resolved.retweetedStatus?.requiresLongTextFetch) {
+                        if (resolved.requiresLongTextFetch) onLoadLongText(resolved)
+                        resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let(onLoadLongText)
+                    }
+                    var bounds by remember(item.id) { mutableStateOf<Rect?>(null) }
+                    FeedCard(
+                        item = resolved,
+                        onClick = { onItemClick(resolved, bounds) },
+                        onBoundsChanged = { bounds = it },
+                        onMediaClick = onMediaClick,
+                        emoticonMap = emoticonMap,
+                        isLongTextLoading = isLongTextLoading,
+                        onLoadLongText = onLoadLongText,
+                        onUrlEntityClick = onUrlEntityClick,
+                        showActionMenu = false,
+                    )
+                }
+                if (loadingMore) item { MineLoadingMoreIndicator() }
+                if (!loadingMore && hasMore) item {
+                    TextButton(
+                        onClick = ::loadMore,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    ) {
+                        Text(if (posts.isEmpty()) "搜索更早的微博" else "加载更多")
+                    }
+                }
+                if (error != null) item {
+                    Text(
+                        text = error.orEmpty(),
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (posts.isNotEmpty() && !hasMore) item {
+                    Text(
+                        text = "没有更多了",
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+    }
+    Box(
+        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+            .navigationBarsPadding().imePadding().padding(horizontal = 18.dp, vertical = 12.dp),
+    ) {
+    if (!editing) {
+        TransparentLiquidCapsule(
+            modifier = Modifier.fillMaxWidth().clickable {
+                draft = draft.copy(selection = TextRange(draft.text.length))
+                editing = true
+            },
+            backdrop = searchBackdrop,
+            pill = true,
+            surfaceColor = if (isAppLightTheme()) Color(0xFFF2F2F2) else Color(0xFF303030),
+            borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.24f),
+            borderWidth = 0.75.dp,
+            frostedBlurRadius = 8.dp,
+        ) {
+            Row(Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                UserSearchIcon(modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("@${profile.screenName}：", color = hintCapsulePlaceholderColor(), fontSize = 15.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 160.dp))
+                Text(draft.text, color = if (isAppLightTheme()) Color.Black else MaterialTheme.colorScheme.onSurface,
+                    fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+    AnimatedVisibility(
+        visible = editing,
+        enter = expandHorizontally(tween(220), expandFrom = Alignment.Start) + fadeIn(tween(120)),
+        exit = shrinkHorizontally(tween(180), shrinkTowards = Alignment.Start) + fadeOut(tween(120)),
+    ) {
+    SearchCapsuleField(
+        value = draft,
+        onValueChange = { draft = it },
+        mode = SearchMode.Weibo,
+        onModeChange = {},
+        onSearch = { search(draft.text) },
+        onClear = { draft = TextFieldValue("") },
+        backdrop = searchBackdrop,
+        placeholder = profile.postSearchPlaceholder,
+        userSearch = true,
+        autoFocus = true,
+        fixedPrefix = "@${profile.screenName}：",
+        modifier = Modifier.fillMaxWidth(),
+    )
+    }
+    }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
 private fun SearchScreen(
     session: WeiboWebSession,
     searchBarOverlay: SearchBarOverlayController,
@@ -20835,7 +21438,7 @@ private fun SearchScreen(
     val searchDraftText = searchDraft.text
 
     LaunchedEffect(searchHistory, searchHistoryExpanded) {
-        if (deleteHistoryQuery != null && deleteHistoryQuery !in searchHistory) {
+        if (deleteHistoryQuery != null && searchHistory.none { it.key == deleteHistoryQuery }) {
             deleteHistoryQuery = null
         }
     }
@@ -21260,6 +21863,7 @@ private fun SearchScreen(
             submitQuery(query, modeOverride = mode)
         }
         searchBarOverlay.onSuggestionUserClick = { user ->
+            searchHistory = searchHistoryStore.touchUser(user)
             focusManager.clearFocus(force = true)
             keyboardController?.hide()
             onUserClick(user.id)
@@ -21377,7 +21981,14 @@ private fun SearchScreen(
                                     searchHistoryExpanded = searchHistoryExpanded,
                                     deleteHistoryQuery = deleteHistoryQuery,
                                     onDeleteHistoryQueryChange = { deleteHistoryQuery = it },
-                                    onHistoryClick = { submitQuery(it) },
+                                    onHistoryClick = { entry ->
+                                        if (entry.userId != null) {
+                                            searchHistory = searchHistoryStore.touchEntry(entry)
+                                            focusManager.clearFocus(force = true)
+                                            keyboardController?.hide()
+                                            onUserClick(entry.userId)
+                                        } else submitQuery(entry.query)
+                                    },
                                     onHistoryDelete = { query ->
                                         searchHistory = searchHistoryStore.remove(query)
                                         deleteHistoryQuery = null
@@ -21839,6 +22450,7 @@ private fun MineScreen(
     onToggleLike: ((FeedItem) -> Unit)? = null,
     onLikeClick: ((FeedItem, Rect) -> Unit)? = null,
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    onSearchUserPosts: ((UserProfile, String) -> Unit)? = null,
     enableSettings: Boolean = true,
     storedAccounts: List<StoredWeiboAccount> = emptyList(),
     activeAccountId: String? = null,
@@ -22247,6 +22859,7 @@ private fun MineScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
+                            VerifiedAvatar(profile?.verification, badgeSize = 11.dp) {
                             RemoteImage(
                                 url = profile?.avatarUrl,
                                 modifier = Modifier
@@ -22258,6 +22871,7 @@ private fun MineScreen(
                                     ),
                                 contentScale = ContentScale.Crop,
                             )
+                            }
                             Column(
                                 modifier = Modifier
                                     .weight(1f)
@@ -22344,6 +22958,10 @@ private fun MineScreen(
                     ) {
                         MineContentTabs(
                             scrollPosition = mineTabScrollPosition,
+                            searchPlaceholder = profile?.postSearchPlaceholder ?: "搜索TA的微博",
+                            onSearchClick = profile?.takeIf { onSearchUserPosts != null }?.let { user ->
+                                { query: String -> onSearchUserPosts?.invoke(user, query) }
+                            },
                             onTabSelected = { tab ->
                                 val sameTab = tab == MineContentTab.entries[pagerState.currentPage]
                                 if (sameTab) {
@@ -22496,10 +23114,9 @@ private fun MineScreen(
                                                 coroutineScope.launch {
                                                     albumListState.stopScroll(MutatePriority.UserInput)
                                                 }
-                                                do {
-                                                    val event = awaitPointerEvent(PointerEventPass.Initial)
-                                                    event.changes.forEach { it.consume() }
-                                                } while (event.changes.any { it.pressed })
+                                                // Suppress a thumbnail click on this down, not the whole
+                                                // gesture: LazyColumn must still receive subsequent moves
+                                                // so a second upward swipe can continue scrolling.
                                             }
                                         },
                                     contentPadding = PaddingValues(bottom = 96.dp),
@@ -23243,6 +23860,7 @@ private fun SettingsAccountRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            VerifiedAvatar(account.verification, badgeSize = 14.dp) {
             RemoteImage(
                 url = account.avatarUrl,
                 modifier = Modifier
@@ -23250,6 +23868,7 @@ private fun SettingsAccountRow(
                     .clip(CircleShape),
                 contentScale = ContentScale.Crop,
             )
+            }
             Text(
                 text = account.screenName.ifBlank { "微博用户" },
                 modifier = Modifier.weight(1f),
@@ -23730,6 +24349,7 @@ private fun SettingsTypographyPreview(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            VerifiedAvatar(item.verification, badgeSize = 10.dp) {
             RemoteImage(
                 url = item.authorAvatarUrl,
                 modifier = Modifier
@@ -23737,6 +24357,7 @@ private fun SettingsTypographyPreview(
                     .clip(CircleShape),
                 contentScale = ContentScale.Crop,
             )
+            }
             Column(Modifier.weight(1f)) {
                 Text(
                     text = item.authorName.ifBlank { "Weibo user" },
@@ -24787,7 +25408,8 @@ private fun MineProfileHeader(
                 }
             }
 
-            Surface(
+            VerifiedAvatar(
+                verification = profile?.verification,
                 modifier = Modifier
                     .padding(start = 16.dp)
                     .size(ProfileHeaderAvatarFrameSize)
@@ -24795,10 +25417,16 @@ private fun MineProfileHeader(
                         y = coverHeight - ProfileHeaderCardCoverOverlap - avatarExposeAboveCard,
                     )
                     .zIndex(2f),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.surface,
-                shadowElevation = 2.dp,
+                badgeSize = 27.dp,
+                badgeOffset = (-3).dp,
             ) {
+                // Only the avatar is circularly clipped; the badge must protrude outside it.
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 2.dp,
+                ) {
                 RemoteImage(
                     url = profile?.avatarUrl,
                     retainPreviousImage = true,
@@ -24818,6 +25446,7 @@ private fun MineProfileHeader(
                         ),
                     contentScale = ContentScale.Crop,
                 )
+                }
             }
         }
 
@@ -24874,6 +25503,7 @@ private fun VisitedUserProfileContent(
     onToggleLike: (FeedItem) -> Unit,
     onLikeClick: (FeedItem, Rect) -> Unit,
     onUrlEntityClick: (FeedUrlEntity) -> Unit,
+    onSearchUserPosts: (UserProfile, String) -> Unit,
     onOpenFollowList: (String, String, String?, String?, FriendListTab) -> Unit,
     showFollowActions: Boolean,
     followLoading: Boolean,
@@ -24920,6 +25550,7 @@ private fun VisitedUserProfileContent(
         onToggleLike = onToggleLike,
         onLikeClick = onLikeClick,
         onUrlEntityClick = onUrlEntityClick,
+        onSearchUserPosts = onSearchUserPosts,
         onOpenFollowList = onOpenFollowList,
         enableSettings = false,
         showPullRefreshIndicator = false,
@@ -24991,6 +25622,7 @@ private fun FollowFansListScreen(
                 verticalAlignment = Alignment.Top,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
+                VerifiedAvatar(overlay.verification, badgeSize = 16.dp) {
                 RemoteImage(
                     url = overlay.avatarUrl,
                     modifier = Modifier
@@ -24998,6 +25630,7 @@ private fun FollowFansListScreen(
                         .clip(CircleShape),
                     contentScale = ContentScale.Crop,
                 )
+                }
                 Column(
                     modifier = Modifier
                         .weight(1f)
@@ -25354,6 +25987,7 @@ private fun RelationUserRow(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.Top,
         ) {
+            VerifiedAvatar(user.verification, badgeSize = 16.dp) {
             RemoteImage(
                 url = user.avatarLarge?.takeIf { it.isNotBlank() } ?: user.avatarUrl,
                 modifier = Modifier
@@ -25361,6 +25995,7 @@ private fun RelationUserRow(
                     .clip(CircleShape),
                 contentScale = ContentScale.Crop,
             )
+            }
             Spacer(Modifier.width(12.dp))
             Column(
                 modifier = Modifier.weight(1f),
@@ -25400,6 +26035,7 @@ private fun RelationUserRow(
                     following = following,
                     followMe = followMe,
                     loading = followLoading,
+                    confirmUnfollow = true,
                     onClick = {
                         scope.launch {
                             followLoading = true
@@ -25443,8 +26079,10 @@ private fun ProfileFollowCapsuleButton(
     specialFollowing: Boolean = false,
     loading: Boolean,
     onClick: () -> Unit,
+    confirmUnfollow: Boolean = false,
 ) {
     val followMenu = LocalProfileFollowMenu.current
+    val unfollowConfirm = LocalUnfollowConfirm.current
     var buttonBounds by remember { mutableStateOf<Rect?>(null) }
     val followTextStyle = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium)
     val textMeasurer = rememberTextMeasurer()
@@ -25461,7 +26099,11 @@ private fun ProfileFollowCapsuleButton(
     Surface(
         onClick = {
             val bounds = buttonBounds
-            if (following && followMenu != null && bounds != null) followMenu(bounds, onClick) else onClick()
+            when {
+                following && confirmUnfollow -> if (bounds != null) unfollowConfirm?.invoke(bounds, onClick)
+                following && followMenu != null && bounds != null -> followMenu(bounds, onClick)
+                else -> onClick()
+            }
         },
         modifier = Modifier
             .then(if (following) Modifier.width(followedWidth) else Modifier)
@@ -25545,16 +26187,14 @@ private fun MineInlineStat(
     label: String,
     onClick: (() -> Unit)? = null,
 ) {
-    Row(
-        modifier = if (onClick != null) {
-            Modifier.clickable(onClick = onClick)
-        } else {
-            Modifier
-        },
-        verticalAlignment = Alignment.CenterVertically,
+    Column(
+        modifier = Modifier.widthIn(min = 44.dp).then(
+            if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
+        ),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         Text(value, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.width(3.dp))
         Text(
             text = label,
             style = MaterialTheme.typography.bodySmall,
@@ -25564,11 +26204,49 @@ private fun MineInlineStat(
 }
 
 @Composable
+@OptIn(ExperimentalLayoutApi::class)
 private fun MineContentTabs(
     scrollPosition: Float,
     onTabSelected: (MineContentTab) -> Unit,
+    onSearchClick: ((String) -> Unit)? = null,
+    searchPlaceholder: String = "搜索TA的微博",
 ) {
     val tabs = MineContentTab.entries
+    var tabTextCenterWindowY by remember { mutableFloatStateOf(Float.NaN) }
+    var tabsTopWindowY by remember { mutableFloatStateOf(0f) }
+    val searchTop = if (tabTextCenterWindowY.isNaN()) (-6).dp else
+        with(LocalDensity.current) { (tabTextCenterWindowY - tabsTopWindowY).toDp() } - 18.dp
+    var searchExpanded by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    val searchFocus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val imeTargetVisible = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding() > 0.dp
+    var searchKeyboardWasVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(searchExpanded, imeTargetVisible) {
+        if (!searchExpanded) {
+            searchKeyboardWasVisible = false
+        } else if (imeTargetVisible) {
+            searchKeyboardWasVisible = true
+        } else if (searchKeyboardWasVisible) {
+            // Android consumes the first back to dismiss IME before Compose BackHandler.
+            // Follow the IME's target state so the capsule collapses during that same dismissal.
+            searchExpanded = false
+            focusManager.clearFocus()
+        }
+    }
+    LaunchedEffect(searchExpanded) {
+        if (searchExpanded) {
+            withFrameNanos { }
+            searchFocus.requestFocus()
+            keyboard?.show()
+        }
+    }
+    BackHandler(enabled = searchExpanded) {
+        searchExpanded = false
+        focusManager.clearFocus()
+        keyboard?.hide()
+    }
     val accent = MaterialTheme.colorScheme.primary
     val density = LocalDensity.current
     val indicatorWidth = 22.dp
@@ -25592,9 +26270,13 @@ private fun MineContentTabs(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp, bottom = 4.dp),
+            .padding(start = 12.dp, bottom = 4.dp)
+            .onGloballyPositioned { tabsTopWindowY = it.boundsInWindow().top },
+            // Both search states share the measured label center rather than the taller tab container.
+            // This excludes the indicator/spacer below the labels from vertical alignment.
     ) {
         Row(
+            modifier = Modifier.padding(end = if (onSearchClick != null) 40.dp else 0.dp),
             horizontalArrangement = Arrangement.spacedBy(22.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
@@ -25615,6 +26297,9 @@ private fun MineContentTabs(
                 ) {
                     Text(
                         text = tab.label,
+                        modifier = Modifier.onGloballyPositioned {
+                            if (index == 0) tabTextCenterWindowY = it.boundsInWindow().center.y
+                        },
                         fontSize = 14.sp,
                         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
                         color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -25634,6 +26319,67 @@ private fun MineContentTabs(
                     .clip(RoundedCornerShape(999.dp))
                     .background(accent),
             )
+        }
+
+        if (onSearchClick != null && !searchExpanded) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = (-16).dp, y = searchTop)
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() },
+                        onClick = {
+                            query = ""
+                            searchExpanded = true
+                        },
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                UserSearchIcon(
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(21.dp),
+                )
+            }
+        }
+        AnimatedVisibility(
+            visible = searchExpanded,
+            modifier = Modifier.align(Alignment.TopEnd).padding(end = 16.dp).offset(y = searchTop),
+            enter = expandHorizontally(tween(220), expandFrom = Alignment.End) + fadeIn(tween(120)),
+            exit = shrinkHorizontally(tween(180), shrinkTowards = Alignment.End) + fadeOut(tween(120)),
+        ) {
+            Row(
+                Modifier.width(160.dp).height(36.dp).clip(CircleShape)
+                    .background(if (isAppLightTheme()) Color(0xFFF2F2F2) else Color(0xFF303030)).padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                UserSearchIcon(modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                BasicTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    modifier = Modifier.weight(1f).fillMaxHeight().focusRequester(searchFocus),
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp, lineHeight = 16.sp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = {
+                        if (query.isNotBlank()) {
+                            focusManager.clearFocus()
+                            keyboard?.hide()
+                            searchExpanded = false
+                            onSearchClick?.invoke(query.trim())
+                        }
+                    }),
+                    decorationBox = { field ->
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                            if (query.isEmpty()) Text(searchPlaceholder, color = hintCapsulePlaceholderColor(), fontSize = 12.sp, lineHeight = 16.sp)
+                            field()
+                        }
+                    },
+                )
+            }
         }
     }
 }

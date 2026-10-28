@@ -10,6 +10,7 @@ data class StoredWeiboAccount(
     val screenName: String,
     val avatarUrl: String?,
     val cookies: Map<String, String>,
+    val verification: UserVerification? = null,
 )
 
 class WeiboAccountStore(context: Context) {
@@ -110,6 +111,7 @@ class WeiboAccountStore(context: Context) {
                         screenName = item.optString("screen_name"),
                         avatarUrl = item.optNullableString("avatar_url"),
                         cookies = cookies,
+                        verification = UserVerification.entries.firstOrNull { it.name == item.optString("verification") },
                     )
                 )
             }
@@ -124,6 +126,7 @@ class WeiboAccountStore(context: Context) {
                         .put("id", account.id)
                         .put("screen_name", account.screenName)
                         .put("avatar_url", account.avatarUrl)
+                        .put("verification", account.verification?.name)
                         .put(
                             "cookies",
                             JSONObject().also { cookieJson ->

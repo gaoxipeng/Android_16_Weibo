@@ -20,6 +20,7 @@ data class RelationUser(
     val verified: Boolean,
     val verifiedReason: String?,
     val location: String?,
+    val verification: UserVerification? = null,
 )
 
 data class RelationPage(
@@ -42,6 +43,7 @@ fun RelationUser.toUserProfile(): UserProfile =
         statusesCount = "--",
         following = following,
         followMe = followMe,
+        verification = verification,
     )
 
 fun SearchUserItem.toRelationUser(): RelationUser {
@@ -61,8 +63,9 @@ fun SearchUserItem.toRelationUser(): RelationUser {
         friendsCount = "--",
         following = following,
         followMe = followMe,
-        verified = false,
+        verified = verification != null,
         verifiedReason = null,
         location = null,
+        verification = verification,
     )
 }

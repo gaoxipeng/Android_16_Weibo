@@ -7,6 +7,7 @@ fun RelationUser.toMentionCandidate(): MentionCandidate? {
         id = id.trim(),
         name = name,
         avatarUrl = avatarLarge?.takeIf { it.isNotBlank() } ?: avatarUrl?.takeIf { it.isNotBlank() },
+        verification = verification,
     )
 }
 
@@ -48,6 +49,7 @@ fun mergeRelationUsers(vararg lists: List<RelationUser>): List<RelationUser> {
                 screenName = existing.screenName.ifBlank { user.screenName },
                 avatarUrl = existing.avatarUrl ?: user.avatarUrl,
                 avatarLarge = existing.avatarLarge ?: user.avatarLarge,
+                verification = existing.verification ?: user.verification,
                 following = existing.following || user.following,
                 followMe = existing.followMe || user.followMe,
             )

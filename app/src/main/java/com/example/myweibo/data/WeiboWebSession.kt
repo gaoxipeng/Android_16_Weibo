@@ -195,8 +195,8 @@ class WeiboWebSession(context: Context) {
             referer = "https://s.weibo.com/",
             origin = "https://s.weibo.com",
         )
-        val page = WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
-        return page.copy(items = enrichSearchFeedItems(page.items))
+        val pageResult = WeiboJsonParser.parseSWeiboSearchTimeline(raw, page)
+        return pageResult.copy(items = enrichSearchFeedItems(pageResult.items))
     }
 
     private suspend fun enrichSearchFeedItems(items: List<FeedItem>): List<FeedItem> {
@@ -290,6 +290,28 @@ class WeiboWebSession(context: Context) {
                 "feature" to "0",
             )
         )
+
+    suspend fun searchUserTimeline(uid: String, query: String, page: Int = 1): TimelinePage {
+        require(uid.isNotBlank()) { "未读取到用户 UID" }
+        require(query.isNotBlank()) { "请输入搜索关键词" }
+        val raw = fetchJson(
+            WeiboEndpoints.USER_SEARCH_BLOG,
+            linkedMapOf(
+                "uid" to uid,
+                "page" to page.toString(),
+                "feature" to "0",
+                "q" to query.trim(),
+            ),
+            referer = "https://weibo.com/u/$uid",
+        )
+        return withContext(Dispatchers.Default) {
+            val root = JSONObject(raw)
+            android.util.Log.i("UserPostSearch", "page=$page ok=${root.opt("ok")} keys=${root.keys().asSequence().joinToString()}")
+            WeiboJsonParser.parseUserSearchTimeline(raw, uid, page).also {
+                android.util.Log.i("UserPostSearch", "page=$page parsed=${it.items.size}")
+            }
+        }
+    }
 
     suspend fun loadUserAlbumImages(
         uid: String,
@@ -591,6 +613,73 @@ class WeiboWebSession(context: Context) {
             ),
         )
         return WeiboJsonParser.parseStatusDetail(raw)
+    }
+
+    private suspend fun loadVoteBootstrap(voteId: String): JSONObject {
+        require(voteId.matches(Regex("[A-Za-z0-9_-]+"))) { "投票 ID 无效" }
+        val html = nativeFetchAbsoluteHtml("https://vote.weibo.com/h5/index/index?vote_id=${voteId.urlEncode()}",
+            "https://vote.weibo.com/", "https://vote.weibo.com")
+        return withContext(Dispatchers.Default) { parseVotePageBootstrap(html) }
+    }
+
+    suspend fun loadVotePoll(voteId: String): FeedPoll = pollFromVoteInfo(
+        requireNotNull(loadVoteBootstrap(voteId).optJSONObject("vote_info")),
+    )
+
+    /** Called only by a user vote/cancel action; does not forward/repost or auto-retry. */
+    suspend fun submitPoll(voteId: String, optionIds: List<String>, cancel: Boolean): FeedPoll {
+        val bootstrap = loadVoteBootstrap(voteId)
+        val info = requireNotNull(bootstrap.optJSONObject("vote_info"))
+        val current = pollFromVoteInfo(info)
+        check(!current.isEnded) { "投票已结束，无法更改" }
+        check(info.optInt("launch_is_loginuser", 0) != 1) { "不能修改自己发起的投票" }
+        if (!cancel) {
+            require(optionIds.size in current.minimum..current.maximum) { "请选择 ${current.minimum} 至 ${current.maximum} 项" }
+            require(optionIds.all { id -> current.options.any { it.id == id } }) { "投票选项已变化，请刷新后重试" }
+            check(!current.hasVoted) { "已经参与投票，请先取消原投票" }
+        } else check(current.hasVoted) { "当前账号尚未投票" }
+        val sk = bootstrap.optString("sk").takeIf { it.isNotBlank() } ?: error("投票登录凭据已失效，请重新登录")
+        val path = if (cancel) "/vote/h5/aj/cancelvote/index"
+            else if (bootstrap.optInt("use_lua", 0) == 1) "/lua_vote/h5/aj/vote/index" else "/vote/h5/aj/vote/index"
+        val params = linkedMapOf("vote_id" to voteId, "sk" to sk)
+        if (!cancel) params["vote_optionids"] = optionIds.joinToString(",")
+        val result = withContext(Dispatchers.IO) {
+            val cookie = mergedCookieHeader("https://vote.weibo.com/")
+            check(hasAuthenticatedCookie(cookie)) { "请先登录微博" }
+            val connection = (URL("https://vote.weibo.com$path").openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                instanceFollowRedirects = false
+                connectTimeout = 12_000
+                readTimeout = 12_000
+                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+                setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                setRequestProperty("Accept", "application/json, text/plain, */*")
+                setRequestProperty("Origin", "https://vote.weibo.com")
+                setRequestProperty("Referer", "https://vote.weibo.com/h5/index/index?vote_id=${voteId.urlEncode()}")
+                setRequestProperty("X-Requested-With", "XMLHttpRequest")
+                setRequestProperty("Cookie", cookie)
+            }
+            try {
+                connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                    writer.write(params.entries.joinToString("&") { "${it.key.urlEncode()}=${it.value.urlEncode()}" })
+                }
+                check(connection.responseCode in 200..299) { "投票请求失败（${connection.responseCode}），请刷新后确认状态" }
+                syncResponseCookies(connection)
+                JSONObject(connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() })
+            } finally { connection.disconnect() }
+        }
+        check(result.optInt("code", 0) == 1) { result.optString("msg").ifBlank { "投票操作未成功" } }
+        val updated = result.optJSONObject("data")?.optJSONObject("vote_info")
+            ?: error("操作已发送，但未返回最新结果，请刷新确认，勿重复提交")
+        updated.keys().forEach { key -> info.put(key, updated.opt(key)) }
+        val submitted = pollFromVoteInfo(info)
+        // Some submit responses contain only the chosen option. Read all option totals afresh;
+        // never retry the state-changing request if this read fails.
+        val refreshed = try { loadVotePoll(voteId) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { null }
+        return refreshed?.takeIf { it.hasVoted == submitted.hasVoted && it.options.isNotEmpty() } ?: submitted
     }
 
     private fun FeedItem.hasAtLeastSameVisibleContentAs(other: FeedItem): Boolean {
@@ -1848,6 +1937,7 @@ class WeiboWebSession(context: Context) {
                 screenName = profile.screenName,
                 avatarUrl = profile.avatarUrl,
                 cookies = captureCookieSnapshot(),
+                verification = profile.verification,
             )
             store.upsertAccount(account, makeActive = makeActive)
             accountPersisted = true

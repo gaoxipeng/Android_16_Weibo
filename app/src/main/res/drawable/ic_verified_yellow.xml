@@ -1,0 +1,8 @@
+<!-- Extracted from official weibo-pro-next/assets/index-WivZsFc9.js (vyellow).
+     SVG geometry retained; CSS currentColor resolved to its official light border.
+     Static artwork only; web sparkle animations are not included. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="16dp" android:height="16dp" android:viewportWidth="100" android:viewportHeight="100">
+    <path android:fillColor="#FFFFFF" android:pathData="M0,50a50,50 0,1 1,100 0a50,50 0,1 1,-100 0"/>
+    <path android:fillColor="#FFC802" android:pathData="M9.524,50a40.476,40.476 0,1 1,80.952 0a40.476,40.476 0,1 1,-80.952 0"/>
+    <path android:fillColor="#FFFFFF" android:fillType="evenOdd" android:pathData="M37.025 33.134 50 59.612l13.153-26.478h11.3L55.404 71.429H44.589L25.542 33.134z"/>
+</vector>
