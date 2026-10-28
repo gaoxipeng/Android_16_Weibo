@@ -8878,7 +8878,7 @@ private fun FeedRefreshCapsuleHint(
     val textColor = when (tone) {
         CapsuleHintTone.Success -> HintCapsuleSuccessText
         CapsuleHintTone.Progress -> HintCapsuleProgressText
-        CapsuleHintTone.Theme -> MaterialTheme.colorScheme.onPrimary
+        CapsuleHintTone.Theme -> Color.White
         CapsuleHintTone.Neutral -> hintCapsuleTextColor()
     }
     OpaqueHintCapsule(modifier = modifier, tone = tone) {
@@ -21999,16 +21999,33 @@ private fun MineScreen(
             }
         }
         if (showAccountManagement) {
-            SettingsPageShell(
-                title = "\u8D26\u53F7\u7BA1\u7406",
-                onBack = {
-                    coroutineScope.launch {
-                        if (session.hasLoginCookie()) {
-                            onPersistLoginSession()
-                        }
+            val closeAccountManagement = {
+                coroutineScope.launch {
+                    if (session.hasLoginCookie()) onPersistLoginSession()
+                }
+                showAccountManagement = false
+            }
+            Dialog(
+                onDismissRequest = closeAccountManagement,
+                properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+            ) {
+                val loginWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+                SideEffect {
+                    loginWindow?.apply {
+                        setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+                        setDimAmount(0f)
+                        clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                        addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
+                        // Keep legacy IME resizing for Android versions before
+                        // edge-to-edge insets handling became the default.
+                        @Suppress("DEPRECATION")
+                        val resizeMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                        setSoftInputMode(resizeMode)
                     }
-                    showAccountManagement = false
-                },
+                }
+                SettingsPageShell(
+                title = "\u8D26\u53F7\u7BA1\u7406",
+                onBack = closeAccountManagement,
             ) {
                 AccountLoginPanel(
                     session = session,
@@ -22034,6 +22051,7 @@ private fun MineScreen(
                         onReturnToFeed()
                     },
                 )
+            }
             }
         } else {
             SettingsScreen(
@@ -24052,12 +24070,18 @@ private fun SettingsBottomBarGlassCard(
                     .padding(horizontal = 16.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "底栏 Liquid Glass",
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Text(
+                        text = "底栏 Liquid Glass",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = "展开调整底栏磨砂和玻璃效果",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 SettingsExpandIndicator(expanded = expanded, rotateOnExpand = true)
             }
             AnimatedVisibility(visible = expanded) {
@@ -26221,9 +26245,7 @@ private fun AccountLoginPanel(
             session = session,
             reloadKey = loginReloadKey,
             onLoginSuccess = onLoginSuccess,
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
+            modifier = Modifier.fillMaxWidth().weight(1f),
         )
     }
 }
@@ -26257,18 +26279,12 @@ private fun AccountLoginWebView(
     val onLoginSuccessState = rememberUpdatedState(onLoginSuccess)
     val loginSuccessNotified = remember(reloadKey) { java.util.concurrent.atomic.AtomicBoolean(false) }
     val loginUrl = "https://passport.weibo.cn/signin/login"
-    val loginUserAgent = remember(context) {
-        WebSettings.getDefaultUserAgent(context)
-            .replace("; wv", "")
-            .replace(" Version/4.0", "")
-    }
     val webView = remember(reloadKey) {
         WebView(context).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            useSafeWebRendering()
             importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             setBackgroundColor(android.graphics.Color.WHITE)
             CookieManager.getInstance().setAcceptCookie(true)
@@ -26282,7 +26298,6 @@ private fun AccountLoginWebView(
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
                 cacheMode = WebSettings.LOAD_DEFAULT
-                userAgentString = loginUserAgent
             }
             webViewClient = object : WebViewClient() {
                 private fun notifyLoginSuccessIfNeeded(host: WebView?) {

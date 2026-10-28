@@ -57,7 +57,7 @@ internal fun WeiboLiquidBottomBar(
     modifier: Modifier = Modifier,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
-    val tabContentColor = if (isAppLightTheme()) Color.Black else Color.White
+    val tabContentColor = if (isAppLightTheme()) Color.Black else Color(0xFFD0D0D0)
     val density = LocalDensity.current
     val barHeight = 64.dp
     val tabs = MainTab.entries

@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import com.example.myweibo.ui.theme.isAppLightTheme
 import com.example.myweibo.data.bottomBarGlassBlurDp
+import com.example.myweibo.data.bottomBarBlurSamplingPadding
 import com.example.myweibo.data.bottomBarGlassSurfaceAlpha
 import com.example.myweibo.data.bottomBarGlassRefractionHeightDp
 import com.example.myweibo.data.bottomBarGlassRefractionAmountDp
@@ -52,7 +53,6 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastRoundToInt
-import androidx.compose.ui.util.lerp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
@@ -60,6 +60,7 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
+import com.kyant.backdrop.effects.vibrancy
 import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.backdrop.shadow.InnerShadow
@@ -96,6 +97,9 @@ fun LiquidBottomTabs(
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
     val capsuleSurfaceColor = Color.White.copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+    val indicatorContainerColor =
+        if (isLightTheme) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+        else Color(0xFF121212).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     val tabsBackdrop = rememberLayerBackdrop()
     val indicatorBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
 
@@ -351,9 +355,14 @@ fun LiquidBottomTabs(
                     backdrop = backdrop,
                     shape = { barShape },
                     effects = {
-                        if (frost > 0f) blur(bottomBarGlassBlurDp(frost).dp.toPx(), TileMode.Clamp)
+                        val radius = bottomBarGlassBlurDp(frost).dp.toPx()
+                        val lensHeight = bottomBarGlassRefractionHeightDp(glass).dp.toPx()
+                        if (radius > 0f) {
+                            blur(radius, TileMode.Clamp)
+                            padding = bottomBarBlurSamplingPadding(radius, lensHeight)
+                        }
                         if (glass > 0f) lens(
-                            bottomBarGlassRefractionHeightDp(glass).dp.toPx(),
+                            lensHeight,
                             bottomBarGlassRefractionAmountDp(glass).dp.toPx(),
                         )
                     },
@@ -411,15 +420,17 @@ fun LiquidBottomTabs(
                         backdrop = backdrop,
                         shape = { barShape },
                         effects = {
-                            if (frost > 0f) blur(bottomBarGlassBlurDp(frost).dp.toPx(), TileMode.Clamp)
-                            if (glass > 0f) lens(
-                                24.dp.toPx() * animatedPressProgress * glass,
-                                24.dp.toPx() * animatedPressProgress * glass,
+                            vibrancy()
+                            blur(bottomBarGlassBlurDp(frost).dp.toPx())
+                            lens(
+                                24.dp.toPx() * animatedPressProgress,
+                                24.dp.toPx() * animatedPressProgress,
                             )
                         },
                         highlight = { Highlight.Default.copy(alpha = animatedPressProgress.coerceIn(0f, 1f)) },
-                        onDrawSurface = { drawRect(capsuleSurfaceColor) },
+                        onDrawSurface = { drawRect(indicatorContainerColor) },
                     )
+                    .then(interactiveHighlight.modifier)
                     .height(56.dp)
                     .fillMaxWidth()
                     .padding(horizontal = 4.dp)
@@ -439,12 +450,9 @@ fun LiquidBottomTabs(
                         backdrop = indicatorBackdrop,
                         shape = { RoundedCornerShape(percent = 50) },
                         effects = {
-                            // The selected capsule remains frosted independently of
-                            // the large bar's adjustable surface and refraction.
-                            blur(24.dp.toPx(), TileMode.Clamp)
-                            if (glass > 0f) lens(
-                                10.dp.toPx() * animatedPressProgress * glass,
-                                14.dp.toPx() * animatedPressProgress * glass,
+                            lens(
+                                10.dp.toPx() * animatedPressProgress,
+                                14.dp.toPx() * animatedPressProgress,
                                 chromaticAberration = true,
                             )
                         },
@@ -464,7 +472,7 @@ fun LiquidBottomTabs(
                         onDrawSurface = {
                             val press = animatedPressProgress.coerceIn(0f, 1f)
                             val gray = if (isLightTheme) Color.Black else Color.White
-                            drawRect(gray.copy(alpha = 0.10f))
+                            drawRect(gray.copy(alpha = 0.14f * (1f - press)))
                             drawRect(Color.Black.copy(alpha = 0.03f * press))
                         },
                     )

@@ -1,6 +1,7 @@
 package com.example.myweibo
 
 import com.example.myweibo.data.bottomBarGlassBlurDp
+import com.example.myweibo.data.bottomBarBlurSamplingPadding
 import com.example.myweibo.data.bottomBarGlassSurfaceAlpha
 import com.example.myweibo.data.bottomBarGlassRefractionHeightDp
 import com.example.myweibo.data.bottomBarGlassRefractionAmountDp
@@ -10,6 +11,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class BottomBarGlassSettingsTest {
+    @Test fun blurredBackgroundKeepsItsSourceMarginAfterLensConsumesPadding() {
+        assertEquals(48f, bottomBarBlurSamplingPadding(24f, 0f), 0.0001f)
+        assertEquals(48f, bottomBarBlurSamplingPadding(24f, 24f) - 24f, 0.0001f)
+        assertEquals(48f, bottomBarBlurSamplingPadding(24f, 12f) - 12f, 0.0001f)
+        assertEquals(24f, bottomBarBlurSamplingPadding(12f, 24f) - 24f, 0.0001f)
+        assertEquals(0f, bottomBarBlurSamplingPadding(0f, 24f), 0.0001f)
+        assertEquals(0f, bottomBarBlurSamplingPadding(Float.NaN, 24f), 0.0001f)
+    }
     @Test fun leftEndpointIsTransparent() {
         assertEquals(0f, bottomBarGlassBlurDp(0f), 0.0001f)
         assertEquals(0f, bottomBarGlassSurfaceAlpha(0f), 0.0001f)
