@@ -121,9 +121,10 @@ class WeiboWebSession(context: Context) {
             linkedMapOf("uid" to uid, "relate" to "fans", "page" to page.toString()),
             "https://weibo.com/u/$uid",
         )
-        return withContext(Dispatchers.Default) {
+        val parsed = withContext(Dispatchers.Default) {
             WeiboJsonParser.parsePersonalFeed(raw, page)
         }
+        return parsed.copy(items = enrichSearchFeedItems(parsed.items))
     }
 
     suspend fun loadHotSearch(): List<HotSearchItem> {
@@ -131,6 +132,15 @@ class WeiboWebSession(context: Context) {
             WeiboEndpoints.SEARCH_BAND,
             mapOf("last_tab" to "hot"),
         )
+        return WeiboJsonParser.parseHotSearch(raw)
+    }
+
+    suspend fun loadPersonalHotSearch(): List<HotSearchItem> {
+        val raw = fetchJson(WeiboEndpoints.PERSONAL_SEARCH_BAND, referer = "https://weibo.com/hot/mine")
+        val root = JSONObject(raw)
+        check(root.optInt("ok", 0) == 1 && root.optJSONObject("data")?.has("realtime") == true) {
+            root.optString("message").ifBlank { "当前账号暂时无法读取我的热搜，请稍后重试" }
+        }
         return WeiboJsonParser.parseHotSearch(raw)
     }
 

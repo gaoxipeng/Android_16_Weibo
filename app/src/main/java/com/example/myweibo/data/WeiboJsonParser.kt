@@ -2913,6 +2913,7 @@ object WeiboJsonParser {
                         label = item.optNullableString("labelName")
                             ?: item.optNullableString("iconDesc")
                             ?: item.optNullableString("small_icon_desc")
+                            ?: item.optNullableString("icon_desc")
                             ?: "",
                         heat = item.optLong("num", 0L),
                     ),

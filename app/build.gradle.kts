@@ -24,8 +24,8 @@ android {
         applicationId = "com.example.myweibo"
         minSdk = 36
         targetSdk = 36
-        versionCode = 58
-        versionName = "20261029"
+        versionCode = 59
+        versionName = "20261030"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -42,6 +42,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Keep instrumentation/layout checks isolated from the signed daily app.
+            applicationIdSuffix = ".layouttest"
+        }
         release {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")

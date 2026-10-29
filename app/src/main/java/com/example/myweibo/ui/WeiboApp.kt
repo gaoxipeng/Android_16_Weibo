@@ -294,6 +294,7 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.TextUnit
@@ -2177,7 +2178,18 @@ private data class VisitedProfileSnapshot(
     val albumScrollOffset: Int = 0,
 )
 
+private class ProfileRetainedUi {
+    val likesList = LazyListState()
+    val videosList = LazyListState()
+    var likes by mutableStateOf<List<FeedItem>>(emptyList())
+    var likesLoaded by mutableStateOf(false)
+    var likesCursor by mutableStateOf<String?>(null)
+    var collapse by mutableFloatStateOf(0f)
+}
+private val LocalProfileRetainedUi = staticCompositionLocalOf<MutableMap<String, ProfileRetainedUi>> { mutableMapOf() }
+
 private data class AlbumViewerState(
+    val backdropBitmap: Bitmap? = null,
     val images: List<FeedImage>,
     val initialIndex: Int,
     val sourceBoundsByIndex: Map<Int, Rect> = emptyMap(),
@@ -2191,6 +2203,7 @@ private data class AlbumViewerState(
 private enum class DetailContentSection {
     Comments,
     Reposts,
+    Likes,
 }
 
 private data class LikeUsersOverlayState(
@@ -2227,12 +2240,26 @@ private data class DetailSnapshot(
     val reposts: List<CommentItem> = emptyList(),
     val repostsNextPage: Int? = null,
     val repostsHasMore: Boolean = true,
+    val likeUsers: List<MentionCandidate> = emptyList(),
+    val likeUsersNextPage: Int? = null,
+    val likeUsersLoaded: Boolean = false,
+    val likesScrollIndex: Int = 0,
+    val likesScrollOffset: Int = 0,
+    val likesListGeneration: Int = 0,
     val scrollIndex: Int = 0,
     val scrollOffset: Int = 0,
     val albumViewerState: AlbumViewerState? = null,
     val instanceKey: Int = 0,
     val sourceBounds: Rect? = null,
     val sourceImage: Bitmap? = null,
+)
+
+private data class RetainedLikeUsersState(
+    val users: List<MentionCandidate>,
+    val nextPage: Int?,
+    val loaded: Boolean,
+    val scrollIndex: Int,
+    val scrollOffset: Int,
 )
 
 private data class ArticleOverlayState(
@@ -3913,6 +3940,8 @@ fun WeiboApp() {
     var mediaOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var articleOverlayInstanceKey by remember { mutableIntStateOf(0) }
     var albumViewerState by remember { mutableStateOf<AlbumViewerState?>(null) }
+    var albumDetailBackdrop by remember { mutableStateOf<Bitmap?>(null) }
+    var albumDetailBackdropVisible by remember { mutableStateOf(false) }
     var albumDismissScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
     var comments by remember { mutableStateOf<List<CommentItem>>(emptyList()) }
     var commentsLoading by remember { mutableStateOf(false) }
@@ -3983,6 +4012,16 @@ fun WeiboApp() {
     var likeUsersLoadingMore by remember { mutableStateOf(false) }
     var likeUsersNextPage by remember { mutableStateOf<Int?>(null) }
     var likeUsersError by remember { mutableStateOf<String?>(null) }
+    var likeUsersLoaded by remember { mutableStateOf(false) }
+    // Detail content can leave composition while a profile overlay is shown.
+    // Keep each detail's outer and section list states above that overlay so
+    // returning does not recreate them at item zero.
+    val detailOuterListStates = remember { mutableMapOf<String, LazyListState>() }
+    val detailCommentsListStates = remember { mutableMapOf<String, LazyListState>() }
+    val detailRepostsListStates = remember { mutableMapOf<String, LazyListState>() }
+    val detailLikesListStates = remember { mutableMapOf<String, LazyListState>() }
+    var detailLikesListGeneration by remember { mutableIntStateOf(0) }
+    val retainedLikeUsersByStatus = remember { mutableStateMapOf<String, RetainedLikeUsersState>() }
     var mineProfile by remember { mutableStateOf<UserProfile?>(null) }
     var mineAccountGeneration by remember { mutableIntStateOf(0) }
     var mineProfileLoading by remember { mutableStateOf(false) }
@@ -4028,7 +4067,13 @@ fun WeiboApp() {
     val profilePreviewCache = remember(activeAccountId) { mutableMapOf<String, UserProfile>() }
     var profileOpeningJob by remember { mutableStateOf<Job?>(null) }
     // One clock moves the incoming page and the outgoing navigation bar.
-    val profileEnterOffset = remember(visitedProfileLoadGeneration) { Animatable(1f) }
+    val profileEnterOffset = remember(visitedProfileLoadGeneration) {
+        Animatable(if (navEnterPendingKind is NavOverlayKind.VisitedProfile) 1f else 0f)
+    }
+    var profileReturnBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    val profileParentBackdrops = remember { mutableStateMapOf<Int, Bitmap>() }
+    var profileReturnCapturing by remember { mutableStateOf(false) }
+    val profileReturnProgress = remember { Animatable(0f) }
     var profileEntryLaidOut by remember(visitedProfileLoadGeneration) { mutableStateOf(false) }
     var visitedListScrollResetGeneration by remember { mutableIntStateOf(-1) }
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
@@ -4218,6 +4263,10 @@ fun WeiboApp() {
         incrementGeneration: Boolean = true,
     ) {
         visitedAlbumJob?.cancel()
+        if (!incrementGeneration && snapshot.userId != visitedUserId) {
+            // Ignore outstanding requests for the page being left after a stack pop.
+            visitedProfileLoadGeneration += 1
+        }
         if (incrementGeneration) {
             visitedProfileLoadGeneration += 1
             visitedListScrollResetGeneration = visitedProfileLoadGeneration
@@ -4425,8 +4474,21 @@ fun WeiboApp() {
         }
     }
 
+    fun retainCurrentLikeUsers(item: FeedItem) {
+        if (!likeUsersLoaded) return
+        val listState = detailLikesListStates[item.id]
+        retainedLikeUsersByStatus[item.id] = RetainedLikeUsersState(
+            users = likeUsers,
+            nextPage = likeUsersNextPage,
+            loaded = true,
+            scrollIndex = listState?.firstVisibleItemIndex ?: 0,
+            scrollOffset = listState?.firstVisibleItemScrollOffset ?: 0,
+        )
+    }
+
     fun currentDetailSnapshot(): DetailSnapshot? {
         val item = selectedItem ?: return null
+        val retainedLikes = retainedLikeUsersByStatus[item.id]
         return DetailSnapshot(
             item = item,
             comments = comments,
@@ -4437,6 +4499,14 @@ fun WeiboApp() {
             reposts = reposts,
             repostsNextPage = repostsNextPage,
             repostsHasMore = repostsHasMore,
+            likeUsers = retainedLikes?.users ?: likeUsers,
+            likeUsersNextPage = if (retainedLikes != null) retainedLikes.nextPage else likeUsersNextPage,
+            likeUsersLoaded = retainedLikes?.loaded ?: likeUsersLoaded,
+            likesScrollIndex = retainedLikes?.scrollIndex
+                ?: detailLikesListStates[item.id]?.firstVisibleItemIndex ?: 0,
+            likesScrollOffset = retainedLikes?.scrollOffset
+                ?: detailLikesListStates[item.id]?.firstVisibleItemScrollOffset ?: 0,
+            likesListGeneration = detailLikesListGeneration,
             scrollIndex = lastDetailScroll.index,
             scrollOffset = lastDetailScroll.offset,
             albumViewerState = albumViewerState,
@@ -4447,6 +4517,11 @@ fun WeiboApp() {
     }
 
     fun restoreDetailSnapshot(snapshot: DetailSnapshot) {
+        // Returning from a profile (or an album search overlay) leaves the same
+        // detail page composed underneath. Re-keying it here would compose a
+        // second DetailScreen over the retained one and attach both LazyColumns
+        // to the same LazyListState, which drops the scroll position to item 0.
+        val sameDetailStillComposed = selectedItem?.id == snapshot.item.id
         commentsRequestJob?.cancel()
         repostsRequestJob?.cancel()
         detailRequestGeneration += 1
@@ -4464,15 +4539,46 @@ fun WeiboApp() {
         reposts = snapshot.reposts
         repostsNextPage = snapshot.repostsNextPage
         repostsHasMore = snapshot.repostsHasMore
+        val retainedLikes = retainedLikeUsersByStatus[snapshot.item.id]
+        likeUsers = retainedLikes?.users ?: snapshot.likeUsers
+        likeUsersNextPage = if (retainedLikes != null) retainedLikes.nextPage else snapshot.likeUsersNextPage
+        likeUsersLoaded = retainedLikes?.loaded ?: snapshot.likeUsersLoaded
+        detailLikesListStates.getOrPut(snapshot.item.id) {
+            LazyListState(snapshot.likesScrollIndex, snapshot.likesScrollOffset)
+        }
+        detailLikesListGeneration = snapshot.likesListGeneration
+        if (retainedLikes == null && snapshot.likeUsersLoaded) {
+            retainedLikeUsersByStatus[snapshot.item.id] = RetainedLikeUsersState(
+                users = snapshot.likeUsers,
+                nextPage = snapshot.likeUsersNextPage,
+                loaded = true,
+                scrollIndex = snapshot.likesScrollIndex,
+                scrollOffset = snapshot.likesScrollOffset,
+            )
+        }
         albumViewerState = snapshot.albumViewerState
-        // Treat a restored detail as a fresh visible transition. Reusing its old key
-        // makes NavAnimatedOverlay's entered-key cache skip the return animation.
-        activeDetailInstanceKey = maxOf(activeDetailInstanceKey, snapshot.instanceKey) + 1
+        if (!sameDetailStillComposed) {
+            // A genuinely different (parent) detail needs a fresh visible transition.
+            // Reusing its old key makes NavAnimatedOverlay's entered-key cache skip
+            // the return animation.
+            activeDetailInstanceKey = maxOf(activeDetailInstanceKey, snapshot.instanceKey) + 1
+        }
         activeDetailSourceBounds = snapshot.sourceBounds
         activeDetailSourceImage = snapshot.sourceImage
-        lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
-        detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
-        detailScrollRestoreToken += 1
+        val retainedOuterState = detailOuterListStates[snapshot.item.id]
+        if (retainedOuterState == null) {
+            lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
+            detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
+            detailScrollRestoreToken += 1
+        } else {
+            // The page stayed in memory underneath the profile. Its live LazyListState
+            // is authoritative; replaying an older snapshot here can jump it to zero.
+            lastDetailScroll = ScrollRestore(
+                retainedOuterState.firstVisibleItemIndex,
+                retainedOuterState.firstVisibleItemScrollOffset,
+            )
+            detailScrollPending = null
+        }
     }
 
     fun loadMoreVisitedPosts() {
@@ -4681,7 +4787,8 @@ fun WeiboApp() {
     }
 
     fun finishVisitedProfileExit() {
-        clearVisitedProfileState()
+        // An old overlay exit callback must not erase a restored parent profile.
+        if (navOverlayStack.none { it is NavOverlayKind.VisitedProfile }) clearVisitedProfileState()
         navExitPendingKind = null
         flushDeferredNavRestore()
     }
@@ -4690,7 +4797,7 @@ fun WeiboApp() {
         selectedTab = state.selectedTab
         bottomBarVisible = state.bottomBarVisible
         minePagerPage = state.minePagerPage
-        if (state.albumViewerState != null) {
+        if (state.albumViewerState != null && navExitPendingKind !is NavOverlayKind.Detail) {
             // Recreate the viewer underneath the outgoing detail, never after it
             // has disappeared and exposed the white album for a frame.
             albumViewerState = state.albumViewerState.copy(animateOpenFromSource = false)
@@ -4706,6 +4813,8 @@ fun WeiboApp() {
     }
 
     fun pushNavigation(kind: NavOverlayKind, navigate: () -> Unit) {
+        flushDeferredNavRestore()
+        deferredNavRestoreGeneration += 1
         nestedDetailReturnAnimating = false
         navStack = navStack + captureNavRestoreState()
         navOverlayStack = navOverlayStack + kind
@@ -4742,6 +4851,14 @@ fun WeiboApp() {
         // clears its first layout while the profile exits, which briefly reveals a white page.
         navStack = navStack.dropLast(1)
         navOverlayStack = navOverlayStack.dropLast(1)
+        if (exitingKind is NavOverlayKind.VisitedProfile &&
+            navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile && previous.visitedProfile != null) {
+            pendingDeferredNavRestore = null
+            deferredNavRestoreGeneration += 1
+            navExitPendingKind = null
+            applyNavRestoreState(previous)
+            return true
+        }
         if (exitingKind is NavOverlayKind.Detail && previous.detail == null &&
             previous.visitedProfile == null && previous.selectedTab == MainTab.Feed
         ) returningHomeDirectly = true
@@ -5009,7 +5126,46 @@ fun WeiboApp() {
             videoPlaybackCoordinator.pauseAll()
             videoPlaybackCoordinator.activeKey = null
         }
-        if (navOverlayStack.lastOrNull() == NavOverlayKind.VisitedProfile(visitedUserId.orEmpty())) {
+        val previousPage = navStack.lastOrNull()
+        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
+            if (profileReturnCapturing || profileReturnBitmap != null) return
+            val window = (context as? android.app.Activity)?.window
+            if (window == null || window.decorView.width <= 0 || window.decorView.height <= 0) {
+                navigateBack()
+                return
+            }
+            profileReturnCapturing = true
+            val bitmap = Bitmap.createBitmap(window.decorView.width, window.decorView.height, Bitmap.Config.ARGB_8888)
+            val capturedStack = navOverlayStack
+            fun finishCapture(success: Boolean) {
+                profileReturnCapturing = false
+                if (capturedStack != navOverlayStack) return
+                if (!success) {
+                    navigateBack()
+                    return
+                }
+                profileReturnBitmap = bitmap
+                navigateBack()
+                scope.launch {
+                    profileReturnProgress.snapTo(0f)
+                    withFrameNanos { }
+                    withFrameNanos { }
+                    profileReturnProgress.animateTo(1f, tween(NavTransitionDurationMs, easing = FastOutSlowInEasing))
+                    profileReturnBitmap = null
+                    profileReturnProgress.snapTo(0f)
+                }
+            }
+            runCatching {
+                android.view.PixelCopy.request(window, bitmap, { result ->
+                    finishCapture(result == android.view.PixelCopy.SUCCESS)
+                }, android.os.Handler(android.os.Looper.getMainLooper()))
+            }.onFailure { finishCapture(false) }
+            return
+        }
+        if (navOverlayStack.lastOrNull() == NavOverlayKind.VisitedProfile(visitedUserId.orEmpty()) &&
+            previousPage?.visitedProfile == null && previousPage?.detail == null &&
+            navOverlayStack.size == 1) {
             // A profile opened from the feed is a visual page layered over the feed, not a
             // replacement for it. Keep the exact feed state/composition intact while the
             // profile slides away; do not run generic state restoration or scroll commands.
@@ -5145,6 +5301,7 @@ fun WeiboApp() {
             videoPeekController.cancel(snap = true)
         }
 
+        fun navigateToPreparedProfile() {
         pushNavigation(NavOverlayKind.VisitedProfile(value)) {
             if (selectedItem == null) {
                 comments = emptyList()
@@ -5159,6 +5316,22 @@ fun WeiboApp() {
                 reloadProfile = false,
             )
         }
+        }
+        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile) {
+            val window = (context as? android.app.Activity)?.window
+            val sourceStack = navOverlayStack
+            if (window != null && window.decorView.width > 0 && window.decorView.height > 0) {
+                val bitmap = Bitmap.createBitmap(window.decorView.width, window.decorView.height, Bitmap.Config.ARGB_8888)
+                runCatching {
+                    android.view.PixelCopy.request(window, bitmap, { result ->
+                        if (navOverlayStack == sourceStack) {
+                            if (result == android.view.PixelCopy.SUCCESS) profileParentBackdrops[sourceStack.size + 1] = bitmap
+                            navigateToPreparedProfile()
+                        }
+                    }, android.os.Handler(android.os.Looper.getMainLooper()))
+                }.onFailure { navigateToPreparedProfile() }
+            } else navigateToPreparedProfile()
+        } else navigateToPreparedProfile()
         }
         profileOpeningJob?.cancel()
         val cached = profilePreviewCache[value]
@@ -6043,80 +6216,92 @@ fun WeiboApp() {
         )
     }
 
+    var openDetailFromSourceAction: ((FeedItem, Rect, DetailContentSection?) -> Unit)? = null
+
     fun openLikeUsers(item: FeedItem, anchorBounds: Rect) {
-        val resolved = resolveFeedItem(item)
-        if (resolved.hasNoLikes()) {
-            operationCapsuleHint = "\u6682\u65e0\u70b9\u8d5e"
-            return
-        }
-        val likeId = resolved.id.trim().takeIf { it.isNotBlank() && it != "0" && it.all(Char::isDigit) }
-            ?: resolved.statusId.trim().takeIf { it.isNotBlank() && it.all(Char::isDigit) }
-            ?: run {
-                showMessage("无法查看点赞", "微博 ID 无效")
-                return
-            }
-        likeUsersOverlay = LikeUsersOverlayState(
-            item = resolved,
-            anchorBounds = anchorBounds,
-            likeId = likeId,
-        )
-        likeUsers = emptyList()
-        likeUsersError = null
-        likeUsersNextPage = null
-        likeUsersLoadingMore = false
-        scope.launch {
-            likeUsersLoading = true
-            runCatching { session.loadLikeUsers(likeId) }
-                .onSuccess { page ->
-                    likeUsers = page.users
-                    likeUsersNextPage = applyLikeUsersLoadResult(
-                        item = resolved,
-                        page = page,
-                        mergedUsers = page.users,
-                        currentPage = 1,
-                    )
-                }
-                .onFailure { error ->
-                    likeUsersError = error.message ?: "加载失败"
-                }
-            likeUsersLoading = false
-        }
+        openDetailFromSourceAction?.invoke(item, anchorBounds, DetailContentSection.Likes)
     }
 
     fun loadMoreLikeUsers() {
-        val overlay = likeUsersOverlay ?: return
         val nextPage = likeUsersNextPage ?: return
         if (likeUsersLoadingMore || likeUsersLoading) return
-        val item = resolveFeedItem(overlay.item)
+        val item = selectedItem ?: return
+        val likeId = item.id.trim().takeIf { it.isNotBlank() && it != "0" && it.all(Char::isDigit) }
+            ?: item.statusId.trim().takeIf { it.isNotBlank() && it.all(Char::isDigit) }
+            ?: return
         scope.launch {
             likeUsersLoadingMore = true
-            runCatching { session.loadLikeUsers(overlay.likeId, nextPage) }
+            runCatching { session.loadLikeUsers(likeId, nextPage) }
                 .onSuccess { page ->
                     if (page.users.isEmpty()) {
                         likeUsersNextPage = null
+                        retainCurrentLikeUsers(item)
                         return@onSuccess
                     }
                     val merged = (likeUsers + page.users).distinctBy { mentionCandidateKey(it) }
                     if (merged.size == likeUsers.size) {
                         likeUsersNextPage = null
+                        retainCurrentLikeUsers(item)
                         return@onSuccess
                     }
                     likeUsers = merged
-                    likeUsersNextPage = applyLikeUsersLoadResult(
-                        item = item,
+                    likeUsersNextPage = resolveLikeUsersNextPage(
                         page = page,
-                        mergedUsers = merged,
                         currentPage = nextPage,
-                        previousKnownTotal = overlay.knownTotal,
+                        loadedCount = merged.size,
+                        knownTotal = listOfNotNull(page.totalCount?.takeIf { it > 0 }, parseApproxDisplayCount(item.likesCount)).maxOrNull(),
                     )
+                    syncItemLikeCountFromLikeUsers(item, page, merged.size)
+                    retainCurrentLikeUsers(item)
                 }
-                .onFailure { error ->
-                    showMessage("加载失败", error.message ?: "无法继续读取点赞列表")
-                }
+                .onFailure { error -> showMessage("加载失败", error.message ?: "无法继续读取点赞列表") }
             likeUsersLoadingMore = false
         }
     }
 
+    fun reloadLikeUsers() {
+        val item = selectedItem ?: return
+        if (item.hasNoLikes()) {
+            likeUsers = emptyList()
+            likeUsersNextPage = null
+            likeUsersError = null
+            likeUsersLoaded = true
+            likeUsersLoading = false
+            likeUsersLoadingMore = false
+            retainCurrentLikeUsers(item)
+            return
+        }
+        val likeId = item.id.trim().takeIf { it.isNotBlank() && it != "0" && it.all(Char::isDigit) }
+            ?: item.statusId.trim().takeIf { it.isNotBlank() && it.all(Char::isDigit) }
+            ?: run {
+                showMessage("无法查看点赞", "微博 ID 无效")
+                return
+            }
+        likeUsers = emptyList()
+        likeUsersNextPage = null
+        likeUsersError = null
+        likeUsersLoadingMore = false
+        likeUsersLoaded = false
+        val requestGeneration = detailRequestGeneration
+        val requestedItemId = item.id
+        scope.launch {
+            likeUsersLoading = true
+            runCatching { session.loadLikeUsers(likeId) }
+                .onSuccess { page ->
+                    if (requestGeneration != detailRequestGeneration || selectedItem?.id != requestedItemId) return@onSuccess
+                    likeUsers = page.users
+                    likeUsersNextPage = applyLikeUsersLoadResult(item, page, page.users, 1)
+                    likeUsersLoaded = true
+                    retainCurrentLikeUsers(item)
+                }
+                .onFailure { error ->
+                    if (requestGeneration == detailRequestGeneration && selectedItem?.id == requestedItemId) {
+                        likeUsersError = error.message ?: "加载失败"
+                    }
+                }
+            if (requestGeneration == detailRequestGeneration && selectedItem?.id == requestedItemId) likeUsersLoading = false
+        }
+    }
     fun closeLikeUsers() {
         likeUsersOverlay = null
         likeUsers = emptyList()
@@ -6397,12 +6582,16 @@ fun WeiboApp() {
         if (section == DetailContentSection.Reposts && reposts.isEmpty() && !repostsLoading) {
             reloadReposts()
         }
+        if (section == DetailContentSection.Likes && !likeUsersLoaded && !likeUsersLoading) {
+            reloadLikeUsers()
+        }
     }
 
     fun reloadDetailContent() {
         when (detailContentSection) {
             DetailContentSection.Comments -> reloadComments()
             DetailContentSection.Reposts -> reloadReposts()
+            DetailContentSection.Likes -> reloadLikeUsers()
         }
     }
 
@@ -6422,6 +6611,19 @@ fun WeiboApp() {
         reposts = emptyList()
         repostsNextPage = null
         repostsHasMore = true
+        likeUsers = emptyList()
+        likeUsersNextPage = null
+        likeUsersError = null
+        likeUsersLoaded = false
+        likeUsersLoading = false
+        likeUsersLoadingMore = false
+        detailLikesListGeneration += 1
+        selectedItem?.id?.let { id ->
+            detailLikesListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
+            detailCommentsListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
+            detailRepostsListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
+            detailOuterListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
+        }
     }
 
     fun openDetailPrepared(
@@ -6432,6 +6634,7 @@ fun WeiboApp() {
         homeThumbnailStore.freezeVisible()
         feedRefreshHint = null
         val resolved = resolveFeedItem(item)
+        retainedLikeUsersByStatus.remove(resolved.id)
         activeDetailSourceBounds = null
         activeDetailSourceImage = null
         prepareInlineVideoHandoffForDetail(resolved)
@@ -6453,6 +6656,7 @@ fun WeiboApp() {
         when (initialSection) {
             DetailContentSection.Comments -> reloadComments()
             DetailContentSection.Reposts -> reloadReposts()
+            DetailContentSection.Likes -> reloadLikeUsers()
         }
     }
 
@@ -6605,7 +6809,13 @@ fun WeiboApp() {
         }.onFailure { navigateWithSource(null) }
     }
 
+    openDetailFromSourceAction = { item, bounds, section ->
+        openDetailFromSource(item, bounds, section = section)
+    }
+
     fun openDetailFromAlbumViewer(item: FeedItem, viewer: AlbumViewerState) {
+        albumDetailBackdrop = viewer.backdropBitmap
+        albumDetailBackdropVisible = viewer.backdropBitmap != null
         val resolved = resolveFeedItem(item)
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
@@ -6614,19 +6824,29 @@ fun WeiboApp() {
         // status detail. In particular, returning must not replay the source-open
         // animation after the large image was already visible.
         albumViewerState = viewer
+        scope.launch {
+        // The Dialog lives in a separate window. Draw its replacement in the
+        // activity before removing that window, otherwise SurfaceFlinger exposes
+        // the album for one frame even when both Compose states change together.
+        withFrameNanos { }
+        withFrameNanos { }
         pushNavigation(NavOverlayKind.Detail(resolved.id)) {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = null
+            activeDetailSourceBounds = null
+            activeDetailSourceImage = null
             activeDetailInstanceKey += 1
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
+            retainedLikeUsersByStatus.remove(resolved.id)
             resetDetailContentState()
             if (resolved.requiresLongTextFetch) {
                 loadLongText(resolved)
             }
             resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let { loadLongText(it) }
             reloadComments()
+        }
         }
     }
 
@@ -7332,7 +7552,9 @@ fun WeiboApp() {
                         return@LaunchedEffect
                     }
                     val currentKey = videoPlaybackCoordinator.activeKey
-                    val preserveKey = currentKey?.takeIf(::keyBelongsToProfile)
+                    // Liked posts belong to other authors and are held by the profile
+                    // page, not visitedPosts. Do not stop a newly requested liked video.
+                    val preserveKey = currentKey
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
                     videoPlaybackCoordinator.activeKey = preserveKey
                     if (preserveKey == null && peekKey == null) {
@@ -7379,6 +7601,7 @@ fun WeiboApp() {
     val pollController = remember(session, activeAccountId) { PollUiController(session) }
     CompositionLocalProvider(
         LocalPollController provides pollController,
+        LocalProfileRetainedUi provides remember { mutableMapOf<String, ProfileRetainedUi>() },
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
@@ -7833,6 +8056,17 @@ fun WeiboApp() {
                         }
                     }
                 }
+                val nestedProfileBackdrop = if (profileReturnBitmap != null) {
+                    profileParentBackdrops[navOverlayStack.size + 1]
+                } else if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+                    navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
+                    profileParentBackdrops[navOverlayStack.size]
+                } else null
+                nestedProfileBackdrop?.let { bitmap ->
+                    Image(bitmap.asImageBitmap(), contentDescription = null,
+                        contentScale = ContentScale.FillBounds,
+                        modifier = Modifier.fillMaxSize().zIndex(589f))
+                }
                 NavAnimatedOverlay(
                     target = visitedProfileNavTarget,
                     modifier = Modifier
@@ -7847,7 +8081,14 @@ fun WeiboApp() {
                     animationKey = visitedProfileLoadGeneration,
                     navKind = visitedProfileNavKind,
                     immediateEnter = true,
-                    onSwipeBack = ::closeVisitedProfile,
+                    onSwipeBack = {
+                        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+                            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
+                            // The gesture already moved the outgoing page fully offscreen.
+                            // Restore its parent without starting a second exit animation.
+                            navigateBack()
+                        } else closeVisitedProfile()
+                    },
                     // On the first tab, reserve rightward dragging for page back;
                     // the pager otherwise consumes it even though it cannot go left.
                     interceptRightSwipe = visitedMinePagerPage == MineContentTab.Posts.ordinal,
@@ -8118,6 +8359,24 @@ fun WeiboApp() {
                             )
                 }
 
+                albumDetailBackdrop?.let { bitmap ->
+                    if (albumDetailBackdropVisible && !bitmap.isRecycled) Image(
+                        bitmap = bitmap.asImageBitmap(), contentDescription = null,
+                        contentScale = ContentScale.FillBounds,
+                        modifier = Modifier.fillMaxSize().zIndex(589f).background(Color.Black),
+                    )
+                }
+                profileReturnBitmap?.let { bitmap ->
+                    Image(bitmap.asImageBitmap(), contentDescription = null,
+                        contentScale = ContentScale.FillBounds,
+                        modifier = Modifier.fillMaxSize().zIndex(NavOverlayExitZIndex + 1f)
+                            .graphicsLayer { translationX = size.width * profileReturnProgress.value }
+                            .pointerInput(Unit) {
+                                awaitPointerEventScope {
+                                    while (true) awaitPointerEvent().changes.forEach { it.consume() }
+                                }
+                            })
+                }
                 NavAnimatedOverlay(
                     target = detailOverlayItem?.let { currentDetailSnapshot()?.copy(item = it) }
                         .takeIf { detailLayerActive },
@@ -8174,7 +8433,14 @@ fun WeiboApp() {
                     key(detailItem.id) {
                         var systemBackStarted by remember { mutableStateOf(false) }
                         LaunchedEffect(activeDetailInstanceKey) { systemBackStarted = false }
-                        val detailListState = rememberLazyListState(detailSnapshot.scrollIndex, detailSnapshot.scrollOffset)
+                        val detailListState = detailOuterListStates.getOrPut(detailItem.id) {
+                            LazyListState(detailSnapshot.scrollIndex, detailSnapshot.scrollOffset)
+                        }
+                        val detailCommentsListState = detailCommentsListStates.getOrPut(detailItem.id) { LazyListState() }
+                        val detailRepostsListState = detailRepostsListStates.getOrPut(detailItem.id) { LazyListState() }
+                        val detailLikesListState = detailLikesListStates.getOrPut(detailItem.id) {
+                            LazyListState(detailSnapshot.likesScrollIndex, detailSnapshot.likesScrollOffset)
+                        }
                         val detailScrollCoordinator = remember { FeedListScrollCoordinator() }
                         LaunchedEffect(detailListState, detailScrollCoordinator) {
                             detailScrollCoordinator.stopScrollAction = {
@@ -8253,16 +8519,25 @@ fun WeiboApp() {
                                 contentSection = detailSnapshot.contentSection,
                                 comments = detailSnapshot.comments,
                                 reposts = detailSnapshot.reposts,
+                                likeUsers = detailSnapshot.likeUsers,
+                                likesListState = detailLikesListState,
+                                commentsListState = detailCommentsListState,
+                                repostsListState = detailRepostsListState,
                                 commentSort = detailSnapshot.commentSort,
                                 isLoadingComments = detailIsActive && commentsLoading,
                                 showCommentsLoadingIndicator = !commentsSortLoading,
                                 isLoadingReposts = detailIsActive && repostsLoading,
+                                isLoadingLikeUsers = detailIsActive && likeUsersLoading,
+                                isLoadingMoreLikeUsers = detailIsActive && likeUsersLoadingMore,
+                                likeUsersHasMore = detailSnapshot.likeUsersNextPage != null,
+                                likeUsersError = likeUsersError,
+                                onLoadMoreLikeUsers = { if (detailIsActive) loadMoreLikeUsers() },
                                 isLoadingMoreComments = detailIsActive && commentsLoadingMore,
                                 isLoadingMoreReposts = detailIsActive && repostsLoadingMore,
                                 isLongTextLoading = { it.statusId in longTextLoadingIds },
                                 onLoadLongText = ::loadLongText,
                                 onToggleLike = ::toggleStatusLike,
-                                onLikeClick = ::openLikeUsers,
+                                onLikeClick = { _, _ -> selectDetailContentSection(DetailContentSection.Likes) },
                                 onBack = { closeDetail() },
                                 onRefresh = { reloadDetailContent() },
                                 onCommentSortChange = ::changeCommentSort,
@@ -8274,12 +8549,22 @@ fun WeiboApp() {
                                 onRefreshComments = { reloadComments() },
                                 onPrepareContentSection = { section ->
                                     if (section == DetailContentSection.Reposts && reposts.isEmpty() && !repostsLoading) reloadReposts()
+                                    if (section == DetailContentSection.Likes && !likeUsersLoaded && !likeUsersLoading) reloadLikeUsers()
                                 },
                                 listState = detailListState,
                                 onMediaClick = ::pushMediaPreview,
                                 emoticonMap = emoticonMap,
                                 onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
-                                onUserClick = ::openUser,
+                                onUserClick = { uid ->
+                                    if (detailIsActive) {
+                                        lastDetailScroll = ScrollRestore(
+                                            detailListState.firstVisibleItemIndex,
+                                            detailListState.firstVisibleItemScrollOffset,
+                                        )
+                                        retainCurrentLikeUsers(detailItem)
+                                    }
+                                    openUser(uid)
+                                },
                                 onComposeComment = ::openCommentComposer,
                                 onExpandNestedComments = ::loadNestedCommentsPage,
                                 nestedCommentsLoadingIds = nestedCommentsLoadingIds,
@@ -8826,6 +9111,11 @@ fun WeiboApp() {
                 key(albumOverlayInstanceKey) {
                 FullscreenImageViewer(
                     images = viewer.images,
+                    onViewerReady = {
+                        if (overlayTopKind(navOverlayStack) == OverlayTop.AlbumViewer) {
+                            albumDetailBackdropVisible = false
+                        }
+                    },
                     initialIndex = viewer.initialIndex,
                     sourceBoundsByIndex = viewer.sourceBoundsByIndex,
                     animateOpenFromSource = viewer.animateOpenFromSource &&
@@ -8853,10 +9143,11 @@ fun WeiboApp() {
                     relatedPosts = relatedPosts,
                     emoticonMap = emoticonMap,
                     statusCache = viewer.statusCache,
-                    onOpenStatus = { item, index, cache ->
+                    onOpenStatus = { item, index, cache, backdrop ->
                         openDetailFromAlbumViewer(
                             item,
                             AlbumViewerState(
+                                backdropBitmap = backdrop,
                                 images = viewer.images,
                                 initialIndex = index,
                                 sourceBoundsByIndex = viewer.sourceBoundsByIndex,
@@ -9357,6 +9648,47 @@ private fun buildStatusTokenRegex(
 @Composable
 private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
 
+// Plain and annotated bodies must share the same shaping, line breaking and
+// vertical metrics. Never stretch glyphs or remeasure individual characters.
+private fun unifiedBodyParagraphStyle(style: TextStyle): TextStyle = style.copy(
+    textAlign = TextAlign.Start,
+    lineBreak = LineBreak.Simple,
+    letterSpacing = 0.sp,
+)
+
+@Composable
+internal fun JustifiedBodyText(
+    text: AnnotatedString,
+    style: TextStyle,
+    modifier: Modifier = Modifier,
+    inlineContent: Map<String, InlineTextContent> = emptyMap(),
+    maxLines: Int = Int.MAX_VALUE,
+    overflow: TextOverflow = TextOverflow.Clip,
+    onTextLayout: (TextLayoutResult) -> Unit = {},
+) {
+    val density = LocalDensity.current
+    val measurer = rememberTextMeasurer()
+    val paragraphStyle = unifiedBodyParagraphStyle(MaterialTheme.typography.bodyLarge.merge(style))
+    BoxWithConstraints(modifier.clipToBounds()) {
+        val widthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(1)
+        val laidOutText = remember(text, paragraphStyle, widthPx, inlineContent, maxLines, overflow, density) {
+            justifyBodyParagraph(text, paragraphStyle, widthPx, inlineContent, maxLines, overflow, density, measurer)
+        }
+        Text(text = laidOutText, style = paragraphStyle, inlineContent = inlineContent,
+            modifier = Modifier.fillMaxWidth(), maxLines = maxLines, overflow = overflow,
+            onTextLayout = { result ->
+                if (text.text.contains("走进婚姻") || text.text.contains("Aeolus RSL")) {
+                    android.util.Log.d("BodyLayoutDiagnostic", "source=" + text.text.take(1200)
+                        .replace("\n", "\\n").replace("\r", "\\r") +
+                        " width=$widthPx lines=" + (0 until result.lineCount).joinToString { line ->
+                            "${result.getLineStart(line)}..${result.getLineEnd(line, true)}:${result.getLineRight(line)}"
+                        })
+                }
+                onTextLayout(result)
+            })
+    }
+}
+
 @Composable
 private fun EmoticonText(
     text: String,
@@ -9385,9 +9717,9 @@ private fun EmoticonText(
     }
 
     if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, trailingLocation, inlineImageLinks, urlEntities)) {
-        Text(
-            text = text,
-            style = style,
+        JustifiedBodyText(
+            text = AnnotatedString(text),
+            style = unifiedBodyParagraphStyle(style),
             modifier = modifier,
             maxLines = maxLines,
             overflow = overflow,
@@ -9584,10 +9916,10 @@ private fun EmoticonText(
             }
         }
     }
-    Text(
+    JustifiedBodyText(
         text = annotatedString,
         inlineContent = inlineContent,
-        style = style,
+        style = unifiedBodyParagraphStyle(style),
         modifier = modifier
             .pointerInput(linkScopeKey) {
                 awaitEachGesture {
@@ -10124,7 +10456,7 @@ private fun FeedCard(
                     onRepostClick = onRepostClick ?: onClick,
                     onCommentClick = onCommentClick ?: onClick,
                     onCommentLongClick = onCommentLongClick,
-                    onLikeClick = onLikeClick?.let { open -> { bounds -> open(item, bounds) } },
+                    onLikeClick = onLikeClick?.let { open -> { bounds -> open(item, cardMotionBounds ?: bounds) } },
                     onToggleLike = onToggleLike?.let { toggle -> { toggle(item) } },
                 )
             }
@@ -13644,6 +13976,9 @@ private fun FullscreenImageViewer(
     images: List<FeedImage>,
     initialIndex: Int,
     onDismiss: () -> Unit,
+    embedded: Boolean = false,
+    viewerInteractive: Boolean = true,
+    onViewerReady: () -> Unit = {},
     onRetargetDuringClose: ((Int) -> Unit)? = null,
     onDismissWithIndex: ((Int) -> Unit)? = null,
     onPageChanged: (suspend (Int) -> Unit)? = null,
@@ -13658,7 +13993,7 @@ private fun FullscreenImageViewer(
     relatedPosts: List<FeedItem> = emptyList(),
     emoticonMap: Map<String, String> = emptyMap(),
     statusCache: Map<String, FeedItem> = emptyMap(),
-    onOpenStatus: ((FeedItem, Int, Map<String, FeedItem>) -> Unit)? = null,
+    onOpenStatus: ((FeedItem, Int, Map<String, FeedItem>, Bitmap?) -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
     val viewerImages = images
@@ -13811,10 +14146,19 @@ private fun FullscreenImageViewer(
         statusLoading = false
     }
 
-    Dialog(
-        onDismissRequest = { dismissViewer() },
-        properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
-    ) {
+    val viewerHost: @Composable (@Composable () -> Unit) -> Unit = { content ->
+        if (embedded) content() else Dialog(
+            onDismissRequest = { dismissViewer() },
+            properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+            content = content,
+        )
+    }
+    viewerHost {
+        LaunchedEffect(Unit) {
+            withFrameNanos { }
+            withFrameNanos { }
+            onViewerReady()
+        }
         val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
         SideEffect {
             dialogWindow?.apply {
@@ -13824,7 +14168,7 @@ private fun FullscreenImageViewer(
                 clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
             }
         }
-        BackHandler { dismissViewer() }
+        BackHandler(enabled = viewerInteractive) { dismissViewer() }
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize().pointerInput(transitionClosing, dismissPreparing) {
                 if ((!transitionClosing && !dismissPreparing) || onRetargetDuringClose == null) return@pointerInput
@@ -14018,7 +14362,18 @@ private fun FullscreenImageViewer(
                     emoticonMap = emoticonMap,
                     onClick = {
                         statusItem?.let { item ->
-                            onOpenStatus?.invoke(item, currentPage, resolvedStatusCache)
+                            val window = dialogWindow
+                            if (window == null || window.decorView.width <= 0) {
+                                onOpenStatus?.invoke(item, currentPage, resolvedStatusCache, null)
+                            } else {
+                                val bitmap = Bitmap.createBitmap(window.decorView.width, window.decorView.height, Bitmap.Config.ARGB_8888)
+                                runCatching {
+                                    android.view.PixelCopy.request(window, bitmap, { result ->
+                                        onOpenStatus?.invoke(item, currentPage, resolvedStatusCache,
+                                            bitmap.takeIf { result == android.view.PixelCopy.SUCCESS })
+                                    }, android.os.Handler(android.os.Looper.getMainLooper()))
+                                }.onFailure { onOpenStatus?.invoke(item, currentPage, resolvedStatusCache, null) }
+                            }
                         }
                     },
                     modifier = Modifier
@@ -17848,10 +18203,18 @@ private fun DetailScreen(
     contentSection: DetailContentSection,
     comments: List<CommentItem>,
     reposts: List<CommentItem>,
+    likeUsers: List<MentionCandidate>,
+    likesListState: LazyListState,
+    commentsListState: LazyListState,
+    repostsListState: LazyListState,
     commentSort: CommentSort,
     isLoadingComments: Boolean,
     showCommentsLoadingIndicator: Boolean = true,
     isLoadingReposts: Boolean,
+    isLoadingLikeUsers: Boolean,
+    isLoadingMoreLikeUsers: Boolean,
+    likeUsersHasMore: Boolean,
+    likeUsersError: String?,
     isLoadingMoreComments: Boolean = false,
     isLoadingMoreReposts: Boolean = false,
     onBack: () -> Unit,
@@ -17869,6 +18232,7 @@ private fun DetailScreen(
     listState: LazyListState = rememberLazyListState(),
     onLoadMoreComments: () -> Unit = {},
     onLoadMoreReposts: () -> Unit = {},
+    onLoadMoreLikeUsers: () -> Unit = {},
     isLongTextLoading: (FeedItem) -> Boolean = { false },
     onLoadLongText: ((FeedItem) -> Unit)? = null,
     onToggleLike: ((FeedItem) -> Unit)? = null,
@@ -17879,44 +18243,66 @@ private fun DetailScreen(
     nestedCommentsLoadingIds: Set<String> = emptySet(),
 ) {
     val scope = rememberCoroutineScope()
-    val detailPager = rememberPagerState(initialPage = if (contentSection == DetailContentSection.Reposts) 1 else 0, pageCount = { 2 })
+    fun sectionPage(section: DetailContentSection): Int = when (section) {
+        DetailContentSection.Comments -> 0
+        DetailContentSection.Reposts -> 1
+        DetailContentSection.Likes -> 2
+    }
+    val detailPager = rememberPagerState(initialPage = sectionPage(contentSection), pageCount = { 3 })
     val repostComposer = LocalRepostComposer.current
     LaunchedEffect(contentSection) {
-        val target = if (contentSection == DetailContentSection.Reposts) 1 else 0
+        val target = sectionPage(contentSection)
         if (detailPager.currentPage != target && !detailPager.isScrollInProgress) detailPager.scrollToPage(target)
     }
-    val visualTabProgress = (detailPager.currentPage + detailPager.currentPageOffsetFraction).coerceIn(0f, 1f)
+    val visualTabProgress = (detailPager.currentPage + detailPager.currentPageOffsetFraction).coerceIn(0f, 2f)
     fun selectPagerSection(section: DetailContentSection) {
         if (section == DetailContentSection.Comments) onRefreshComments()
         onPrepareContentSection(section)
         scope.launch {
-            detailPager.animateScrollToPage(if (section == DetailContentSection.Reposts) 1 else 0,
+            detailPager.animateScrollToPage(sectionPage(section),
                 animationSpec = tween(220, easing = FastOutSlowInEasing))
             onSelectContentSection(section)
         }
     }
     var commentTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
     var repostTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
+    var likesTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
     var commentTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
     var repostTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
+    var likesTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
     var sectionHeaderLeft by remember(item.id) { mutableFloatStateOf(0f) }
     val commentVisibility = Modifier
     val showingReposts = detailPager.currentPage == 1
-    val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
+    val showingLikes = detailPager.currentPage == 2
+    val isLoadingSection = when (detailPager.currentPage) {
+        1 -> isLoadingReposts
+        2 -> isLoadingLikeUsers
+        else -> isLoadingComments
+    }
     var pullRefreshing by remember { mutableStateOf(false) }
     var detailVideoViewport by remember { mutableStateOf(DetailVideoViewport()) }
     var sectionHeaderTop by remember(item.id) { mutableFloatStateOf(Float.MAX_VALUE) }
     val currentSectionHeaderTop by rememberUpdatedState(sectionHeaderTop)
     val currentDetailViewport by rememberUpdatedState(detailVideoViewport)
-    val commentsScrollState = rememberLazyListState()
-    val repostsScrollState = rememberLazyListState()
+    val commentsScrollState = commentsListState
+    val repostsScrollState = repostsListState
+    val likesScrollState = likesListState
+    var appliedCommentSort by remember(item.id) { mutableStateOf(commentSort) }
     LaunchedEffect(item.id, commentSort) {
         // A different ordering is a new comment list. Reset only its inner
         // scroll position, keeping the body and pinned section header in place.
+        // Re-running this after returning from a profile would drag the list
+        // back to item zero, so only act on an actual ordering change.
+        if (appliedCommentSort == commentSort) return@LaunchedEffect
+        appliedCommentSort = commentSort
         commentsScrollState.scrollToItem(0)
     }
     val activeSectionScrollState by rememberUpdatedState(
-        if (detailPager.currentPage == 1) repostsScrollState else commentsScrollState,
+        when (detailPager.currentPage) {
+            1 -> repostsScrollState
+            2 -> likesScrollState
+            else -> commentsScrollState
+        },
     )
     val continueIntoComments = remember {
         object : NestedScrollConnection {
@@ -18008,8 +18394,9 @@ private fun DetailScreen(
                                     }
                                     // At the first tab, rightward movement belongs to
                                     // the existing page-back gesture, not tab switching.
-                                    if (contentSection == DetailContentSection.Comments && displacement.x > 0f) break
-                                    if (contentSection == DetailContentSection.Reposts && displacement.x < 0f) {
+                                    val currentPage = sectionPage(contentSection)
+                                    if (currentPage == 0 && displacement.x > 0f) break
+                                    if (currentPage == 2 && displacement.x < 0f) {
                                         // Consume the terminal direction without moving either
                                         // the list or indicator, and do not pass it to page-back.
                                         change.consume()
@@ -18020,7 +18407,16 @@ private fun DetailScreen(
                                     // Start fetching as soon as a valid page drag starts,
                                     // before the finger is released and settling begins.
                                     onPrepareContentSection(
-                                        if (displacement.x < 0f) DetailContentSection.Reposts else DetailContentSection.Comments,
+                                        when {
+                                            displacement.x < 0f -> when (currentPage) {
+                                                0 -> DetailContentSection.Reposts
+                                                else -> DetailContentSection.Likes
+                                            }
+                                            else -> when (currentPage) {
+                                                2 -> DetailContentSection.Reposts
+                                                else -> DetailContentSection.Comments
+                                            }
+                                        },
                                     )
                                 }
                                 change.consume()
@@ -18030,11 +18426,15 @@ private fun DetailScreen(
                                 if (!change.pressed) {
                                     val commitSection = abs(delta) > 24.dp.toPx()
                                     scope.launch {
-                                        val target = if (commitSection) (if (delta < 0f) 1 else 0)
-                                            else if (contentSection == DetailContentSection.Reposts) 1 else 0
+                                        val current = sectionPage(contentSection)
+                                        val target = if (commitSection) (current + if (delta < 0f) 1 else -1).coerceIn(0, 2) else current
                                         detailPager.animateScrollToPage(target, animationSpec = tween(
                                             if (commitSection) 220 else 320, easing = FastOutSlowInEasing))
-                                        onSelectContentSection(if (target == 1) DetailContentSection.Reposts else DetailContentSection.Comments)
+                                        onSelectContentSection(when (target) {
+                                            1 -> DetailContentSection.Reposts
+                                            2 -> DetailContentSection.Likes
+                                            else -> DetailContentSection.Comments
+                                        })
                                     }
                                     break
                                 }
@@ -18092,7 +18492,7 @@ private fun DetailScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        DetailSectionTab("评论 ${item.commentsCount}", !showingReposts,
+                        DetailSectionTab("评论 ${item.commentsCount}", !showingReposts && !showingLikes,
                             onWidthChanged = { commentTabWidth = it },
                             onLongClick = { onComposeComment?.invoke(item, null) },
                             onCenterChanged = { commentTabCenter = it }) {
@@ -18105,31 +18505,17 @@ private fun DetailScreen(
                             onCenterChanged = { repostTabCenter = it }) {
                             selectPagerSection(DetailContentSection.Reposts)
                         }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(3.dp),
-                            modifier = Modifier.padding(start = 20.dp, bottom = 2.dp)
-                                .onGloballyPositioned { detailLikeBounds = it.boundsInWindow() }
-                                .combinedClickable(
-                                    onClick = { detailLikeBounds?.let { onLikeClick?.invoke(item, it) } },
-                                    onLongClick = { onToggleLike?.invoke(item) },
-                                ),
-                        ) {
-                        Text(
-                            text = "赞 ${item.likesCount}",
-                            color = if (item.liked) StatusLikeColor else MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        if (item.liked) Icon(
-                            painter = painterResource(R.drawable.ic_status_like),
-                            contentDescription = "已点赞",
-                            tint = Color.Unspecified,
-                            modifier = Modifier.size(15.dp),
-                        )
+                        Spacer(Modifier.width(20.dp))
+                        DetailSectionTab("赞 ${item.likesCount}", showingLikes,
+                            onLongClick = { onToggleLike?.invoke(item) },
+                            onWidthChanged = { likesTabWidth = it },
+                            onCenterChanged = { likesTabCenter = it },
+                            liked = item.liked,
+                            showLikeIcon = true) {
+                            selectPagerSection(DetailContentSection.Likes)
                         }
                         Spacer(Modifier.weight(1f))
-                        if (!showingReposts) {
+                        if (!showingReposts && !showingLikes) {
                             Box(Modifier.padding(bottom = 4.dp)) {
                             CommentSortToggle(
                                 selected = commentSort,
@@ -18139,10 +18525,20 @@ private fun DetailScreen(
                         }
                     }
                     val indicatorDensity = LocalDensity.current
-                    val indicatorWidthPx = lerp(commentTabWidth, repostTabWidth, visualTabProgress)
+                    val indicatorProgress = if (visualTabProgress <= 1f) visualTabProgress else visualTabProgress - 1f
+                    val indicatorWidthPx = if (visualTabProgress <= 1f) {
+                        lerp(commentTabWidth, repostTabWidth, indicatorProgress)
+                    } else {
+                        lerp(repostTabWidth, likesTabWidth, indicatorProgress)
+                    }
+                    val indicatorCenter = if (visualTabProgress <= 1f) {
+                        lerp(commentTabCenter, repostTabCenter, indicatorProgress)
+                    } else {
+                        lerp(repostTabCenter, likesTabCenter, indicatorProgress)
+                    }
                     Box(Modifier.align(Alignment.BottomStart)
                         .offset { IntOffset(
-                            (lerp(commentTabCenter, repostTabCenter, visualTabProgress) - sectionHeaderLeft -
+                            (indicatorCenter - sectionHeaderLeft -
                                 indicatorWidthPx / 2f).roundToInt(),
                             -with(indicatorDensity) { 7.dp.toPx() }.roundToInt(),
                         ) }
@@ -18158,6 +18554,101 @@ private fun DetailScreen(
                     }.coerceAtLeast(1.dp)
                     HorizontalPager(state = detailPager, userScrollEnabled = false,
                         beyondViewportPageCount = 1, modifier = Modifier.fillMaxWidth().height(height)) { page ->
+                        if (page == 2) {
+                            val pageList = likesScrollState
+                            val collapseBody = remember(listState, pageList) {
+                                object : NestedScrollConnection {
+                                    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                                        if (available.y > 0f && pageList.canScrollBackward) return Offset(0f, -pageList.dispatchRawDelta(-available.y))
+                                        if (available.y < 0f && listState.firstVisibleItemIndex == 0) {
+                                            val remainingBody = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == "detail-section-header" }
+                                                ?.offset?.coerceAtLeast(0)?.toFloat() ?: -available.y
+                                            return Offset(0f, -listState.dispatchRawDelta(min(-available.y, remainingBody)))
+                                        }
+                                        return Offset.Zero
+                                    }
+                                    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                                        if (available.y > 0f && !pageList.canScrollBackward && listState.canScrollBackward) return Offset(0f, -listState.dispatchRawDelta(-available.y))
+                                        return Offset.Zero
+                                    }
+                                }
+                            }
+                            LaunchedEffect(pageList, likeUsers.size, isLoadingLikeUsers, isLoadingMoreLikeUsers, likeUsersHasMore) {
+                                snapshotFlow {
+                                    val info = pageList.layoutInfo
+                                    info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 2
+                                }.distinctUntilChanged().collect { nearEnd ->
+                                    if (nearEnd && likeUsersHasMore && !isLoadingLikeUsers && !isLoadingMoreLikeUsers && likeUsers.isNotEmpty()) onLoadMoreLikeUsers()
+                                }
+                            }
+                            BoxWithConstraints(Modifier.fillMaxSize()) {
+                                val tileGap = LikeUsersLayout.TileGap
+                                val tileWidthDefault = LikeUsersLayout.TileWidthDefault
+                                val rowMargin = 12.dp
+                                val rowWidth = (maxWidth - rowMargin * 2).coerceAtLeast(1.dp)
+                                val columns = ((rowWidth + tileGap) / (tileWidthDefault + tileGap))
+                                    .toInt().coerceAtLeast(1)
+                                val tileWidth = ((rowWidth - tileGap * (columns - 1)) / columns)
+                                    .coerceAtMost(tileWidthDefault)
+                                LazyColumn(
+                                    state = pageList,
+                                    flingBehavior = rememberWeiboListFlingBehavior(),
+                                    modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
+                                    contentPadding = PaddingValues(bottom = 24.dp),
+                                ) {
+                                if (isLoadingLikeUsers && likeUsers.isNotEmpty() && !pullRefreshing) {
+                                    item(key = "likes-section-refresh") {
+                                        Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.TopCenter) {
+                                            AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
+                                        }
+                                    }
+                                }
+                                if (isLoadingLikeUsers && likeUsers.isEmpty()) {
+                                    item(key = "likes-loading") {
+                                        Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.TopCenter) {
+                                            AppLoadingIndicator(size = 22.dp, strokeWidth = 2.dp)
+                                        }
+                                    }
+                                }
+                                if (likeUsers.isEmpty() && !isLoadingLikeUsers) {
+                                    item(key = "likes-empty") {
+                                        Text(
+                                            text = likeUsersError ?: "暂无点赞",
+                                            modifier = Modifier.fillMaxWidth().heightIn(min = LocalConfiguration.current.screenHeightDp.dp - 180.dp).padding(vertical = 8.dp),
+                                            fontSize = CommentAuthorFontSize,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            textAlign = TextAlign.Center,
+                                        )
+                                    }
+                                }
+                                items(likeUsers.chunked(columns), key = { row -> row.firstOrNull()?.let(::mentionCandidateKey) ?: "likes-empty-row" }) { row ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = rowMargin, vertical = 4.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                    ) {
+                                        row.forEach { user ->
+                                            MentionSuggestionAvatarTile(
+                                                user = user,
+                                                tileWidth = tileWidth,
+                                                onSelect = { user -> onUserClick?.invoke(user.id) },
+                                            )
+                                        }
+                                        repeat((columns - row.size).coerceAtLeast(0)) {
+                                            Spacer(Modifier.width(tileWidth))
+                                        }
+                                    }
+                                }
+                                if (isLoadingMoreLikeUsers && likeUsers.isNotEmpty()) {
+                                    item(key = "likes-loading-more") {
+                                        Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                            AppLoadingIndicator()
+                                        }
+                                    }
+                                }
+                            }
+                            }
+                        } else {
                         val showingReposts = page == 1
                         val sectionItems = if (showingReposts) reposts else comments
                         val isLoadingSection = if (showingReposts) isLoadingReposts else isLoadingComments
@@ -18271,6 +18762,7 @@ private fun DetailScreen(
                     }
                 }
                         }
+                        }
                     }
                 }
             }
@@ -18282,7 +18774,8 @@ private fun DetailScreen(
 
 @Composable
 private fun DetailSectionTab(label: String, selected: Boolean, onWidthChanged: (Float) -> Unit,
-    onLongClick: (() -> Unit)? = null, onCenterChanged: (Float) -> Unit, onClick: () -> Unit) {
+    onLongClick: (() -> Unit)? = null, onCenterChanged: (Float) -> Unit,
+    liked: Boolean = false, showLikeIcon: Boolean = false, onClick: () -> Unit) {
     Column(
         modifier = Modifier.onGloballyPositioned {
             onCenterChanged(it.boundsInWindow().center.x)
@@ -18290,12 +18783,22 @@ private fun DetailSectionTab(label: String, selected: Boolean, onWidthChanged: (
         }.combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(vertical = 3.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(
-            text = label,
-            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(
+                text = label,
+                color = if (liked) StatusLikeColor else if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (showLikeIcon && liked) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_status_like),
+                    contentDescription = "已点赞",
+                    tint = Color.Unspecified,
+                    modifier = Modifier.size(13.dp),
+                )
+            }
+        }
         Spacer(Modifier.height(1.dp))
     }
 }
@@ -19918,7 +20421,7 @@ private fun LikeUsersGrid(
             key(rowIndex) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(LikeUsersLayout.TileGap),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     rowUsers.forEach { user ->
                         key(mentionCandidateKey(user)) {
@@ -19928,6 +20431,9 @@ private fun LikeUsersGrid(
                                 onSelect = { onUserClick(user.id) },
                             )
                         }
+                    }
+                    repeat((columns - rowUsers.size).coerceAtLeast(0)) {
+                        Spacer(Modifier.width(tileWidth))
                     }
                 }
             }
@@ -20605,9 +21111,7 @@ private fun SearchCapsuleField(
         modifier = modifier,
         backdrop = backdrop,
         pill = true,
-        surfaceColor = if (userSearch) {
-            if (isAppLightTheme()) Color(0xFFF2F2F2) else Color(0xFF303030)
-        } else Color.White.copy(alpha = 0.2f),
+        surfaceColor = Color.White.copy(alpha = 0.2f),
         borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
         else Color.White.copy(alpha = 0.24f),
         borderWidth = 0.75.dp,
@@ -21065,7 +21569,7 @@ private fun HotSearchRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(vertical = 11.dp),
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
@@ -21080,7 +21584,7 @@ private fun HotSearchRow(
         Text(
             text = displayWord,
             modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyLarge,
+            style = MaterialTheme.typography.bodyLarge.copy(letterSpacing = (-0.2).sp),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -21113,6 +21617,100 @@ private fun HotSearchRow(
 }
 
 private const val SearchImeFollowDurationMillis = 120
+
+private class PersonalHotSearchState {
+    var items by mutableStateOf<List<HotSearchItem>>(emptyList())
+    var loading by mutableStateOf(false)
+    var error by mutableStateOf<String?>(null)
+    var generation by mutableIntStateOf(-1)
+}
+
+@Composable
+private fun HotSearchBoards(
+    session: WeiboWebSession,
+    pager: androidx.compose.foundation.pager.PagerState,
+    personal: PersonalHotSearchState,
+    standardItems: List<HotSearchItem>,
+    standardLoading: Boolean,
+    standardError: String?,
+    refreshGeneration: Int,
+    onRetryStandard: () -> Unit,
+    onSelect: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var retry by remember { mutableIntStateOf(0) }
+    LaunchedEffect(pager.currentPage, refreshGeneration, retry, personal) {
+        if (pager.currentPage != 1 || personal.generation == refreshGeneration && personal.error == null) return@LaunchedEffect
+        personal.loading = true
+        personal.error = null
+        try {
+            personal.items = session.loadPersonalHotSearch()
+            personal.generation = refreshGeneration
+        } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            personal.error = error.message ?: "我的热搜加载失败"
+        } finally {
+            personal.loading = false
+        }
+    }
+    // Render the board as part of the search screen's outer LazyColumn. This
+    // keeps one continuous vertical scroll so the history can leave the screen
+    // and the final hot-search row can settle just above the fixed search bar.
+    val visibleBoardItems = if (pager.currentPage == 0) standardItems else personal.items
+    val boardHeight = if (visibleBoardItems.isNotEmpty()) {
+        41.dp * visibleBoardItems.size.toFloat() + 16.dp
+    } else 100.dp
+    Column(Modifier.fillMaxWidth()) {
+        val progress = (pager.currentPage + pager.currentPageOffsetFraction).coerceIn(0f, 1f)
+        Box(Modifier.fillMaxWidth().height(34.dp)) {
+            Row(Modifier.align(Alignment.TopStart)) {
+                listOf("热搜", "我的").forEachIndexed { index, title ->
+                    val selected = if (progress < 0.5f) index == 0 else index == 1
+                    Box(Modifier.width(60.dp).height(30.dp).clickable {
+                        scope.launch { pager.animateScrollToPage(index, animationSpec = tween(220)) }
+                    }, contentAlignment = Alignment.CenterStart) {
+                        Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            Box(Modifier.align(Alignment.BottomStart).offset(x = 0.dp + 60.dp * progress)
+                .width(34.dp).height(3.dp).background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50)))
+        }
+        HorizontalPager(state = pager, beyondViewportPageCount = 1,
+            modifier = Modifier.fillMaxWidth().height(boardHeight)) { page ->
+            val items = if (page == 0) standardItems else personal.items
+            val loading = if (page == 0) standardLoading ||
+                standardItems.isEmpty() && standardError == null && refreshGeneration == 0
+                else personal.loading || personal.generation < 0 && personal.error == null
+            val error = if (page == 0) standardError else personal.error
+            Column(Modifier.fillMaxWidth()) {
+                if (items.isEmpty()) {
+                    Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
+                        Column(Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally) {
+                            when {
+                                loading -> AppLoadingIndicator()
+                                error != null -> {
+                                    Text(error, style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    TextButton(onClick = { if (page == 0) onRetryStandard() else retry++ }) { Text("重试") }
+                                }
+                                else -> Text(if (page == 0) "暂无热搜" else "暂无我的热搜",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                }
+                items.forEachIndexed { index, entry ->
+                    HotSearchRow(index + 1, entry) { onSelect(entry.word) }
+                    if (index < items.lastIndex) HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+                }
+            }
+        }
+    }
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -21310,7 +21908,7 @@ private fun UserPostsSearchScreen(
             },
             backdrop = searchBackdrop,
             pill = true,
-            surfaceColor = if (isAppLightTheme()) Color(0xFFF2F2F2) else Color(0xFF303030),
+            surfaceColor = Color.White.copy(alpha = 0.2f),
             borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.24f),
             borderWidth = 0.75.dp,
             frostedBlurRadius = 8.dp,
@@ -21419,6 +22017,9 @@ private fun SearchScreen(
     var hotSearchItems by remember { mutableStateOf<List<HotSearchItem>>(emptyList()) }
     var hotSearchLoading by remember { mutableStateOf(false) }
     var hotSearchError by remember { mutableStateOf<String?>(null) }
+    var hotRefreshGeneration by remember { mutableIntStateOf(0) }
+    val hotBoardPager = rememberPagerState(pageCount = { 2 })
+    val personalHotBoard = remember(mineProfileId) { PersonalHotSearchState() }
     var resultItems by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var userResultItems by remember { mutableStateOf<List<RelationUser>>(emptyList()) }
     var resultLoading by remember { mutableStateOf(false) }
@@ -21571,6 +22172,7 @@ private fun SearchScreen(
 
     suspend fun reloadHotSearch() {
         if (!hasLoginCookie) return
+        hotRefreshGeneration += 1
         hotSearchLoading = true
         hotSearchError = null
         runCatching { session.loadHotSearch() }
@@ -21667,7 +22269,7 @@ private fun SearchScreen(
         }
     }
 
-    LaunchedEffect(hasLoginCookie) {
+    LaunchedEffect(hasLoginCookie, mineProfileId) {
         if (hasLoginCookie) reloadHotSearch()
     }
 
@@ -22001,65 +22603,24 @@ private fun SearchScreen(
                             }
                         }
                         item(key = "history-chip-spacer") {
-                            Spacer(Modifier.height(16.dp))
+                            Spacer(Modifier.height(8.dp))
                         }
                     }
-                    item {
-                        Text(
-                            text = "热搜",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.padding(bottom = 8.dp),
+                    item(key = "hot-search-boards") {
+                        HotSearchBoards(
+                            session = session,
+                            pager = hotBoardPager,
+                            personal = personalHotBoard,
+                            standardItems = hotSearchItems,
+                            standardLoading = hotSearchLoading,
+                            standardError = hotSearchError,
+                            refreshGeneration = hotRefreshGeneration,
+                            onRetryStandard = { scope.launch { reloadHotSearch() } },
+                            onSelect = { word ->
+                                onSearchModeChange(SearchMode.Weibo)
+                                submitQuery(word, modeOverride = SearchMode.Weibo)
+                            },
                         )
-                    }
-                    when {
-                        hotSearchError != null && hotSearchItems.isEmpty() -> {
-                            item {
-                                Column(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Text(
-                                        text = hotSearchError.orEmpty(),
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                    Text(
-                                        text = "下拉刷新重试",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                            }
-                        }
-                        hotSearchItems.isEmpty() && !hotSearchLoading -> {
-                            item {
-                                Text(
-                                    text = "暂无热搜",
-                                    modifier = Modifier.padding(vertical = 16.dp),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        else -> {
-                            itemsIndexed(
-                                hotSearchItems,
-                                key = { _, item -> item.word },
-                                contentType = { _, _ -> "hot_search" },
-                            ) { index, item ->
-                                HotSearchRow(
-                                    rank = index + 1,
-                                    item = item,
-                                    onClick = {
-                                        onSearchModeChange(SearchMode.Weibo)
-                                        submitQuery(item.word, modeOverride = SearchMode.Weibo)
-                                    },
-                                )
-                                if (index < hotSearchItems.lastIndex) {
-                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
-                                }
-                            }
-                        }
                     }
                 } else {
                     when {
@@ -22130,12 +22691,17 @@ private fun SearchScreen(
                         }
                         else -> {
                             items(resultItems, key = { it.id }, contentType = ::feedCardContentType) { item ->
-                                val resolved = resolveFeedItem(item)
-                                var cardBounds by remember(resolved.id) { mutableStateOf<Rect?>(null) }
+                                // Keep the result card backed by the exact item snapshot returned
+                                // by this search request. Opening detail may fetch/expand long text
+                                // into the global status cache; resolving that cache here would
+                                // silently change this LazyColumn item's height on return and nudge
+                                // the neighboring results. The detail entry point resolves the
+                                // latest item independently.
+                                var cardBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
                                 CompositionLocalProvider(LocalHiddenFeedCardId provides hiddenSourceCardId) {
                                 FeedCard(
-                                    item = resolved,
-                                    onClick = { onItemClick(resolved, cardBounds) },
+                                    item = item,
+                                    onClick = { onItemClick(item, cardBounds) },
                                     onBoundsChanged = { cardBounds = it },
                                     onMediaClick = onMediaClick,
                                     emoticonMap = emoticonMap,
@@ -22146,6 +22712,11 @@ private fun SearchScreen(
                                     onLikeClick = onLikeClick,
                                     onUrlEntityClick = onUrlEntityClick,
                                     menuBackEnabled = resultsBackEnabled,
+                                    // Keep the trailing menu slot composed while this search
+                                    // layer is covered by detail. Otherwise the author row gains
+                                    // 48dp of width on return, metadata may unwrap, and the card
+                                    // (plus following results) shifts vertically as the arrow pops in.
+                                    showActionMenu = true,
                                 )
                                 }
                             }
@@ -22519,12 +23090,13 @@ private fun MineScreen(
     )
     val coroutineScope = rememberCoroutineScope()
     val likesUid = profile?.id.orEmpty()
-    val likesListState = rememberLazyListState()
-    var likedPosts by remember(likesUid, activeAccountId) { mutableStateOf(emptyList<FeedItem>()) }
-    var likesLoaded by remember(likesUid, activeAccountId) { mutableStateOf(false) }
+    val retainedUi = LocalProfileRetainedUi.current.getOrPut("$activeAccountId:$likesUid") { ProfileRetainedUi() }
+    val likesListState = retainedUi.likesList
+    var likedPosts by retainedUi::likes
+    var likesLoaded by retainedUi::likesLoaded
     var likesLoading by remember(likesUid, activeAccountId) { mutableStateOf(false) }
     var likesError by remember(likesUid, activeAccountId) { mutableStateOf<String?>(null) }
-    var likesCursor by remember(likesUid, activeAccountId) { mutableStateOf<String?>(null) }
+    var likesCursor by retainedUi::likesCursor
     var likesJob by remember(likesUid, activeAccountId) { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     DisposableEffect(likesUid, activeAccountId) {
         onDispose { likesJob?.cancel() }
@@ -22732,7 +23304,7 @@ private fun MineScreen(
             .collect { onLoadMorePosts() }
     }
 
-    val videoAlbumListState = rememberLazyListState()
+    val videoAlbumListState = retainedUi.videosList
     val photoAlbumListState = albumListState
     val activeAlbumListState = if (pagerState.currentPage == MineContentTab.Videos.ordinal)
         videoAlbumListState else albumListState
@@ -22781,11 +23353,7 @@ private fun MineScreen(
         MineContentTab.Videos.ordinal -> videoAlbumListState
         else -> albumListState
     }
-    var headerCollapseOffsetPx by remember(profile?.id, collapseThresholdPx) {
-        mutableFloatStateOf(
-            if (activeListState.firstVisibleItemIndex > 0) collapseThresholdPx.toFloat() else 0f,
-        )
-    }
+    var headerCollapseOffsetPx by retainedUi::collapse
     val profileCollapseConnection = remember(
         activeListState,
         collapseThresholdPx,
@@ -25057,18 +25625,34 @@ private fun SettingsEmoticonCard(
                                 .verticalScroll(rememberScrollState()),
                         ) {
                             val gap = 6.dp
-                            val cellWidth = (maxWidth - gap * 6) / 7
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(gap),
+                            val minCellWidth = 44.dp
+                            val maxCellWidth = 58.dp
+                            val columnCount = ((maxWidth + gap) / (minCellWidth + gap))
+                                .toInt().coerceAtLeast(1)
+                            val cellWidth = ((maxWidth - gap * (columnCount - 1)) / columnCount)
+                                .coerceAtMost(maxCellWidth)
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
                                 verticalArrangement = Arrangement.spacedBy(gap),
-                                maxItemsInEachRow = 7,
                             ) {
-                                sortedEmoticons.forEach { (phrase, url) ->
-                                    SettingsEmoticonTile(
-                                        phrase = phrase,
-                                        url = url,
-                                        width = cellWidth,
-                                    )
+                                sortedEmoticons.chunked(columnCount).forEachIndexed { rowIndex, row ->
+                                    key(rowIndex) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceEvenly,
+                                        ) {
+                                            row.forEach { (phrase, url) ->
+                                                SettingsEmoticonTile(
+                                                    phrase = phrase,
+                                                    url = url,
+                                                    width = cellWidth,
+                                                )
+                                            }
+                                            repeat((columnCount - row.size).coerceAtLeast(0)) {
+                                                Spacer(Modifier.width(cellWidth))
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -26160,7 +26744,7 @@ private fun MineInlineStats(
     val canOpenList = onOpenFollowList != null && !profile?.id.isNullOrBlank()
     Row(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(24.dp),
     ) {
         MineInlineStat(
             value = profile?.followersCount ?: "--",
@@ -27105,7 +27689,7 @@ private fun wrapArticleHtml(content: String): String = """
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
     <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; margin: 0; line-height: 1.7; color: #333; word-break: break-word; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; margin: 0; line-height: 1.7; color: #333; word-break: break-word; text-align: justify; }
     img { max-width: 100%; height: auto; }
     a { color: #ff8200; }
     </style>

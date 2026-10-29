@@ -31,6 +31,7 @@ object WeiboEndpoints {
     const val CANCEL_LIKE = "/ajax/statuses/cancelLike"
     const val STATUS_DESTROY = "/ajax/statuses/destroy"
     const val SEARCH_BAND = "/ajax/side/searchBand"
+    const val PERSONAL_SEARCH_BAND = "/ajax/statuses/mineBand"
     const val SEARCH_SIDE = "/ajax/side/search"
 
     fun timelinePath(kind: TimelineKind): String =
