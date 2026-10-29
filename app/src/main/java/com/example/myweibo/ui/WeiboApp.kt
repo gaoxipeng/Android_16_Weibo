@@ -150,7 +150,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.LocationOn
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
@@ -10113,7 +10112,9 @@ private fun FeedCard(
             FeedPollCard(displayItem, onUrlEntityClick, Modifier.padding(horizontal = FeedCardContentHorizontalPadding))
             FeedLocationCapsule(
                 item = displayItem,
-                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
+                // Action labels are vertically centered in a 26.dp touch row. Balance
+                // that inset so the location pill sits midway between visible content.
+                modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding).padding(top = 6.dp),
             )
             if (showStatusActions && !sharedDetailCard) TraceComposition("WeiboCard.Actions") {
                 StatusActions(
@@ -10303,7 +10304,7 @@ private fun FeedPollCard(item: FeedItem, onUrlEntityClick: ((FeedUrlEntity) -> U
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(option.text, Modifier.weight(1f), fontSize = 14.sp)
-                val votes = option.count?.toString() ?: option.countText
+                val votes = if (poll.hasVoted) option.count?.toString() ?: option.countText else null
                 votes?.let {
                     Text(if (it.endsWith("票")) it else "${it}票", modifier = Modifier.padding(start = 8.dp),
                         fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -10361,7 +10362,8 @@ private fun FeedLocationCapsule(item: FeedItem, modifier: Modifier = Modifier) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Icon(Icons.Rounded.LocationOn, contentDescription = null, tint = Color(0xFF579CF4), modifier = Modifier.size(15.dp))
+        Icon(painterResource(R.drawable.ic_feed_location), contentDescription = null,
+            tint = Color(0xFF579CF4), modifier = Modifier.size(15.dp))
         Text(name, fontSize = 12.sp, lineHeight = 16.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1, overflow = TextOverflow.Ellipsis,
