@@ -9999,7 +9999,7 @@ private fun FeedCard(
                         sharedDetailCard -> 6.dp
                         insetRounded -> if (showStatusActions) 10.dp else 14.dp
                         compactBottomSpacing -> 2.dp
-                        else -> if (showStatusActions) 6.dp else 10.dp
+                        else -> if (showStatusActions) 8.dp else 10.dp
                     },
                 ),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -10118,7 +10118,8 @@ private fun FeedCard(
             )
             if (showStatusActions && !sharedDetailCard) TraceComposition("WeiboCard.Actions") {
                 StatusActions(
-                    modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding),
+                    modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding)
+                        .padding(top = if (!insetRounded && !compactBottomSpacing) 4.dp else 0.dp),
                     item = item,
                     onRepostClick = onRepostClick ?: onClick,
                     onCommentClick = onCommentClick ?: onClick,
@@ -10356,7 +10357,7 @@ private fun FeedLocationCapsule(item: FeedItem, modifier: Modifier = Modifier) {
             .background(MaterialTheme.colorScheme.surface)
             .border(0.75.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), CircleShape)
             .clickable(enabled = url != null) {
-                url?.let { WeiboStatusActions.openExternalUrl(context, it, "无法打开地理位置") }
+                url?.let { WeiboStatusActions.openPlace(context, it, name) }
             }
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,

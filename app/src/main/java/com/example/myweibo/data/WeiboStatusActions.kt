@@ -6,6 +6,23 @@ import android.net.Uri
 import android.widget.Toast
 
 object WeiboStatusActions {
+    /** Open a known POI container directly; the web redirect can fail client identity checks. */
+    fun openPlace(context: Context, rawUrl: String, name: String) {
+        val decoded = Uri.decode(rawUrl)
+        val match = Regex("(?i)(?:2306570042|100101)(B[0-9a-f]{15,})").find(decoded)
+        if (match != null) {
+            val container = "2306570042" + match.groupValues[1]
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("sinaweibo://cardlist").buildUpon()
+                .appendQueryParameter("containerid", container).build()).apply {
+                setPackage("com.sina.weibo")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (runCatching { context.startActivity(intent) }.isSuccess) return
+        }
+        val fallback = rawUrl.takeIf { it.isNotBlank() }
+            ?: "https://s.weibo.com/weibo?q=" + java.net.URLEncoder.encode(name, Charsets.UTF_8.name())
+        openExternalUrl(context, fallback, "无法打开地理位置")
+    }
     /** Open a super-topic with the official client when its native container ID is present. */
     fun openSuperTopicInWeiboApp(context: Context, vararg rawUrls: String): Boolean {
         val containerId = rawUrls.asSequence()

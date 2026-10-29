@@ -2196,7 +2196,7 @@ object WeiboJsonParser {
 
     private fun buildWeiboPlacePageUrl(poiIdRaw: String?): String? {
         val id = normalizePoiId(poiIdRaw) ?: return null
-        val pageId = if (id.startsWith("100101")) id else "100101$id"
+        val pageId = "2306570042" + id.removePrefix("100101")
         return "https://weibo.com/p/$pageId"
     }
 
@@ -2205,10 +2205,10 @@ object WeiboJsonParser {
         vararg fallbacks: JSONObject?,
     ): String? {
         sequenceOf(primary, *fallbacks).forEach { obj ->
-            pickLocationUrl(obj)?.let { return it }
+            buildWeiboPlacePageUrl(pickPoiId(obj))?.let { return it }
         }
         sequenceOf(primary, *fallbacks).forEach { obj ->
-            buildWeiboPlacePageUrl(pickPoiId(obj))?.let { return it }
+            pickLocationUrl(obj)?.let { return it }
         }
         return null
     }
