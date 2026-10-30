@@ -1656,15 +1656,37 @@ object WeiboJsonParser {
             }
         }
         val fromMixMedia = imagesFromMixMedia(status.optJSONObject("mix_media_info"))
-        return mergeDuplicateFeedImages(fromStatus + fromUrlStruct + fromMixMedia)
+        // For mixed-media posts, mix_media_info.items is the ordered presentation
+        // list used by the client. pic_ids remains useful as a fallback/source of
+        // missing image metadata, but can be in a different order for Nearby feeds.
+        val orderedImages = if (fromMixMedia.isNotEmpty()) {
+            fromMixMedia + fromStatus + fromUrlStruct
+        } else {
+            fromStatus + fromUrlStruct
+        }
+        return mergeDuplicateFeedImages(orderedImages)
     }
 
     private fun mergeDuplicateFeedImages(images: List<FeedImage>): List<FeedImage> =
-        images.groupBy { image ->
-            image.largeUrl.ifBlank { image.id }.substringBefore('?')
-        }.map { (_, group) ->
+        images.groupBy(::feedImageMergeKey).map { (_, group) ->
             group.reduce(::mergeFeedImagePair)
         }
+
+    /**
+     * A status can expose the same photo through pic_infos and mix_media_info, but the
+     * large URL is not a safe identity: malformed/variant payloads may reuse it for
+     * distinct pic_ids (notably Live Photos, whose motion URL must stay paired with
+     * its own still). Prefer the API photo id and use the URL only when no id exists.
+     */
+    private fun feedImageMergeKey(image: FeedImage): String {
+        val id = image.id.trim()
+        if (id.isNotBlank() && !id.startsWith("http", ignoreCase = true)) {
+            return "id:${id.substringBeforeLast('.')}"
+        }
+        val url = image.largeUrl.ifBlank { image.thumbnailUrl }.substringBefore('?')
+        val pid = sinaimgPidFromUrl(url)
+        return if (pid != null) "pid:$pid" else "url:$url"
+    }
 
     private fun mergeFeedImagePair(primary: FeedImage, secondary: FeedImage): FeedImage {
         val liveVideo = primary.livePhotoVideoUrl ?: secondary.livePhotoVideoUrl

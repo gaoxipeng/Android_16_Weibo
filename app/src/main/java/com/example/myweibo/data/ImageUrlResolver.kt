@@ -9,11 +9,23 @@ object ImageUrlResolver {
     }
 
     // Feed/detail can represent the same photo by PID or by a different CDN URL.
-    fun thumbnailIdentity(image: FeedImage): String =
-        (listOf(image.largeUrl, image.thumbnailUrl) + image.downloadUrls)
+    fun thumbnailIdentity(image: FeedImage): String {
+        val id = image.id.trim().takeIf { it.isNotBlank() }?.let { value ->
+            if (value.startsWith("http", ignoreCase = true)) {
+                sinaImageId(value)
+            } else {
+                value.substringBeforeLast('.')
+            }
+        }
+        val urlId = (listOf(image.largeUrl, image.thumbnailUrl) + image.downloadUrls)
             .firstNotNullOfOrNull(::sinaImageId)
-            ?: image.id.takeIf { it.isNotBlank() && !it.startsWith("http") }
-            ?: image.largeUrl.ifBlank { image.thumbnailUrl }
+        return when {
+            id != null && urlId != null -> "$id:$urlId"
+            id != null -> id
+            urlId != null -> urlId
+            else -> image.largeUrl.ifBlank { image.thumbnailUrl }
+        }
+    }
 
     fun thumbnailCacheKey(image: FeedImage, quality: FeedThumbnailQuality, previewUrl: String? = null): String =
         "${thumbnailIdentity(image)}:$quality:$previewUrl"

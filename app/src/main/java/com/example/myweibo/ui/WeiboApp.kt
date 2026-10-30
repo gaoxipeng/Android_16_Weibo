@@ -294,7 +294,6 @@ import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.unit.TextUnit
@@ -9648,47 +9647,6 @@ private fun buildStatusTokenRegex(
 @Composable
 private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
 
-// Plain and annotated bodies must share the same shaping, line breaking and
-// vertical metrics. Never stretch glyphs or remeasure individual characters.
-private fun unifiedBodyParagraphStyle(style: TextStyle): TextStyle = style.copy(
-    textAlign = TextAlign.Start,
-    lineBreak = LineBreak.Simple,
-    letterSpacing = 0.sp,
-)
-
-@Composable
-internal fun JustifiedBodyText(
-    text: AnnotatedString,
-    style: TextStyle,
-    modifier: Modifier = Modifier,
-    inlineContent: Map<String, InlineTextContent> = emptyMap(),
-    maxLines: Int = Int.MAX_VALUE,
-    overflow: TextOverflow = TextOverflow.Clip,
-    onTextLayout: (TextLayoutResult) -> Unit = {},
-) {
-    val density = LocalDensity.current
-    val measurer = rememberTextMeasurer()
-    val paragraphStyle = unifiedBodyParagraphStyle(MaterialTheme.typography.bodyLarge.merge(style))
-    BoxWithConstraints(modifier.clipToBounds()) {
-        val widthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(1)
-        val laidOutText = remember(text, paragraphStyle, widthPx, inlineContent, maxLines, overflow, density) {
-            justifyBodyParagraph(text, paragraphStyle, widthPx, inlineContent, maxLines, overflow, density, measurer)
-        }
-        Text(text = laidOutText, style = paragraphStyle, inlineContent = inlineContent,
-            modifier = Modifier.fillMaxWidth(), maxLines = maxLines, overflow = overflow,
-            onTextLayout = { result ->
-                if (text.text.contains("走进婚姻") || text.text.contains("Aeolus RSL")) {
-                    android.util.Log.d("BodyLayoutDiagnostic", "source=" + text.text.take(1200)
-                        .replace("\n", "\\n").replace("\r", "\\r") +
-                        " width=$widthPx lines=" + (0 until result.lineCount).joinToString { line ->
-                            "${result.getLineStart(line)}..${result.getLineEnd(line, true)}:${result.getLineRight(line)}"
-                        })
-                }
-                onTextLayout(result)
-            })
-    }
-}
-
 @Composable
 private fun EmoticonText(
     text: String,
@@ -9717,9 +9675,9 @@ private fun EmoticonText(
     }
 
     if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, trailingLocation, inlineImageLinks, urlEntities)) {
-        JustifiedBodyText(
-            text = AnnotatedString(text),
-            style = unifiedBodyParagraphStyle(style),
+        Text(
+            text = text,
+            style = style,
             modifier = modifier,
             maxLines = maxLines,
             overflow = overflow,
@@ -9916,10 +9874,10 @@ private fun EmoticonText(
             }
         }
     }
-    JustifiedBodyText(
+    Text(
         text = annotatedString,
         inlineContent = inlineContent,
-        style = unifiedBodyParagraphStyle(style),
+        style = style,
         modifier = modifier
             .pointerInput(linkScopeKey) {
                 awaitEachGesture {
@@ -13384,6 +13342,13 @@ private fun resolveFeedImageForViewer(
 }
 
 private fun imagesReferToSamePhoto(a: FeedImage, b: FeedImage): Boolean {
+    val aId = a.id.trim().takeIf { it.isNotBlank() && !it.startsWith("http", ignoreCase = true) }
+        ?.substringBeforeLast('.')
+    val bId = b.id.trim().takeIf { it.isNotBlank() && !it.startsWith("http", ignoreCase = true) }
+        ?.substringBeforeLast('.')
+    // When both payloads have API photo ids, never borrow motion data across ids
+    // just because a CDN URL or one of its variants happens to be shared.
+    if (aId != null && bId != null) return aId == bId
     if (a.largeUrl == b.largeUrl || a.id == b.id) return true
     val aKeys = albumImageMatchKeys(a)
     val bKeys = albumImageMatchKeys(b)
