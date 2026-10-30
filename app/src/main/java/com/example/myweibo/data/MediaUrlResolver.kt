@@ -13,7 +13,12 @@ object MediaUrlResolver {
         protocolCandidates(url, allowDataUri = false)
 
     fun downloadableVideoCandidates(media: FeedMedia): List<String> =
-        listOfNotNull(media.downloadUrl, media.streamUrl)
+        listOfNotNull(
+            media.downloadUrl,
+            media.streamUrl,
+            media.replayUrl,
+            media.resolvedPlaybackUrl(),
+        )
             .flatMap(::downloadUrlCandidates)
             .filter { it.isNotBlank() && !it.contains(".m3u8", ignoreCase = true) }
             .distinct()

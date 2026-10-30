@@ -96,7 +96,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
@@ -153,6 +153,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.VolumeUp
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -192,6 +194,8 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -337,6 +341,7 @@ import com.example.myweibo.data.extractActiveMentionQuery
 import com.example.myweibo.data.filterMentionCandidatesByQuery
 import com.example.myweibo.data.mentionCandidateKey
 import com.example.myweibo.data.ImageSaveHelper
+import com.example.myweibo.data.LivePhotoContainerMirrorDetector
 import com.example.myweibo.data.LivePhotoMirrorCorrectionStore
 import com.example.myweibo.data.LivePhotoMirrorDetector
 import com.example.myweibo.data.ImageUrlResolver
@@ -348,6 +353,7 @@ import com.example.myweibo.data.HotSearchItem
 import com.example.myweibo.data.RelationUser
 import com.example.myweibo.data.toRelationUser
 import com.example.myweibo.data.toUserProfile
+import com.example.myweibo.data.FeedAudio
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.isSavableToAlbum
 import com.example.myweibo.data.toAlbumFeedMedia
@@ -2400,18 +2406,17 @@ private class PollUiController(val session: WeiboWebSession) {
         busy[id] = true
         try {
             polls[id] = session.loadVotePoll(id)
-            android.util.Log.i("WeiboVote", "refresh options=${polls[id]?.options?.size} voted=${polls[id]?.hasVoted}")
             errors.remove(id)
         } catch (cancelled: CancellationException) { throw cancelled
         } catch (error: Exception) {
             errors[id] = error.message ?: "投票状态刷新失败"
-            android.util.Log.i("WeiboVote", "refresh failed: ${errors[id]}")
         } finally { busy[id] = false }
     }
 }
 private val LocalPollController = staticCompositionLocalOf<PollUiController?> { null }
 private val LocalAppCacheClearAction = staticCompositionLocalOf<(suspend (AppCacheCategory?) -> AppCacheClearResult)?> { null }
 private val LocalImageSaveHint = staticCompositionLocalOf { ImageSaveHintController() }
+private val LocalVoiceAudioController = staticCompositionLocalOf<VoiceAudioController?> { null }
 private val LocalTopicClickHandler = staticCompositionLocalOf<((String) -> Unit)?> { null }
 private val LocalStaleVideoMediaRefresher =
     staticCompositionLocalOf<((FeedMedia, String) -> Unit)?> { null }
@@ -2430,8 +2435,128 @@ private data class AppCapsuleHintState(
     val progress: Float? = null,
 )
 
-private class ImageSaveHintController {
-    var activeHint by mutableStateOf<AppCapsuleHintState?>(null)
+@Stable
+private class VoiceAudioController(private val context: Context) {
+    private val scope = CoroutineScope(Dispatchers.Main.immediate)
+    private var player: androidx.media3.exoplayer.ExoPlayer? = null
+    private var ticker: Job? = null
+
+    var activeKey by mutableStateOf<String?>(null)
+        private set
+    var isPlaying by mutableStateOf(false)
+        private set
+    var positionMs by mutableLongStateOf(0L)
+        private set
+    var durationMs by mutableLongStateOf(0L)
+        private set
+    var failed by mutableStateOf(false)
+        private set
+
+    fun toggle(key: String, audio: FeedAudio) {
+        val current = player
+        if (activeKey == key && current != null) {
+            if (current.isPlaying) {
+                current.pause()
+            } else {
+                if (current.playbackState == androidx.media3.common.Player.STATE_ENDED) current.seekTo(0)
+                current.play()
+            }
+            return
+        }
+        releasePlayer()
+        failed = false
+        activeKey = key
+        positionMs = 0L
+        durationMs = audio.durationMs
+        val next = androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+            setAudioAttributes(androidx.media3.common.AudioAttributes.DEFAULT, true)
+            setMediaSource(buildVideoMediaSource(context, audio.mediaUrl, useCache = false))
+            prepare()
+            playWhenReady = true
+        }
+        next.addListener(object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                    durationMs = next.duration.coerceAtLeast(0L)
+                }
+                if (playbackState == androidx.media3.common.Player.STATE_ENDED) {
+                    isPlaying = false
+                    positionMs = durationMs
+                    stopTicker()
+                }
+            }
+
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+                if (playing) startTicker() else stopTicker()
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                failed = true
+                isPlaying = false
+                stopTicker()
+            }
+        })
+        player = next
+        startTicker()
+    }
+
+    private fun startTicker() {
+        stopTicker()
+        ticker = scope.launch {
+            while (true) {
+                player?.let {
+                    positionMs = it.currentPosition.coerceAtLeast(0L)
+                    it.duration.takeIf { value -> value > 0L }?.let { value -> durationMs = value }
+                }
+                delay(120L)
+            }
+        }
+    }
+
+    private fun stopTicker() {
+        ticker?.cancel()
+        ticker = null
+    }
+
+    fun pause() {
+        player?.pause()
+        isPlaying = false
+        stopTicker()
+    }
+
+    fun seekTo(fraction: Float) {
+        val current = player ?: return
+        val total = current.duration.takeIf { it > 0L } ?: durationMs
+        if (total <= 0L) return
+        val target = (total * fraction.coerceIn(0f, 1f)).toLong()
+        current.seekTo(target)
+        positionMs = target
+    }
+
+    fun release() {
+        stopTicker()
+        releasePlayer()
+    }
+
+    private fun releasePlayer() {
+        player?.release()
+        player = null
+        activeKey = null
+        isPlaying = false
+        positionMs = 0L
+    }
+}
+
+private class ImageSaveHintController(
+    private val appScope: CoroutineScope = CoroutineScope(Dispatchers.Main.immediate),
+) {    var activeHint by mutableStateOf<AppCapsuleHintState?>(null)
+
+    /**
+     * Long-running saves must not live in a menu's rememberCoroutineScope:
+     * dismissing the image menu cancels that scope mid-batch.
+     */
+    fun launchSave(block: suspend () -> Unit): Job = appScope.launch { block() }
 
     fun showProgress(current: Int, total: Int) {
         activeHint = AppCapsuleHintState(
@@ -3644,11 +3769,18 @@ private suspend fun detectLivePhotoMirrorCorrection(
     stillBitmap: Bitmap?,
 ): LivePhotoMirrorCorrection {
     if (!image.isLivePhoto) return LivePhotoMirrorCorrection.None
-    val still = stillBitmap?.takeIfDrawable() ?: loadLivePhotoStillForMirrorDetection(image) ?: return LivePhotoMirrorCorrection.None
     val videoUrl = image.livePhotoVideoUrl.orEmpty()
-    val frame = LivePhotoMirrorDetector.loadReferenceFrameFromUrl(videoUrl)
-        ?: return LivePhotoMirrorCorrection.None
-    val mirrorVideo = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(still, frame)
+    // A reflected MOV matrix is rendered mirrored by Media3 even though
+    // MediaMetadataRetriever normalizes the same frames, so the container check
+    // must not depend on the still image being downloadable.
+    if (LivePhotoContainerMirrorDetector.hasReflectedVideoTrack(videoUrl) == true) {
+        LivePhotoMirrorCorrectionStore.putMirrorVideo(image, true)
+        return LivePhotoMirrorCorrection.MirrorVideo
+    }
+    // Cropped thumbnails (or a stale transition preview) are not reliable inputs
+    // for a full-frame mirror comparison. Decode the actual still with its EXIF.
+    val still = loadLivePhotoStillForMirrorDetection(image) ?: return LivePhotoMirrorCorrection.None
+    val mirrorVideo = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(still, videoUrl) == true
     LivePhotoMirrorCorrectionStore.putMirrorVideo(image, mirrorVideo)
     return if (mirrorVideo) {
         LivePhotoMirrorCorrection.MirrorVideo
@@ -3658,7 +3790,6 @@ private suspend fun detectLivePhotoMirrorCorrection(
 }
 
 private suspend fun loadLivePhotoStillForMirrorDetection(image: FeedImage): Bitmap? {
-    resolveFullscreenPreviewBitmap(image)?.takeIfDrawable()?.let { return it }
     val candidates = ImageUrlResolver.livePhotoStillCandidates(image)
     for (url in candidates) {
         runCatching {
@@ -5557,7 +5688,20 @@ fun WeiboApp() {
                             sortFeedTimelineItems(page.items)
                         } else page.items
                         reconcileFeedLikeState(page.items)
-                        nextCursor = page.nextCursor
+                        // groupstimeline does not always return max_id, especially
+                        // for 特别关注; without a cursor the bottom trigger never
+                        // starts a second page. Fall back to the newest item id.
+                        nextCursor = page.nextCursor ?: when (requestedKind) {
+                            TimelineKind.SpecialFollowing, TimelineKind.FriendsCircle ->
+                                page.items.lastOrNull()?.id
+                            else -> null
+                        }
+                        if (requestedKind == TimelineKind.SpecialFollowing) {
+                            android.util.Log.e(
+                                "SpecialFollow",
+                                "refresh items=${page.items.size} serverCursor=${page.nextCursor} next=$nextCursor",
+                            )
+                        }
                         absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                         hasLoginCookie = true
                         persistLoginSession()
@@ -5665,10 +5809,18 @@ fun WeiboApp() {
     }
 
     fun loadMore() {
-        val cursor = nextCursor ?: return
+        val cursor = nextCursor ?: run {
+            if (timelineKind == TimelineKind.SpecialFollowing) {
+                android.util.Log.e("SpecialFollow", "loadMore skipped: nextCursor=null")
+            }
+            return
+        }
         if (feedLoadingMore || isLoading) return
         val requestGeneration = timelineRequestGeneration
         val requestedKind = timelineKind
+        if (requestedKind == TimelineKind.SpecialFollowing) {
+            android.util.Log.e("SpecialFollow", "loadMore start cursor=$cursor")
+        }
         timelineLoadMoreJob = scope.launch {
             feedLoadingMore = true
             runCatchingPreservingCancellation {
@@ -5709,9 +5861,19 @@ fun WeiboApp() {
                         appended == 0 -> null
                         else -> page.nextCursor ?: page.items.lastOrNull()?.id
                     }
+                    if (requestedKind == TimelineKind.SpecialFollowing) {
+                        android.util.Log.e(
+                            "SpecialFollow",
+                            "loadMore page items=${page.items.size} appended=$appended " +
+                                "serverCursor=${page.nextCursor} next=$nextCursor",
+                        )
+                    }
                     if (raw != null) timelineCacheStore.appendFollowingTimeline(raw)
                 }
                 .onFailure { error ->
+                    if (requestedKind == TimelineKind.SpecialFollowing) {
+                        android.util.Log.e("SpecialFollow", "loadMore failed: ${error.message}", error)
+                    }
                     if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
                         showMessage("\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u4E0B\u4E00\u9875")
                     }
@@ -7622,7 +7784,11 @@ fun WeiboApp() {
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
-        val imageSaveHintController = remember { ImageSaveHintController() }
+        val imageSaveHintController = remember(scope) { ImageSaveHintController(scope) }
+        val voiceAudioController = remember(context) { VoiceAudioController(context) }
+        DisposableEffect(voiceAudioController) {
+            onDispose { voiceAudioController.release() }
+        }
         val feedTypographyMetrics = rememberFeedTypographyMetrics(feedFontSize, feedLineSpacing)
         val feedEmoticonInlineContent = rememberFeedEmoticonInlineContent(emoticonMap, feedTypographyMetrics)
         LaunchedEffect(feedFontSize, feedLineSpacing) {
@@ -7681,6 +7847,7 @@ fun WeiboApp() {
             LocalFeedListScrollCoordinator provides feedListScrollCoordinator,
             LocalImagePeekController provides imagePeekController,
             LocalImageSaveHint provides imageSaveHintController,
+            LocalVoiceAudioController provides voiceAudioController,
             LocalVideoPeekController provides videoPeekController,
             LocalFeedThumbnailQuality provides feedThumbnailQuality,
             LocalFeedBodyTextStyle provides feedTypographyMetrics.body,
@@ -10478,6 +10645,137 @@ private fun FeedCard(
 }
 
 @Composable
+private fun VoiceMessageCard(
+    audio: FeedAudio,
+    modifier: Modifier = Modifier,
+) {
+    val controller = LocalVoiceAudioController.current
+    val videoCoordinator = LocalVideoPlaybackCoordinator.current
+    val key = audio.mediaId?.takeIf { it.isNotBlank() } ?: audio.mediaUrl
+    val active = controller?.activeKey == key
+    val playing = active && controller?.isPlaying == true
+    val failed = active && controller?.failed == true
+    val positionMs = if (active) controller?.positionMs ?: 0L else 0L
+    val durationMs = if (active && (controller?.durationMs ?: 0L) > 0L) {
+        controller!!.durationMs
+    } else {
+        audio.durationMs
+    }
+    val progress = if (durationMs > 0L) {
+        (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    var capsuleWidthPx by remember { mutableIntStateOf(1) }
+    var dragProgress by remember(key) { mutableStateOf<Float?>(null) }
+    val displayedProgress = dragProgress ?: progress
+    Box(
+        modifier = modifier
+            .height(44.dp)
+            .clip(VideoControlCapsuleShape)
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .onSizeChanged { capsuleWidthPx = it.width.coerceAtLeast(1) }
+            .pointerInput(key, active) {
+                if (!active) return@pointerInput
+                detectHorizontalDragGestures(
+                    onDragStart = { offset ->
+                        dragProgress = (offset.x / capsuleWidthPx.toFloat()).coerceIn(0f, 1f)
+                    },
+                    onHorizontalDrag = { change, _ ->
+                        change.consume()
+                        dragProgress = (change.position.x / capsuleWidthPx.toFloat()).coerceIn(0f, 1f)
+                    },
+                    onDragEnd = {
+                        dragProgress?.let { controller?.seekTo(it) }
+                        dragProgress = null
+                    },
+                    onDragCancel = { dragProgress = null },
+                )
+            }
+            .clickable(enabled = controller != null) {
+                videoCoordinator.pauseAll()
+                controller?.toggle(key, audio)
+            },
+    ) {
+        VoiceCapsuleProgressLine(
+            progress = displayedProgress,
+            animate = playing && dragProgress == null,
+            modifier = Modifier.matchParentSize(),
+        )
+        Row(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.VolumeUp,
+                    contentDescription = if (playing) "暂停语音" else "播放语音",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(17.dp),
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = if (failed) "语音加载失败" else "语音",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = formatVoiceDuration(durationMs),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun VoiceCapsuleProgressLine(
+    progress: Float,
+    animate: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val displayedProgress by animateFloatAsState(
+        targetValue = progress.coerceIn(0f, 1f),
+        animationSpec = if (animate) {
+            tween(durationMillis = 120, easing = LinearEasing)
+        } else {
+            snap()
+        },
+        label = "voice-capsule-progress",
+    )
+    BoxWithConstraints(
+        modifier = modifier.clip(VideoControlCapsuleShape),
+    ) {
+        if (maxWidth >= VideoProgressLineWidth) {
+            val lineOffset = (maxWidth * displayedProgress - VideoProgressLineWidth)
+                .coerceIn(0.dp, maxWidth - VideoProgressLineWidth)
+            Box(
+                modifier = Modifier
+                    .offset(x = lineOffset)
+                    .width(VideoProgressLineWidth)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(percent = 50))
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+        }
+    }
+}
+
+private fun formatVoiceDuration(durationMs: Long): String {
+    val seconds = (durationMs / 1000.0).roundToInt().coerceAtLeast(1)
+    return "${seconds}\""
+}
+
+@Composable
 private fun StatusTextSection(
     item: FeedItem,
     emoticonMap: Map<String, String>,
@@ -10500,6 +10798,28 @@ private fun StatusTextSection(
     }
     val resolvedUrlEntities = remember(bodyText, urlEntities, inlineImageLinks) {
         completeBareUrlEntities(bodyText, urlEntities, inlineImageLinks.keys)
+    }
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+    item.audio?.let { audio ->
+        VoiceMessageCard(
+            audio = audio,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        audio.transcript?.takeIf { it.isNotBlank() }?.let { transcript ->
+            Text(
+                text = transcript,
+                style = style,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
+        }
     }
     EmoticonText(
         modifier = Modifier.fillMaxWidth(),
@@ -10526,6 +10846,7 @@ private fun StatusTextSection(
         urlEntities = resolvedUrlEntities,
         onUrlEntityClick = onUrlEntityClick,
     )
+    }
 }
 
 private fun resolveFeedLocationOpenUrl(locationName: String?, locationUrl: String?): String? {
@@ -12463,7 +12784,7 @@ private fun ImageActionOverlay(
                             separatorBefore = true,
                             onClick = {
                                 saving = true
-                                scope.launch {
+                                saveHint.launchSave {
                                     val result = saveHint.saveAll(context, resolvedImages, statusItem)
                                     if (result.saved > 0) {
                                         requestDismiss()
@@ -15260,7 +15581,7 @@ private fun BoxScope.FullscreenImageActionMenu(
                     separatorBefore = true,
                     onClick = {
                         saving = true
-                        scope.launch {
+                        saveHint.launchSave {
                             val result = saveHint.saveAll(context, images, statusItem)
                             if (result.saved > 0) {
                                 onDismiss()
@@ -15291,8 +15612,7 @@ private fun BoxScope.FullscreenImageActionMenu(
 }
 
 @Composable
-private fun LivePhotoOverlay(
-    image: FeedImage,
+private fun LivePhotoOverlay(    image: FeedImage,
     stillBitmap: Bitmap? = null,
     modifier: Modifier = Modifier,
     isActive: Boolean = true,

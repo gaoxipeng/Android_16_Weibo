@@ -59,6 +59,11 @@ object MotionPhotoVideoPreparer {
             throw IllegalStateException("Live Photo 视频格式无效")
         }
         if (!mirror) return normalized
+        // Compose the horizontal mirror into the container matrix instead of
+        // re-encoding every frame. For a reflected MOV this turns the matrix into
+        // the transform the gallery needs, and it keeps batch saves immediate.
+        val matrixPatched = applyHorizontalMirrorDisplayMatrix(normalized)
+        if (matrixPatched !== normalized) return matrixPatched
         return mirrorVideoPixelsHorizontally(context, normalized)
     }
 

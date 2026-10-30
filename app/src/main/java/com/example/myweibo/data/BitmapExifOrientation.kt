@@ -8,11 +8,8 @@ import java.io.ByteArrayInputStream
 import kotlin.math.roundToInt
 
 /**
- * Decodes remote still images while honoring EXIF rotation.
- *
- * Some Weibo live-photo stills carry mirrored EXIF orientations even though the
- * paired video is not mirrored. Treating mirror-only tags as normal keeps the
- * still frame aligned with the motion frame while preserving camera rotation.
+ * Decodes remote still images honoring all eight EXIF orientations.
+ * Still-image orientation must not be guessed from a paired video's orientation.
  */
 object BitmapExifOrientation {
     fun decodeSampledBitmap(bytes: ByteArray, maxDecodeDim: Int): Bitmap? {
@@ -76,22 +73,31 @@ object BitmapExifOrientation {
     }
 
     private fun rotateBitmapForExif(bitmap: Bitmap, orientation: Int): Bitmap {
-        val degrees = when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90,
-            ExifInterface.ORIENTATION_TRANSPOSE -> 90f
-            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-            ExifInterface.ORIENTATION_ROTATE_270,
-            ExifInterface.ORIENTATION_TRANSVERSE -> 270f
-            else -> 0f
+        val matrix = Matrix().apply {
+            when (orientation) {
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> setScale(-1f, 1f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> setRotate(180f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> setScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> {
+                    setRotate(90f)
+                    postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_90 -> setRotate(90f)
+                ExifInterface.ORIENTATION_TRANSVERSE -> {
+                    setRotate(270f)
+                    postScale(-1f, 1f)
+                }
+                ExifInterface.ORIENTATION_ROTATE_270 -> setRotate(270f)
+            }
         }
-        if (degrees == 0f) return bitmap
+        if (matrix.isIdentity) return bitmap
         return Bitmap.createBitmap(
             bitmap,
             0,
             0,
             bitmap.width,
             bitmap.height,
-            Matrix().apply { postRotate(degrees) },
+            matrix,
             true,
         )
     }

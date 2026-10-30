@@ -24,20 +24,12 @@ object LivePhotoMotionPhotoAssembler {
         val videoBytes = downloadVideoBytes(videoUrl)
         val stillBitmap = decodeStillBitmap(imageBytes)
             ?: throw IllegalStateException("Live Photo still image decode failed")
-        val mirrorVideo = resolveMirrorVideo(image, stillBitmap, videoBytes, videoUrl)
+        val mirrorVideo = resolveMirrorVideo(image, stillBitmap, videoBytes)
         val preparedVideo = MotionPhotoVideoPreparer.prepareForMotionPhoto(
             context = context,
             sourceBytes = videoBytes,
             mirror = mirrorVideo,
         )
-        if (mirrorVideo) {
-            val referenceFrame = LivePhotoMirrorDetector.loadReferenceFrameFromBytes(preparedVideo)
-            if (referenceFrame != null &&
-                LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(stillBitmap, referenceFrame)
-            ) {
-                throw IllegalStateException("Live Photo video mirror verification failed")
-            }
-        }
         if (preparedVideo.isEmpty()) {
             throw IllegalStateException("Live Photo video is empty")
         }
@@ -70,15 +62,19 @@ object LivePhotoMotionPhotoAssembler {
         image: FeedImage,
         stillBitmap: Bitmap,
         videoBytes: ByteArray,
-        videoUrl: String,
     ): Boolean {
-        LivePhotoMirrorCorrectionStore.getMirrorVideo(image)?.let { cached ->
-            if (!cached) return false
+        // Playback already resolved this image (including the container-matrix
+        // check); reuse that decision instead of paying for a second detection.
+        LivePhotoMirrorCorrectionStore.getMirrorVideo(image)?.let { return it }
+        if (LivePhotoContainerMirrorDetector.hasReflectedVideoTrack(videoBytes) == true) {
+            LivePhotoMirrorCorrectionStore.putMirrorVideo(image, true)
+            return true
         }
+        // Decode frames from the bytes already downloaded; loading them from the
+        // URL first made save wait on a second, slow network pass.
         val detected = LivePhotoMirrorDetector.shouldMirrorVideoToMatchStill(
             stillBitmap,
             videoBytes,
-            videoUrl,
         )
         LivePhotoMirrorCorrectionStore.putMirrorVideo(image, detected)
         return detected

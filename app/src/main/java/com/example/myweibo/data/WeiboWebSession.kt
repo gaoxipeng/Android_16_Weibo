@@ -56,6 +56,8 @@ class WeiboWebSession(context: Context) {
     private val mweiboSessionMutex = Mutex()
     private val profileLongTextSemaphore = Semaphore(3)
     private var mweiboSessionReady = false
+    @Volatile
+    private var specialFollowingGroupId: String? = null
     private val viewportCoordinator = SessionWebViewportCoordinator()
 
     var currentUrl: String = ""
@@ -316,10 +318,7 @@ class WeiboWebSession(context: Context) {
         )
         return withContext(Dispatchers.Default) {
             val root = JSONObject(raw)
-            android.util.Log.i("UserPostSearch", "page=$page ok=${root.opt("ok")} keys=${root.keys().asSequence().joinToString()}")
-            WeiboJsonParser.parseUserSearchTimeline(raw, uid, page).also {
-                android.util.Log.i("UserPostSearch", "page=$page parsed=${it.items.size}")
-            }
+            WeiboJsonParser.parseUserSearchTimeline(raw, uid, page)
         }
     }
 
@@ -475,14 +474,23 @@ class WeiboWebSession(context: Context) {
 
     suspend fun loadTimelineRaw(kind: TimelineKind, cursor: String? = null): String {
         if (kind == TimelineKind.SpecialFollowing) {
-            val group = findTimelineChannel(fetchJson(WeiboEndpoints.ALL_GROUPS), kind.label)
+            val groupId = specialFollowingGroupId ?: findTimelineChannel(
+                fetchJson(WeiboEndpoints.ALL_GROUPS),
+                kind.label,
+            )?.groupId?.also { specialFollowingGroupId = it }
                 ?: error("微博未提供当前账号的特别关注分组，请确认已设置特别关注")
             return fetchJson(
                 WeiboEndpoints.GROUP_TIMELINE,
-                linkedMapOf("list_id" to group.groupId, "refresh" to "4", "count" to "25").apply {
-                    if (cursor != null) put("max_id", cursor)
+                linkedMapOf(
+                    "list_id" to groupId,
+                    // refresh=4 is the initial snapshot; follow-up pages must
+                    // ask for older data with max_id instead of refreshing again.
+                    "refresh" to if (cursor == null) "4" else "0",
+                    "count" to "25",
+                ).apply {
+                    if (cursor == null) put("since_id", "0") else put("max_id", cursor)
                 },
-                "https://weibo.com/mygroups?gid=${group.groupId}",
+                "https://weibo.com/mygroups?gid=$groupId",
             )
         }
         if (kind == TimelineKind.Hot || kind == TimelineKind.Nearby) {

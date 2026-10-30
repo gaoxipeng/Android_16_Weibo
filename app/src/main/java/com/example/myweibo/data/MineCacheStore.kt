@@ -187,6 +187,14 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             .put("edit_count", editCount)
             .put("is_pinned", isPinned)
             .put("visibility", visibility?.apiValue)
+            .put("audio", audio?.let { audio ->
+                JSONObject()
+                    .put("media_url", audio.mediaUrl)
+                    .put("duration", audio.durationMs)
+                    .put("transcript", audio.transcript)
+                    .put("media_id", audio.mediaId)
+                    .put("format", audio.format)
+            })
             .put("images", images.toFeedImagesJsonArray())
             .put("medias", medias.toFeedMediasJsonArray())
             .put("media", media?.toJson())
@@ -244,6 +252,21 @@ class MineCacheStore internal constructor(private val accountCacheDir: File) {
             editCount = optInt("edit_count"),
             isPinned = optBoolean("is_pinned"),
             visibility = WeiboPostVisibility.fromApiValue(optInt("visibility", -1)),
+            audio = optJSONObject("audio")?.let { audio ->
+                val url = audio.optNullableString("media_url")
+                val duration = audio.optLong("duration", 0L)
+                if (!url.isNullOrBlank() && duration > 0L) {
+                    FeedAudio(
+                        mediaUrl = url,
+                        durationMs = duration,
+                        transcript = audio.optNullableString("transcript"),
+                        mediaId = audio.optNullableString("media_id"),
+                        format = audio.optNullableString("format"),
+                    )
+                } else {
+                    null
+                }
+            },
             images = optJSONArray("images").toFeedImages(),
             medias = optJSONArray("medias").toFeedMedias()
                 .ifEmpty { optJSONObject("media")?.toFeedMedia()?.let(::listOf).orEmpty() },

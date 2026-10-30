@@ -1369,6 +1369,26 @@ object WeiboJsonParser {
 
     private const val WEIBO_MID_EPOCH_OFFSET = 515483463L
 
+    private fun parseFeedAudio(status: JSONObject): FeedAudio? {
+        val info = status.optJSONObject("blog_audio") ?: return null
+        val mediaUrl = info.optNullableString("media_url")
+            ?: info.optNullableString("mediaUrl")
+            ?: return null
+        val durationMs = info.optLong("duration", 0L)
+            .takeIf { it > 0L }
+            ?: return null
+        val transcript = info.optNullableString("transcript")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        return FeedAudio(
+            mediaUrl = normalizeUrl(mediaUrl),
+            durationMs = durationMs,
+            transcript = transcript,
+            mediaId = info.optNullableString("media_id"),
+            format = info.optNullableString("media_format"),
+        )
+    }
+
     private fun parseStatus(status: JSONObject, allowRetweeted: Boolean): FeedItem? {
         val id = status.optNullableString("idstr")
             ?: status.optNullableString("mid")
@@ -1504,6 +1524,7 @@ object WeiboJsonParser {
             urlEntities = urlEntities,
             retweetedStatus = retweeted,
             poll = parseFeedPoll(status, urlEntities),
+            audio = parseFeedAudio(status),
             verification = parseUserVerification(user),
             isEdited = isEdited,
             editCount = editCount,

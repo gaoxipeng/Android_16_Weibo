@@ -68,6 +68,30 @@ object LivePhotoMirrorDetector {
         return null
     }
 
+    /**
+     * A Live Photo's still/key frame is not guaranteed to be at the middle of the
+     * motion clip. Compare several frames and use the closest match for each
+     * orientation; otherwise ordinary motion can be mistaken for (or hide) a
+     * horizontal mirror.
+     */
+    fun shouldMirrorVideoToMatchStill(still: Bitmap, videoUrl: String): Boolean? {
+        val headers = livePhotoFrameHeaders()
+        for (candidate in MediaUrlResolver.livePhotoVideoCandidates(videoUrl)) {
+            val decision = runCatching {
+                MediaMetadataRetriever().use { retriever ->
+                    retriever.setDataSource(candidate, headers)
+                    val frames = extractReferenceFrames(retriever)
+                    if (frames.isEmpty()) return@use null
+                    val normalError = frames.minOf { normalizedFrameError(still, it, mirrorStill = false) }
+                    val mirroredError = frames.minOf { normalizedFrameError(still, it, mirrorStill = true) }
+                    mirroredError < normalError * 0.92f && normalError - mirroredError > 180f
+                }
+            }.getOrNull()
+            if (decision != null) return decision
+        }
+        return null
+    }
+
     fun loadReferenceFrameFromFile(file: File): Bitmap? =
         runCatching {
             MediaMetadataRetriever().use { retriever ->
@@ -83,6 +107,13 @@ object LivePhotoMirrorDetector {
                     ?.takeIf(::hasUsableFrameSignal)
             }
             ?: retriever.frameAtTime?.takeIf(::hasUsableFrameSignal)
+
+    private fun extractReferenceFrames(retriever: MediaMetadataRetriever): List<Bitmap> =
+        livePhotoReferenceFrameTimesUs(retriever)
+            .mapNotNull { timeUs ->
+                retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?.takeIf(::hasUsableFrameSignal)
+            }
 
     private fun livePhotoFrameHeaders(): Map<String, String> {
         val cookie = CookieManager.getInstance().getCookie("https://weibo.com/").orEmpty()

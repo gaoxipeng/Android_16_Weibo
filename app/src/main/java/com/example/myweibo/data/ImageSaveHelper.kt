@@ -36,12 +36,12 @@ object ImageSaveHelper {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     private const val PER_IMAGE_SAVE_TIMEOUT_MS = 35_000L
-    private const val LIVE_PHOTO_SAVE_TIMEOUT_MS = 55_000L
-    private const val BATCH_LIVE_PHOTO_SAVE_TIMEOUT_MS = 48_000L
+    private const val LIVE_PHOTO_SAVE_TIMEOUT_MS = 120_000L
+    private const val BATCH_LIVE_PHOTO_SAVE_TIMEOUT_MS = 120_000L
     private const val PER_IMAGE_DOWNLOAD_TIMEOUT_MS = 18_000L
     private const val PER_IMAGE_DOWNLOAD_MAX_DURATION_MS = 24_000L
     private const val LIVE_PHOTO_VIDEO_DOWNLOAD_MAX_DURATION_MS = 45_000L
-    private const val VIDEO_DOWNLOAD_MAX_DURATION_MS = 180_000L
+    private const val VIDEO_DOWNLOAD_MAX_DURATION_MS = 600_000L
     private const val BATCH_PREFETCH_AHEAD = 2
     private const val PER_DOWNLOAD_CONNECT_TIMEOUT_MS = 8_000
     private const val PER_DOWNLOAD_READ_TIMEOUT_MS = 12_000
@@ -144,6 +144,7 @@ object ImageSaveHelper {
                 uniqueSuffix = uniqueSuffix,
                 metadata = resolvedMetadata,
                 verifyTwice = batchOptions?.verifyMotionPhotoTwice ?: false,
+                verifySaved = batchOptions == null,
             )
             if (liveResult.isSuccess || batchOptions?.fallbackToStaticOnLivePhotoFailure != true) {
                 return liveResult
@@ -230,6 +231,7 @@ object ImageSaveHelper {
         uniqueSuffix: String,
         metadata: ImageSaveMetadata,
         verifyTwice: Boolean = false,
+        verifySaved: Boolean = true,
     ): Result<String> {
         val assembled = LivePhotoMotionPhotoAssembler.assemble(
             context = context,
@@ -241,6 +243,9 @@ object ImageSaveHelper {
             return Result.failure(
                 error as? Exception ?: IllegalStateException("Live Photo 合成失败"),
             )
+        }
+        MotionPhotoValidator.validate(assembled.bytes)?.let { reason ->
+            return Result.failure(IllegalStateException("Live Photo 合成校验失败：$reason"))
         }
         val uri = insertMedia(
             context = context,
@@ -261,7 +266,9 @@ object ImageSaveHelper {
                 output.write(assembled.bytes)
                 output.flush()
             } ?: throw IllegalStateException("无法打开输出流")
-            verifySavedMotionPhoto(context, uri, assembled.bytes)
+            if (verifySaved) {
+                verifySavedMotionPhoto(context, uri, assembled.bytes)
+            }
             finalizeMedia(context, uri, metadata, xmpSnippet = xmpSnippet)
             if (verifyTwice) {
                 verifySavedMotionPhoto(context, uri, assembled.bytes)
@@ -344,9 +351,11 @@ object ImageSaveHelper {
                 }
                 val prefetchJob = prefetchJobs.remove(index)
                 val preloadedBytes = prefetchJob?.let { prefetch ->
-                    withTimeoutOrNull(PER_IMAGE_DOWNLOAD_MAX_DURATION_MS) {
-                        prefetch.await()
-                    }
+                    runCatching {
+                        withTimeoutOrNull(PER_IMAGE_DOWNLOAD_MAX_DURATION_MS) {
+                            prefetch.await()
+                        }
+                    }.getOrNull()
                 }
                 if (preloadedBytes == null) {
                     prefetchJob?.cancel()
@@ -431,12 +440,13 @@ object ImageSaveHelper {
             }
         }
         emitProgress(0.02f)
-        val bytes = candidates.firstNotNullOfOrNull { url ->
-            runCatching {
-                downloadBytes(
+        var lastError: Exception? = null
+        var downloadedFile: File? = null
+        for (url in candidates) {
+            val file = runCatching {
+                downloadVideoToFile(
+                    context = context,
                     url = url,
-                    maxBytes = 256 * 1024 * 1024,
-                    maxDurationMs = VIDEO_DOWNLOAD_MAX_DURATION_MS,
                     onProgress = { downloaded, total ->
                         val fraction = if (total > 0L) {
                             0.05f + downloaded.toFloat() / total.toFloat() * 0.8f
@@ -446,9 +456,21 @@ object ImageSaveHelper {
                         fraction?.let(::emitProgress)
                     },
                 )
-            }.getOrNull()
+            }.onFailure { lastError = it as? Exception ?: IllegalStateException(it.message) }
+                .getOrNull()
+            if (file != null) {
+                downloadedFile = file
+                break
+            }
         }
-            ?: return@withContext Result.failure(IllegalStateException("没有可下载的视频地址"))
+        if (downloadedFile == null) {
+            return@withContext Result.failure(
+                IllegalStateException(
+                    lastError?.message?.takeIf { it.isNotBlank() }?.let { "视频下载失败：$it" }
+                        ?: "没有可下载的视频地址",
+                ),
+            )
+        }
         emitProgress(0.9f)
         val displayName = "weibo_video_${sanitize(media.title)}_${System.currentTimeMillis()}.mp4"
         val uri = insertMedia(
@@ -456,12 +478,18 @@ object ImageSaveHelper {
             displayName = displayName,
             mimeType = "video/mp4",
             relativePath = "${Environment.DIRECTORY_MOVIES}/MyWeibo",
-        ) ?: return@withContext Result.failure(IllegalStateException("无法写入视频"))
+        ) ?: run {
+            downloadedFile?.delete()
+            return@withContext Result.failure(IllegalStateException("无法写入视频"))
+        }
         val writeResult = runCatching {
-            context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                ?: throw IllegalStateException("无法打开视频输出流")
+            context.contentResolver.openOutputStream(uri)?.use { output ->
+                downloadedFile!!.inputStream().use { input -> input.copyTo(output, 64 * 1024) }
+                output.flush()
+            } ?: throw IllegalStateException("无法打开视频输出流")
             finalizeMedia(context, uri)
         }
+        downloadedFile?.delete()
         if (writeResult.isFailure) {
             context.contentResolver.delete(uri, null, null)
             return@withContext Result.failure(
@@ -469,6 +497,49 @@ object ImageSaveHelper {
             )
         }
         Result.success(displayName)
+    }
+
+    private fun downloadVideoToFile(
+        context: Context,
+        url: String,
+        onProgress: ((downloaded: Long, total: Long) -> Unit)?,
+    ): File {
+        val file = File.createTempFile("weibo_save_video_", ".mp4", context.cacheDir)
+        var lastError: Exception? = null
+        repeat(2) { attempt ->
+            try {
+                val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = PER_DOWNLOAD_CONNECT_TIMEOUT_MS
+                    readTimeout = PER_DOWNLOAD_READ_TIMEOUT_MS
+                    applyWeiboRequestHeaders(includeCookie = true)
+                }
+                val totalBytes = connection.contentLengthLong.takeIf { it > 0L } ?: -1L
+                connection.inputStream.use { input ->
+                    FileOutputStream(file).use { output ->
+                        val buffer = ByteArray(64 * 1024)
+                        val startedAt = System.currentTimeMillis()
+                        var downloaded = 0L
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            downloaded += read
+                            onProgress?.invoke(downloaded, totalBytes)
+                            if (System.currentTimeMillis() - startedAt > VIDEO_DOWNLOAD_MAX_DURATION_MS) {
+                                throw java.net.SocketTimeoutException("视频下载超时")
+                            }
+                        }
+                    }
+                }
+                if (file.length() <= 0L) throw IllegalStateException("视频下载为空")
+                return file
+            } catch (error: Exception) {
+                lastError = error
+                file.delete()
+                if (attempt < 1) Thread.sleep(200L)
+            }
+        }
+        throw lastError ?: IllegalStateException("视频下载失败")
     }
 
     fun formatInfo(image: FeedImage, sizeBytes: Long?): List<String> = buildList {

@@ -47,11 +47,22 @@ data class FeedItem(
     /** 服务端 visible.type；null 表示未提供，不猜测受限范围。 */
     val visibility: WeiboPostVisibility? = null,
     val poll: FeedPoll? = null,
+    /** 微博语音（blog_audio）：音频地址、时长和官方转写。 */
+    val audio: FeedAudio? = null,
     val verification: UserVerification? = null,
 ) {
     val media: FeedMedia?
         get() = medias.firstOrNull()
 }
+
+@Immutable
+data class FeedAudio(
+    val mediaUrl: String,
+    val durationMs: Long,
+    val transcript: String? = null,
+    val mediaId: String? = null,
+    val format: String? = null,
+)
 
 @Immutable
 data class FeedPoll(
