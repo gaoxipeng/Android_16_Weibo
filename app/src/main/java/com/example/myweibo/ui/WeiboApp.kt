@@ -5731,10 +5731,8 @@ fun WeiboApp() {
                         persistLoginSession()
                         if (page.items.isEmpty()) {
                             feedRefreshHint = null
-                            if (requestedGroupId != null) {
+                            if (requestedGroupId != null || requestedKind == TimelineKind.SpecialFollowing) {
                                 operationCapsuleHint = null
-                            } else if (requestedKind == TimelineKind.SpecialFollowing) {
-                                operationCapsuleHint = "暂无特别关注的微博"
                             } else {
                                 showMessage("没有读取到微博", "请稍后刷新")
                             }
@@ -8103,7 +8101,7 @@ fun WeiboApp() {
                                 isLoading = isLoading,
                                 cacheLoaded = feedCacheLoaded,
                                 hasLoginCookie = hasLoginCookie,
-                                isCustomGroupFeed = selectedTimelineGroupId != null,
+                                isGroupTimeline = selectedTimelineGroupId != null || timelineKind == TimelineKind.SpecialFollowing,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
                                 onRefresh = { refreshTimeline() },
@@ -9856,7 +9854,7 @@ private fun FollowFeedScreen(
     isLoading: Boolean,
     cacheLoaded: Boolean,
     hasLoginCookie: Boolean,
-    isCustomGroupFeed: Boolean = false,
+    isGroupTimeline: Boolean = false,
     emoticonMap: Map<String, String> = emptyMap(),
     onUserClick: ((String) -> Unit)? = null,
     onRefresh: () -> Unit,
@@ -9917,15 +9915,15 @@ private fun FollowFeedScreen(
             if (items.isEmpty() && !isLoading) {
                 item(key = "feed-empty") {
                     EmptyState(
-                        title = if (isCustomGroupFeed) "\u6682\u65E0\u5185\u5BB9" else if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
-                        body = if (isCustomGroupFeed) {
-                            "\u8FD9\u4E2A\u5206\u7EC4\u6682\u65F6\u6CA1\u6709\u5FAE\u535A\uFF0C\u53EF\u4EE5\u91CD\u65B0\u52A0\u8F7D\u3002"
+                        title = if (isGroupTimeline) "\u6682\u65E0\u5185\u5BB9" else if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
+                        body = if (isGroupTimeline) {
+                            null
                         } else if (hasLoginCookie) {
                             "\u5DF2\u68C0\u6D4B\u5230\u5FAE\u535A\u767B\u5F55\u6001\u3002\u4E0B\u62C9\u6216\u70B9\u51FB\u5E95\u90E8\u9996\u9875\u6309\u94AE\uFF0C\u5373\u53EF\u540C\u6B65\u5173\u6CE8\u4FE1\u606F\u6D41\u3002"
                         } else {
                             "\u672C\u5730\u8FD8\u6CA1\u6709\u7F13\u5B58\u7684\u4FE1\u606F\u6D41\u3002\u8BF7\u5230\u6211\u7684\u9875\u9762\u7684\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\u3002"
                         },
-                        actionLabel = if (isCustomGroupFeed) "\u91CD\u65B0\u52A0\u8F7D" else if (hasLoginCookie) "\u7ACB\u5373\u540C\u6B65" else "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
+                        actionLabel = if (isGroupTimeline) "\u91CD\u65B0\u52A0\u8F7D" else if (hasLoginCookie) "\u7ACB\u5373\u540C\u6B65" else "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
                         onAction = {
                             if (hasLoginCookie) {
                                 onRefresh()
@@ -28943,7 +28941,7 @@ private fun imageViewScaleType(contentScale: ContentScale): ImageView.ScaleType 
 @Composable
 private fun EmptyState(
     title: String,
-    body: String,
+    body: String?,
     actionLabel: String? = null,
     onAction: (() -> Unit)? = null,
 ) {
@@ -28953,11 +28951,13 @@ private fun EmptyState(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-        Text(
-            text = body,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        body?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         if (actionLabel != null && onAction != null) {
             Button(onClick = onAction) { Text(actionLabel) }
         }
