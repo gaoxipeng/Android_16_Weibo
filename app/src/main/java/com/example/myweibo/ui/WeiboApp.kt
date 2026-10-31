@@ -4,6 +4,8 @@ package com.example.myweibo.ui
 
 import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.res.Configuration
 import android.content.ComponentCallbacks2
 import android.content.Intent
@@ -154,12 +156,13 @@ import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.VolumeUp
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -175,6 +178,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -378,6 +382,7 @@ import com.example.myweibo.data.AppearanceMode
 import com.example.myweibo.data.ThemeSettingsStore
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
+import com.example.myweibo.data.TimelineGroup
 import com.example.myweibo.data.UserProfile
 import com.example.myweibo.data.WeiboStatusActions
 import com.example.myweibo.data.WeiboAccountStore
@@ -2944,6 +2949,11 @@ private data class DeleteStatusConfirmRequest(
     val anchorBoundsInRoot: Rect,
 )
 
+private data class ProfileActionRequest(
+    val profile: UserProfile,
+    val anchorBoundsInRoot: Rect,
+)
+
 private data class ProfileFollowMenuRequest(
     val profile: UserProfile,
     val anchor: Rect,
@@ -4013,6 +4023,8 @@ fun WeiboApp() {
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(feedDisplaySettingsStore.readTimelineKind()) }
+    var timelineGroups by remember { mutableStateOf<List<TimelineGroup>>(emptyList()) }
+    var selectedTimelineGroupId by remember { mutableStateOf<String?>(null) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
     var nextCursor by remember { mutableStateOf<String?>(null) }
@@ -4119,6 +4131,14 @@ fun WeiboApp() {
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
+    LaunchedEffect(hasLoginCookie, activeAccountId) {
+        if (!hasLoginCookie) {
+            timelineGroups = emptyList()
+            return@LaunchedEffect
+        }
+        runCatching { session.loadTimelineGroups() }
+            .onSuccess { timelineGroups = it }
+    }
     var cacheLoaded by remember { mutableStateOf(false) }
     var feedCacheLoaded by remember { mutableStateOf(false) }
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
@@ -4193,6 +4213,8 @@ fun WeiboApp() {
     var visitedAlbumError by remember { mutableStateOf<String?>(null) }
     var visitedAlbumJob by remember { mutableStateOf<Job?>(null) }
     var visitedFollowLoading by remember { mutableStateOf(false) }
+    var profileActionsFor by remember { mutableStateOf<ProfileActionRequest?>(null) }
+    var pendingBlockProfile by remember { mutableStateOf<ProfileActionRequest?>(null) }
     var visitedProfileLoadGeneration by remember { mutableIntStateOf(0) }
     val profilePreviewCache = remember(activeAccountId) { mutableMapOf<String, UserProfile>() }
     var profileOpeningJob by remember { mutableStateOf<Job?>(null) }
@@ -5660,6 +5682,7 @@ fun WeiboApp() {
         timelineRequestGeneration += 1
         val requestGeneration = timelineRequestGeneration
         val requestedKind = timelineKind
+        val requestedGroupId = selectedTimelineGroupId
         timelineRefreshJob = scope.launch {
             val previousItems = items
             isLoading = true
@@ -5670,8 +5693,9 @@ fun WeiboApp() {
             }
             try {
                 runCatchingPreservingCancellation {
-                    if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
-                        val raw = session.loadTimelineRaw(requestedKind)
+                    if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                        val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it) }
+                            ?: session.loadTimelineRaw(requestedKind)
                         if (requestedKind == TimelineKind.Following) {
                             timelineCacheStore.writeFollowingTimeline(raw)
                         }
@@ -5681,10 +5705,10 @@ fun WeiboApp() {
                     }
                 }
                     .onSuccess { page ->
-                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
                             return@onSuccess
                         }
-                        items = if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                        items = if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                             sortFeedTimelineItems(page.items)
                         } else page.items
                         reconcileFeedLikeState(page.items)
@@ -5707,7 +5731,9 @@ fun WeiboApp() {
                         persistLoginSession()
                         if (page.items.isEmpty()) {
                             feedRefreshHint = null
-                            if (requestedKind == TimelineKind.SpecialFollowing) {
+                            if (requestedGroupId != null) {
+                                operationCapsuleHint = null
+                            } else if (requestedKind == TimelineKind.SpecialFollowing) {
                                 operationCapsuleHint = "暂无特别关注的微博"
                             } else {
                                 showMessage("没有读取到微博", "请稍后刷新")
@@ -5719,7 +5745,7 @@ fun WeiboApp() {
                         }
                     }
                     .onFailure { error ->
-                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
                             return@onFailure
                         }
                         feedRefreshHint = null
@@ -5733,12 +5759,12 @@ fun WeiboApp() {
                         showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                     }
             } finally {
-                if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
+                if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
                     isLoading = false
                     timelineRefreshJob = null
                 }
             }
-            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
+            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
                 if (feedListState.layoutInfo.totalItemsCount > 0) {
                     feedListState.animateScrollToTopSmooth()
                 }
@@ -5796,12 +5822,27 @@ fun WeiboApp() {
     }
 
     fun switchTimelineKind(kind: TimelineKind) {
-        if (kind == timelineKind) return
+        if (kind == timelineKind && selectedTimelineGroupId == null) return
         timelineRefreshJob?.cancel()
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         timelineKind = kind
+        selectedTimelineGroupId = null
         feedDisplaySettingsStore.writeTimelineKind(kind)
+        items = emptyList()
+        nextCursor = null
+        feedRefreshHint = null
+        refreshTimeline(showRefreshHint = false)
+    }
+
+    fun switchTimelineGroup(group: TimelineGroup) {
+        timelineRefreshJob?.cancel()
+        timelineLoadMoreJob?.cancel()
+        timelineRequestGeneration += 1
+        selectedTimelineGroupId = group.id
+        timelineKind = TimelineKind.SpecialFollowing
+        feedDisplaySettingsStore.writeTimelineKind(TimelineKind.SpecialFollowing)
+        selectedTab = MainTab.Feed
         items = emptyList()
         nextCursor = null
         feedRefreshHint = null
@@ -5818,28 +5859,30 @@ fun WeiboApp() {
         if (feedLoadingMore || isLoading) return
         val requestGeneration = timelineRequestGeneration
         val requestedKind = timelineKind
+        val requestedGroupId = selectedTimelineGroupId
         if (requestedKind == TimelineKind.SpecialFollowing) {
             android.util.Log.e("SpecialFollow", "loadMore start cursor=$cursor")
         }
         timelineLoadMoreJob = scope.launch {
             feedLoadingMore = true
             runCatchingPreservingCancellation {
-                if (requestedKind == TimelineKind.Following) {
-                    val raw = session.loadTimelineRaw(requestedKind, cursor)
+                if (requestedGroupId != null || requestedKind == TimelineKind.Following) {
+                    val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it, cursor) }
+                        ?: session.loadTimelineRaw(requestedKind, cursor)
                     withContext(Dispatchers.Default) { WeiboJsonParser.parseTimeline(raw) } to raw
                 } else {
                     session.loadTimeline(requestedKind, cursor) to null
                 }
             }
                 .onSuccess { (page, raw) ->
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
                         return@onSuccess
                     }
                     // \u5728 Default \u7EBF\u7A0B\u6C60\u505A\u7EAF CPU \u8BA1\u7B97\uFF08merge \u53BB\u91CD + emoticon \u6536\u96C6\uFF09\uFF0C
                     // \u907F\u514D\u5728\u5206\u9875\u89E6\u53D1\u5E27\u963B\u585E\u4E3B\u7EBF\u7A0B\u3002
                     val currentItems = items  // \u5728 Main \u4E0A\u5148\u62CD\u5FEB\u7167
                     val (merged, appended) = withContext(Dispatchers.Default) {
-                        if (requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                        if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                             mergeFeedTimelinePages(currentItems, page.items)
                         } else {
                             val existingIds = currentItems.mapTo(HashSet()) { it.id }
@@ -5847,7 +5890,7 @@ fun WeiboApp() {
                             (currentItems + added) to added.size
                         }
                     }
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind) {
+                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
                         return@onSuccess
                     }
                     val discoveredEmoticons = withContext(Dispatchers.Default) {
@@ -5874,11 +5917,11 @@ fun WeiboApp() {
                     if (requestedKind == TimelineKind.SpecialFollowing) {
                         android.util.Log.e("SpecialFollow", "loadMore failed: ${error.message}", error)
                     }
-                    if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
+                    if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
                         showMessage("\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u4E0B\u4E00\u9875")
                     }
                 }
-            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind) {
+            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
                 feedLoadingMore = false
                 timelineLoadMoreJob = null
             }
@@ -8060,6 +8103,7 @@ fun WeiboApp() {
                                 isLoading = isLoading,
                                 cacheLoaded = feedCacheLoaded,
                                 hasLoginCookie = hasLoginCookie,
+                                isCustomGroupFeed = selectedTimelineGroupId != null,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
                                 onRefresh = { refreshTimeline() },
@@ -8336,6 +8380,21 @@ fun WeiboApp() {
                                         visitedProfile?.id != mineProfile?.id,
                                     followLoading = visitedFollowLoading,
                                     onFollowClick = { toggleVisitedFollow() },
+                                    onOpenOfficialProfile = { profile, anchor ->
+                                        profileActionsFor = ProfileActionRequest(profile, anchor)
+                                        scope.launch {
+                                            runCatching { session.isUserBlocked(profile.id) }
+                                                .onSuccess { blocked ->
+                                                    profileActionsFor
+                                                        ?.takeIf { it.profile.id == profile.id }
+                                                        ?.let { current ->
+                                                            profileActionsFor = current.copy(
+                                                                profile = current.profile.copy(blockedByMe = blocked),
+                                                            )
+                                                        }
+                                                }
+                                        }
+                                    },
                                 )
                             }
                         }
@@ -8954,10 +9013,19 @@ fun WeiboApp() {
                 }
             }
             val timelineMenuKinds = remember { TimelineKind.entries.toList() }
-            val timelineMenuLabels = remember { timelineMenuKinds.map(TimelineKind::label) }
+            val timelineMenuLabels = remember(timelineGroups) {
+                timelineMenuKinds.map(TimelineKind::label) + listOf("我的分组") + timelineGroups.map(TimelineGroup::name)
+            }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
-            val timelineMenuHeight = ActionMenuCardInset * 2 +
-                ActionMenuCapsuleHeight * timelineMenuKinds.size + ActionMenuItemGap * (timelineMenuKinds.size - 1)
+            val timelineMenuNaturalHeight = ActionMenuCardInset * 4 +
+                ActionMenuCapsuleHeight * (timelineMenuKinds.size + timelineGroups.size + 1) +
+                ActionMenuItemGap * (timelineMenuKinds.size + timelineGroups.size + 2) + 38.dp
+            val timelineMenuHeight = minOf(
+                timelineMenuNaturalHeight,
+                (LocalConfiguration.current.screenHeightDp.dp - 160.dp).coerceAtLeast(280.dp),
+            )
+            val timelineMenuDividerColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.12f)
+            else Color.White.copy(alpha = 0.18f)
             AnimatedVisibility(
                 visible = bottomBarNavVisible && bottomBarVisible,
                 enter = slideInVertically(tween(160)) { it },
@@ -8979,6 +9047,7 @@ fun WeiboApp() {
                     timelineMenuExpanded = timelineMenuExpanded,
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
                     selectedTimelineKind = timelineKind,
+                    selectedTimelineLabel = timelineGroups.firstOrNull { it.id == selectedTimelineGroupId }?.name,
                     onTimelineKindChange = { kind ->
                         dismissFollowListForTabSwitch()
                         selectedTab = MainTab.Feed
@@ -9029,23 +9098,90 @@ fun WeiboApp() {
                         }
                     },
                     timelineMenuContent = { dismiss ->
-                        ImageActionFrostedCard(
-                            modifier = Modifier.width(timelineMenuWidth),
-                            menuHeight = timelineMenuHeight,
+                        Column(
+                            modifier = Modifier
+                                .width(timelineMenuWidth)
+                                .heightIn(max = timelineMenuHeight)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            timelineMenuKinds.forEachIndexed { index, kind ->
-                                ImageActionRow(
-                                    label = kind.label,
-                                    enabled = true,
-                                    selected = timelineKind == kind,
-                                    separatorBefore = index > 0,
-                                    onClick = {
-                                        dismiss()
-                                        dismissFollowListForTabSwitch()
-                                        selectedTab = MainTab.Feed
-                                        switchTimelineKind(kind)
-                                    },
-                                )
+                            ImageActionFrostedCard(modifier = Modifier.fillMaxWidth()) {
+                                val specialIndex = timelineMenuKinds.indexOf(TimelineKind.SpecialFollowing)
+                                    .takeIf { it >= 0 } ?: (timelineMenuKinds.lastIndex)
+                                val primaryKinds = timelineMenuKinds.take(specialIndex + 1)
+                                primaryKinds.forEachIndexed { index, kind ->
+                                    ImageActionRow(
+                                        label = kind.label,
+                                        enabled = true,
+                                        selected = selectedTimelineGroupId == null && timelineKind == kind,
+                                        separatorBefore = index > 0,
+                                        onClick = {
+                                            dismiss()
+                                            dismissFollowListForTabSwitch()
+                                            selectedTab = MainTab.Feed
+                                            switchTimelineKind(kind)
+                                        },
+                                    )
+                                }
+                                if (timelineGroups.isNotEmpty()) {
+                                    Box(
+                                        Modifier.fillMaxWidth().height(0.5.dp)
+                                            .background(timelineMenuDividerColor),
+                                    )
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalArrangement = Arrangement.spacedBy(0.dp),
+                                    ) {
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(
+                                                    start = ActionMenuCapsulePaddingHorizontal,
+                                                    top = 1.dp,
+                                                    end = ActionMenuCapsulePaddingHorizontal,
+                                                    bottom = 0.dp,
+                                                ),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            Text(
+                                                text = "我的分组",
+                                                modifier = Modifier.weight(1f),
+                                                fontSize = 11.sp,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                            )
+                                        }
+                                        timelineGroups.forEach { group ->
+                                            ImageActionRow(
+                                                label = group.name,
+                                                enabled = true,
+                                                selected = selectedTimelineGroupId == group.id,
+                                                onClick = {
+                                                    dismiss()
+                                                    dismissFollowListForTabSwitch()
+                                                    switchTimelineGroup(group)
+                                                },
+                                            )
+                                        }
+                                    }
+                                    Box(
+                                        Modifier.fillMaxWidth().height(0.5.dp)
+                                            .background(timelineMenuDividerColor),
+                                    )
+                                }
+                                timelineMenuKinds.drop(specialIndex + 1).forEachIndexed { index, kind ->
+                                    ImageActionRow(
+                                        label = kind.label,
+                                        enabled = true,
+                                        selected = selectedTimelineGroupId == null && timelineKind == kind,
+                                        separatorBefore = index > 0 || timelineGroups.isEmpty(),
+                                        onClick = {
+                                            dismiss()
+                                            dismissFollowListForTabSwitch()
+                                            selectedTab = MainTab.Feed
+                                            switchTimelineKind(kind)
+                                        },
+                                    )
+                                }
                             }
                         }
                     },
@@ -9099,6 +9235,56 @@ fun WeiboApp() {
                     pendingDeleteStatus = DeleteStatusConfirmRequest(item, anchor)
                 },
             )
+            profileActionsFor?.let { request ->
+                ProfileActionMenuOverlay(
+                    request = request,
+                    backdrop = menuGlassBackdrop,
+                    onDismiss = { profileActionsFor = null },
+                    onOpenOfficialProfile = {
+                        profileActionsFor = null
+                        WeiboStatusActions.openUserProfileInWeiboApp(context, request.profile.id)
+                    },
+                    onShare = {
+                        profileActionsFor = null
+                        WeiboStatusActions.shareUserProfile(
+                            context,
+                            request.profile.id,
+                            request.profile.screenName,
+                        )
+                    },
+                    onBlock = {
+                        profileActionsFor = null
+                        pendingBlockProfile = request
+                    },
+                )
+            }
+            pendingBlockProfile?.let { request ->
+                DeleteStatusConfirmOverlay(
+                    backdrop = menuGlassBackdrop,
+                    anchorBoundsInRoot = request.anchorBoundsInRoot,
+                    deleting = false,
+                    destructiveLabel = if (request.profile.blockedByMe) "确认解除黑名单" else "确认加入黑名单",
+                    secondaryLabel = "取消",
+                    onConfirm = {
+                        pendingBlockProfile = null
+                        scope.launch {
+                            runCatching { session.setUserBlocked(request.profile.id, !request.profile.blockedByMe) }
+                                .onSuccess {
+                                    val blocked = request.profile.copy(blockedByMe = !request.profile.blockedByMe)
+                                    if (visitedProfile?.id == blocked.id) visitedProfile = blocked
+                                    profilePreviewCache[blocked.id] = blocked
+                                    operationCapsuleHint = if (blocked.blockedByMe) {
+                                        "已将 ${blocked.screenName} 加入黑名单"
+                                    } else {
+                                        "已将 ${blocked.screenName} 移出黑名单"
+                                    }
+                                }
+                                .onFailure { error -> showMessage("黑名单操作失败", error.message ?: "请稍后重试") }
+                        }
+                    },
+                    onDismiss = { pendingBlockProfile = null },
+                )
+            }
             editHistoryItem?.let { item ->
                 EditHistoryViewer(item, session, emoticonMap, onDismiss = { editHistoryItem = null })
             }
@@ -9670,6 +9856,7 @@ private fun FollowFeedScreen(
     isLoading: Boolean,
     cacheLoaded: Boolean,
     hasLoginCookie: Boolean,
+    isCustomGroupFeed: Boolean = false,
     emoticonMap: Map<String, String> = emptyMap(),
     onUserClick: ((String) -> Unit)? = null,
     onRefresh: () -> Unit,
@@ -9730,13 +9917,15 @@ private fun FollowFeedScreen(
             if (items.isEmpty() && !isLoading) {
                 item(key = "feed-empty") {
                     EmptyState(
-                        title = if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
-                        body = if (hasLoginCookie) {
+                        title = if (isCustomGroupFeed) "\u6682\u65E0\u5185\u5BB9" else if (hasLoginCookie) "\u6682\u65E0\u672C\u5730\u7F13\u5B58" else "\u9700\u8981\u767B\u5F55\u5FAE\u535A",
+                        body = if (isCustomGroupFeed) {
+                            "\u8FD9\u4E2A\u5206\u7EC4\u6682\u65F6\u6CA1\u6709\u5FAE\u535A\uFF0C\u53EF\u4EE5\u91CD\u65B0\u52A0\u8F7D\u3002"
+                        } else if (hasLoginCookie) {
                             "\u5DF2\u68C0\u6D4B\u5230\u5FAE\u535A\u767B\u5F55\u6001\u3002\u4E0B\u62C9\u6216\u70B9\u51FB\u5E95\u90E8\u9996\u9875\u6309\u94AE\uFF0C\u5373\u53EF\u540C\u6B65\u5173\u6CE8\u4FE1\u606F\u6D41\u3002"
                         } else {
                             "\u672C\u5730\u8FD8\u6CA1\u6709\u7F13\u5B58\u7684\u4FE1\u606F\u6D41\u3002\u8BF7\u5230\u6211\u7684\u9875\u9762\u7684\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\u3002"
                         },
-                        actionLabel = if (hasLoginCookie) "\u7ACB\u5373\u540C\u6B65" else "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
+                        actionLabel = if (isCustomGroupFeed) "\u91CD\u65B0\u52A0\u8F7D" else if (hasLoginCookie) "\u7ACB\u5373\u540C\u6B65" else "\u6253\u5F00\u5FAE\u535A\u767B\u5F55\u9875",
                         onAction = {
                             if (hasLoginCookie) {
                                 onRefresh()
@@ -10714,7 +10903,7 @@ private fun VoiceMessageCard(
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
-                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.VolumeUp,
+                    imageVector = if (playing) Icons.Rounded.Pause else Icons.AutoMirrored.Rounded.VolumeUp,
                     contentDescription = if (playing) "暂停语音" else "播放语音",
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(17.dp),
@@ -10821,31 +11010,33 @@ private fun StatusTextSection(
             )
         }
     }
-    EmoticonText(
-        modifier = Modifier.fillMaxWidth(),
-        text = bodyText,
-        contentKey = item.statusId.ifBlank { item.id },
-        emoticonMap = emoticonMap,
-        style = style,
-        onUserClick = onUserClick,
-        leadingAuthorName = leadingAuthorName,
-        onLeadingAuthorClick = onLeadingAuthorClick,
-        onBodyClick = onBodyClick,
-        trailingLabel = if (item.isLongText && onLoadLongText != null) {
-            if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
-        } else {
-            null
-        },
-        onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
-            { onLoadLongText(item) }
-        } else {
-            null
-        },
-        inlineImageLinks = inlineImageLinks,
-        onInlineImageClick = onInlineImageClick,
-        urlEntities = resolvedUrlEntities,
-        onUrlEntityClick = onUrlEntityClick,
-    )
+    SelectionContainer {
+        EmoticonText(
+            modifier = Modifier.fillMaxWidth(),
+            text = bodyText,
+            contentKey = item.statusId.ifBlank { item.id },
+            emoticonMap = emoticonMap,
+            style = style,
+            onUserClick = onUserClick,
+            leadingAuthorName = leadingAuthorName,
+            onLeadingAuthorClick = onLeadingAuthorClick,
+            onBodyClick = onBodyClick,
+            trailingLabel = if (item.isLongText && onLoadLongText != null) {
+                if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
+            } else {
+                null
+            },
+            onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
+                { onLoadLongText(item) }
+            } else {
+                null
+            },
+            inlineImageLinks = inlineImageLinks,
+            onInlineImageClick = onInlineImageClick,
+            urlEntities = resolvedUrlEntities,
+            onUrlEntityClick = onUrlEntityClick,
+        )
+    }
     }
 }
 
@@ -11585,6 +11776,73 @@ private fun FeedCardActionMenuOverlay(
                     )
                 }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileActionMenuOverlay(
+    request: ProfileActionRequest,
+    backdrop: Backdrop,
+    onDismiss: () -> Unit,
+    onOpenOfficialProfile: () -> Unit,
+    onShare: () -> Unit,
+    onBlock: () -> Unit,
+) {
+    BackHandler(onBack = onDismiss)
+    val labels = listOf(
+        "跳转到微博",
+        "分享",
+        if (request.profile.blockedByMe) "解除黑名单" else "加入黑名单",
+    )
+    val menuHeight = ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * labels.size +
+        ActionMenuItemGap * (labels.size - 1)
+    val density = LocalDensity.current
+
+    BoxWithConstraints(modifier = Modifier.fillMaxSize().zIndex(625f)) {
+        val menuWidth = rememberActionMenuWidth(labels, maxWidth - 28.dp)
+        val menuWidthPx = with(density) { menuWidth.toPx() }
+        val menuHeightPx = with(density) { menuHeight.toPx() }
+        val placement = calculateFeedCardActionMenuOffsetPx(
+            anchorBounds = request.anchorBoundsInRoot,
+            screenWidthPx = with(density) { maxWidth.toPx() },
+            screenHeightPx = with(density) { maxHeight.toPx() },
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
+            marginPx = with(density) { 14.dp.toPx() },
+            gapPx = with(density) { 6.dp.toPx() },
+        )
+        val originInMenu = computeActionMenuOriginInMenu(
+            anchorInRoot = request.anchorBoundsInRoot.center,
+            menuOffset = placement.offset,
+            menuWidthPx = menuWidthPx,
+            menuHeightPx = menuHeightPx,
+        )
+        Box(
+            Modifier.fillMaxSize().clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = onDismiss,
+            ),
+        )
+        ActionMenuReveal(
+            visible = true,
+            menuWidth = menuWidth,
+            menuHeight = menuHeight,
+            originInMenu = originInMenu,
+            modifier = Modifier.offset { placement.offset }.width(menuWidth).height(menuHeight),
+        ) {
+            ImageActionFrostedCard(modifier = Modifier.fillMaxSize(), backdrop = backdrop) {
+                ImageActionRow(label = labels[0], enabled = true, onClick = onOpenOfficialProfile)
+                ImageActionRow(label = labels[1], enabled = true, separatorBefore = true, onClick = onShare)
+                ImageActionRow(
+                    label = labels[2],
+                    enabled = true,
+                    separatorBefore = true,
+                    textColor = MaterialTheme.colorScheme.error,
+                    onClick = onBlock,
+                )
             }
         }
     }
@@ -23345,6 +23603,7 @@ private fun MineScreen(
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
     onOpenFollowList: ((String, String, String?, String?, FriendListTab) -> Unit)? = null,
+    onOpenOfficialProfile: ((UserProfile, Rect) -> Unit)? = null,
     showPullRefreshIndicator: Boolean = true,
 ) {
     var showSettings by remember { mutableStateOf(false) }
@@ -23796,6 +24055,7 @@ private fun MineScreen(
                             followLoading = followLoading,
                             onFollowClick = onFollowClick,
                             onOpenFollowList = openFollowListForProfile,
+                            onOpenOfficialProfile = onOpenOfficialProfile,
                         )
                     }
                     }
@@ -26132,9 +26392,11 @@ private fun MineProfileHeader(
     followLoading: Boolean = false,
     onFollowClick: () -> Unit = {},
     onOpenFollowList: ((FriendListTab) -> Unit)? = null,
+    onOpenOfficialProfile: ((UserProfile, Rect) -> Unit)? = null,
 ) {
     val avatarExposeAboveCard = ProfileHeaderAvatarFrameSize / 3f
     var avatarBounds by remember { mutableStateOf<Rect?>(null) }
+    var officialProfileActionBounds by remember { mutableStateOf<Rect?>(null) }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         BoxWithConstraints(
@@ -26235,12 +26497,40 @@ private fun MineProfileHeader(
                                     ),
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
-                                Text(
-                                    text = profile?.screenName ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
-                                    style = MaterialTheme.typography.headlineSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    softWrap = true,
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        text = profile?.screenName ?: if (hasLoginCookie) "\u5FAE\u535A\u7528\u6237" else "\u672A\u767B\u5F55",
+                                        modifier = Modifier.weight(1f),
+                                        style = MaterialTheme.typography.headlineSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        softWrap = true,
+                                    )
+                                    if (onOpenOfficialProfile != null && profile?.id?.isNotBlank() == true) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .offset(x = 8.dp, y = (-5).dp)
+                                                .onGloballyPositioned { officialProfileActionBounds = it.boundsInRoot() }
+                                                .clickable(
+                                                    indication = null,
+                                                    interactionSource = remember { MutableInteractionSource() },
+                                                ) {
+                                                    officialProfileActionBounds?.let { bounds ->
+                                                        onOpenOfficialProfile(profile, bounds)
+                                                    }
+                                                },
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            SettingsExpandIndicator(
+                                                modifier = Modifier.size(18.dp),
+                                                tint = weiboMetaTextColor(),
+                                            )
+                                        }
+                                    }
+                                }
                                 val profileDescription = profile?.description?.takeIf { it.isNotBlank() }
                                     ?: if (!hasLoginCookie) "\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A" else null
                                 if (profileDescription != null) {
@@ -26380,6 +26670,7 @@ private fun VisitedUserProfileContent(
     showFollowActions: Boolean,
     followLoading: Boolean,
     onFollowClick: () -> Unit,
+    onOpenOfficialProfile: (UserProfile, Rect) -> Unit,
 ) {
     MineScreen(
         session = session,
@@ -26429,6 +26720,7 @@ private fun VisitedUserProfileContent(
         showFollowActions = showFollowActions,
         followLoading = followLoading,
         onFollowClick = onFollowClick,
+        onOpenOfficialProfile = onOpenOfficialProfile,
     )
 }
 
@@ -27029,10 +27321,10 @@ private fun MineInlineStats(
     val canOpenList = onOpenFollowList != null && !profile?.id.isNullOrBlank()
     Row(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(24.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         MineInlineStat(
-            value = profile?.followersCount ?: "--",
+            value = formatMineFollowerCount(profile?.followersCount ?: "--"),
             label = "\u7C89\u4E1D",
             onClick = if (canOpenList) {
                 { onOpenFollowList(FriendListTab.Fans) }
@@ -27059,20 +27351,32 @@ private fun MineInlineStat(
     label: String,
     onClick: (() -> Unit)? = null,
 ) {
-    Column(
+    Row(
         modifier = Modifier.widthIn(min = 44.dp).then(
             if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
         ),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(0.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Text(value, fontWeight = FontWeight.SemiBold)
+        Text(value, fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
         Text(
             text = label,
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+private fun formatMineFollowerCount(value: String): String {
+    val trimmed = value.trim()
+    val raw = trimmed.replace(",", "")
+    val count = when {
+        raw.endsWith("万") -> raw.removeSuffix("万").toDoubleOrNull()?.times(10_000)
+        else -> raw.toDoubleOrNull()
+    } ?: return value
+    if (count < 100_000_000) return value
+    val yi = count / 100_000_000.0
+    return "${String.format(java.util.Locale.ROOT, "%.1f", yi).removeSuffix(".0")}亿"
 }
 
 @Composable

@@ -105,6 +105,41 @@ object WeiboStatusActions {
         }
     }
 
+    fun openUserProfileInWeiboApp(context: Context, uid: String) {
+        val id = uid.trim().takeIf { it.isNotBlank() } ?: run {
+            Toast.makeText(context, "无法生成用户主页链接", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val packageManager = context.packageManager
+        val candidates = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("sinaweibo://userinfo?uid=${Uri.encode(id)}")).apply {
+                setPackage("com.sina.weibo")
+            },
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://weibo.com/u/${Uri.encode(id)}")).apply {
+                setPackage("com.sina.weibo")
+            },
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://weibo.com/u/${Uri.encode(id)}")),
+        )
+        val intent = candidates.firstOrNull { it.resolveActivity(packageManager) != null }
+        if (intent == null) {
+            Toast.makeText(context, "无法打开微博用户主页", Toast.LENGTH_SHORT).show()
+            return
+        }
+        runCatching { context.startActivity(intent) }
+            .onFailure { Toast.makeText(context, "无法打开微博用户主页", Toast.LENGTH_SHORT).show() }
+    }
+
+    fun shareUserProfile(context: Context, uid: String, screenName: String) {
+        val id = uid.trim().takeIf { it.isNotBlank() } ?: return
+        val url = "https://weibo.com/u/${Uri.encode(id)}"
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, "${screenName.ifBlank { "微博用户" }} $url")
+        }
+        runCatching { context.startActivity(Intent.createChooser(sendIntent, "分享用户主页")) }
+            .onFailure { Toast.makeText(context, "无法分享用户主页", Toast.LENGTH_SHORT).show() }
+    }
+
     /** 打开地点 / 外链：优先官方微博 App，否则系统浏览器。 */
     fun openExternalUrl(context: Context, rawUrl: String, failureMessage: String = "无法打开链接") {
         val url = rawUrl.trim().takeIf { it.isNotBlank() } ?: run {

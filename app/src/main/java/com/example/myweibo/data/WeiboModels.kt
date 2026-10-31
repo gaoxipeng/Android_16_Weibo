@@ -324,6 +324,7 @@ data class UserProfile(
     val following: Boolean = false,
     val followMe: Boolean = false,
     val specialFollowing: Boolean = false,
+    val blockedByMe: Boolean = false,
     val gender: String? = null,
     val verification: UserVerification? = null,
 ) {

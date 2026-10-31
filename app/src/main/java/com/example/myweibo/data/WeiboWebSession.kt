@@ -544,6 +544,25 @@ class WeiboWebSession(context: Context) {
         return fetchJson(WeiboEndpoints.timelinePath(kind), params, referer)
     }
 
+    suspend fun loadTimelineGroups(): List<TimelineGroup> =
+        parseTimelineGroups(
+            fetchJson("/ajax/profile/getGroups", linkedMapOf("showBilateral" to "1")),
+        )
+
+    suspend fun loadTimelineGroupRaw(groupId: String, cursor: String? = null): String {
+        val id = groupId.trim()
+        require(id.isNotBlank()) { "无效的分组 ID" }
+        return fetchJson(
+            WeiboEndpoints.GROUP_TIMELINE,
+            linkedMapOf(
+                "list_id" to id,
+                "refresh" to if (cursor == null) "4" else "0",
+                "count" to "25",
+            ).apply { if (cursor == null) put("since_id", "0") else put("max_id", cursor) },
+            "https://weibo.com/mygroups?gid=$id",
+        )
+    }
+
     data class CommentsPage(
         val items: List<CommentItem>,
         val nextCursor: String?,
@@ -1135,6 +1154,64 @@ class WeiboWebSession(context: Context) {
         WeiboJsonParser.assertMutationSuccess(raw, "设置特别关注失败")
     }
 
+    suspend fun setUserBlocked(uid: String, blocked: Boolean) {
+        val target = uid.trim()
+        require(target.isNotBlank()) { "无效的用户 UID" }
+        val raw = if (blocked) {
+            postJson(
+                "/ajax/statuses/filterUser",
+                JSONObject().put("uid", target).put("status", 1).put("interact", 1).put("follow", 1),
+                "https://weibo.com/u/$target",
+            )
+        } else {
+            postForm(
+                "/aj/f/delblack?ajwvr=6",
+                linkedMapOf(
+                    "uid" to target,
+                    "objectid" to "",
+                    "f" to "1",
+                    "__rnd" to System.currentTimeMillis().toString(),
+                ),
+                "https://weibo.com/set/shield?type=user",
+            )
+        }
+        val root = JSONObject(raw)
+        if (root.optInt("code", -1) != 100000 && root.optInt("ok", 0) != 1 && !root.optBoolean("result", false)) {
+            val message = root.optString("msg").ifBlank { root.optString("message") }
+            throw IllegalStateException(message.ifBlank { if (blocked) "加入黑名单失败" else "解除黑名单失败" })
+        }
+    }
+
+    suspend fun isUserBlocked(uid: String): Boolean {
+        val target = uid.trim()
+        require(target.isNotBlank()) { "无效的用户 UID" }
+        var page = 1
+        var totalPages = Int.MAX_VALUE
+        while (page <= totalPages && page <= 500) {
+            val raw = fetchJson(
+                "/ajax/setting/getFilteredUsers",
+                linkedMapOf("page" to page.toString()),
+                "https://weibo.com/set/shield?type=user",
+            )
+            val root = JSONObject(raw)
+            val data = root.optJSONObject("data") ?: root
+            val cards = data.optJSONArray("card_group") ?: root.optJSONArray("card_group") ?: JSONArray()
+            val targetPattern = Regex("(?:[?&]|^)uid=${Regex.escape(target)}(?:[&#]|$)")
+            for (index in 0 until cards.length()) {
+                val card = cards.optJSONObject(index) ?: continue
+                if (targetPattern.containsMatchIn(card.optString("scheme"))) return true
+                val user = card.optJSONObject("user") ?: card.optJSONObject("mblog")?.optJSONObject("user")
+                if (user?.let { it.optString("idstr", it.optString("id")) } == target) return true
+            }
+            val pageInfo = data.optJSONObject("page") ?: root.optJSONObject("page")
+            totalPages = pageInfo?.optInt("totalpage", pageInfo.optInt("total_page", page))
+                ?: if (cards.length() >= 20) page + 1 else page
+            if (cards.length() == 0 || (pageInfo == null && cards.length() < 20)) break
+            page++
+        }
+        return false
+    }
+
     suspend fun loadFriends(uid: String, page: Int, tab: FriendListTab): RelationPage {
         val targetUid = uid.trim()
         require(targetUid.isNotBlank()) { "无效的用户 UID" }
@@ -1396,6 +1473,35 @@ class WeiboWebSession(context: Context) {
         path: String,
         params: Map<String, String>,
         referer: String = WEIBO_HOME,
+    ): String = nativePostFormUrl(
+        url = "https://weibo.com$path",
+        pathForError = path,
+        params = params,
+        referer = referer,
+        userAgent = DESKTOP_CHROME_USER_AGENT,
+        origin = "https://weibo.com",
+    )
+
+    private suspend fun nativeApiPostForm(
+        path: String,
+        params: Map<String, String>,
+        referer: String = WEIBO_HOME,
+    ): String = nativePostFormUrl(
+        url = "https://api.weibo.cn$path",
+        pathForError = path,
+        params = params,
+        referer = referer,
+        userAgent = MWEIBO_USER_AGENT,
+        origin = "https://api.weibo.cn",
+    )
+
+    private suspend fun nativePostFormUrl(
+        url: String,
+        pathForError: String,
+        params: Map<String, String>,
+        referer: String,
+        userAgent: String,
+        origin: String,
     ): String =
         withContext(Dispatchers.IO) {
             CookieManager.getInstance().flush()
@@ -1407,18 +1513,18 @@ class WeiboWebSession(context: Context) {
             val body = params.entries.joinToString("&") { (key, value) ->
                 "${key.urlEncode()}=${value.urlEncode()}"
             }
-            val connection = (URL("https://weibo.com$path").openConnection() as HttpURLConnection).apply {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
                 connectTimeout = 12_000
                 readTimeout = 12_000
                 instanceFollowRedirects = true
-                setRequestProperty("User-Agent", DESKTOP_CHROME_USER_AGENT)
+                setRequestProperty("User-Agent", userAgent)
                 setRequestProperty("Accept", "application/json, text/plain, */*")
                 setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
                 setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                 setRequestProperty("Referer", referer)
-                setRequestProperty("Origin", "https://weibo.com")
+                setRequestProperty("Origin", origin)
                 setRequestProperty("X-Requested-With", "XMLHttpRequest")
                 setRequestProperty("Cookie", cookie)
             }
@@ -1438,7 +1544,7 @@ class WeiboWebSession(context: Context) {
                 val errorBody = connection.errorStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
                     .orEmpty()
                 throw IllegalStateException(
-                    "weibo-native-post-failed:$status ${errorBody.take(120)}"
+                    "weibo-native-post-failed:$status $pathForError ${errorBody.take(120)}"
                 )
             }
 

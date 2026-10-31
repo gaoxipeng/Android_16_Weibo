@@ -858,6 +858,8 @@ object WeiboJsonParser {
             following = user.optTruthy("following"),
             followMe = user.optTruthy("follow_me"),
             specialFollowing = user.optTruthy("special_follow"),
+            blockedByMe = sequenceOf("blocking", "blocked_by_me", "is_blocked", "blocked", "block")
+                .any { user.optTruthy(it) },
             gender = user.optNullableString("gender"),
             verification = parseUserVerification(user),
         )
@@ -902,8 +904,20 @@ object WeiboJsonParser {
 
     fun assertMutationSuccess(raw: String, defaultError: String) {
         val root = JSONObject(raw)
-        if (root.optInt("ok", 0) != 1 && !root.optBoolean("result", false)) {
-            throw IllegalStateException(root.optNullableString("msg") ?: defaultError)
+        val code = root.optNullableString("code")
+        if (root.optInt("ok", 0) != 1 &&
+            !root.optBoolean("result", false) &&
+            code != "100000"
+        ) {
+            val data = root.optJSONObject("data")
+            val message = root.optNullableString("msg")
+                ?: root.optNullableString("message")
+                ?: root.optNullableString("error_description")
+                ?: root.optNullableString("error")
+                ?: data?.optNullableString("msg")
+                ?: data?.optNullableString("message")
+            val detail = message ?: root.toString().take(240)
+            throw IllegalStateException("$defaultError：$detail")
         }
     }
 

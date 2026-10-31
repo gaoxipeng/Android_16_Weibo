@@ -49,6 +49,7 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuExpanded: Boolean,
     onTimelineMenuExpandedChange: (Boolean) -> Unit,
     selectedTimelineKind: TimelineKind = TimelineKind.Following,
+    selectedTimelineLabel: String? = null,
     onTimelineKindChange: (TimelineKind) -> Unit = {},
     timelineMenuContent: @Composable (dismiss: () -> Unit) -> Unit,
     timelineMenuWidth: Dp = 152.dp,
@@ -115,7 +116,7 @@ internal fun WeiboLiquidBottomBar(
                             WeiboTabIcon(tab = tab, color = tabColor, size = 22.dp)
                         }
                         Text(
-                            text = if (tab == MainTab.Feed) selectedTimelineKind.label else tab.label,
+                            text = if (tab == MainTab.Feed) selectedTimelineLabel ?: selectedTimelineKind.label else tab.label,
                             color = tabColor,
                             fontSize = 10.sp,
                             lineHeight = 12.sp,
