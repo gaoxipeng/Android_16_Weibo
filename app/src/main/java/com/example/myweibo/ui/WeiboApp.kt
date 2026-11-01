@@ -172,10 +172,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -414,6 +412,8 @@ import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
 import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
 import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
 import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
+import com.example.myweibo.ui.liquidglass.SettingsLiquidSlider
+import com.example.myweibo.ui.liquidglass.SettingsLiquidToggle
 import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
 import com.example.myweibo.ui.liquidglass.liquidRegularMenuGlassEffects
 import com.kyant.backdrop.Backdrop
@@ -4051,6 +4051,7 @@ fun WeiboApp() {
     var navEnterPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var navExitPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var nestedDetailReturnAnimating by remember { mutableStateOf(false) }
+    var nestedDetailReturnSnapshot by remember { mutableStateOf<DetailSnapshot?>(null) }
     var pendingDeferredNavRestore by remember { mutableStateOf<NavRestoreState?>(null) }
     var deferredNavRestoreGeneration by remember { mutableIntStateOf(0) }
     var lastDetailScroll by remember { mutableStateOf(ScrollRestore()) }
@@ -4929,6 +4930,7 @@ fun WeiboApp() {
 
     fun clearNavExitPendingKind() {
         nestedDetailReturnAnimating = false
+        nestedDetailReturnSnapshot = null
         navExitPendingKind = null
         flushDeferredNavRestore()
         if (selectedItem == null) {
@@ -4968,6 +4970,7 @@ fun WeiboApp() {
         flushDeferredNavRestore()
         deferredNavRestoreGeneration += 1
         nestedDetailReturnAnimating = false
+        nestedDetailReturnSnapshot = null
         navStack = navStack + captureNavRestoreState()
         navOverlayStack = navOverlayStack + kind
         navEnterPendingKind = kind
@@ -4999,6 +5002,10 @@ fun WeiboApp() {
                 )
             }
         }
+        // popNavigation removes this snapshot from navStack immediately, but a
+        // nested detail's return animation still needs that parent rendered below
+        // the outgoing child. Preserve it independently until the animation ends.
+        nestedDetailReturnSnapshot = if (nestedDetailReturnAnimating) previous.detail else null
         // Keep the existing feed composition alive beneath the profile. Re-keying it here
         // clears its first layout while the profile exits, which briefly reveals a white page.
         navStack = navStack.dropLast(1)
@@ -8606,9 +8613,10 @@ fun WeiboApp() {
                     // A saved detail is not necessarily the immediate previous
                     // page: A -> profile -> B must reveal the retained profile,
                     // never paint A inside B's higher-z-index transition layer.
-                    parentTarget = navStack.lastOrNull()?.detail.takeIf {
-                        navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
-                    },
+                    parentTarget = nestedDetailReturnSnapshot.takeIf { nestedDetailReturnAnimating }
+                        ?: navStack.lastOrNull()?.detail.takeIf {
+                            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
+                        },
                     modifier = Modifier
                         .fillMaxSize()
                         .blockHiddenTouches(detailOverlayVisible),
@@ -9192,7 +9200,9 @@ fun WeiboApp() {
                 visible = exitHintVisible,
                 token = exitHintToken,
                 onDismiss = { exitHintVisible = false },
-                modifier = Modifier.align(Alignment.Center),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = feedRefreshTopInset + 10.dp),
             )
             FeedCardActionMenuOverlay(
                 controller = feedCardActionMenuController,
@@ -11008,7 +11018,7 @@ private fun StatusTextSection(
             )
         }
     }
-    SelectionContainer {
+    val bodyContent: @Composable () -> Unit = {
         EmoticonText(
             modifier = Modifier.fillMaxWidth(),
             text = bodyText,
@@ -11034,6 +11044,11 @@ private fun StatusTextSection(
             urlEntities = resolvedUrlEntities,
             onUrlEntityClick = onUrlEntityClick,
         )
+    }
+    if (LocalDetailInlineVideoPlayback.current) {
+        SelectionContainer(content = bodyContent)
+    } else {
+        bodyContent()
     }
     }
 }
@@ -19479,8 +19494,10 @@ private fun CommentComposerDialog(
     var text by remember(target) { mutableStateOf(TextFieldValue("")) }
     var alsoRepost by remember(target) { mutableStateOf(false) }
     var emoticonPanelVisible by remember(target) { mutableStateOf(false) }
+    var copiedCommentHintVisible by remember(target) { mutableStateOf(false) }
     var selectedPhotoUris by remember(target) { mutableStateOf<List<Uri>>(emptyList()) }
     val focusRequester = remember { FocusRequester() }
+    val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
     val canSubmit = (target.isRepost || text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
@@ -19632,19 +19649,41 @@ private fun CommentComposerDialog(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     target.replyTo?.let { reply ->
-                        Text(
-                            text = "@${reply.authorName}: ${reply.text.trim().replace(Regex("\\s+"), " ").take(46)}",
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(10.dp))
                                 .background(inputColor)
                                 .padding(horizontal = 10.dp, vertical = 6.dp),
-                            fontSize = 12.sp,
-                            lineHeight = 16.sp,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        ) {
+                            Text(
+                                text = "@${reply.authorName}: ${reply.text.trim().replace(Regex("\\s+"), " ").take(46)}",
+                                modifier = Modifier.fillMaxWidth(),
+                                style = inputTextStyle.copy(
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                ),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                            ) {
+                                Text(
+                                    text = "复制",
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable {
+                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                            clipboard.setPrimaryClip(ClipData.newPlainText("评论", reply.text))
+                                            copiedCommentHintVisible = true
+                                        }
+                                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                        }
                     }
 
                     AnimatedVisibility(visible = mentionPanelExpanded && displayedMentionSuggestions.isNotEmpty()) {
@@ -19869,6 +19908,21 @@ private fun CommentComposerDialog(
                         )
                     }
                 }
+            }
+            AnimatedVisibility(
+                visible = copiedCommentHintVisible,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 10.dp)
+                    .zIndex(1000f),
+                enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { height -> -height / 2 },
+                exit = fadeOut(tween(180)) + slideOutVertically(tween(180)) { height -> -height / 2 },
+            ) {
+                FeedRefreshCapsuleHint(
+                    message = "已复制评论",
+                    tone = CapsuleHintTone.Theme,
+                    onDismiss = { copiedCommentHintVisible = false },
+                )
             }
         }
     }
@@ -25779,7 +25833,7 @@ private fun SettingsPlaybackCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Switch(
+            SettingsLiquidToggle(
                 checked = backgroundPlaybackEnabled,
                 onCheckedChange = onBackgroundPlaybackChange,
             )
@@ -25821,9 +25875,14 @@ private fun SettingsBottomBarGlassCard(
             }
             AnimatedVisibility(visible = expanded) {
                 Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
-                    SettingsGlassSlider("磨砂", frostAmount, onFrostChange, onFrostCommit, "透明", "白色磨砂")
-                    Spacer(Modifier.height(8.dp))
-                    SettingsGlassSlider("玻璃", glassAmount, onGlassChange, onGlassCommit, "无折射", "强折射")
+                    SettingsGlassSlider("磨砂效果", frostAmount, onFrostChange, onFrostCommit, "透明", "磨砂")
+                    Spacer(Modifier.height(14.dp))
+                    HorizontalDivider(
+                        thickness = 0.5.dp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    SettingsGlassSlider("玻璃效果", glassAmount, onGlassChange, onGlassCommit, "无折射", "强折射")
                 }
             }
         }
@@ -25847,16 +25906,35 @@ private fun SettingsGlassSlider(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
-    Slider(
-        value = amount.coerceIn(0f, 1f),
-        onValueChange = onAmountChange,
-        onValueChangeFinished = onAmountCommit,
-        valueRange = 0f..1f,
+    Row(
         modifier = Modifier.fillMaxWidth(),
-    )
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        Text(leftLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(rightLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            leftLabel,
+            modifier = Modifier.width(44.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+        )
+        SettingsLiquidSlider(
+            value = amount.coerceIn(0f, 1f),
+            onValueChange = onAmountChange,
+            onValueChangeFinished = onAmountCommit,
+            valueRange = 0f..1f,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            rightLabel,
+            modifier = Modifier.width(44.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+            textAlign = TextAlign.End,
+        )
     }
 }
 
@@ -25888,7 +25966,7 @@ private fun SettingsFeedDisplayCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Switch(
+            SettingsLiquidToggle(
                 checked = hideBottomBarOnScroll,
                 onCheckedChange = onHideBottomBarOnScrollChange,
             )
@@ -25913,7 +25991,7 @@ private fun SettingsCommentLikeCountCard() {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Switch(checked = showCommentLikes, onCheckedChange = setShowCommentLikes)
+            SettingsLiquidToggle(checked = showCommentLikes, onCheckedChange = setShowCommentLikes)
         }
     }
 }
