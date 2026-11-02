@@ -3301,7 +3301,6 @@ private data class ImagePeekRequest(
     val allImages: List<FeedImage>,
     val imageIndex: Int,
     val anchorBounds: Rect,
-    val pressOffset: Offset,
     val resolveAnchorBounds: () -> Rect,
     val statusItem: FeedItem? = null,
     val onCancel: () -> Unit,
@@ -3353,6 +3352,7 @@ private class ImagePeekController {
     fun release() {
         if (activeRequest != null && pendingDismiss == null) {
             isFloating = true
+            pendingDismiss = ImagePeekDismissReason.Release
         }
     }
 
@@ -9365,7 +9365,6 @@ fun WeiboApp() {
                     allImages = request.allImages,
                     initialImageIndex = request.imageIndex,
                     anchorBounds = request.anchorBounds,
-                    pressOffset = request.pressOffset,
                     resolveAnchorBounds = request.resolveAnchorBounds,
                     statusItem = request.statusItem,
                     isFloating = imagePeekController.isFloating,
@@ -12224,13 +12223,12 @@ private fun FeedImageCell(
                 allImages = allImages,
                 imageIndex = imageIndex,
                 anchorBounds = bounds,
-                pressOffset = pressWindowOffset,
                 statusItem = imageOwner,
                 resolveAnchorBounds = {
                     anchorHolder.boundsInWindow() ?: bounds
                 },
                 onCancel = { resetPeekState() },
-                onRelease = {},
+                onRelease = { resetPeekState() },
                 onOpenFullscreenBehind = { index ->
                     onOpenViewer(index, null, {
                         resetPeekState()
@@ -12555,7 +12553,6 @@ private fun ImageActionOverlay(
     allImages: List<FeedImage>,
     initialImageIndex: Int,
     anchorBounds: Rect,
-    pressOffset: Offset,
     resolveAnchorBounds: () -> Rect,
     statusItem: FeedItem? = null,
     isFloating: Boolean,
@@ -12565,18 +12562,13 @@ private fun ImageActionOverlay(
     onOpenFullscreenBehind: (Int) -> Unit,
     onEnterFullscreenHandoffComplete: () -> Unit,
 ) {
-    val onMessage = LocalUiMessenger.current
-    val saveHint = LocalImageSaveHint.current
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val imagePeekController = LocalImagePeekController.current
-    var saving by remember { mutableStateOf(false) }
     val images = allImages.ifEmpty { listOf(image) }
     val resolvedImages = remember(images, statusItem) {
         images.map { it.resolveForSave(statusItem, images) }
     }
-    val showSaveAll = images.size > 1
     val safeInitialIndex = initialImageIndex.coerceIn(0, images.lastIndex)
     val pagerState = rememberPagerState(initialPage = safeInitialIndex) { images.size }
     val pagerFlingBehavior = PagerDefaults.flingBehavior(
@@ -12590,7 +12582,6 @@ private fun ImageActionOverlay(
     val enterProgress = remember { Animatable(0f) }
     val fullscreenExpandProgress = remember { Animatable(0f) }
     var fullscreenOpened by remember { mutableStateOf(false) }
-    var actionMenuVisible by remember { mutableStateOf(false) }
     var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
     var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
     var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
@@ -12609,7 +12600,6 @@ private fun ImageActionOverlay(
     }
 
     LaunchedEffect(Unit) {
-        actionMenuVisible = true
         val layoutStart = mediaPeekLayoutStartProgress()
         enterProgress.snapTo(layoutStart)
         enterProgress.animateTo(
@@ -12647,7 +12637,6 @@ private fun ImageActionOverlay(
         when (dismissReason) {
             null -> return@LaunchedEffect
             ImagePeekDismissReason.EnterFullscreen -> {
-                actionMenuVisible = false
                 if (enterProgress.value < 1f) {
                     enterProgress.snapTo(1f)
                 }
@@ -12667,7 +12656,6 @@ private fun ImageActionOverlay(
                 onEnterFullscreenHandoffComplete()
             }
             else -> {
-                actionMenuVisible = false
                 fullscreenExpandProgress.snapTo(0f)
                 closingAnchorBounds = resolveAnchorBounds()
                 if (isFloating) {
@@ -12677,7 +12665,10 @@ private fun ImageActionOverlay(
                     peekDismissMorphProgress.snapTo(1f)
                     peekDismissMorphProgress.animateTo(
                         targetValue = 0f,
-                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
+                        animationSpec = tween(
+                            durationMillis = 250,
+                            easing = FastOutSlowInEasing,
+                        ),
                     )
                 } else {
                     enterProgress.animateTo(
@@ -12894,9 +12885,6 @@ private fun ImageActionOverlay(
                     }
                 }
             } else {
-            val previewMenuBackdrop = rememberLayerBackdrop()
-            val previewHazeState = rememberHazeState()
-
             val screenAspect = maxWidthPx / maxHeightPx.coerceAtLeast(1f)
             val fullscreenImageWidthPx: Float
             val fullscreenImageHeightPx: Float
@@ -12922,37 +12910,8 @@ private fun ImageActionOverlay(
                 expandCenterX = maxWidthPx / 2f,
                 expandCenterY = maxHeightPx / 2f,
             )
-            val menuLabels = buildList {
-                add("\u4fdd\u5b58")
-                if (showSaveAll) add("\u4fdd\u5b58\u5168\u90e8")
-                add("\u5206\u4eab")
-            }
-            val menuHeight = if (showSaveAll) ActionMenuThreeRowHeight else ActionMenuTwoRowHeight
-            val menuWidth = rememberActionMenuWidth(menuLabels, maxWidth - 28.dp)
-            val menuPlacement = calculateActionMenuOffsetFromAnchorPx(
-                anchorBounds = motion.visualBounds,
-                screenWidthPx = maxWidthPx,
-                screenHeightPx = maxHeightPx,
-                menuWidthPx = with(density) { menuWidth.toPx() },
-                menuHeightPx = with(density) { menuHeight.toPx() },
-                marginPx = with(density) { 14.dp.toPx() },
-                gapPx = with(density) { 10.dp.toPx() },
-            )
-
-            val menuWidthPx = with(density) { menuWidth.toPx() }
-            val menuHeightPx = with(density) { menuHeight.toPx() }
-            val menuRevealVisible = actionMenuVisible && expandProgress == 0f && !fullscreenOpened
-            val originInMenu = computeActionMenuOriginInMenu(
-                anchorInRoot = pressOffset,
-                menuOffset = menuPlacement.offset,
-                menuWidthPx = menuWidthPx,
-                menuHeightPx = menuHeightPx,
-            )
             Box(
-                Modifier
-                    .fillMaxSize()
-                .hazeSource(previewHazeState)
-                    .layerBackdrop(previewMenuBackdrop),
+                Modifier.fillMaxSize(),
             ) {
             Box(
                 modifier = Modifier
@@ -13018,73 +12977,6 @@ private fun ImageActionOverlay(
                 }
             }
             }
-
-            ActionMenuReveal(
-                visible = menuRevealVisible,
-                menuWidth = menuWidth,
-                menuHeight = menuHeight,
-                originInMenu = originInMenu,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .offset { menuPlacement.offset }
-                    .width(menuWidth)
-                    .height(menuHeight),
-            ) {
-                ImageActionFrostedCard(
-                    modifier = Modifier.fillMaxSize(),
-                    backdrop = previewMenuBackdrop,
-                    hazeState = previewHazeState,
-                ) {
-                    ImageActionRow(
-                        label = "保存",
-                        enabled = !saving,
-                        onClick = {
-                            saving = true
-                            scope.launch {
-                                if (saveHint.saveOne(context, currentImage, statusItem)) {
-                                    requestDismiss()
-                                }
-                                saving = false
-                            }
-                        },
-                    )
-                    if (showSaveAll) {
-                        ImageActionRow(
-                            label = "保存全部",
-                            enabled = !saving,
-                            separatorBefore = true,
-                            onClick = {
-                                saving = true
-                                saveHint.launchSave {
-                                    val result = saveHint.saveAll(context, resolvedImages, statusItem)
-                                    if (result.saved > 0) {
-                                        requestDismiss()
-                                    }
-                                    saving = false
-                                }
-                            },
-                        )
-                    }
-                    ImageActionRow(
-                        label = "分享",
-                        enabled = !saving,
-                        separatorBefore = true,
-                        onClick = {
-                            saving = true
-                            scope.launch {
-                                ImageSaveHelper.shareImage(context, currentImage)
-                                    .onFailure { error ->
-                                        onMessage("分享失败", error.message ?: "请稍后重试")
-                                    }
-                                saving = false
-                            }
-                        },
-                    )
-                }
-            }
-            ImageSaveHintOverlay(
-                modifier = Modifier.align(Alignment.TopCenter),
-            )
             }
     }
 }
