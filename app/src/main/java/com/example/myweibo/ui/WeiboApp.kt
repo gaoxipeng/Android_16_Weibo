@@ -14175,7 +14175,7 @@ private fun MediaStrip(
                             allImages = images,
                             imageIndex = 0,
                             imageOwner = imageOwner,
-                            hiddenForViewer = viewerOpen && viewerActiveIndex == 0,
+                            hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
@@ -14219,7 +14219,7 @@ private fun MediaStrip(
                                     allImages = images,
                                     imageIndex = cellIndex,
                                     imageOwner = imageOwner,
-                                    hiddenForViewer = viewerOpen && viewerActiveIndex == cellIndex,
+                                    hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
@@ -14268,9 +14268,11 @@ private fun MediaStrip(
                     onPageChanged = { viewerActiveIndex = it },
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     animateOpenFromSource = viewerAnimateOpenFromSource,
-                    onCloseStart = {
-                        // Keep the source thumbnail hidden until the return morph finishes.
+                    onReturnLanded = {
+                        // Restore beneath the landed image before removing the dialog window.
                         viewerReturning = true
+                        viewerDismissHook?.invoke()
+                        viewerDismissHook = null
                     },
                     imageOwner = imageOwner,
                     onDismiss = {
@@ -14517,6 +14519,7 @@ private fun FullscreenImageViewer(
     sourceCornerRadius: Dp = ThumbnailMorphCornerRadius,
     avoidOpeningCropForExtremeAspect: Boolean = false,
     onCloseStart: (() -> Unit)? = null,
+    onReturnLanded: (() -> Unit)? = null,
     imageOwner: FeedItem? = null,
     session: WeiboWebSession? = null,
     relatedPosts: List<FeedItem> = emptyList(),
@@ -14583,6 +14586,11 @@ private fun FullscreenImageViewer(
                         targetValue = 0f,
                         animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
                     )
+                    onReturnLanded?.invoke()
+                    // Let the activity render its thumbnail while the dialog still covers it.
+                    // Window removal before this frame exposes an empty source for a flash.
+                    withFrameNanos { }
+                    withFrameNanos { }
                     finishDismiss()
                 }
             } else {
