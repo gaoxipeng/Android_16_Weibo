@@ -14175,7 +14175,7 @@ private fun MediaStrip(
                             allImages = images,
                             imageIndex = 0,
                             imageOwner = imageOwner,
-                            hiddenForViewer = false,
+                            hiddenForViewer = viewerOpen && viewerActiveIndex == 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
@@ -14219,7 +14219,7 @@ private fun MediaStrip(
                                     allImages = images,
                                     imageIndex = cellIndex,
                                     imageOwner = imageOwner,
-                                    hiddenForViewer = false,
+                                    hiddenForViewer = viewerOpen && viewerActiveIndex == cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
@@ -14269,10 +14269,8 @@ private fun MediaStrip(
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     animateOpenFromSource = viewerAnimateOpenFromSource,
                     onCloseStart = {
-                        // Restore the real thumbnail BEFORE the dialog shrinks onto it.
-                        // The two windows cannot otherwise hand off in the same frame.
+                        // Keep the source thumbnail hidden until the return morph finishes.
                         viewerReturning = true
-                        viewerCloseHandoff?.invoke()
                     },
                     imageOwner = imageOwner,
                     onDismiss = {
@@ -14280,6 +14278,7 @@ private fun MediaStrip(
                         viewerReturning = false
                         viewerSourceBoundsByIndex = emptyMap()
                         viewerAnimateOpenFromSource = true
+                        viewerCloseHandoff?.invoke()
                         viewerCloseHandoff = null
                         viewerDismissHook?.invoke()
                         viewerDismissHook = null
@@ -21504,6 +21503,7 @@ private fun CommentImageStrip(
 
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
+    var activeThumbnailIndex by remember { mutableStateOf(0) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
@@ -21542,6 +21542,7 @@ private fun CommentImageStrip(
                     allImages = images,
                     imageIndex = index,
                     modifier = Modifier.size(72.dp),
+                    hiddenForViewer = viewerOpen && activeThumbnailIndex == index,
                     previewUrl = image.thumbnailUrl,
                     contentScale = ContentScale.Crop,
                     showLiveBadge = true,
@@ -21564,6 +21565,7 @@ private fun CommentImageStrip(
                 initialIndex = viewerIndex,
                 sourceBoundsByIndex = viewerSourceBoundsByIndex,
                 animateOpenFromSource = viewerAnimateOpenFromSource,
+                onPageChanged = { activeThumbnailIndex = it },
                 onDismiss = {
                     viewerOpen = false
                     viewerSourceBoundsByIndex = emptyMap()
