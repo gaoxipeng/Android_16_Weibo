@@ -12981,7 +12981,7 @@ private fun ImageActionOverlay(
                     .mediaPeekMotionLayer(
                         motion = motion,
                         fingerDragOffset = { imagePeekController.fingerDragOffset },
-                        shadowElevation = if (layoutProgress > 0.28f && expandProgress == 0f) {
+                        shadowElevation = if (images.size > 1 && layoutProgress > 0.28f && expandProgress == 0f) {
                             16.dp
                         } else {
                             0.dp
