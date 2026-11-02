@@ -521,7 +521,7 @@ private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result
         Result.failure(error)
     }
 
-private const val MediaLongPressTimeoutMillis = 500L
+private const val MediaLongPressTimeoutMillis = 300L
 private const val MediaPeekCompressScale = 0.968f
 private const val MediaPeekPopPeakScale = 1.06f
 private const val MediaPeekHoldCompressPhase = 0.82f
@@ -542,6 +542,15 @@ private val MediaPeekEnterAnimationSpec = tween<Float>(
 private val MediaPeekDismissAnimationSpec = tween<Float>(
     durationMillis = 220,
     easing = FastOutSlowInEasing,
+)
+private val ImagePeekMotionEasing = FastOutSlowInEasing
+private val ImagePeekEnterAnimationSpec = tween<Float>(
+    durationMillis = 360,
+    easing = ImagePeekMotionEasing,
+)
+private val ImagePeekDismissAnimationSpec = tween<Float>(
+    durationMillis = 260,
+    easing = ImagePeekMotionEasing,
 )
 
 private enum class MediaPeekHapticStage {
@@ -716,6 +725,17 @@ private fun mediaPeekLayoutProgress(rawProgress: Float): Float {
     if (t <= layoutStart) return 0f
     val phase = ((t - layoutStart) / (1f - layoutStart)).coerceIn(0f, 1f)
     return MediaPeekLayoutEasing.transform(phase)
+}
+
+private fun imagePeekLayoutProgress(rawProgress: Float): Float =
+    ImagePeekMotionEasing.transform(rawProgress.coerceIn(0f, 1f))
+
+private fun imagePeekEnterScale(rawProgress: Float): Float {
+    val progress = rawProgress.coerceIn(0f, 1f)
+    // A restrained lift at the midpoint keeps the thumbnail-to-preview morph
+    // dimensional without the abrupt overshoot used by the video peek.
+    val lift = 0.018f * (4f * progress * (1f - progress))
+    return 1f + lift
 }
 
 private fun computeMediaPeekGraphicsMotion(
@@ -1146,6 +1166,12 @@ private val MorandiThemeColors = listOf(
     MorandiThemeColor("gray_purple", "灰紫", Color(0xFF977C8C), Color(0xFFC0A987), Color(0xFF977C8C)),
     MorandiThemeColor("navy", "藏蓝", Color(0xFF4F6887), Color(0xFF8A9BB3), Color(0xFF4F6887)),
     MorandiThemeColor("brick_orange", "砖橘", Color(0xFFD1836B), Color(0xFFE5B09B), Color(0xFFD1836B)),
+    MorandiThemeColor("vivid_rose", "玫瑰红", Color(0xFFE91E63), Color(0xFFF8BBD0), Color(0xFFE91E63)),
+    MorandiThemeColor("vivid_orange", "活力橙", Color(0xFFF06414), Color(0xFFFFD5B5), Color(0xFFF06414)),
+    MorandiThemeColor("vivid_amber", "琥珀金", Color(0xFFD99400), Color(0xFFFFE7A0), Color(0xFFD99400)),
+    MorandiThemeColor("vivid_green", "翡翠绿", Color(0xFF00A86B), Color(0xFFA6E8CB), Color(0xFF00A86B)),
+    MorandiThemeColor("vivid_blue", "晴空蓝", Color(0xFF1677FF), Color(0xFFBEDAFF), Color(0xFF1677FF)),
+    MorandiThemeColor("vivid_purple", "鸢尾紫", Color(0xFF8B3DFF), Color(0xFFDFC8FF), Color(0xFF8B3DFF)),
 )
 
 private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
@@ -1246,6 +1272,7 @@ private fun <T> NavAnimatedOverlay(
     var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
     val returnCardLayout = remember(animationKey) { mutableStateOf<Rect?>(null) }
     var displayed by remember { mutableStateOf<T?>(null) }
+    val horizontalSwipeExclusions = remember(animationKey) { HorizontalSwipeExclusionRegistry() }
     val detailContentByIdentity = remember { mutableStateMapOf<Any, T>() }
     var previousDetailIdentity by remember { mutableStateOf<Any?>(null) }
     if (target != null) {
@@ -1279,6 +1306,12 @@ private fun <T> NavAnimatedOverlay(
         awaitEachGesture {
             val gesturePass = if (interceptRightSwipe) PointerEventPass.Initial else PointerEventPass.Main
             val down = awaitFirstDown(requireUnconsumed = false, pass = gesturePass)
+            if (interceptRightSwipe && horizontalSwipeExclusions.containsLocal(down.position)) {
+                // Leave gestures that start on a media thumbnail or seek bar to
+                // that child; profile right-swipe navigation remains enabled
+                // everywhere else.
+                return@awaitEachGesture
+            }
             if (swipeSettling) return@awaitEachGesture
             val tracker = VelocityTracker()
             tracker.addPosition(down.uptimeMillis, down.position)
@@ -1466,7 +1499,10 @@ private fun <T> NavAnimatedOverlay(
     // `displayed` may outlive the visual exit for deferred navigation cleanup.
     if (avVisible || transitionState.currentState || !transitionState.isIdle) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
-        .onGloballyPositioned { overlayOrigin = it.boundsInRoot().topLeft }) {
+        .onGloballyPositioned {
+            overlayOrigin = it.boundsInRoot().topLeft
+            horizontalSwipeExclusions.setRootOrigin(overlayOrigin)
+        }) {
     returnBackground?.let { bitmap ->
         Image(bitmap.asImageBitmap(), contentDescription = null,
             modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
@@ -1564,6 +1600,7 @@ private fun <T> NavAnimatedOverlay(
             }
         }) {
         CompositionLocalProvider(
+            LocalHorizontalSwipeExclusionRegistry provides horizontalSwipeExclusions,
             LocalDetailReturnCardLayout provides returnCardLayout,
             LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling),
             LocalDetailPageReveal provides if (returningPage) 1f else pageReveal.coerceIn(0f, 1f),
@@ -2398,6 +2435,7 @@ private fun upgradeWeiboWebUrl(url: String): String {
 }
 
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
+private val LocalProfileInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
@@ -3007,6 +3045,41 @@ private class NavTransitionCoordinator {
 
 private val LocalNavTransitionCoordinator = staticCompositionLocalOf { NavTransitionCoordinator() }
 private val LocalPageSwipeBack = staticCompositionLocalOf<(() -> Unit)?> { null }
+
+private class HorizontalSwipeExclusionRegistry {
+    @Volatile
+    private var regions: Map<Any, Rect> = emptyMap()
+    @Volatile
+    private var rootOrigin: Offset = Offset.Zero
+
+    fun setRootOrigin(origin: Offset) {
+        rootOrigin = origin
+    }
+
+    @Synchronized
+    fun update(key: Any, bounds: Rect?) {
+        regions = if (bounds == null) regions - key else regions + (key to bounds)
+    }
+
+    fun containsLocal(point: Offset): Boolean {
+        val rootPoint = point + rootOrigin
+        return regions.values.any { it.contains(rootPoint) }
+    }
+}
+
+private val LocalHorizontalSwipeExclusionRegistry =
+    staticCompositionLocalOf<HorizontalSwipeExclusionRegistry?> { null }
+
+@Composable
+private fun Modifier.excludeParentHorizontalSwipe(key: Any): Modifier {
+    val registry = LocalHorizontalSwipeExclusionRegistry.current ?: return this
+    DisposableEffect(registry, key) {
+        onDispose { registry.update(key, null) }
+    }
+    return onGloballyPositioned { coordinates ->
+        registry.update(key, coordinates.boundsInRoot())
+    }
+}
 private data class DetailCardMotion(val source: Rect, val progress: Float, val pageX: Float, val sourceHandoff: Float)
 private val LocalDetailCardMotion = staticCompositionLocalOf<DetailCardMotion?> { null }
 private val LocalDetailReturnCardLayout = staticCompositionLocalOf<androidx.compose.runtime.MutableState<Rect?>?> { null }
@@ -3302,6 +3375,7 @@ private data class ImagePeekRequest(
     val imageIndex: Int,
     val anchorBounds: Rect,
     val resolveAnchorBounds: () -> Rect,
+    val resolveAnchorBoundsForIndex: (Int) -> Rect? = { null },
     val statusItem: FeedItem? = null,
     val onCancel: () -> Unit,
     val onRelease: () -> Unit,
@@ -3313,6 +3387,15 @@ private class ImagePeekController {
     var activeRequest by mutableStateOf<ImagePeekRequest?>(null)
     var pendingDismiss by mutableStateOf<ImagePeekDismissReason?>(null)
     var isFloating by mutableStateOf(false)
+    @Volatile
+    var pointerInputBlocked: Boolean = false
+        private set
+    @Volatile
+    var pointerDismissPending: Boolean = false
+        private set
+    @Volatile
+    var pointerImageSwitchOccurred: Boolean = false
+        private set
     var fingerDragOffset by mutableStateOf(Offset.Zero)
         private set
 
@@ -3331,33 +3414,43 @@ private class ImagePeekController {
     }
 
     fun dispatchHorizontalDrag(deltaX: Float) {
-        if (deltaX != 0f) {
-            horizontalDragHandler?.invoke(deltaX)
-        }
+        horizontalDragHandler?.invoke(deltaX)
     }
 
     fun open(request: ImagePeekRequest) {
+        pointerInputBlocked = true
+        pointerDismissPending = false
+        pointerImageSwitchOccurred = false
         pendingDismiss = null
         isFloating = false
         fingerDragOffset = Offset.Zero
         activeRequest = request
     }
 
+    fun markImageSwitchOccurred() {
+        pointerImageSwitchOccurred = true
+    }
+
     fun cancel() {
-        if (activeRequest != null && pendingDismiss == null) {
+        if (pointerInputBlocked && !pointerDismissPending) {
+            pointerDismissPending = true
             pendingDismiss = ImagePeekDismissReason.Cancel
         }
     }
 
-    fun release() {
-        if (activeRequest != null && pendingDismiss == null) {
+    fun release(keepFloating: Boolean = false) {
+        if (pointerInputBlocked && !pointerDismissPending) {
             isFloating = true
-            pendingDismiss = ImagePeekDismissReason.Release
+            if (!keepFloating) {
+                pointerDismissPending = true
+                pendingDismiss = ImagePeekDismissReason.Release
+            }
         }
     }
 
     fun enterFullscreen() {
-        if (activeRequest != null && pendingDismiss == null) {
+        if (pointerInputBlocked && !pointerDismissPending) {
+            pointerDismissPending = true
             pendingDismiss = ImagePeekDismissReason.EnterFullscreen
         }
     }
@@ -3368,6 +3461,9 @@ private class ImagePeekController {
         activeRequest = null
         pendingDismiss = null
         isFloating = false
+        pointerInputBlocked = false
+        pointerDismissPending = false
+        pointerImageSwitchOccurred = false
         fingerDragOffset = Offset.Zero
         horizontalDragHandler = null
         when (reason) {
@@ -3383,6 +3479,9 @@ private class ImagePeekController {
         activeRequest = null
         pendingDismiss = null
         isFloating = false
+        pointerInputBlocked = false
+        pointerDismissPending = false
+        pointerImageSwitchOccurred = false
         fingerDragOffset = Offset.Zero
         horizontalDragHandler = null
         request?.onEnterFullscreenHandoffComplete?.invoke()
@@ -4021,6 +4120,7 @@ fun WeiboApp() {
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
     var feedRefreshHint by remember { mutableStateOf<String?>(null) }
+    var feedRefreshHintGeneration by remember { mutableIntStateOf(0) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(feedDisplaySettingsStore.readTimelineKind()) }
     var timelineGroups by remember { mutableStateOf<List<TimelineGroup>>(emptyList()) }
@@ -4042,12 +4142,13 @@ fun WeiboApp() {
         detailActionMenuController.dismiss()
     }
 
-    SideEffect {
-        videoPlaybackCoordinator.detailOverlayOpen = selectedItem != null
-    }
-
     var navStack by remember { mutableStateOf<List<NavRestoreState>>(emptyList()) }
     var navOverlayStack by remember { mutableStateOf<List<NavOverlayKind>>(emptyList()) }
+    SideEffect {
+        // A retained detail under a user profile must not suppress that profile's videos.
+        videoPlaybackCoordinator.detailOverlayOpen = selectedItem != null &&
+            overlayTopKind(navOverlayStack) == OverlayTop.Detail
+    }
     var navEnterPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var navExitPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var nestedDetailReturnAnimating by remember { mutableStateOf(false) }
@@ -5446,10 +5547,13 @@ fun WeiboApp() {
             it.authorId == preparedProfile.id
         })
         val leavingDetailForProfile = selectedItem != null
-        if (leavingDetailForProfile) {
-            // The detail player can be hosted by the persistent peek layer even while it
-            // visually sits inside the card. Tear down every handoff before the profile
-            // overlay opens so neither its Surface nor audio can leak into the next page.
+        if (leavingDetailForProfile &&
+            overlayTopKind(navOverlayStack) != OverlayTop.MediaPreview &&
+            videoPeekController.activeRequest == null
+        ) {
+            // A profile can be opened from a comment while the detail video is fullscreen.
+            // Preserve that explicit fullscreen owner so a video selected on the profile
+            // can take over playback and transfer it back when the profile closes.
             videoPlaybackCoordinator.pauseAll()
             videoPlaybackCoordinator.activeKey = null
             videoPlaybackCoordinator.fullscreenKey = null
@@ -5688,6 +5792,7 @@ fun WeiboApp() {
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         val requestGeneration = timelineRequestGeneration
+        val refreshHintGeneration = feedRefreshHintGeneration
         val requestedKind = timelineKind
         val requestedGroupId = selectedTimelineGroupId
         timelineRefreshJob = scope.launch {
@@ -5743,7 +5848,7 @@ fun WeiboApp() {
                             } else {
                                 showMessage("没有读取到微博", "请稍后刷新")
                             }
-                        } else if (showRefreshHint) {
+                        } else if (showRefreshHint && refreshHintGeneration == feedRefreshHintGeneration) {
                             feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                         } else {
                             feedRefreshHint = null
@@ -6840,8 +6945,9 @@ fun WeiboApp() {
         initialSection: DetailContentSection,
         scrollToContentSection: Boolean,
     ) {
-        homeThumbnailStore.freezeVisible()
+        feedRefreshHintGeneration += 1
         feedRefreshHint = null
+        homeThumbnailStore.freezeVisible()
         val resolved = resolveFeedItem(item)
         retainedLikeUsersByStatus.remove(resolved.id)
         activeDetailSourceBounds = null
@@ -6946,30 +7052,18 @@ fun WeiboApp() {
 
     fun openAlbumVideoDetail(media: FeedMedia, statusId: String, sourceBounds: Rect?) {
         scope.launch {
-            try {
-                val item = session.loadStatusDetail(statusId)
-                    ?: error("未能获取该视频所属的微博")
-                val video = item.medias.firstOrNull {
-                    it.streamUrl == media.streamUrl ||
-                        (!it.coverUrl.isNullOrBlank() && it.coverUrl == media.coverUrl)
-                } ?: item.medias.firstOrNull { it.type == MediaType.Video }
-                openDetail(item)
-                // Preserve the album tile as the transition destination. Without
-                // an origin this path cannot use the detail card return motion.
-                activeDetailSourceBounds = sourceBounds
-                if (video != null) {
-                    val key = videoPlaybackKey(video, item.id)
-                    // Album/video tiles do not own a playing Surface. This is a
-                    // fresh detail playback request, not a transfer from a source
-                    // player: a phantom pending handoff makes acquisition wait and
-                    // repeatedly reacquire its newly created player.
-                    videoPlaybackCoordinator.requestInlinePlayback(key)
-                }
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                showMessage("打开微博失败", error.message.orEmpty())
-            }
+            // Album endpoints often return an expired/low-quality stream URL. Re-fetch
+            // the owning status before creating the fullscreen player, then play the
+            // matching refreshed media directly (without detouring through the post).
+            val freshMedia = runCatching {
+                session.loadStatusDetail(statusId)
+                    ?.let { detail ->
+                        MediaUrlResolver.pickRefreshedMedia(media, detail)
+                            ?: detail.medias.firstOrNull { it.type == media.type && it.isStreamPlayable() }
+                    }
+            }.getOrNull()
+            val playableMedia = freshMedia ?: media
+            pushMediaPreview(playableMedia, statusId)
         }
     }
 
@@ -7685,9 +7779,7 @@ fun WeiboApp() {
             videoPeekController.isFloating &&
             !videoPeekController.isFullscreenMode &&
             videoPeekController.pendingDismiss == null
-        val profileInlinePlaybackActive = visitedUserId != null &&
-            foregroundOverlay == OverlayTop.VisitedProfile &&
-            selectedItem == null &&
+        val profileInlinePlaybackActive = foregroundOverlay == OverlayTop.VisitedProfile &&
             albumViewerState == null &&
             mediaPreview == null &&
             articleOverlay == null
@@ -7720,9 +7812,23 @@ fun WeiboApp() {
                         videoPlaybackCoordinator.pausePeek()
                     }
                 }
+                profileInlinePlaybackActive -> {
+                    val currentKey = videoPlaybackCoordinator.activeKey
+                    val peekKey = videoPlaybackCoordinator.peekPlaybackKey
+                    val overlayRequestKey = videoPeekController.activeRequest?.let { request ->
+                        videoPlaybackKey(request.media, request.playbackOwnerId)
+                    }
+                    val preserveKey = currentKey ?: overlayRequestKey ?: peekKey
+                    // The visited profile is layered over the retained detail. Its video
+                    // selection owns the inline player even though selectedItem still
+                    // refers to the covered detail page.
+                    videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
+                }
                 selectedItem != null -> {
-                    // 详情页冷启动点播会写入 activeKey；本 effect 以 activeKey 为 key，
-                    // 若非 handoff 时一律清成 null，会立刻拆掉 PlayerView，出现有声无画。
+                    // Keep the active detail/profile video mounted while the visited
+                    // profile is layered over a detail page. The profile guard below
+                    // preserves a newly selected profile video; this path only applies
+                    // when the foreground overlay is not the profile.
                     val preserveKey = if (videoPlaybackCoordinator.detailHandoffActive) {
                         videoPlaybackCoordinator.pendingPeekHandoffKey
                             ?: videoPlaybackCoordinator.activeKey
@@ -7732,45 +7838,6 @@ fun WeiboApp() {
                     videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
                     if (videoPlaybackCoordinator.activeKey != preserveKey) {
                         videoPlaybackCoordinator.activeKey = preserveKey
-                    }
-                }
-                profileInlinePlaybackActive -> {
-                    val profilePlaybackKeys = visitedPosts
-                        .map(::resolveFeedItem)
-                        .flatMap(::feedItemInlinePlaybackKeys)
-                        .toSet()
-                    fun keyBelongsToProfile(key: String): Boolean =
-                        profilePlaybackKeys.any { candidate ->
-                            videoPlaybackCoordinator.matchesPlaybackKey(candidate, key)
-                        }
-                    val peekKey = videoPlaybackCoordinator.peekPlaybackKey
-                    val overlayRequestKey = videoPeekController.activeRequest?.let { request ->
-                        videoPlaybackKey(request.media, request.playbackOwnerId)
-                    }
-                    val overlayActiveOnProfile = overlayRequestKey != null &&
-                        keyBelongsToProfile(overlayRequestKey) &&
-                        videoPeekController.pendingDismiss !in setOf(
-                            VideoPeekDismissReason.Cancel,
-                            VideoPeekDismissReason.PlaybackEnded,
-                        )
-                    if (overlayActiveOnProfile) {
-                        // During inline -> fullscreen expansion activeKey and peekPlaybackKey
-                        // are intentionally cleared. The persistent overlay request remains
-                        // the visible owner and must not be cancelled by the profile guard.
-                        videoPlaybackCoordinator.pauseInlineOnly(exceptKey = overlayRequestKey)
-                        return@LaunchedEffect
-                    }
-                    val currentKey = videoPlaybackCoordinator.activeKey
-                    // Liked posts belong to other authors and are held by the profile
-                    // page, not visitedPosts. Do not stop a newly requested liked video.
-                    val preserveKey = currentKey
-                    videoPlaybackCoordinator.pauseInlineOnly(exceptKey = preserveKey)
-                    videoPlaybackCoordinator.activeKey = preserveKey
-                    if (preserveKey == null && peekKey == null) {
-                        currentKey?.let(videoPlaybackCoordinator::cancelPeekHandoff)
-                        if (videoPeekController.activeRequest != null) {
-                            videoPeekController.cancel()
-                        }
                     }
                 }
                 userPostsSearchInlinePlaybackActive || searchInlinePlaybackActive ||
@@ -7812,6 +7879,10 @@ fun WeiboApp() {
         LocalPollController provides pollController,
         LocalProfileRetainedUi provides remember { mutableMapOf<String, ProfileRetainedUi>() },
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
+        LocalProfileInlineVideoPlayback provides (
+            overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile &&
+                navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
+            ),
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
             showCommentLikeCount = enabled
@@ -8304,8 +8375,9 @@ fun WeiboApp() {
                             navigateBack()
                         } else closeVisitedProfile()
                     },
-                    // On the first tab, reserve rightward dragging for page back;
-                    // the pager otherwise consumes it even though it cannot go left.
+                    // Keep profile right-swipe navigation on the posts tab, but
+                    // exclude media thumbnails and seek bars through the bounds
+                    // registry so their horizontal gestures stay local.
                     interceptRightSwipe = visitedMinePagerPage == MineContentTab.Posts.ordinal,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
@@ -9366,6 +9438,7 @@ fun WeiboApp() {
                     initialImageIndex = request.imageIndex,
                     anchorBounds = request.anchorBounds,
                     resolveAnchorBounds = request.resolveAnchorBounds,
+                    resolveAnchorBoundsForIndex = request.resolveAnchorBoundsForIndex,
                     statusItem = request.statusItem,
                     isFloating = imagePeekController.isFloating,
                     dismissReason = imagePeekController.pendingDismiss,
@@ -12193,6 +12266,7 @@ private fun FeedImageCell(
     hiddenForViewer: Boolean = false,
     onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
+    resolveAnchorBoundsForIndex: (Int) -> Rect? = { null },
 ) {
     var actionOpen by remember(image.id) { mutableStateOf(false) }
     var peekActive by remember(image.id) { mutableStateOf(false) }
@@ -12200,9 +12274,10 @@ private fun FeedImageCell(
     var lastReportedAnchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
     val anchorHolder = remember(image.id) { LayoutAnchorHolder() }
     val imagePeekController = LocalImagePeekController.current
-    val feedListScrollCoordinator = LocalFeedListScrollCoordinator.current
-    val gestureScope = rememberCoroutineScope()
     val mediaHaptics = rememberMediaPeekHaptics()
+    val density = LocalDensity.current
+    val horizontalSwipeThresholdPx = with(density) { 48.dp.toPx() }
+    val verticalGestureThresholdPx = with(density) { 56.dp.toPx() }
     val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
 
     fun resetPeekState() {
@@ -12212,7 +12287,7 @@ private fun FeedImageCell(
         imagePeekController.resetFingerDragOffset()
     }
 
-    fun openImagePeek(pressWindowOffset: Offset) {
+    fun openImagePeek() {
         val bounds = anchorHolder.boundsInWindow() ?: return
         actionOpen = true
         peekActive = true
@@ -12224,6 +12299,7 @@ private fun FeedImageCell(
                 imageIndex = imageIndex,
                 anchorBounds = bounds,
                 statusItem = imageOwner,
+                resolveAnchorBoundsForIndex = resolveAnchorBoundsForIndex,
                 resolveAnchorBounds = {
                     anchorHolder.boundsInWindow() ?: bounds
                 },
@@ -12260,103 +12336,79 @@ private fun FeedImageCell(
             .background(
                 if (actionOpen) Color.Black else MaterialTheme.colorScheme.surfaceContainerHighest,
             )
+            .excludeParentHorizontalSwipe("image:${imageOwner?.id.orEmpty()}:${image.id}:$imageIndex")
             .pointerInput(image.id) {
-                awaitEachGesture {
-                    val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    if (down.isConsumed) return@awaitEachGesture
-                    val stoppedScroll = cancelFeedListScrollOnTap(feedListScrollCoordinator, gestureScope, down)
-                    if (stoppedScroll) {
-                        return@awaitEachGesture
-                    }
-                    var lastPosition = down.position
-                    var pressResult = MediaLongPressResult.Tap
-                    pressResult = awaitMediaLongPress(
-                        down = down,
-                        viewConfiguration = viewConfiguration,
-                        onHoldProgress = { pressHoldProgress = it },
-                        onHaptic = mediaHaptics::perform,
-                        consumeTap = true,
-                    )
-
-                    when (pressResult) {
-                        MediaLongPressResult.Tap -> {
-                            val currentBounds = anchorHolder.boundsInWindow() ?: bounds
+                var previewOpened = false
+                var previewDismissStarted = false
+                var fullscreenHandoffStarted = false
+                var horizontalSwipeTriggered = false
+                var totalDrag = Offset.Zero
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { _ ->
+                        if (!imagePeekController.pointerInputBlocked) {
+                            previewOpened = true
+                            previewDismissStarted = false
+                            fullscreenHandoffStarted = false
+                            horizontalSwipeTriggered = false
+                            totalDrag = Offset.Zero
+                            pressHoldProgress = 1f
+                            mediaHaptics.perform(MediaPeekHapticStage.Compress)
+                            openImagePeek()
+                        }
+                    },
+                    onDragEnd = {
+                        if (previewOpened) {
+                            peekActive = false
+                            imagePeekController.resetFingerDragOffset()
+                            if (!previewDismissStarted && !fullscreenHandoffStarted) {
+                                imagePeekController.release(
+                                    keepFloating = imagePeekController.pointerImageSwitchOccurred,
+                                )
+                            }
+                        }
+                        pressHoldProgress = 0f
+                    },
+                    onDragCancel = {
+                        if (previewOpened && !fullscreenHandoffStarted) {
+                            peekActive = false
+                            imagePeekController.cancel()
+                        }
+                        pressHoldProgress = 0f
+                    },
+                    onDrag = { change, dragAmount ->
+                        if (!previewOpened) return@detectDragGesturesAfterLongPress
+                        change.consume()
+                        totalDrag += dragAmount
+                        val horizontalDominant = abs(totalDrag.x) > abs(totalDrag.y) * 1.15f
+                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
+                        if (allImages.size > 1 && horizontalDominant) {
+                            if (!horizontalSwipeTriggered && abs(totalDrag.x) >= horizontalSwipeThresholdPx) {
+                                horizontalSwipeTriggered = true
+                                imagePeekController.dispatchHorizontalDrag(totalDrag.x)
+                            }
+                            return@detectDragGesturesAfterLongPress
+                        }
+                        imagePeekController.updateFingerDragOffset(totalDrag)
+                        if (verticalDominant && totalDrag.y >= verticalGestureThresholdPx && !previewDismissStarted) {
+                            previewDismissStarted = true
+                            imagePeekController.release()
+                        } else if (verticalDominant && totalDrag.y <= -verticalGestureThresholdPx && !fullscreenHandoffStarted) {
+                            fullscreenHandoffStarted = true
+                            imagePeekController.enterFullscreen()
+                        }
+                    },
+                )
+            }
+            .pointerInput(image.id) {
+                detectTapGestures(
+                    onTap = {
+                        if (!imagePeekController.pointerInputBlocked) {
+                            val currentBounds = anchorHolder.boundsInWindow() ?: return@detectTapGestures
                             onAnchorBoundsChanged(currentBounds)
                             onOpenViewer(imageIndex, currentBounds, null, null)
                         }
-                        MediaLongPressResult.Cancelled -> Unit
-                        MediaLongPressResult.LongPress -> Unit
-                    }
-                    if (pressResult != MediaLongPressResult.LongPress) {
-                        return@awaitEachGesture
-                    }
-
-                    val pressWindowOffset = down.position.toWindowPosition(bounds)
-                    down.consume()
-                    openImagePeek(pressWindowOffset)
-                    imagePeekController.updateFingerDragOffset(Offset.Zero)
-
-                    val dragGestureThreshold = 82f
-                    var cancelledByDrag = false
-                    var fullscreenByDrag = false
-                    val canSwipeImages = allImages.size > 1
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        if (!change.pressed) {
-                            break
-                        }
-                        lastPosition = change.position
-                        val totalDrag = lastPosition - down.position
-                        val horizontalDominant = abs(totalDrag.x) > abs(totalDrag.y) * 1.15f
-                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                        if (canSwipeImages && horizontalDominant) {
-                            val deltaX = change.position.x - change.previousPosition.x
-                            imagePeekController.dispatchHorizontalDrag(deltaX)
-                            change.consume()
-                            continue
-                        }
-                        change.consume()
-                        imagePeekController.updateFingerDragOffset(
-                            change.position.toWindowPosition(bounds) - pressWindowOffset,
-                        )
-                        if (
-                            totalDrag.y > dragGestureThreshold &&
-                            verticalDominant
-                        ) {
-                            cancelledByDrag = true
-                            imagePeekController.cancel()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                        if (
-                            totalDrag.y < -dragGestureThreshold &&
-                            verticalDominant
-                        ) {
-                            fullscreenByDrag = true
-                            imagePeekController.enterFullscreen()
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                    }
-
-                    imagePeekController.resetFingerDragOffset()
-                    if (!cancelledByDrag && !fullscreenByDrag) {
-                        peekActive = false
-                        imagePeekController.release()
-                    }
-                }
+                    },
+                )
             },
     ) {
         FeedImageThumbnailContent(
@@ -12554,6 +12606,7 @@ private fun ImageActionOverlay(
     initialImageIndex: Int,
     anchorBounds: Rect,
     resolveAnchorBounds: () -> Rect,
+    resolveAnchorBoundsForIndex: (Int) -> Rect?,
     statusItem: FeedItem? = null,
     isFloating: Boolean,
     dismissReason: ImagePeekDismissReason?,
@@ -12588,9 +12641,14 @@ private fun ImageActionOverlay(
     var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
     val peekDismissMorphProgress = remember { Animatable(1f) }
 
+    fun resolveCurrentAnchorBounds(): Rect =
+        resolveAnchorBoundsForIndex(pagerState.currentPage)
+            ?.takeIf { it.width > 0f && it.height > 0f }
+            ?: resolveAnchorBounds()
+
     fun requestDismiss(handoffBounds: Rect? = null) {
         if (isFloating && dismissReason == null) {
-            closingAnchorBounds = resolveAnchorBounds()
+            closingAnchorBounds = resolveCurrentAnchorBounds()
             peekDismissStartBounds = handoffBounds
             peekDismissTargetBounds = closingAnchorBounds
                 .takeIf { it.width > 0f && it.height > 0f }
@@ -12600,30 +12658,29 @@ private fun ImageActionOverlay(
     }
 
     LaunchedEffect(Unit) {
-        val layoutStart = mediaPeekLayoutStartProgress()
-        enterProgress.snapTo(layoutStart)
+        enterProgress.snapTo(0f)
         enterProgress.animateTo(
             targetValue = 1f,
-            animationSpec = MediaPeekEnterAnimationSpec,
+            animationSpec = ImagePeekEnterAnimationSpec,
         )
-    }
-
-    LaunchedEffect(isFloating) {
-        if (isFloating && enterProgress.value < 1f) {
-            val resumeFrom = enterProgress.value.coerceAtLeast(mediaPeekLayoutStartProgress())
-            if (enterProgress.value < resumeFrom) {
-                enterProgress.snapTo(resumeFrom)
-            }
-            enterProgress.animateTo(1f, MediaPeekEnterAnimationSpec)
-        }
     }
 
     DisposableEffect(pagerState, scope) {
         if (images.size > 1) {
+            var horizontalPageSwitchTriggered = false
             imagePeekController.bindHorizontalDragHandler { deltaX ->
-                scope.launch {
-                    pagerState.scroll {
-                        scrollBy(-deltaX)
+                if (deltaX == 0f) {
+                    horizontalPageSwitchTriggered = false
+                } else if (!horizontalPageSwitchTriggered) {
+                    horizontalPageSwitchTriggered = true
+                    val targetPage = (
+                        pagerState.currentPage + if (deltaX < 0f) 1 else -1
+                        ).coerceIn(0, images.lastIndex)
+                    if (targetPage != pagerState.currentPage) {
+                        imagePeekController.markImageSwitchOccurred()
+                        scope.launch {
+                            pagerState.animateScrollToPage(targetPage)
+                        }
                     }
                 }
             }
@@ -12657,7 +12714,7 @@ private fun ImageActionOverlay(
             }
             else -> {
                 fullscreenExpandProgress.snapTo(0f)
-                closingAnchorBounds = resolveAnchorBounds()
+                closingAnchorBounds = resolveCurrentAnchorBounds()
                 if (isFloating) {
                     peekDismissTargetBounds = closingAnchorBounds
                         .takeIf { it.width > 0f && it.height > 0f }
@@ -12665,15 +12722,12 @@ private fun ImageActionOverlay(
                     peekDismissMorphProgress.snapTo(1f)
                     peekDismissMorphProgress.animateTo(
                         targetValue = 0f,
-                        animationSpec = tween(
-                            durationMillis = 250,
-                            easing = FastOutSlowInEasing,
-                        ),
+                        animationSpec = ImagePeekDismissAnimationSpec,
                     )
                 } else {
                     enterProgress.animateTo(
                         targetValue = 0f,
-                        animationSpec = MediaPeekDismissAnimationSpec,
+                        animationSpec = ImagePeekDismissAnimationSpec,
                     )
                 }
                 onDismissComplete()
@@ -12704,7 +12758,7 @@ private fun ImageActionOverlay(
             )
             .pointerInput(isFloating, dismissReason, images.size) {
                 if (!isFloating || dismissReason != null) return@pointerInput
-                val dragGestureThreshold = 82f
+                val dragGestureThreshold = with(density) { 56.dp.toPx() }
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     var totalDrag = Offset.Zero
@@ -12754,17 +12808,13 @@ private fun ImageActionOverlay(
                     }
                 }
             }
-            .zIndex(
-                if (fullscreenExpandProgress.value > 0f || dismissReason == ImagePeekDismissReason.EnterFullscreen) {
-                    550f
-                } else {
-                    300f
-                },
-            ),
+            // The active media gesture must sit above the visited-profile page
+            // swipe layer, otherwise a rightward image swipe becomes navigation.
+            .zIndex(650f),
     ) {
         val rawProgress = enterProgress.value.coerceIn(0f, 1f)
-        val layoutProgress = mediaPeekLayoutProgress(rawProgress)
-        val enterScale = mediaPeekEnterScale(rawProgress)
+        val layoutProgress = imagePeekLayoutProgress(rawProgress)
+        val enterScale = imagePeekEnterScale(rawProgress)
         val fingerFollowAlpha = if (isFloating) 0f else (1f - expandProgressForBackdrop).coerceIn(0f, 1f)
         val expandProgress = expandProgressForBackdrop
         val useFloatingDismissMorph = isFloating &&
@@ -13850,13 +13900,25 @@ private fun ImageActionPreviewImage(
     val resolvedImage = remember(image, imageOwner, relatedPosts) {
         resolveFeedImageForViewer(image, imageOwner, relatedPosts)
     }
-    var originalBitmap by remember(resolvedImage) { mutableStateOf<Bitmap?>(null) }
+    val thumbnailQuality = LocalFeedThumbnailQuality.current
+    val thumbnailBitmap = remember(resolvedImage, thumbnailQuality) {
+        FeedBitmapCache.get(feedImageCacheCandidates(resolvedImage, thumbnailQuality))
+            ?: FeedBitmapCache.get(feedImageUrlCandidates(resolvedImage))
+    }
+    var qualityBitmap by remember(resolvedImage.largeUrl) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(resolvedImage, isActive) {
-        if (isActive) originalBitmap = withContext(Dispatchers.IO) { loadFullscreenBitmap(resolvedImage) }
+        qualityBitmap = null
+        if (isActive && !resolvedImage.isGif) {
+            qualityBitmap = loadFloatingPeekBitmap(resolvedImage)
+        }
     }
     var livePlaying by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
-    LaunchedEffect(isActive, resolvedImage.isLivePhoto, resolvedImage.largeUrl) {
-        livePlaying = isActive && resolvedImage.isLivePhoto
+    LaunchedEffect(isActive, resolvedImage.isLivePhoto, qualityBitmap) {
+        // The floating peek is a lightweight still-image preview. Starting a
+        // Live Photo decoder while the still image is still loading can allocate
+        // a second surface and stall the UI under memory pressure. Start motion
+        // only after the sharper still is ready, and only for the active page.
+        livePlaying = isActive && resolvedImage.isLivePhoto && qualityBitmap != null
     }
     Box(modifier) {
     FeedImagePreviewContent(
@@ -13866,11 +13928,9 @@ private fun ImageActionPreviewImage(
         isActive = isActive,
         isFullscreen = false,
         modifier = Modifier.fillMaxSize(),
+        placeholderBitmap = thumbnailBitmap,
+        qualityBitmap = qualityBitmap,
     )
-    originalBitmap?.takeIf { !resolvedImage.isGif && !(resolvedImage.isLivePhoto && livePlaying) }?.let { bitmap ->
-        Image(bitmap = bitmap.asImageBitmap(), contentDescription = null,
-            contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
-    }
     }
 }
 
@@ -13997,17 +14057,27 @@ private fun FeedImagePreviewContent(
     modifier: Modifier = Modifier,
     isActive: Boolean = true,
     isFullscreen: Boolean = false,
+    placeholderBitmap: Bitmap? = null,
+    qualityBitmap: Bitmap? = null,
 ) {
     Box(
         modifier = modifier.background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
+        placeholderBitmap?.takeIfDrawable()?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+            )
+        }
         if (image.isGif) {
             AnimatedRemoteImage(
                 url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Fit,
-                placeholderBackground = Color.Black,
+                placeholderBackground = if (placeholderBitmap == null) Color.Black else Color.Transparent,
             )
         } else {
             RemoteImage(
@@ -14015,7 +14085,15 @@ private fun FeedImagePreviewContent(
                 fallbackUrls = image.downloadUrls.drop(1),
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Fit,
-                placeholderBackground = Color.Black,
+                placeholderBackground = if (placeholderBitmap == null) Color.Black else Color.Transparent,
+            )
+        }
+        qualityBitmap?.takeIfDrawable()?.let { bitmap ->
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
             )
         }
         if (image.isLivePhoto && livePlaying) {
@@ -14154,6 +14232,9 @@ private fun MediaStrip(
                                         if (viewerOpen) {
                                             viewerSourceBoundsByIndex = viewerSourceBoundsByIndex + (cellIndex to bounds)
                                         }
+                                    },
+                                    resolveAnchorBoundsForIndex = { targetIndex ->
+                                        thumbnailBoundsByIndex[targetIndex]
                                     },
                                 )
                             }
@@ -16500,6 +16581,7 @@ private fun WeiboVideoSurface(
     val staleVideoMediaRefresher = LocalStaleVideoMediaRefresher.current
     val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
     val isInlineFeedOrDetail = !isPeekPlayback && !isFullscreen && !seamlessOverlayPlayback
+    val isInlineProfileOverDetail = LocalProfileInlineVideoPlayback.current
     val isLiveBroadcast = media.isLiveBroadcast()
     val isLiveReplay = media.isLiveReplay()
     val hideProgressControls = isLiveBroadcast
@@ -16815,7 +16897,7 @@ private fun WeiboVideoSurface(
         }
 
     var inlinePlayer by remember(playbackKey, videoUrl) {
-        val returningPlayer = if (isInlineFeedOrDetail && videoCoordinator.isInlineReturnPending(playbackKey)) {
+        val returningPlayer = if ((isInlineFeedOrDetail || isInlineProfileOverDetail) && videoCoordinator.isInlineReturnPending(playbackKey)) {
             videoCoordinator.consumeHandoffPlayer(playbackKey)?.also {
                 configureExistingPlayer(it, deferPlaybackUntilSurface = true)
             }
@@ -16824,7 +16906,7 @@ private fun WeiboVideoSurface(
     }
     var inlineWaitingForHandoff by remember(playbackKey) { mutableStateOf(false) }
 
-    if (isInlineFeedOrDetail) {
+    if (isInlineFeedOrDetail || isInlineProfileOverDetail) {
         LaunchedEffect(
             playbackKey,
             videoUrl,
@@ -16973,7 +17055,7 @@ private fun WeiboVideoSurface(
         return createFreshPlayer()
     }
 
-    val immediatePlayer = if (isInlineFeedOrDetail) {
+    val immediatePlayer = if (isInlineFeedOrDetail || isInlineProfileOverDetail) {
         null
     } else {
         remember(
@@ -16996,7 +17078,7 @@ private fun WeiboVideoSurface(
         mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null)
     }
 
-    if (!isInlineFeedOrDetail) {
+    if (!isInlineFeedOrDetail && !isInlineProfileOverDetail) {
         LaunchedEffect(
             awaitingFullscreenHandoff,
             awaitingPeekHandoffSource,
@@ -17040,14 +17122,14 @@ private fun WeiboVideoSurface(
     }
 
     LaunchedEffect(videoCoordinator.detailOverlayOpen) {
-        if (!isInlineFeedOrDetail) return@LaunchedEffect
+        if (!isInlineFeedOrDetail && !isInlineProfileOverDetail) return@LaunchedEffect
         if (!videoCoordinator.detailOverlayOpen && inlinePlayer != null) {
             // no-op: keep inline player alive for return navigation
         }
     }
 
     val player = when {
-        isInlineFeedOrDetail -> inlinePlayer
+        isInlineFeedOrDetail || isInlineProfileOverDetail -> inlinePlayer
         else -> immediatePlayer ?: deferredPlayer
     }
     val playerViewHolder = remember { object { var view: androidx.media3.ui.PlayerView? = null } }
@@ -17063,7 +17145,7 @@ private fun WeiboVideoSurface(
     }
     fun ownsOutput(): Boolean = player != null && !stashedForHandoffState.value &&
         videoCoordinator.surfaceOwnership.owns(player, surfaceOwner)
-    fun handingInlineOutputAway(): Boolean = isInlineFeedOrDetail && isOutgoingInlineVideoHandoff(
+    fun handingInlineOutputAway(): Boolean = (isInlineFeedOrDetail || isInlineProfileOverDetail) && isOutgoingInlineVideoHandoff(
         videoCoordinator.peekPlaybackKey?.let { videoCoordinator.matchesPlaybackKey(it, playbackKey) } == true,
         videoCoordinator.isPlaybackKeyHandoffPending(playbackKey),
         videoCoordinator.isFullscreenHandoffPending(playbackKey),
@@ -17073,7 +17155,7 @@ private fun WeiboVideoSurface(
         mutableStateOf(videoCoordinator.consumeTransitionFrame(playbackKey))
     }
 
-    if (!isInlineFeedOrDetail) {
+    if (!isInlineFeedOrDetail && !isInlineProfileOverDetail) {
         LaunchedEffect(
             player,
             playbackKey,
@@ -17132,7 +17214,7 @@ private fun WeiboVideoSurface(
         val target = player ?: return
         playerViewHolder.view = view
         videoCoordinator.bindOutput(target, surfaceOwner, view)
-        val pendingDetailHandoffResume = isInlineFeedOrDetail &&
+        val pendingDetailHandoffResume = (isInlineFeedOrDetail || isInlineProfileOverDetail) &&
             isDetailInlinePlayback &&
             videoCoordinator.detailHandoffActive &&
             videoCoordinator.shouldResumeInlineHandoff(playbackKey)
@@ -17207,7 +17289,8 @@ private fun WeiboVideoSurface(
         resumeAfterSurfaceAttach,
         videoCoordinator.pendingPeekHandoffKey,
     ) {
-        if (userPaused || !isInlineFeedOrDetail || !isDetailInlinePlayback || player == null) return@LaunchedEffect
+        if (userPaused || (!isInlineFeedOrDetail && !isInlineProfileOverDetail) ||
+            !(isDetailInlinePlayback || isInlineProfileOverDetail) || player == null) return@LaunchedEffect
         if (!ownsOutput()) return@LaunchedEffect
         if (!videoCoordinator.detailHandoffActive || handingInlineOutputAway()) return@LaunchedEffect
         if (!videoCoordinator.shouldResumeInlineHandoff(playbackKey)) return@LaunchedEffect
@@ -17223,7 +17306,7 @@ private fun WeiboVideoSurface(
         }
     }
 
-    if (player == null || (!isInlineFeedOrDetail && stashedForHandoff)) {
+    if (player == null || (!isInlineFeedOrDetail && !isInlineProfileOverDetail && stashedForHandoff)) {
         Box(
             modifier = modifier.background(Color.Black),
             contentAlignment = Alignment.Center,
@@ -17258,7 +17341,7 @@ private fun WeiboVideoSurface(
     }
     var videoFrameReady by remember(player) {
         mutableStateOf(
-            transitionFrame == null && isInlineFeedOrDetail &&
+            transitionFrame == null && (isInlineFeedOrDetail || isInlineProfileOverDetail) &&
                 player.playbackState == androidx.media3.common.Player.STATE_READY &&
                 player.videoSize.width > 0 &&
                 (player.isPlaying || player.currentPosition > 0L),
@@ -17507,7 +17590,7 @@ private fun WeiboVideoSurface(
                 videoCoordinator.isInlineReturnPending(playbackKey)
             val transferringToDetail = !isDetailInlinePlayback &&
                 videoCoordinator.isTransferringToDetail(playbackKey)
-            val switchingToAnotherInline = isInlineFeedOrDetail &&
+            val switchingToAnotherInline = (isInlineFeedOrDetail || isInlineProfileOverDetail) &&
                 !isPeekPlayback &&
                 !isFullscreen &&
                 !seamlessOverlayPlayback &&
@@ -18209,6 +18292,7 @@ private fun WeiboVideoSurface(
                 durationMs = durationMs,
                 speed = displayedSpeed,
                 backdrop = videoControlBackdrop,
+                horizontalGestureExclusionKey = "video-progress:$playbackKey",
                 onPlayPause = { togglePlayPause() },
                 onSeek = { target ->
                     showControls()
@@ -18348,6 +18432,7 @@ private fun VideoControls(
     onSpeedClick: () -> Unit,
     backdrop: Backdrop,
     modifier: Modifier = Modifier,
+    horizontalGestureExclusionKey: Any? = null,
     onScrubbingChanged: (Boolean) -> Unit = {},
 ) {
     val progress = if (durationMs > 0L) {
@@ -18361,8 +18446,12 @@ private fun VideoControls(
     val onSeekState by rememberUpdatedState(onSeek)
     val onScrubbingChangedState by rememberUpdatedState(onScrubbingChanged)
 
+    val swipeExclusionModifier = horizontalGestureExclusionKey?.let {
+        Modifier.excludeParentHorizontalSwipe(it)
+    } ?: Modifier
     TransparentLiquidCapsule(
         modifier = modifier
+            .then(swipeExclusionModifier)
             .pointerInput(durationState) {
                 val horizontalDominanceRatio = 1.15f
                 awaitEachGesture {
@@ -24560,7 +24649,7 @@ private val appHelpSections = listOf(
             "「我的」和用户主页提供「微博、相册、视频、赞过」四个标签，可点击或左右滑动切换。",
             "微博展示该用户发布的内容；相册展示照片，视频单独展示；媒体列表接近底部时继续加载。",
             "「赞过」请求正在查看的用户公开可见的点赞微博，支持下拉刷新和分页；可见范围受微博接口及隐私设置限制。",
-            "视频页点击封面会进入所属微博详情，并播放对应视频。",
+            "视频页点击封面可直接播放对应视频；从首页 @昵称、评论或关注列表进入用户主页后，也可点击微博卡片内的播放按钮。",
             "相册点击照片查看大图；左右切图后关闭，会按需要定位对应缩略图。惯性滚动中首次点击仅停止滚动。",
             "头像与封面可放大查看；点击关注、粉丝统计可进入列表，访问其他用户时可关注或取消关注。",
         ),
@@ -24610,7 +24699,8 @@ private val appHelpSections = listOf(
             "自动隐藏底栏、显示评论点赞数、后台播放声音为独立开关。",
             "表情同步可更新本地表情；图片清晰度可选省流、标准、高清，主要影响缩略图。",
             "行距与字号可调整正文阅读效果；深色模式支持浅色、深色和跟随系统。",
-            "主题颜色提供九种配色，作用于导航、按钮和强调文字；关于页面显示当前安装版本。",
+            "在「我的 → 设置 → 主题颜色」选择配色，立即应用并自动保存，作用于导航、按钮和强调文字。",
+            "主题颜色保留九种柔和配色，新增玫瑰红、活力橙、琥珀金、翡翠绿、晴空蓝、鸢尾紫六种鲜艳配色；深色模式可单独设置。",
             "内容加载失败可先下拉重试，登录失效则重新登录。删除本地账号不等于注销微博账号。",
             "本应用为非官方客户端，接口变化、隐私限制或风控可能影响部分内容及操作。",
         ),
@@ -25464,11 +25554,11 @@ private fun SettingsThemeColorGrid(
                 rowOptions.forEach { option ->
                     val isSelected = selected.storageValue == option.storageValue
                     val textColor = readableTextColor(option.primary)
-                    val swatchShape = RoundedCornerShape(10.dp)
+                    val swatchShape = CircleShape
                     Box(
                         modifier = Modifier
                             .width(cellWidth)
-                            .height(30.dp)
+                            .height(cellWidth)
                             .clip(swatchShape)
                             .border(
                                 width = if (isSelected) 1.5.dp else 1.dp,
@@ -25484,7 +25574,7 @@ private fun SettingsThemeColorGrid(
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = option.label,
+                            text = if (isSelected) "✓" else "",
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 2.dp),
@@ -25672,9 +25762,12 @@ private fun SettingsThemeColorCard(
                         .fillMaxWidth()
                         .padding(start = 8.dp, end = 8.dp, bottom = 12.dp),
                 ) {
-                    val gap = 4.dp
-                    val columns = 3
-                    val cellWidth = (maxWidth - gap * (columns - 1)) / columns
+                    val cellWidth = 36.dp
+                    val minimumGap = 12.dp
+                    val columns = ((maxWidth + minimumGap) / (cellWidth + minimumGap)).toInt().coerceAtLeast(1)
+                    val gap = if (columns > 1) {
+                        (maxWidth - cellWidth * columns) / (columns - 1)
+                    } else minimumGap
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         SettingsThemeColorGrid(
                             options = MorandiThemeColors,
@@ -27853,6 +27946,7 @@ private fun MineAlbumTile(
     onAnchorBoundsChanged: (Rect) -> Unit = {},
     onVideoClick: (FeedMedia, String) -> Unit,
 ) {
+    val albumVideoDetailOpener = LocalAlbumVideoDetailOpener.current
     val imageOwner = remember(image.id, image.largeUrl, relatedPosts) {
         findPostForAlbumImage(postLookup, image)
     }
@@ -27860,7 +27954,6 @@ private fun MineAlbumTile(
         image.toAlbumFeedMedia()
     }
     val playbackOwnerId = image.statusId?.takeIf { it.isNotBlank() } ?: image.id
-    val openAlbumDetail = LocalAlbumVideoDetailOpener.current
     var videoTileBounds by remember(image.id, image.largeUrl) { mutableStateOf<Rect?>(null) }
     if (albumMedia != null && image.isAlbumVideo) {
         AlbumVideoTile(
@@ -27868,7 +27961,14 @@ private fun MineAlbumTile(
             media = albumMedia,
             size = size,
             playbackOwnerId = playbackOwnerId,
-            onVideoClick = { openAlbumDetail?.invoke(albumMedia, playbackOwnerId, videoTileBounds) },
+            onVideoClick = {
+                val opener = albumVideoDetailOpener
+                if (opener != null) {
+                    opener(albumMedia, playbackOwnerId, videoTileBounds)
+                } else {
+                    onVideoClick(albumMedia, playbackOwnerId)
+                }
+            },
             onBoundsChanged = { videoTileBounds = it },
         )
     } else {
@@ -29367,6 +29467,23 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
         }
     }
     return null
+}
+
+private suspend fun loadFloatingPeekBitmap(image: FeedImage): Bitmap? = withContext(Dispatchers.IO) {
+    // A 2K decode is noticeably sharper than feed thumbnails while keeping the
+    // floating preview well below the memory cost of decoding a full 4K/8K scan.
+    for (url in fullscreenImageUrlCandidates(image)) {
+        val bitmap = runCatching {
+            loadRemoteBitmap(
+                url = url,
+                maxDecodeDim = 2048,
+                connectTimeoutMs = 5_000,
+                readTimeoutMs = 10_000,
+            )
+        }.getOrNull()
+        if (bitmap != null) return@withContext bitmap
+    }
+    null
 }
 
 private fun loadFullscreenBitmap(image: FeedImage, forceNetwork: Boolean = false): android.graphics.Bitmap? {
