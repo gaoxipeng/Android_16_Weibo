@@ -1150,28 +1150,32 @@ private const val FullscreenBitmapCacheMaxBytes = 160 * 1024 * 1024
 
 private data class MorandiThemeColor(
     val storageValue: String,
-    val label: String,
     val primary: Color,
     val primaryContainer: Color,
     val secondary: Color,
 )
 
 private val MorandiThemeColors = listOf(
-    MorandiThemeColor("wine_red", "酒红", Color(0xFFAF6060), Color(0xFFD49A9A), Color(0xFFAF6060)),
-    MorandiThemeColor("olive_green", "橄榄绿", Color(0xFF7A8A61), Color(0xFFB0B99C), Color(0xFF7A8A61)),
-    MorandiThemeColor("tea_brown", "茶棕", Color(0xFF8C6E5D), Color(0xFFB8A294), Color(0xFF8C6E5D)),
-    MorandiThemeColor("caramel", "焦糖", Color(0xFFC28866), Color(0xFFDDB89C), Color(0xFFC28866)),
-    MorandiThemeColor("mustard", "芥末黄", Color(0xFFCDA868), Color(0xFFE2C89F), Color(0xFFCDA868)),
-    MorandiThemeColor("forest_green", "墨绿", Color(0xFF597A6E), Color(0xFF94ACA2), Color(0xFF597A6E)),
-    MorandiThemeColor("gray_purple", "灰紫", Color(0xFF977C8C), Color(0xFFC0A987), Color(0xFF977C8C)),
-    MorandiThemeColor("navy", "藏蓝", Color(0xFF4F6887), Color(0xFF8A9BB3), Color(0xFF4F6887)),
-    MorandiThemeColor("brick_orange", "砖橘", Color(0xFFD1836B), Color(0xFFE5B09B), Color(0xFFD1836B)),
-    MorandiThemeColor("vivid_rose", "玫瑰红", Color(0xFFE91E63), Color(0xFFF8BBD0), Color(0xFFE91E63)),
-    MorandiThemeColor("vivid_orange", "活力橙", Color(0xFFF06414), Color(0xFFFFD5B5), Color(0xFFF06414)),
-    MorandiThemeColor("vivid_amber", "琥珀金", Color(0xFFD99400), Color(0xFFFFE7A0), Color(0xFFD99400)),
-    MorandiThemeColor("vivid_green", "翡翠绿", Color(0xFF00A86B), Color(0xFFA6E8CB), Color(0xFF00A86B)),
-    MorandiThemeColor("vivid_blue", "晴空蓝", Color(0xFF1677FF), Color(0xFFBEDAFF), Color(0xFF1677FF)),
-    MorandiThemeColor("vivid_purple", "鸢尾紫", Color(0xFF8B3DFF), Color(0xFFDFC8FF), Color(0xFF8B3DFF)),
+    MorandiThemeColor("wine_red", Color(0xFFAF6060), Color(0xFFD49A9A), Color(0xFFAF6060)),
+    MorandiThemeColor("olive_green", Color(0xFF7A8A61), Color(0xFFB0B99C), Color(0xFF7A8A61)),
+    MorandiThemeColor("tea_brown", Color(0xFF8C6E5D), Color(0xFFB8A294), Color(0xFF8C6E5D)),
+    MorandiThemeColor("caramel", Color(0xFFC28866), Color(0xFFDDB89C), Color(0xFFC28866)),
+    MorandiThemeColor("mustard", Color(0xFFCDA868), Color(0xFFE2C89F), Color(0xFFCDA868)),
+    MorandiThemeColor("forest_green", Color(0xFF597A6E), Color(0xFF94ACA2), Color(0xFF597A6E)),
+    MorandiThemeColor("gray_purple", Color(0xFF977C8C), Color(0xFFC0A987), Color(0xFF977C8C)),
+    MorandiThemeColor("navy", Color(0xFF4F6887), Color(0xFF8A9BB3), Color(0xFF4F6887)),
+    MorandiThemeColor("brick_orange", Color(0xFFD1836B), Color(0xFFE5B09B), Color(0xFFD1836B)),
+    MorandiThemeColor("gray", Color(0xFF73777F), Color(0xFFD5D7DC), Color(0xFF73777F)),
+    MorandiThemeColor("vivid_rose", Color(0xFFE91E63), Color(0xFFF8BBD0), Color(0xFFE91E63)),
+    MorandiThemeColor("vivid_orange", Color(0xFFF06414), Color(0xFFFFD5B5), Color(0xFFF06414)),
+    MorandiThemeColor("vivid_amber", Color(0xFFD99400), Color(0xFFFFE7A0), Color(0xFFD99400)),
+    MorandiThemeColor("vivid_green", Color(0xFF00A86B), Color(0xFFA6E8CB), Color(0xFF00A86B)),
+    MorandiThemeColor("vivid_blue", Color(0xFF1677FF), Color(0xFFBEDAFF), Color(0xFF1677FF)),
+    MorandiThemeColor("vivid_purple", Color(0xFF8B3DFF), Color(0xFFDFC8FF), Color(0xFF8B3DFF)),
+    MorandiThemeColor("vivid_cyan", Color(0xFF00B8D9), Color(0xFFB3F0F7), Color(0xFF00B8D9)),
+    MorandiThemeColor("vivid_lime", Color(0xFF65B800), Color(0xFFD9F2A6), Color(0xFF65B800)),
+    MorandiThemeColor("vivid_coral", Color(0xFFFF4D3D), Color(0xFFFFD1C7), Color(0xFFFF4D3D)),
+    MorandiThemeColor("vivid_magenta", Color(0xFFD500F9), Color(0xFFF2B8FF), Color(0xFFD500F9)),
 )
 
 private fun morandiThemeColorFromStorage(value: String?): MorandiThemeColor =
@@ -1197,13 +1201,7 @@ private fun detailCardSpring() = androidx.compose.animation.core.keyframes<Float
     1f at DetailTransitionDurationMs
 }
 private val DetailReturnEasing = Easing { fraction ->
-    val peak = 206f / DetailReturnDurationMs
-    if (fraction <= peak) {
-        (1f + DetailCardOvershoot) * DetailMotionEasing.transform(fraction / peak)
-    } else {
-        1f + DetailCardOvershoot *
-            (1f - FastOutSlowInEasing.transform((fraction - peak) / (1f - peak)))
-    }
+    DetailMotionEasing.transform(fraction)
 }
 private fun detailCardReturnSpec() = tween<Float>(
     durationMillis = DetailReturnDurationMs,
@@ -1463,6 +1461,8 @@ private fun <T> NavAnimatedOverlay(
     val isAnimating = !transitionState.isIdle
     val isExiting = isAnimating && !transitionState.targetState
     val zIndex = when {
+        navKind is NavOverlayKind.Detail && sourceBounds != null &&
+            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling || swipeCardReturn > 0f) -> 90f
         isExiting -> NavOverlayExitZIndex
         stackTop -> NavOverlayTopZIndex
         else -> layerBaseZIndex
@@ -1565,18 +1565,18 @@ private fun <T> NavAnimatedOverlay(
                 } else 0f
                 val width = bounds.width.coerceAtLeast(1f)
                 val height = bounds.height.coerceAtLeast(1f)
+                val cardRect = returnCardLayout.value
+                val cardInset = cardRect?.topLeft ?: Offset.Zero
                 scaleX = 1f
                 scaleY = 1f
                 // Align the actual inset card, not the whole viewport. At the end:
                 // overlayOrigin + translation + cardInset == sourceBounds.topLeft.
-                val cardInset = returnCardLayout.value?.topLeft ?: Offset.Zero
                 val targetX = bounds.left - overlayOrigin.x - cardInset.x
                 val targetY = bounds.top - overlayOrigin.y - cardInset.y
                 translationX = swipeOffset * (1f - amount) + targetX * amount
                 translationY = 24.dp.toPx() * swipeProgress * (1f - amount) + targetY * amount
                 // Move only the measured rounded card, not the surrounding page
                 // surface or navigation-bar strip. Keep the final source alignment.
-                val cardRect = returnCardLayout.value
                 val initialWidth = if (returningPage) cardRect?.width ?: size.width else size.width
                 val initialHeight = if (returningPage) cardRect?.height ?: size.height else size.height
                 val cropWidth = (initialWidth + (width - initialWidth) * amount).coerceAtLeast(1f)
@@ -4185,6 +4185,8 @@ fun WeiboApp() {
             }
     }
     var hiddenFeedCardId by remember { mutableStateOf<String?>(null) }
+    var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
+    var detailSystemBackInProgress by remember { mutableStateOf(false) }
     LaunchedEffect(feedListState, selectedItem, navExitPendingKind) {
         snapshotFlow { feedListState.isScrollInProgress }.collect { scrolling ->
             if (scrolling && selectedItem == null && navExitPendingKind == null) homeThumbnailStore.releaseSnapshot()
@@ -5043,6 +5045,7 @@ fun WeiboApp() {
         nestedDetailReturnAnimating = false
         nestedDetailReturnSnapshot = null
         navExitPendingKind = null
+        detailSystemBackInProgress = false
         flushDeferredNavRestore()
         if (selectedItem == null) {
             hiddenFeedCardId = null
@@ -7123,12 +7126,40 @@ fun WeiboApp() {
             navigateWithSource(null)
             return
         }
+        val barMaskInBitmap = if (fromFeed && bottomBarVisible) {
+            bottomBarBoundsInRoot?.let { bounds ->
+                android.graphics.RectF(
+                    bounds.left + rootInWindow[0] - crop.left,
+                    bounds.top + rootInWindow[1] - crop.top,
+                    bounds.right + rootInWindow[0] - crop.left,
+                    bounds.bottom + rootInWindow[1] - crop.top,
+                ).takeIf { it.intersect(0f, 0f, crop.width().toFloat(), crop.height().toFloat()) }
+            }
+        } else null
         detailSourceCapturePending = true
         runCatching {
             val image = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
             android.view.PixelCopy.request(window, crop, image, { result ->
-                if (result != android.view.PixelCopy.SUCCESS) image.recycle()
-                navigateWithSource(image.takeIf { result == android.view.PixelCopy.SUCCESS })
+                if (result != android.view.PixelCopy.SUCCESS) {
+                    image.recycle()
+                    navigateWithSource(null)
+                } else {
+                    barMaskInBitmap?.let { mask ->
+                        val maskPath = android.graphics.Path().apply {
+                            addRoundRect(
+                                mask,
+                                mask.height() / 2f,
+                                mask.height() / 2f,
+                                android.graphics.Path.Direction.CW,
+                            )
+                        }
+                        val clearPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                            xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+                        }
+                        android.graphics.Canvas(image).drawPath(maskPath, clearPaint)
+                    }
+                    navigateWithSource(image)
+                }
             }, android.os.Handler(android.os.Looper.getMainLooper()))
         }.onFailure { navigateWithSource(null) }
     }
@@ -7919,6 +7950,8 @@ fun WeiboApp() {
     MyWeiboScaffold { innerPadding ->
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
+        // The feed bar must never sample the detail page or its return scrim.
+        val homeContentBackdrop = rememberLayerBackdrop()
         val menuGlassBackdrop = bottomBarBackdrop
         val searchBarOverlay = remember { SearchBarOverlayController() }
         var timelineMenuExpanded by remember { mutableStateOf(false) }
@@ -8181,12 +8214,15 @@ fun WeiboApp() {
                             .fillMaxSize()
                             .background(MaterialTheme.colorScheme.background)
                             .graphicsLayer { alpha = feedVisibleAlpha }
+                            .layerBackdrop(homeContentBackdrop)
                             .blockHiddenTouches(feedUiOnTop || composeWebVisible),
                     ) {
                         key(feedResumeGeneration) {
                             CompositionLocalProvider(
                                 LocalHomeThumbnailStore provides homeThumbnailStore,
-                                LocalHiddenFeedCardId provides hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
+                                LocalHiddenFeedCardId provides hiddenFeedCardId.takeUnless {
+                                    navExitPendingKind is NavOverlayKind.Detail || detailSystemBackInProgress
+                                },
                             ) {
                             FollowFeedScreen(
                                 session = session,
@@ -8724,6 +8760,9 @@ fun WeiboApp() {
                     sourceBounds = activeDetailSourceBounds,
                     sourceImage = activeDetailSourceImage,
                     onSwipeReturnCommit = {
+                        // Keep the home backdrop fully populated for the whole
+                        // return. The source screenshot covers the card itself,
+                        // while the real bar remains above it in the home layer.
                         hiddenFeedCardId = null
                         val previous = navStack.lastOrNull()
                         if (previous != null) bottomBarVisible = previous.bottomBarVisible
@@ -8732,6 +8771,9 @@ fun WeiboApp() {
                             (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search)
                     },
                     onSwipeBack = {
+                        // Reveal the source only once the moving detail has finished
+                        // and its host sets swipeCommitted, hiding the outgoing pixels.
+                        hiddenFeedCardId = null
                         closeDetail()
                         detailSwipeReturningHome = false
                         // The gesture already finished the card's return. Restore
@@ -8756,7 +8798,10 @@ fun WeiboApp() {
                     // outgoing subtree as soon as the parent snapshot is restored.
                     key(detailItem.id) {
                         var systemBackStarted by remember { mutableStateOf(false) }
-                        LaunchedEffect(activeDetailInstanceKey) { systemBackStarted = false }
+                        LaunchedEffect(activeDetailInstanceKey) {
+                            systemBackStarted = false
+                            detailSystemBackInProgress = false
+                        }
                         val detailListState = detailOuterListStates.getOrPut(detailItem.id) {
                             LazyListState(detailSnapshot.scrollIndex, detailSnapshot.scrollOffset)
                         }
@@ -8816,11 +8861,16 @@ fun WeiboApp() {
                             enabled = detailOverlayVisible && detailIsActive,
                         ) { events ->
                             try {
-                                events.collect { systemBackStarted = true }
+                                events.collect {
+                                    systemBackStarted = true
+                                    detailSystemBackInProgress = true
+                                }
                                 systemBackStarted = true
+                                detailSystemBackInProgress = true
                                 closeDetail()
                             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                 systemBackStarted = false
+                                detailSystemBackInProgress = false
                                 throw cancelled
                             }
                         }
@@ -9142,10 +9192,11 @@ fun WeiboApp() {
             ) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
-                    backdrop = bottomBarBackdrop,
+                    backdrop = if (selectedTab == MainTab.Feed) homeContentBackdrop else bottomBarBackdrop,
                     frostAmount = bottomBarFrostAmount,
                     glassAmount = bottomBarGlassAmount,
                     timelineMenuExpanded = timelineMenuExpanded,
+                    onBarBoundsChanged = { bottomBarBoundsInRoot = it },
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
                     selectedTimelineKind = timelineKind,
                     selectedTimelineLabel = timelineGroups.firstOrNull { it.id == selectedTimelineGroupId }?.name,
@@ -18935,9 +18986,15 @@ private fun DetailScreen(
                 val target = sharedCardBounds
                 if (sharedCardMotion != null && target != null) {
                     alpha = 1f - sharedCardMotion.sourceHandoff
-                    val remaining = 1f - sharedCardMotion.progress.coerceIn(-0.05f, 1.05f)
-                    translationX = (sharedCardMotion.source.left - target.left) * remaining
-                    translationY = (sharedCardMotion.source.top - target.top) * remaining
+                    val progress = sharedCardMotion.progress.coerceIn(-0.05f, 1.05f)
+                    val remaining = 1f - progress
+                    val deltaX = sharedCardMotion.source.left - target.left
+                    val deltaY = sharedCardMotion.source.top - target.top
+                    // Travel depends on source position; the rebound must not.
+                    // Convert overshoot to a fixed physical distance on each axis.
+                    val rebound = 120.dp.toPx() * remaining
+                    translationX = if (progress > 1f) kotlin.math.sign(deltaX) * rebound else deltaX * remaining
+                    translationY = if (progress > 1f) kotlin.math.sign(deltaY) * rebound else deltaY * remaining
                 }
                 else if (sharedCardMotion != null) alpha = 1f - sharedCardMotion.sourceHandoff
             },
@@ -24666,7 +24723,7 @@ private val appHelpSections = listOf(
         title = "底部导航与首页",
         items = listOf(
             "底部依次为信息流、消息、搜索、写微博、我的。",
-            "长按第一个小房子图标，可切换「最新微博、好友圈、我的收藏、我的赞」，下方文字显示当前选择。",
+            "长按第一个小房子图标，可切换「最新微博、好友圈、我的收藏、我的赞、热门、同城」或自定义分组；下方文字显示当前选择。",
             "下拉刷新当前信息流，接近列表末尾时自动加载更多；刷新成功会显示更新条数提示。",
             "「自动隐藏底栏」开启时，上滑隐藏、下滑显示；关闭后滚动时保持显示。进入设置和编辑等页面时底栏会隐藏。",
             "首页连续按两次返回可退出应用。",
@@ -24750,7 +24807,7 @@ private val appHelpSections = listOf(
             "表情同步可更新本地表情；图片清晰度可选省流、标准、高清，主要影响缩略图。",
             "行距与字号可调整正文阅读效果；深色模式支持浅色、深色和跟随系统。",
             "在「我的 → 设置 → 主题颜色」选择配色，立即应用并自动保存，作用于导航、按钮和强调文字。",
-            "主题颜色保留九种柔和配色，新增玫瑰红、活力橙、琥珀金、翡翠绿、晴空蓝、鸢尾紫六种鲜艳配色；深色模式可单独设置。",
+            "主题颜色提供九种柔和配色、一种灰色和十种鲜艳配色，新增亮青、亮绿、珊瑚红和洋红；深色模式可单独设置。",
             "内容加载失败可先下拉重试，登录失效则重新登录。删除本地账号不等于注销微博账号。",
             "本应用为非官方客户端，接口变化、隐私限制或风控可能影响部分内容及操作。",
         ),
@@ -24917,13 +24974,6 @@ private fun SettingsHelpContent() {
         ),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item {
-            Text(
-                text = "本页汇总了当前版本的主要交互方式。部分功能依赖微博网页接口，若官方调整页面，个别入口可能失效。",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
         appHelpSections.forEach { section ->
             item {
                 SettingsHelpSectionCard(section = section)
@@ -25787,12 +25837,6 @@ private fun SettingsThemeColorCard(
                                         .size(8.dp)
                                         .clip(CircleShape)
                                         .background(selected.primary),
-                                )
-                                Text(
-                                    text = selected.label,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1,
                                 )
                             }
                         }

@@ -17,6 +17,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.TransformOrigin
@@ -26,6 +27,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import com.example.myweibo.R
@@ -55,6 +58,7 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuWidth: Dp = 152.dp,
     timelineMenuHeight: Dp = 89.dp,
     timelineMenuGap: Dp = 4.dp,
+    onBarBoundsChanged: ((Rect) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
@@ -92,7 +96,9 @@ internal fun WeiboLiquidBottomBar(
                 gestureController = tabsGestureController,
                 feedTabIndex = feedIndex,
                 onTabLongPress = { onTimelineMenuExpandedChange(true) },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().onGloballyPositioned {
+                    onBarBoundsChanged?.invoke(it.boundsInRoot())
+                },
             ) {
                 val tabCoverage = LocalLiquidBottomTabCoverage.current
                 val pressProgress = LocalLiquidBottomTabPressProgress.current
