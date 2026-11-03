@@ -1512,6 +1512,16 @@ private fun <T> NavAnimatedOverlay(
             Box(Modifier.fillMaxSize()) { content(parent) }
         }
     }
+    // Use the same background as the full detail page, including while a
+    // cancelled gesture settles to zero. The opaque endpoints then match.
+    if (overlayVisible && navKind is NavOverlayKind.Detail &&
+        (swipeOffset > 0f || swipeSettling) && !swipeCommitted) {
+        val scrimAlpha = (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f) *
+            (1f - swipeCardReturn).coerceIn(0f, 1f)
+        Box(Modifier.fillMaxSize().background(
+            MaterialTheme.colorScheme.background.copy(alpha = scrimAlpha),
+        ))
+    }
     AnimatedVisibility(
         visibleState = transitionState,
         modifier = Modifier.fillMaxSize().then(swipeModifier),
@@ -5911,7 +5921,7 @@ fun WeiboApp() {
                     if (page.items.isEmpty()) {
                         feedRefreshHint = null
                         showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
-                    } else {
+                    } else if (selectedItem == null && navOverlayStack.isEmpty()) {
                         feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                     }
                 }
@@ -7068,6 +7078,17 @@ fun WeiboApp() {
     }
 
     fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null, section: DetailContentSection? = null) {
+        if (feedRefreshHint != null) {
+            feedRefreshHint = null
+            feedRefreshHintGeneration += 1
+            scope.launch {
+                // PixelCopy must capture the feed only after the capsule is gone.
+                withFrameNanos { }
+                withFrameNanos { }
+                openDetailFromSource(item, sourceBounds, hostItem, section)
+            }
+            return
+        }
         if (detailSourceCapturePending) return
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
         fun navigateWithSource(image: Bitmap?) {
@@ -9035,6 +9056,7 @@ fun WeiboApp() {
                     )
                 }
             }
+            key(feedRefreshHintGeneration) {
             AnimatedVisibility(
                 visible = capsuleHintState != null,
                 enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
@@ -9059,6 +9081,7 @@ fun WeiboApp() {
                 }
             }
             // A nested detail pop returns to another detail; it must not expose the
+            }
             // main navigation bar during that in-layer transition.
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
             val topicSearchForeground = selectedTab == MainTab.Search &&
@@ -14946,6 +14969,23 @@ private fun AlbumImageStatusCaption(
                 ),
             )
             .navigationBarsPadding()
+            .pointerInput(statusItem, onClick) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    down.consume()
+                    var released = false
+                    var moved = false
+                    do {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        event.changes.forEach { change ->
+                            if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) moved = true
+                            if (!change.pressed) released = true
+                            change.consume()
+                        }
+                    } while (!released)
+                    if (!moved && statusItem != null) onClick()
+                }
+            }
             .clickable(
                 enabled = statusItem != null,
                 onClick = onClick,
