@@ -1191,15 +1191,15 @@ private const val RemoteBytesAnimatedMaxRead = 64 * 1024 * 1024
 private const val RemoteDiskBytesCacheMaxTotal = 256 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
 private const val DetailTransitionDurationMs = 250
+private const val DetailEntryDurationMs = 200
 private const val DetailReturnDurationMs = DetailTransitionDurationMs
 // Reach most of the travel early, leaving a gentler, longer deceleration tail.
 private val DetailMotionEasing = CubicBezierEasing(0.20f, 0.68f, 0.30f, 1f)
-private fun detailCardSpring() = androidx.compose.animation.core.keyframes<Float> {
-    durationMillis = DetailTransitionDurationMs
-    0f at 0 using DetailMotionEasing
-    (1f + DetailCardOvershoot) at 206 using FastOutSlowInEasing
-    1f at DetailTransitionDurationMs
-}
+private val DetailEntryEasing = DetailMotionEasing
+private fun detailCardEntrySpec() = tween<Float>(
+    durationMillis = DetailEntryDurationMs,
+    easing = DetailEntryEasing,
+)
 private val DetailReturnEasing = Easing { fraction ->
     DetailMotionEasing.transform(fraction)
 }
@@ -1243,10 +1243,12 @@ private fun <T> NavAnimatedOverlay(
     sourceReturnZIndex: Float? = null,
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
+    sourceReturnImage: Bitmap? = sourceImage,
     returnBackground: Bitmap? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
+    onSourceCardHandoffReady: () -> Unit = {},
     onClearPendingEnter: () -> Unit = {},
     onClearPendingExit: () -> Unit = {},
     enter: EnterTransition = navStackEnterTransition(),
@@ -1259,6 +1261,7 @@ private fun <T> NavAnimatedOverlay(
     val pageBack = onSwipeBack ?: LocalPageSwipeBack.current
     val latestPageBack by rememberUpdatedState(pageBack)
     val latestSwipeReturnCommit by rememberUpdatedState(onSwipeReturnCommit)
+    val latestSourceCardHandoffReady by rememberUpdatedState(onSourceCardHandoffReady)
     val swipeScope = rememberCoroutineScope()
     // A returning profile leaves gesture values in this retained host.
     // Reset during composition, not in LaunchedEffect after its first draw.
@@ -1267,6 +1270,9 @@ private fun <T> NavAnimatedOverlay(
     var swipeSettling by remember(profileGestureIdentity) { mutableStateOf(false) }
     var swipeCommitted by remember(profileGestureIdentity) { mutableStateOf(false) }
     var swipeCardReturn by remember(profileGestureIdentity) { mutableFloatStateOf(0f) }
+    val sourceHandoffBitmap = remember(sourceReturnImage) {
+        sourceReturnImage?.takeUnless { it.isRecycled }?.asImageBitmap()
+    }
     var overlayWidth by remember { mutableIntStateOf(1) }
     var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
     val returnCardLayout = remember(animationKey) { mutableStateOf<Rect?>(null) }
@@ -1281,6 +1287,7 @@ private fun <T> NavAnimatedOverlay(
     // 栈内仍挂载（target != null）但被上层盖住时，保持组合树不销毁，避免 LazyList 滚动位置丢失。
     val avVisible = target != null || overlayVisible
     val transitionIdentity = animationKey ?: target
+    var detailExitHandoffHold by remember(transitionIdentity) { mutableStateOf(false) }
     var entrySnapshotProgress by remember(transitionIdentity) { mutableFloatStateOf(0f) }
     val nestedCardEntry = remember(transitionIdentity) {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
@@ -1289,7 +1296,7 @@ private fun <T> NavAnimatedOverlay(
     }
     val nestedCardProgress = remember(transitionIdentity) { Animatable(if (nestedCardEntry) 0f else 1f) }
     LaunchedEffect(transitionIdentity) {
-        if (nestedCardEntry) nestedCardProgress.animateTo(1f, detailCardSpring())
+        if (nestedCardEntry) nestedCardProgress.animateTo(1f, detailCardEntrySpec())
     }
     LaunchedEffect(transitionIdentity, navKind, avVisible) {
         if (target == null) return@LaunchedEffect
@@ -1356,6 +1363,14 @@ private fun <T> NavAnimatedOverlay(
                         // replaces it in the same frame. Fading over a blank source
                         // makes it wash out to white and then snap back to full color.
                         swipeCardReturn = 1f
+                        if (navKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating) {
+                            // Let the real home card refresh its backdrop while the
+                            // captured card still fully covers it. This keeps the
+                            // bottom bar's glass source current when the overlay exits.
+                            latestSourceCardHandoffReady()
+                            withFrameNanos { }
+                            withFrameNanos { }
+                        }
                     } else if (!commit) {
                         val startOffset = swipeOffset
                         animate(0f, 1f, animationSpec = tween(180, easing = FastOutSlowInEasing)) { value, _ ->
@@ -1412,7 +1427,7 @@ private fun <T> NavAnimatedOverlay(
     val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
         if (immediateEnter || sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
         else if (wantsEnterAnimation && navKind is NavOverlayKind.Detail) slideInHorizontally(
-            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
+            animationSpec = tween(DetailEntryDurationMs, easing = DetailEntryEasing),
             initialOffsetX = { it },
         )
         else if (wantsEnterAnimation) enter else EnterTransition.None
@@ -1499,7 +1514,7 @@ private fun <T> NavAnimatedOverlay(
     }
     // Keep pixels/input only while a page is visible or actually animating.
     // `displayed` may outlive the visual exit for deferred navigation cleanup.
-    if (avVisible || transitionState.currentState || !transitionState.isIdle) {
+    if (avVisible || transitionState.currentState || !transitionState.isIdle || detailExitHandoffHold) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned {
             overlayOrigin = it.boundsInRoot().topLeft
@@ -1534,14 +1549,14 @@ private fun <T> NavAnimatedOverlay(
         val revealProgress by transition.animateFloat(
             transitionSpec = {
                 if (targetState == androidx.compose.animation.EnterExitState.PostExit) detailCardReturnSpec()
-                else detailCardSpring()
+                else detailCardEntrySpec()
             },
             label = "card-detail-reveal",
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
         val pageReveal = if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
         SideEffect { entrySnapshotProgress = pageReveal }
         val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling
-        val returnSnapshot = remember(sourceImage) { sourceImage?.asImageBitmap() }
+        val returnSnapshot = remember(sourceReturnImage) { sourceReturnImage?.asImageBitmap() }
         // The original feed card is hidden as navigation starts. Keep its
         // captured pixels in place until the detail card is laid out, then hand
         // off only the opening moments of the existing card motion.
@@ -1644,10 +1659,10 @@ private fun <T> NavAnimatedOverlay(
                         transitionIdentity != previousDetailIdentity
                     ) {
                         slideInHorizontally(
-                            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
+                            animationSpec = tween(DetailEntryDurationMs, easing = DetailEntryEasing),
                             initialOffsetX = { fullWidth -> fullWidth },
                         ) togetherWith slideOutHorizontally(
-                            animationSpec = tween(DetailTransitionDurationMs, easing = DetailMotionEasing),
+                            animationSpec = tween(DetailEntryDurationMs, easing = DetailEntryEasing),
                             targetOffsetX = { fullWidth -> -fullWidth },
                         )
                     } else {
@@ -1663,6 +1678,23 @@ private fun <T> NavAnimatedOverlay(
             displayed?.let { item -> content(item) }
         }
         }
+        }
+    }
+    if (detailExitHandoffHold && navKind is NavOverlayKind.Detail &&
+        sourceBounds != null && sourceHandoffBitmap != null
+    ) {
+        Canvas(Modifier.matchParentSize()) {
+            drawImage(
+                sourceHandoffBitmap,
+                dstOffset = IntOffset(
+                    (sourceBounds.left - overlayOrigin.x).roundToInt(),
+                    (sourceBounds.top - overlayOrigin.y).roundToInt(),
+                ),
+                dstSize = IntSize(
+                    sourceBounds.width.roundToInt().coerceAtLeast(1),
+                    sourceBounds.height.roundToInt().coerceAtLeast(1),
+                ),
+            )
         }
     }
     if (navKind is NavOverlayKind.Detail && overlayVisible &&
@@ -1686,6 +1718,18 @@ private fun <T> NavAnimatedOverlay(
             if (!transitionState.isIdle || transitionState.targetState) return@LaunchedEffect
             if (effectiveExitHoldMillis > 0L) {
                 delay(effectiveExitHoldMillis)
+            }
+            if (navKind is NavOverlayKind.Detail && sourceBounds != null && sourceReturnImage != null &&
+                pendingExitKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
+            ) {
+                // The return card has reached its source and now uses the captured
+                // source pixels. Reveal the live card beneath it for one rendered
+                // frame so the feed backdrop is ready before the bar is uncovered.
+                detailExitHandoffHold = true
+                latestSourceCardHandoffReady()
+                withFrameNanos { }
+                withFrameNanos { }
+                detailExitHandoffHold = false
             }
             displayed = null
             detailContentByIdentity.clear()
@@ -2311,6 +2355,7 @@ private data class DetailSnapshot(
     val instanceKey: Int = 0,
     val sourceBounds: Rect? = null,
     val sourceImage: Bitmap? = null,
+    val sourceReturnImage: Bitmap? = sourceImage,
 )
 
 private data class RetainedLikeUsersState(
@@ -4173,9 +4218,12 @@ fun WeiboApp() {
     var activeDetailInstanceKey by remember { mutableIntStateOf(0) }
     var activeDetailSourceBounds by remember { mutableStateOf<Rect?>(null) }
     var activeDetailSourceImage by remember { mutableStateOf<Bitmap?>(null) }
+    var activeDetailSourceReturnImage by remember { mutableStateOf<Bitmap?>(null) }
     var detailSourceCapturePending by remember { mutableStateOf(false) }
     var returningHomeDirectly by remember { mutableStateOf(false) }
     var detailSwipeReturningHome by remember { mutableStateOf(false) }
+    var feedBackdropFrozenForDetail by remember { mutableStateOf(false) }
+    val homeContentBackdrop = rememberLayerBackdrop()
     var preservedFeedSourceItem by remember { mutableStateOf<FeedItem?>(null) }
     LaunchedEffect(feedListState) {
         snapshotFlow { feedListState.layoutInfo.visibleItemsInfo.map { it.key } }
@@ -4188,6 +4236,7 @@ fun WeiboApp() {
     }
     var hiddenFeedCardId by remember { mutableStateOf<String?>(null) }
     var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
+    var activeDetailBottomBarImage by remember { mutableStateOf<Bitmap?>(null) }
     var detailSystemBackInProgress by remember { mutableStateOf(false) }
     LaunchedEffect(feedListState, selectedItem, navExitPendingKind) {
         snapshotFlow { feedListState.isScrollInProgress }.collect { scrolling ->
@@ -4781,6 +4830,7 @@ fun WeiboApp() {
             instanceKey = activeDetailInstanceKey,
             sourceBounds = activeDetailSourceBounds,
             sourceImage = activeDetailSourceImage,
+            sourceReturnImage = activeDetailSourceReturnImage ?: activeDetailSourceImage,
         )
     }
 
@@ -4833,6 +4883,7 @@ fun WeiboApp() {
         }
         activeDetailSourceBounds = snapshot.sourceBounds
         activeDetailSourceImage = snapshot.sourceImage
+        activeDetailSourceReturnImage = snapshot.sourceReturnImage
         val retainedOuterState = detailOuterListStates[snapshot.item.id]
         if (retainedOuterState == null) {
             lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
@@ -5052,7 +5103,10 @@ fun WeiboApp() {
         if (selectedItem == null) {
             hiddenFeedCardId = null
             activeDetailSourceImage = null
+            activeDetailSourceReturnImage = null
             activeDetailSourceBounds = null
+            homeContentBackdrop.isFrozen = false
+            feedBackdropFrozenForDetail = false
         }
     }
 
@@ -6966,6 +7020,7 @@ fun WeiboApp() {
         retainedLikeUsersByStatus.remove(resolved.id)
         activeDetailSourceBounds = null
         activeDetailSourceImage = null
+        activeDetailSourceReturnImage = null
         prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
         activeDetailInstanceKey += 1
@@ -7066,18 +7121,21 @@ fun WeiboApp() {
 
     fun openAlbumVideoDetail(media: FeedMedia, statusId: String, sourceBounds: Rect?) {
         scope.launch {
-            // Album endpoints often return an expired/low-quality stream URL. Re-fetch
-            // the owning status before creating the fullscreen player, then play the
-            // matching refreshed media directly (without detouring through the post).
-            val freshMedia = runCatching {
-                session.loadStatusDetail(statusId)
-                    ?.let { detail ->
-                        MediaUrlResolver.pickRefreshedMedia(media, detail)
-                            ?: detail.medias.firstOrNull { it.type == media.type && it.isStreamPlayable() }
-                    }
-            }.getOrNull()
-            val playableMedia = freshMedia ?: media
-            pushMediaPreview(playableMedia, statusId)
+            val cachedPost = (visitedPosts + minePosts).firstOrNull {
+                it.id == statusId || it.statusId == statusId
+            }
+            val post = cachedPost ?: runCatching { session.loadStatusDetail(statusId) }.getOrNull()
+            if (post == null) {
+                showMessage("无法打开微博", "未能获取这条视频对应的微博。")
+                return@launch
+            }
+            val mediaForPost = MediaUrlResolver.pickRefreshedMedia(media, post)
+                ?: post.medias.firstOrNull { it.type == media.type && it.isStreamPlayable() }
+                ?: media
+            openDetail(post)
+            videoPlaybackCoordinator.requestInlinePlayback(
+                videoPlaybackKey(mediaForPost, post.statusId.ifBlank { post.id }),
+            )
         }
     }
 
@@ -7095,12 +7153,23 @@ fun WeiboApp() {
         }
         if (detailSourceCapturePending) return
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
-        fun navigateWithSource(image: Bitmap?) {
+        fun navigateWithSource(
+            image: Bitmap?,
+            returnImage: Bitmap? = image,
+            bottomBarImage: Bitmap? = null,
+        ) {
             detailSourceCapturePending = false
-            if (fromFeed && sourceBounds != null) {
+            if (sourceBounds != null && selectedItem == null) {
                 hiddenFeedCardId = item.id
-                preservedFeedSourceItem = hostItem ?: item
+                if (fromFeed) preservedFeedSourceItem = hostItem ?: item
             }
+            if (fromFeed && sourceBounds != null) {
+                // Preserve the already-painted home feed as the bottom bar's glass
+                // source until the return layer has completely handed off.
+                homeContentBackdrop.isFrozen = true
+                feedBackdropFrozenForDetail = true
+            }
+            activeDetailBottomBarImage = bottomBarImage
             if (sourceBounds != null && selectedItem == null &&
                 selectedTab == MainTab.Search && visitedUserId == null) {
                 hiddenFeedCardId = item.id
@@ -7108,6 +7177,7 @@ fun WeiboApp() {
             openDetailInternal(item, hostItem, section = section)
             activeDetailSourceBounds = sourceBounds
             activeDetailSourceImage = image
+            activeDetailSourceReturnImage = returnImage
         }
         val window = (context as? android.app.Activity)?.window
         if (window == null || sourceBounds == null) {
@@ -7127,6 +7197,20 @@ fun WeiboApp() {
             navigateWithSource(null)
             return
         }
+        val barBoundsToCapture = bottomBarBoundsInRoot?.takeIf { bounds ->
+            fromFeed && bottomBarVisible &&
+                sourceBounds.left < bounds.right && sourceBounds.right > bounds.left &&
+                sourceBounds.top < bounds.bottom && sourceBounds.bottom > bounds.top
+        }
+        val barCrop = barBoundsToCapture?.let { bounds ->
+            android.graphics.Rect(
+                (bounds.left + rootInWindow[0]).roundToInt(),
+                (bounds.top + rootInWindow[1]).roundToInt(),
+                (bounds.right + rootInWindow[0]).roundToInt(),
+                (bounds.bottom + rootInWindow[1]).roundToInt(),
+            ).takeIf { it.intersect(0, 0, decor.width, decor.height) && !it.isEmpty }
+        }
+        val captureRect = android.graphics.Rect(crop).apply { barCrop?.let(::union) }
         val barMaskInBitmap = if (fromFeed && bottomBarVisible) {
             bottomBarBoundsInRoot?.let { bounds ->
                 android.graphics.RectF(
@@ -7139,12 +7223,70 @@ fun WeiboApp() {
         } else null
         detailSourceCapturePending = true
         runCatching {
-            val image = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
-            android.view.PixelCopy.request(window, crop, image, { result ->
+            val frame = Bitmap.createBitmap(captureRect.width(), captureRect.height(), Bitmap.Config.ARGB_8888)
+            android.view.PixelCopy.request(window, captureRect, frame, { result ->
                 if (result != android.view.PixelCopy.SUCCESS) {
-                    image.recycle()
+                    frame.recycle()
                     navigateWithSource(null)
                 } else {
+                    val image = Bitmap.createBitmap(
+                        frame,
+                        crop.left - captureRect.left,
+                        crop.top - captureRect.top,
+                        crop.width(),
+                        crop.height(),
+                    )
+                    val bottomBarImage = barCrop?.let {
+                        val capturedBar = Bitmap.createBitmap(
+                            frame,
+                            it.left - captureRect.left,
+                            it.top - captureRect.top,
+                            it.width(),
+                            it.height(),
+                        )
+                        Bitmap.createBitmap(capturedBar.width, capturedBar.height, Bitmap.Config.ARGB_8888).also { clippedBar ->
+                            val roundedShape = android.graphics.Path().apply {
+                                addRoundRect(
+                                    android.graphics.RectF(
+                                        0f,
+                                        0f,
+                                        clippedBar.width.toFloat(),
+                                        clippedBar.height.toFloat(),
+                                    ),
+                                    clippedBar.height / 2f,
+                                    clippedBar.height / 2f,
+                                    android.graphics.Path.Direction.CW,
+                                )
+                            }
+                            android.graphics.Canvas(clippedBar).apply {
+                                save()
+                                clipPath(roundedShape)
+                                drawBitmap(capturedBar, 0f, 0f, null)
+                                restore()
+                            }
+                            if (capturedBar !== frame && !capturedBar.isRecycled) capturedBar.recycle()
+                        }
+                    }
+                    val returnImage = image.copy(Bitmap.Config.ARGB_8888, true) ?: image
+                    frame.recycle()
+                    if (returnImage !== image) {
+                        barMaskInBitmap?.let { mask ->
+                            // The return bitmap moves with the card. Remove the
+                            // captured bar and its large soft shadow from that
+                            // moving layer; the stationary live bar supplies both.
+                            val shadowRadius = 48f * context.resources.displayMetrics.density
+                            val movingBarAndShadow = android.graphics.RectF(mask).apply {
+                                inset(-shadowRadius, -shadowRadius)
+                                intersect(0f, 0f, returnImage.width.toFloat(), returnImage.height.toFloat())
+                            }
+                            if (!movingBarAndShadow.isEmpty) {
+                                val clearPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                                    xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+                                }
+                                android.graphics.Canvas(returnImage).drawRect(movingBarAndShadow, clearPaint)
+                            }
+                        }
+                    }
                     barMaskInBitmap?.let { mask ->
                         val maskPath = android.graphics.Path().apply {
                             addRoundRect(
@@ -7159,7 +7301,7 @@ fun WeiboApp() {
                         }
                         android.graphics.Canvas(image).drawPath(maskPath, clearPaint)
                     }
-                    navigateWithSource(image)
+                    navigateWithSource(image, returnImage, bottomBarImage)
                 }
             }, android.os.Handler(android.os.Looper.getMainLooper()))
         }.onFailure { navigateWithSource(null) }
@@ -7191,6 +7333,7 @@ fun WeiboApp() {
             albumViewerState = null
             activeDetailSourceBounds = null
             activeDetailSourceImage = null
+            activeDetailSourceReturnImage = null
             activeDetailInstanceKey += 1
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
@@ -7952,7 +8095,7 @@ fun WeiboApp() {
         val hazeState = rememberHazeState()
         val bottomBarBackdrop = rememberLayerBackdrop()
         // The feed bar must never sample the detail page or its return scrim.
-        val homeContentBackdrop = rememberLayerBackdrop()
+        SideEffect { homeContentBackdrop.isFrozen = feedBackdropFrozenForDetail }
         val menuGlassBackdrop = bottomBarBackdrop
         val searchBarOverlay = remember { SearchBarOverlayController() }
         var timelineMenuExpanded by remember { mutableStateOf(false) }
@@ -8228,9 +8371,7 @@ fun WeiboApp() {
                         key(feedResumeGeneration) {
                             CompositionLocalProvider(
                                 LocalHomeThumbnailStore provides homeThumbnailStore,
-                                LocalHiddenFeedCardId provides hiddenFeedCardId.takeUnless {
-                                    navExitPendingKind is NavOverlayKind.Detail || detailSystemBackInProgress
-                                },
+                                LocalHiddenFeedCardId provides hiddenFeedCardId,
                             ) {
                             FollowFeedScreen(
                                 session = session,
@@ -8358,7 +8499,7 @@ fun WeiboApp() {
                                 else captureSearchBackground(ready)
                             },
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
-                            hiddenSourceCardId = hiddenFeedCardId.takeUnless { navExitPendingKind is NavOverlayKind.Detail },
+                            hiddenSourceCardId = hiddenFeedCardId,
                             onMediaClick = ::pushMediaPreview,
                             onUserClick = ::openUser,
                             resolveFeedItem = ::resolveFeedItem,
@@ -8770,20 +8911,19 @@ fun WeiboApp() {
                     sourceBounds = activeDetailSourceBounds,
                     sourceImage = activeDetailSourceImage,
                     onSwipeReturnCommit = {
-                        // Keep the home backdrop fully populated for the whole
-                        // return. The source screenshot covers the card itself,
-                        // while the real bar remains above it in the home layer.
-                        hiddenFeedCardId = null
+                        // Keep the real source card hidden until the return motion
+                        // completes; the detail snapshot supplies its pixels during
+                        // the handoff, avoiding a second copy appearing underneath.
                         val previous = navStack.lastOrNull()
                         if (previous != null) bottomBarVisible = previous.bottomBarVisible
                         detailSwipeReturningHome = previous != null && previous.detail == null &&
                             previous.visitedProfile == null &&
                             (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search)
                     },
-                    onSwipeBack = {
-                        // Reveal the source only once the moving detail has finished
-                        // and its host sets swipeCommitted, hiding the outgoing pixels.
+                    onSourceCardHandoffReady = {
                         hiddenFeedCardId = null
+                    },
+                    onSwipeBack = {
                         closeDetail()
                         detailSwipeReturningHome = false
                         // The gesture already finished the card's return. Restore
@@ -9153,6 +9293,32 @@ fun WeiboApp() {
             val bottomBarNavVisible = !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
                 ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
                     (selectedItem == null || detailExiting || detailSwipeReturningHome)))
+            val bottomBarRequestedVisible = bottomBarNavVisible && bottomBarVisible
+            val bottomBarSlideProgress by animateFloatAsState(
+                targetValue = if (bottomBarRequestedVisible) 1f else 0f,
+                animationSpec = tween(160, easing = FastOutSlowInEasing),
+                label = "bottom-bar-visibility-slide",
+            )
+            val detailPageTransitionActive = detailLayerActive || detailExiting || detailSwipeReturningHome
+            val showDetailBottomBarSnapshot = activeDetailBottomBarImage != null && detailPageTransitionActive
+            val detailBottomBarSnapshotAlpha by animateFloatAsState(
+                targetValue = if (showDetailBottomBarSnapshot) 1f else 0f,
+                animationSpec = tween(if (showDetailBottomBarSnapshot) 0 else 180),
+                label = "detail-return-bottom-bar-snapshot",
+            )
+            LaunchedEffect(activeDetailBottomBarImage, showDetailBottomBarSnapshot) {
+                val snapshot = activeDetailBottomBarImage ?: return@LaunchedEffect
+                if (showDetailBottomBarSnapshot) return@LaunchedEffect
+                delay(220)
+                if (activeDetailBottomBarImage === snapshot && !detailPageTransitionActive) {
+                    activeDetailBottomBarImage = null
+                    withFrameNanos { }
+                    if (!snapshot.isRecycled) snapshot.recycle()
+                }
+            }
+            val detailBottomBarImageBitmap = remember(activeDetailBottomBarImage) {
+                activeDetailBottomBarImage?.takeUnless { it.isRecycled }?.asImageBitmap()
+            }
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
                     withFrameNanos { }
@@ -9188,14 +9354,18 @@ fun WeiboApp() {
             val timelineMenuDividerColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.12f)
             else Color.White.copy(alpha = 0.18f)
             AnimatedVisibility(
-                visible = bottomBarNavVisible && bottomBarVisible,
+                // Keep the glass node composed behind detail. Recreating drawBackdrop
+                // at return starts with an empty capture and flashes transparent before
+                // its first frame samples the restored home page.
+                visible = bottomBarRequestedVisible || detailLayerActive,
                 enter = slideInVertically(tween(160)) { it },
                 exit = if (profileLayerActive) ExitTransition.None else slideOutVertically(tween(160)) { it },
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .graphicsLayer {
+                        translationY = size.height * (1f - bottomBarSlideProgress)
                         if (profileLayerActive && navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true) {
-                            translationY = size.height * (1f - profileEnterOffset.value)
+                            translationY += size.height * (1f - profileEnterOffset.value)
                         }
                     }
                     .zIndex(91f),
@@ -9205,6 +9375,8 @@ fun WeiboApp() {
                     backdrop = if (selectedTab == MainTab.Feed) homeContentBackdrop else bottomBarBackdrop,
                     frostAmount = bottomBarFrostAmount,
                     glassAmount = bottomBarGlassAmount,
+                    backdropSnapshot = detailBottomBarImageBitmap,
+                    backdropSnapshotAlpha = detailBottomBarSnapshotAlpha,
                     timelineMenuExpanded = timelineMenuExpanded,
                     onBarBoundsChanged = { bottomBarBoundsInRoot = it },
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
@@ -10825,7 +10997,7 @@ private fun FeedCard(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = FeedCardContentHorizontalPadding),
+                    .padding(start = FeedCardContentHorizontalPadding),
                     verticalAlignment = Alignment.Top,
                 ) {
                     Box(
@@ -10849,6 +11021,7 @@ private fun FeedCard(
                         FeedCardActionMenu(
                             item = item,
                             backHandlerEnabled = menuBackEnabled,
+                            arrowOffsetX = (-5).dp,
                         )
                     }
                 }
@@ -11497,7 +11670,8 @@ private fun FeedItem.actionMenuKey(): String = statusId.ifBlank { id }
 private fun FeedCardActionMenu(
     item: FeedItem,
     backHandlerEnabled: Boolean = true,
-    buttonSize: Dp = 48.dp,
+    buttonSize: Dp = 32.dp,
+    arrowOffsetX: Dp = 7.dp,
 ) {
     val controller = LocalFeedCardActionMenuController.current
     val menuKey = item.actionMenuKey()
@@ -11536,7 +11710,7 @@ private fun FeedCardActionMenu(
             contentAlignment = Alignment.Center,
         ) {
             SettingsExpandIndicator(
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(DownArrowSize).offset(x = arrowOffsetX, y = (-7).dp),
                 tint = weiboMetaTextColor(),
             )
         }
@@ -11586,7 +11760,7 @@ private fun DetailFeedCardActionMenu(
             contentAlignment = Alignment.Center,
         ) {
             SettingsExpandIndicator(
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(DownArrowSize).offset(x = 7.dp, y = (-7).dp),
                 tint = weiboMetaTextColor(),
             )
         }
@@ -11610,7 +11784,7 @@ private fun DetailFeedCardActionMenu(
                 (if (canDelete) ActionMenuFourRowHeight else ActionMenuThreeRowHeight).toPx()
             },
             marginPx = with(density) { 14.dp.toPx() },
-            gapPx = with(density) { 6.dp.toPx() },
+            gapPx = with(density) { ActionMenuAnchorGap.toPx() },
         )
         Box(
             Modifier
@@ -11824,7 +11998,7 @@ private fun FeedCardActionMenuOverlay(
     }
     val menuHeight = ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * menuLabels.size +
         ActionMenuItemGap * (menuLabels.size - 1).coerceAtLeast(0)
-    val gapFromButton = 6.dp
+    val gapFromButton = ActionMenuAnchorGap
     val screenMargin = 14.dp
     val anchor = request.anchorBoundsInRoot
 
@@ -11980,7 +12154,7 @@ private fun ProfileActionMenuOverlay(
             menuWidthPx = menuWidthPx,
             menuHeightPx = menuHeightPx,
             marginPx = with(density) { 14.dp.toPx() },
-            gapPx = with(density) { 6.dp.toPx() },
+            gapPx = with(density) { ActionMenuAnchorGap.toPx() },
         )
         val originInMenu = computeActionMenuOriginInMenu(
             anchorInRoot = request.anchorBoundsInRoot.center,
@@ -12054,7 +12228,7 @@ private fun DeleteStatusConfirmOverlay(
             menuWidthPx = menuWidthPx,
             menuHeightPx = menuHeightPx,
             marginPx = with(density) { 14.dp.toPx() },
-            gapPx = with(density) { 6.dp.toPx() },
+            gapPx = with(density) { ActionMenuAnchorGap.toPx() },
         )
         ImageActionFrostedCard(
             modifier = Modifier
@@ -12209,6 +12383,7 @@ private fun AuthorRow(
                     text = metadataText,
                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.58f),
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
             if (false) {
@@ -12526,6 +12701,7 @@ private fun FeedImageCell(
 }
 
 private val ActionMenuPreferredWidth = 260.dp
+private val ActionMenuAnchorGap = 2.dp
 private val ActionMenuWidthExtra = 24.dp
 private val ActionMenuCornerRadius = 20.dp
 private val ActionMenuBlurRadius = 16.dp
@@ -12533,6 +12709,7 @@ private val ActionMenuCardInset = 5.dp
 private val ActionMenuItemGap = 3.dp
 private val ActionMenuCapsuleHeight = 38.dp
 private val ActionMenuCapsulePaddingHorizontal = 14.dp
+private val DownArrowSize = 18.dp
 private val ActionMenuTwoRowHeight =
     ActionMenuCardInset * 2 + ActionMenuCapsuleHeight * 2 + ActionMenuItemGap
 private val ActionMenuThreeRowHeight =
@@ -19478,7 +19655,7 @@ private fun DetailStickyAuthorHeader(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = if (embeddedInCard) FeedCardContentHorizontalPadding else 26.dp)
+                    .padding(start = if (embeddedInCard) FeedCardContentHorizontalPadding else 26.dp)
                     .padding(
                         top = if (embeddedInCard) 8.dp else topInset + 12.dp,
                         bottom = if (embeddedInCard) 6.dp else 10.dp,
@@ -19497,7 +19674,10 @@ private fun DetailStickyAuthorHeader(
                     )
                 }
                 if (item.visibility == null || item.visibility == WeiboPostVisibility.Public) Box(Modifier.zIndex(1f)) {
-                    FeedCardActionMenu(item = item)
+                    FeedCardActionMenu(
+                        item = item,
+                        arrowOffsetX = if (embeddedInCard) (-5).dp else (-19).dp,
+                    )
                 }
             }
             if (!embeddedInCard) HorizontalDivider(
@@ -20338,7 +20518,7 @@ private fun ComposeWeiboScreen(
                             Icon(
                                 painter = painterResource(R.drawable.ic_chevron_down),
                                 contentDescription = null,
-                                modifier = Modifier.size(16.dp),
+                                modifier = Modifier.size(DownArrowSize),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -24141,7 +24321,18 @@ private fun MineScreen(
                                 modifier = Modifier
                                     .weight(1f)
                                     .fillMaxHeight()
-                                    .consumeTouchEvents(),
+                                    .clickable(
+                                        indication = null,
+                                        interactionSource = remember { MutableInteractionSource() },
+                                    ) {
+                                        coroutineScope.launch {
+                                            if (headerCollapseOffsetPx > 0f) {
+                                                headerCollapseOffsetPx = 0f
+                                            } else {
+                                                headerCollapseOffsetPx = collapseThresholdPx.toFloat()
+                                            }
+                                        }
+                                    },
                                 verticalArrangement = Arrangement.Center,
                             ) {
                                 Text(
@@ -26092,7 +26283,7 @@ private fun weiboMetaTextColor(): Color =
 @Composable
 private fun SettingsExpandIndicator(
     expanded: Boolean = false,
-    modifier: Modifier = Modifier.size(20.dp),
+    modifier: Modifier = Modifier.size(DownArrowSize),
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     rotateOnExpand: Boolean = false,
 ) {

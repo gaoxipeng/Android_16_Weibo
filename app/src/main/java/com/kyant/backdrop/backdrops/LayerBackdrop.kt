@@ -6,6 +6,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.GraphicsLayerScope
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.DrawScope
@@ -40,6 +41,8 @@ class LayerBackdrop internal constructor(
     override val isCoordinatesDependent: Boolean = true
 
     internal var layerCoordinates: LayoutCoordinates? by mutableStateOf(null)
+    internal var lastLayerPositionInWindow: Offset? by mutableStateOf(null)
+    internal var isFrozen: Boolean by mutableStateOf(false)
 
     private var inverseLayerScope: InverseLayerScope? = null
 
@@ -49,18 +52,28 @@ class LayerBackdrop internal constructor(
         layerBlock: (GraphicsLayerScope.() -> Unit)?
     ) {
         val coordinates = coordinates ?: return
-        val layerCoordinates = layerCoordinates ?: return
+        val layerCoordinates = layerCoordinates
+        val sourcePositionInWindow = layerCoordinates
+            ?.let { runCatching { it.positionInWindow() }.getOrNull() }
+            ?: lastLayerPositionInWindow
+            ?: return
         withTransform({
             if (layerBlock != null) {
                 with(obtainInverseLayerScope()) { inverseTransform(density, layerBlock) }
             }
-            val offset =
+            val offset = if (layerCoordinates != null) {
                 try {
                     layerCoordinates.localPositionOf(coordinates)
                 } catch (_: Exception) {
                     // TODO: outer transformations lead to wrong position calculation
-                    coordinates.positionInWindow() - layerCoordinates.positionInWindow()
+                    coordinates.positionInWindow() - sourcePositionInWindow
                 }
+            } else {
+                // The source can detach for a frame while navigation is handing off
+                // its page. Keep drawing its last recorded layer at the last known
+                // window position instead of exposing an empty/transparent backdrop.
+                coordinates.positionInWindow() - sourcePositionInWindow
+            }
             translate(-offset.x, -offset.y)
         }) {
             drawLayer(graphicsLayer)

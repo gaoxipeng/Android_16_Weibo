@@ -39,9 +39,11 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.TransformOrigin
@@ -50,6 +52,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastRoundToInt
@@ -86,6 +90,8 @@ fun LiquidBottomTabs(
     tabsCount: Int,
     frostAmount: Float = 0f,
     glassAmount: Float = 1f,
+    backdropSnapshot: ImageBitmap? = null,
+    backdropSnapshotAlpha: Float = 0f,
     modifier: Modifier = Modifier,
     gestureController: LiquidBottomTabsGestureController =
         rememberLiquidBottomTabsGestureController(),
@@ -104,7 +110,21 @@ fun LiquidBottomTabs(
     val indicatorBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
 
     BoxWithConstraints(
-        modifier = modifier.graphicsLayer { clip = false },
+        modifier = modifier
+            .graphicsLayer { clip = false }
+            .drawWithContent {
+                drawContent()
+                val snapshot = backdropSnapshot
+                val alpha = backdropSnapshotAlpha.coerceIn(0f, 1f)
+                if (snapshot != null && alpha > 0f) {
+                    drawImage(
+                        snapshot,
+                        dstOffset = IntOffset.Zero,
+                        dstSize = IntSize(size.width.fastRoundToInt(), size.height.fastRoundToInt()),
+                        alpha = alpha,
+                    )
+                }
+            },
         contentAlignment = Alignment.CenterStart,
     ) {
         val density = LocalDensity.current

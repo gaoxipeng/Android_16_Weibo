@@ -3,6 +3,7 @@ package com.kyant.backdrop.backdrops
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.node.DrawModifierNode
 import androidx.compose.ui.node.GlobalPositionAwareModifierNode
 import androidx.compose.ui.node.ModifierNodeElement
@@ -54,12 +55,15 @@ private class LayerBackdropNode(
 
     override fun ContentDrawScope.draw() {
         drawContent()
-        recordLayer(backdrop.graphicsLayer) { backdrop.onDraw(this@draw) }
+        if (!backdrop.isFrozen) {
+            recordLayer(backdrop.graphicsLayer) { backdrop.onDraw(this@draw) }
+        }
     }
 
     override fun onGloballyPositioned(coordinates: LayoutCoordinates) {
         if (coordinates.isAttached) {
             backdrop.layerCoordinates = coordinates
+            backdrop.lastLayerPositionInWindow = coordinates.positionInWindow()
         }
     }
 

@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.platform.LocalDensity
@@ -59,6 +60,8 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuHeight: Dp = 89.dp,
     timelineMenuGap: Dp = 4.dp,
     onBarBoundsChanged: ((Rect) -> Unit)? = null,
+    backdropSnapshot: ImageBitmap? = null,
+    backdropSnapshotAlpha: Float = 0f,
     modifier: Modifier = Modifier,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
@@ -92,6 +95,8 @@ internal fun WeiboLiquidBottomBar(
                 accentColor = accentColor,
                 frostAmount = frostAmount,
                 glassAmount = glassAmount,
+                backdropSnapshot = backdropSnapshot,
+                backdropSnapshotAlpha = backdropSnapshotAlpha,
                 tabsCount = tabs.size,
                 gestureController = tabsGestureController,
                 feedTabIndex = feedIndex,
