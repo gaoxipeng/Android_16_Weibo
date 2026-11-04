@@ -1240,6 +1240,7 @@ private fun <T> NavAnimatedOverlay(
     pendingEnterKind: NavOverlayKind? = null,
     pendingExitKind: NavOverlayKind? = null,
     nestedDetailReturnAnimating: Boolean = false,
+    sourceReturnZIndex: Float? = null,
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
     returnBackground: Bitmap? = null,
@@ -1462,7 +1463,8 @@ private fun <T> NavAnimatedOverlay(
     val isExiting = isAnimating && !transitionState.targetState
     val zIndex = when {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
-            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling || swipeCardReturn > 0f) -> 90f
+            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling || swipeCardReturn > 0f) ->
+            sourceReturnZIndex ?: 90f
         isExiting -> NavOverlayExitZIndex
         stackTop -> NavOverlayTopZIndex
         else -> layerBaseZIndex
@@ -5556,9 +5558,6 @@ fun WeiboApp() {
             (listOfNotNull(selectedItem) + items + minePosts + visitedPosts).forEach(::collect)
         }.distinctBy { it.id }
         fun openPreparedUser(preparedProfile: UserProfile) {
-        val preparedPosts = com.example.myweibo.data.TimelinePage(knownPosts.filter {
-            it.authorId == preparedProfile.id
-        })
         val leavingDetailForProfile = selectedItem != null
         if (leavingDetailForProfile &&
             overlayTopKind(navOverlayStack) != OverlayTop.MediaPreview &&
@@ -5587,8 +5586,10 @@ fun WeiboApp() {
             loadVisitedUserProfile(
                 lookup,
                 preparedProfile = preparedProfile,
-                preparedPosts = preparedPosts,
-                refreshPrepared = true,
+                // The tapped status may be old. Do not seed the profile timeline
+                // with it; fetch the user's current page 1 (which includes pins).
+                preparedPosts = null,
+                refreshPrepared = false,
                 reloadProfile = false,
             )
         }
@@ -8051,7 +8052,14 @@ fun WeiboApp() {
                 ?: (navExitPendingKind as? NavOverlayKind.UserPostsSearch)
             val followListLayerActive = navOverlayStack.any { it is NavOverlayKind.FollowList } &&
                 followListOverlay != null
-            val followListUiOnTop = overlayTop == OverlayTop.FollowList && followListLayerActive
+            val followListCoveredByVisitedProfile = followListLayerActive &&
+                overlayTop == OverlayTop.VisitedProfile
+            val followListUiOnTop = (overlayTop == OverlayTop.FollowList || followListCoveredByVisitedProfile) &&
+                followListLayerActive
+            // A visited profile covers the follow list, but the list is still the
+            // active parent page. Keep its Compose subtree alive so LazyListState
+            // survives any number of profile visits without index restoration races.
+            val keepFollowListAlive = followListLayerActive && followListOverlay != null
             val followListNavKind = followListOverlay?.uid?.let { NavOverlayKind.FollowList(it) }
             val followListExiting = navOverlayKindsMatch(navExitPendingKind, followListNavKind)
             val albumLayerActive = navOverlayStack.any { it == NavOverlayKind.AlbumViewer } && albumViewerState != null
@@ -8275,13 +8283,14 @@ fun WeiboApp() {
                 }
 
                 NavAnimatedOverlay(
-                    target = followListOverlay.takeIf { followListLayerActive },
-                    modifier = Modifier
-                        .fillMaxSize()
+                    target = followListOverlay.takeIf { keepFollowListAlive },
+                    modifier = Modifier.fillMaxSize()
+                        .graphicsLayer { alpha = if (followListUiOnTop || followListExiting) 1f else 0f }
                         .blockHiddenTouches(followListUiOnTop || followListExiting),
-                    stackTop = followListUiOnTop,
+                    stackTop = overlayTop == OverlayTop.FollowList && followListLayerActive,
                     layerBaseZIndex = 550f,
                     visible = followListUiOnTop,
+                    stackAnimated = false,
                     animationKey = followListOverlay?.instanceKey,
                     navKind = followListNavKind,
                     pendingEnterKind = navEnterPendingKind,
@@ -8757,6 +8766,7 @@ fun WeiboApp() {
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     nestedDetailReturnAnimating = nestedDetailReturnAnimating,
+                    sourceReturnZIndex = 580f.takeIf { navStack.lastOrNull()?.visitedProfile != null },
                     sourceBounds = activeDetailSourceBounds,
                     sourceImage = activeDetailSourceImage,
                     onSwipeReturnCommit = {
@@ -9141,7 +9151,7 @@ fun WeiboApp() {
             val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
                 navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
             val bottomBarNavVisible = !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
-                ((visitedUserId == null || profileIsExiting) &&
+                ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
                     (selectedItem == null || detailExiting || detailSwipeReturningHome)))
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
@@ -26977,8 +26987,8 @@ private fun FollowFansListScreen(
                     if (sameTab) {
                         coroutineScope.launch {
                             when (tab) {
-FriendListTab.Following -> followingListState.animateScrollToTopSmooth()
-                FriendListTab.Fans -> fansListState.animateScrollToTopSmooth()
+                                FriendListTab.Following -> followingListState.animateScrollToTopSmooth()
+                                FriendListTab.Fans -> fansListState.animateScrollToTopSmooth()
                             }
                         }
                     } else {
