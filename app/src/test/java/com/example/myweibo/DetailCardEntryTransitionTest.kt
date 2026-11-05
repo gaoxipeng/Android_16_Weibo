@@ -3,6 +3,7 @@ package com.example.myweibo
 import com.example.myweibo.ui.detailEntrySnapshotAlpha
 import com.example.myweibo.ui.detailCardReturnAmount
 import com.example.myweibo.ui.DetailCardOvershoot
+import com.example.myweibo.ui.shouldKeepDetailExitHandoff
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -23,5 +24,52 @@ class DetailCardEntryTransitionTest {
         assertEquals(1f, detailCardReturnAmount(0f), 0.0001f)
         assertEquals(0f, detailCardReturnAmount(1f), 0.0001f)
         assertEquals(1f + DetailCardOvershoot, detailCardReturnAmount(-1f), 0.0001f)
+    }
+
+    @Test fun keepsReturningOverlayOnTheIdleFrameBeforeHandoff() {
+        assertEquals(
+            true,
+            shouldKeepDetailExitHandoff(
+                overlayVisible = false,
+                transitionIdle = true,
+                transitionVisible = false,
+                hasReturnSource = true,
+                nestedDetailReturn = false,
+                alreadyHolding = false,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldKeepDetailExitHandoff(
+                overlayVisible = false,
+                transitionIdle = true,
+                transitionVisible = false,
+                hasReturnSource = true,
+                nestedDetailReturn = false,
+                alreadyHolding = true,
+            ),
+        )
+        assertEquals(
+            false,
+            shouldKeepDetailExitHandoff(
+                overlayVisible = true,
+                transitionIdle = false,
+                transitionVisible = true,
+                hasReturnSource = true,
+                nestedDetailReturn = false,
+                alreadyHolding = false,
+            ),
+        )
+        assertEquals(
+            false,
+            shouldKeepDetailExitHandoff(
+                overlayVisible = false,
+                transitionIdle = true,
+                transitionVisible = false,
+                hasReturnSource = true,
+                nestedDetailReturn = true,
+                alreadyHolding = false,
+            ),
+        )
     }
 }

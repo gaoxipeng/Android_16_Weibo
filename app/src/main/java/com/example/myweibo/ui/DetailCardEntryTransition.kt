@@ -11,3 +11,21 @@ internal fun detailEntrySnapshotAlpha(progress: Float, cardLaidOut: Boolean): Fl
     if (!cardLaidOut) return 1f
     return (1f - progress / 0.22f).coerceIn(0f, 1f)
 }
+
+/**
+ * Keep the returning overlay composed on the same frame the visibility
+ * transition goes idle. Setting the hold only inside LaunchedEffect would
+ * drop the overlay for one frame while the live source card is still hidden.
+ */
+internal fun shouldKeepDetailExitHandoff(
+    overlayVisible: Boolean,
+    transitionIdle: Boolean,
+    transitionVisible: Boolean,
+    hasReturnSource: Boolean,
+    nestedDetailReturn: Boolean,
+    alreadyHolding: Boolean,
+): Boolean {
+    if (overlayVisible || !hasReturnSource || nestedDetailReturn) return false
+    if (alreadyHolding) return true
+    return transitionIdle && !transitionVisible
+}

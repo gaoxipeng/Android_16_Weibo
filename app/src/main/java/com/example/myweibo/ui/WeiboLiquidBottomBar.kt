@@ -2,6 +2,7 @@ package com.example.myweibo.ui
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -46,6 +47,7 @@ import kotlin.math.roundToInt
 @Composable
 internal fun WeiboLiquidBottomBar(
     selectedTab: MainTab,
+    darkSurfaceOverride: Boolean = false,
     onTabChange: (MainTab) -> Unit,
     backdrop: Backdrop,
     frostAmount: Float = 0f,
@@ -65,7 +67,7 @@ internal fun WeiboLiquidBottomBar(
     modifier: Modifier = Modifier,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
-    val tabContentColor = if (isAppLightTheme()) Color.Black else Color(0xFFD0D0D0)
+    val tabContentColor = if (isAppLightTheme() && !darkSurfaceOverride) Color.Black else Color(0xFFD0D0D0)
     val density = LocalDensity.current
     val barHeight = 64.dp
     val tabs = MainTab.entries
@@ -95,6 +97,7 @@ internal fun WeiboLiquidBottomBar(
                 accentColor = accentColor,
                 frostAmount = frostAmount,
                 glassAmount = glassAmount,
+                forceDarkSurface = darkSurfaceOverride,
                 backdropSnapshot = backdropSnapshot,
                 backdropSnapshotAlpha = backdropSnapshotAlpha,
                 tabsCount = tabs.size,

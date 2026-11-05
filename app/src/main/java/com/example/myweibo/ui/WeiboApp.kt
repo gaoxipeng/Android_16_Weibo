@@ -26,9 +26,11 @@ import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebSettings
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import com.example.myweibo.data.useSafeWebRendering
 import android.widget.ImageView
 import android.widget.Toast
@@ -1247,6 +1249,7 @@ private fun <T> NavAnimatedOverlay(
     returnBackground: Bitmap? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
+    commitCardReturn: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
     onSourceCardHandoffReady: () -> Unit = {},
     onClearPendingEnter: () -> Unit = {},
@@ -1262,6 +1265,7 @@ private fun <T> NavAnimatedOverlay(
     val latestPageBack by rememberUpdatedState(pageBack)
     val latestSwipeReturnCommit by rememberUpdatedState(onSwipeReturnCommit)
     val latestSourceCardHandoffReady by rememberUpdatedState(onSourceCardHandoffReady)
+    val latestNestedDetailReturnAnimating by rememberUpdatedState(nestedDetailReturnAnimating)
     val swipeScope = rememberCoroutineScope()
     // A returning profile leaves gesture values in this retained host.
     // Reset during composition, not in LaunchedEffect after its first draw.
@@ -1305,8 +1309,35 @@ private fun <T> NavAnimatedOverlay(
         swipeCommitted = false
         swipeCardReturn = 0f
     }
+    suspend fun playCommittedCardReturn() {
+        // Reveal the retained source before settling. Do not settle onto a
+        // screenshot and then replace it with a differently positioned card.
+        latestSwipeReturnCommit()
+        animate(0f, 1f, animationSpec = detailCardReturnSpec()) {
+            value, _ -> swipeCardReturn = value
+        }
+        // Keep the returning card fully opaque until the original replaces it
+        // in the same frame. Fading over a blank source makes it wash out to
+        // white and then snap back to full color.
+        swipeCardReturn = 1f
+        if (navKind is NavOverlayKind.Detail && !latestNestedDetailReturnAnimating) {
+            // Let the real home card refresh its backdrop while the captured
+            // card still fully covers it. This keeps the bottom bar's glass
+            // source current when the overlay exits.
+            latestSourceCardHandoffReady()
+            withFrameNanos { }
+            withFrameNanos { }
+        }
+        swipeCommitted = true
+        latestPageBack?.invoke()
+    }
+    LaunchedEffect(commitCardReturn, transitionIdentity) {
+        if (!commitCardReturn || swipeCommitted || sourceBounds == null) return@LaunchedEffect
+        swipeSettling = true
+        playCommittedCardReturn()
+    }
     val swipeEnabled = stackTop && overlayVisible && navKind != null && pageBack != null &&
-        pendingEnterKind == null && pendingExitKind == null
+        pendingEnterKind == null && pendingExitKind == null && !commitCardReturn
     val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity, interceptRightSwipe) {
         if (!swipeEnabled) return@pointerInput
         awaitEachGesture {
@@ -1352,25 +1383,8 @@ private fun <T> NavAnimatedOverlay(
                 swipeSettling = true
                 swipeScope.launch {
                     if (commit && sourceBounds != null) {
-                        // Reveal the retained source before settling, just as the
-                        // system-back path does. Do not settle onto a screenshot
-                        // and then replace it with a differently positioned card.
-                        latestSwipeReturnCommit()
-                        animate(0f, 1f, animationSpec = detailCardReturnSpec()) {
-                            value, _ -> swipeCardReturn = value
-                        }
-                        // Keep the returning card fully opaque until the original
-                        // replaces it in the same frame. Fading over a blank source
-                        // makes it wash out to white and then snap back to full color.
-                        swipeCardReturn = 1f
-                        if (navKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating) {
-                            // Let the real home card refresh its backdrop while the
-                            // captured card still fully covers it. This keeps the
-                            // bottom bar's glass source current when the overlay exits.
-                            latestSourceCardHandoffReady()
-                            withFrameNanos { }
-                            withFrameNanos { }
-                        }
+                        playCommittedCardReturn()
+                        return@launch
                     } else if (!commit) {
                         val startOffset = swipeOffset
                         animate(0f, 1f, animationSpec = tween(180, easing = FastOutSlowInEasing)) { value, _ ->
@@ -1478,7 +1492,8 @@ private fun <T> NavAnimatedOverlay(
     val isExiting = isAnimating && !transitionState.targetState
     val zIndex = when {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
-            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling || swipeCardReturn > 0f) ->
+            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling ||
+                swipeCardReturn > 0f || commitCardReturn) ->
             sourceReturnZIndex ?: 90f
         isExiting -> NavOverlayExitZIndex
         stackTop -> NavOverlayTopZIndex
@@ -1512,9 +1527,20 @@ private fun <T> NavAnimatedOverlay(
         }
         return
     }
+    val detailReturnHandoffPending = displayed != null &&
+        shouldKeepDetailExitHandoff(
+            overlayVisible = avVisible,
+            transitionIdle = transitionState.isIdle,
+            transitionVisible = transitionState.targetState || transitionState.currentState,
+            hasReturnSource = navKind is NavOverlayKind.Detail && sourceBounds != null &&
+                sourceReturnImage != null && pendingExitKind is NavOverlayKind.Detail,
+            nestedDetailReturn = nestedDetailReturnAnimating,
+            alreadyHolding = detailExitHandoffHold,
+        )
     // Keep pixels/input only while a page is visible or actually animating.
     // `displayed` may outlive the visual exit for deferred navigation cleanup.
-    if (avVisible || transitionState.currentState || !transitionState.isIdle || detailExitHandoffHold) {
+    if (avVisible || transitionState.currentState || !transitionState.isIdle ||
+        detailExitHandoffHold || detailReturnHandoffPending) {
     Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned {
             overlayOrigin = it.boundsInRoot().topLeft
@@ -1555,7 +1581,8 @@ private fun <T> NavAnimatedOverlay(
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
         val pageReveal = if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
         SideEffect { entrySnapshotProgress = pageReveal }
-        val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling
+        val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f ||
+            swipeSettling || (commitCardReturn && sourceBounds != null && !swipeCommitted)
         val returnSnapshot = remember(sourceReturnImage) { sourceReturnImage?.asImageBitmap() }
         // The original feed card is hidden as navigation starts. Keep its
         // captured pixels in place until the detail card is laid out, then hand
@@ -1629,7 +1656,8 @@ private fun <T> NavAnimatedOverlay(
         CompositionLocalProvider(
             LocalHorizontalSwipeExclusionRegistry provides horizontalSwipeExclusions,
             LocalDetailReturnCardLayout provides returnCardLayout,
-            LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling),
+            LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f ||
+                swipeSettling || commitCardReturn),
             LocalDetailPageReveal provides if (returningPage) 1f else pageReveal.coerceIn(0f, 1f),
             LocalDetailCardMotion provides sourceBounds?.takeUnless { returningPage }?.let {
                 DetailCardMotion(it, pageReveal, swipeOffset * (1f - swipeCardReturn), sourceHandoff)
@@ -1680,7 +1708,7 @@ private fun <T> NavAnimatedOverlay(
         }
         }
     }
-    if (detailExitHandoffHold && navKind is NavOverlayKind.Detail &&
+    if ((detailExitHandoffHold || detailReturnHandoffPending) && navKind is NavOverlayKind.Detail &&
         sourceBounds != null && sourceHandoffBitmap != null
     ) {
         Canvas(Modifier.matchParentSize()) {
@@ -4262,6 +4290,7 @@ fun WeiboApp() {
     var composeSubmitting by remember { mutableStateOf(false) }
     var composeSessionKey by remember { mutableIntStateOf(0) }
     var messagesSessionKey by remember { mutableIntStateOf(0) }
+    var messagesInboxRoute by remember { mutableStateOf(true) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
@@ -8910,6 +8939,9 @@ fun WeiboApp() {
                     sourceReturnZIndex = 580f.takeIf { navStack.lastOrNull()?.visitedProfile != null },
                     sourceBounds = activeDetailSourceBounds,
                     sourceImage = activeDetailSourceImage,
+                    commitCardReturn = detailSystemBackInProgress &&
+                        activeDetailSourceBounds != null &&
+                        !nestedDetailReturnAnimating,
                     onSwipeReturnCommit = {
                         // Keep the real source card hidden until the return motion
                         // completes; the detail snapshot supplies its pixels during
@@ -8930,6 +8962,7 @@ fun WeiboApp() {
                     onSwipeBack = {
                         closeDetail()
                         detailSwipeReturningHome = false
+                        detailSystemBackInProgress = false
                         // The gesture already finished the card's return. Restore
                         // the retained feed in this frame, rather than waiting for
                         // another visibility exit while its source is still blank.
@@ -9012,16 +9045,22 @@ fun WeiboApp() {
                             detailScrollPending = null
                         }
                         PredictiveBackHandler(
-                            enabled = detailOverlayVisible && detailIsActive,
+                            enabled = detailOverlayVisible && detailIsActive &&
+                                !detailSystemBackInProgress && !detailSwipeReturningHome,
                         ) { events ->
                             try {
                                 events.collect {
                                     systemBackStarted = true
-                                    detailSystemBackInProgress = true
                                 }
                                 systemBackStarted = true
-                                detailSystemBackInProgress = true
-                                closeDetail()
+                                if (activeDetailSourceBounds != null && !nestedDetailReturnAnimating) {
+                                    // Play the same card-return motion as a mid-screen
+                                    // swipe, then pop. Closing first would expose the
+                                    // hidden source card for a frame.
+                                    detailSystemBackInProgress = true
+                                } else {
+                                    closeDetail()
+                                }
                             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                 systemBackStarted = false
                                 detailSystemBackInProgress = false
@@ -9148,7 +9187,7 @@ fun WeiboApp() {
                 Modifier
                     .then(if (messagesOverlayVisible) Modifier.fillMaxSize() else Modifier.size(0.dp))
                     .padding(innerPadding)
-                    .zIndex(if (messagesOverlayVisible) 2f else -10f)
+                    .zIndex(if (messagesOverlayVisible) 0f else -10f)
                     .blockHiddenTouches(messagesOverlayVisible),
             ) {
                 if (!hasLoginCookie) {
@@ -9158,8 +9197,13 @@ fun WeiboApp() {
                         MessagesScreen(
                             onRootBack = ::handleRootBackPress,
                             active = messagesOverlayVisible,
+                            darkTheme = darkTheme,
+                            onInboxRouteChanged = { messagesInboxRoute = it },
                         )
                     }
+                }
+                if (messagesOverlayVisible && darkTheme) {
+                    Spacer(Modifier.fillMaxWidth().height(WindowInsets.statusBars.asPaddingValues().calculateTopPadding()).background(Color(0xFF121212)))
                 }
             }
             // Keep the search glass outside the layerBackdrop it samples. If it is inside
@@ -9167,6 +9211,7 @@ fun WeiboApp() {
             Box(
                 Modifier
                     .fillMaxSize()
+                    .zIndex(3f)
                     .padding(innerPadding),
             ) {
                 if (searchBarOverlay.active) {
@@ -9294,10 +9339,11 @@ fun WeiboApp() {
             // it. Its own exit must not precede the page's first animated frame.
             val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
                 navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
-            val bottomBarNavVisible = !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
+            val bottomBarNavVisible = (selectedTab == MainTab.Messages && messagesInboxRoute) || (!userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
                 ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
-                    (selectedItem == null || detailExiting || detailSwipeReturningHome)))
-            val bottomBarRequestedVisible = bottomBarNavVisible && bottomBarVisible
+                    (selectedItem == null || detailExiting || detailSwipeReturningHome))))
+            val bottomBarRequestedVisible = bottomBarNavVisible &&
+                (bottomBarVisible || (selectedTab == MainTab.Messages && messagesInboxRoute))
             val bottomBarSlideProgress by animateFloatAsState(
                 targetValue = if (bottomBarRequestedVisible) 1f else 0f,
                 animationSpec = tween(160, easing = FastOutSlowInEasing),
@@ -9376,6 +9422,7 @@ fun WeiboApp() {
             ) {
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
+                    darkSurfaceOverride = darkTheme && selectedTab == MainTab.Messages && messagesInboxRoute,
                     backdrop = if (selectedTab == MainTab.Feed) homeContentBackdrop else bottomBarBackdrop,
                     frostAmount = bottomBarFrostAmount,
                     glassAmount = bottomBarGlassAmount,
@@ -23658,18 +23705,23 @@ private fun SearchScreen(
 private fun MobileWeiboWebScreen(
     pageUrl: String,
     onRootBack: () -> Unit,
+    onInboxRouteChanged: (Boolean) -> Unit = {},
     userAgent: String? = null,
     active: Boolean = true,
+    darkTheme: Boolean = isSystemInDarkTheme(),
 ) {
     val context = LocalContext.current
+    val activity = context as? android.app.Activity
+    val view = LocalView.current
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val bottomBarGap = LiquidBottomBarContentGap
     // Lay out Chromium at the final IME size once, rather than reflowing the
     // whole conversation DOM on every keyboard animation frame.
     val imeBottom = WindowInsets.imeAnimationTarget.asPaddingValues().calculateBottomPadding()
-    val bottomInset = maxOf(imeBottom, LiquidBottomBarReserve) + bottomBarGap
+    val bottomBarGap = LiquidBottomBarContentGap
+    val navigationBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val fileUploadBridge = remember { MobileWebFileUploadBridge() }
     var messagePageLoaded by remember(pageUrl) { mutableStateOf(false) }
+    val currentDarkTheme by rememberUpdatedState(darkTheme)
 
     val fileChooserLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -23683,6 +23735,7 @@ private fun MobileWeiboWebScreen(
 
     val webView = remember(pageUrl) {
         WebView(context).apply {
+            setBackgroundColor(if (darkTheme) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -23715,11 +23768,54 @@ private fun MobileWeiboWebScreen(
                 userAgentString = userAgent ?: WebSettings.getDefaultUserAgent(context)
                     .replace("; wv", "")
                     .replace(" Version/4.0", "")
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+                    WebSettingsCompat.setAlgorithmicDarkeningAllowed(this, darkTheme)
+                }
             }
             // Leave DOM focus entirely to the site/browser. Intercepting focus
             // loses the user's first tap on the conversation composer.
-            webViewClient = WebViewClient()
+            webViewClient = object : WebViewClient() {
+                private fun reportRoute(url: String?) {
+                    if (url.isNullOrBlank()) return
+                    val route = runCatching { Uri.parse(url) }.getOrNull()
+                    val inbox = route?.host == "m.weibo.cn" &&
+                        route.path?.trimEnd('/') == "/message" &&
+                        route.getQueryParameter("uid").isNullOrBlank() &&
+                        route.getQueryParameter("id").isNullOrBlank()
+                    onInboxRouteChanged(inbox)
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    reportRoute(url)
+                    if (currentDarkTheme) view?.alpha = 0f
+                }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.let { currentView ->
+                        reportRoute(url ?: currentView.url)
+                        applyWebViewDarkMode(currentView, currentDarkTheme)
+                        applyMessageDomTheme(currentView, currentDarkTheme)
+                        currentView.postDelayed({ currentView.alpha = 1f }, 100L)
+                    }
+                }
+            }
         }
+    }
+
+    SideEffect {
+        applyWebViewDarkMode(webView, darkTheme)
+        if (active && activity != null) {
+            activity.window.statusBarColor = if (darkTheme) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE
+            activity.window.navigationBarColor = if (darkTheme) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE
+            activity.window.decorView.setBackgroundColor(
+                if (darkTheme) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE,
+            )
+            WindowCompat.getInsetsController(activity.window, view).apply {
+                isAppearanceLightStatusBars = !darkTheme
+                isAppearanceLightNavigationBars = !darkTheme
+            }
+        }
+        webView.setBackgroundColor(if (darkTheme) android.graphics.Color.rgb(18, 18, 18) else android.graphics.Color.WHITE)
+        if (messagePageLoaded) applyMessageDomTheme(webView, darkTheme)
     }
 
     DisposableEffect(pageUrl) {
@@ -23752,12 +23848,21 @@ private fun MobileWeiboWebScreen(
         if (active) {
             webView.visibility = View.VISIBLE
             webView.onResume()
+            while (true) {
+                val route = runCatching { Uri.parse(webView.url.orEmpty()) }.getOrNull()
+                if (route?.host == "m.weibo.cn") {
+                    val inbox = route.path?.trimEnd('/') == "/message" &&
+                        route.getQueryParameter("uid").isNullOrBlank() &&
+                        route.getQueryParameter("id").isNullOrBlank()
+                    onInboxRouteChanged(inbox)
+                }
+                delay(250)
+            }
         } else {
             webView.onPause()
             webView.visibility = View.GONE
         }
     }
-
 
     BackHandler(enabled = active) {
         if (webView.canGoBack()) {
@@ -23770,7 +23875,9 @@ private fun MobileWeiboWebScreen(
     Box(
         Modifier
             .fillMaxSize()
-            .padding(top = topInset, bottom = bottomInset),
+            // Inbox scrolls behind the floating tab bar; a conversation has no
+            // tab bar, so keep its composer above Android's gesture navigation.
+            .padding(top = topInset, bottom = imeBottom + navigationBottom),
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize().onSizeChanged { size ->
@@ -23798,6 +23905,60 @@ private fun MobileWeiboWebScreen(
     }
 }
 
+@Suppress("DEPRECATION")
+private fun applyWebViewDarkMode(webView: WebView, darkTheme: Boolean) {
+    val settings = webView.settings
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+        WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, darkTheme)
+    }
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
+        WebSettingsCompat.setForceDark(
+            settings,
+            if (darkTheme) WebSettingsCompat.FORCE_DARK_ON else WebSettingsCompat.FORCE_DARK_OFF,
+        )
+    }
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK_STRATEGY)) {
+        WebSettingsCompat.setForceDarkStrategy(
+            settings,
+            WebSettingsCompat.DARK_STRATEGY_USER_AGENT_DARKENING_ONLY,
+        )
+    }
+    webView.invalidate()
+}
+
+private fun applyMessageDomTheme(webView: WebView, darkTheme: Boolean) {
+    if (webView.url?.contains("m.weibo.cn") != true) return
+    val js = if (!darkTheme) """
+        (function(){document.getElementById('__app_message_theme')?.remove();
+        document.documentElement.style.colorScheme='light';})();
+    """.trimIndent() else """
+        (function(){
+          document.documentElement.style.colorScheme='dark';
+          var s=document.getElementById('__app_message_theme');
+          if(!s){s=document.createElement('style');s.id='__app_message_theme';document.head.appendChild(s);}
+          s.textContent=`html,body,#app,#__next{background:#121212!important;color:#d8d8d8!important}
+            header,nav,footer,[class*=card],[class*=panel],[class*=item],[class*=list],[class*=header],[class*=footer]{background-color:#252525!important;color:#d8d8d8!important;border-color:#3a3a3a!important}
+            body *{border-color:#3a3a3a!important;color:#d8d8d8!important}
+            div,section,header,nav,footer{background-color:#252525!important}
+            [class*=message],[class*=msg],[class*=conversation],[class*=session]{background-color:#292929!important}
+            small, time, [class*=time], [class*=date], [class*=desc], [class*=sub], [class*=tip], [class*=hint], [class*=summary]{color:#969696!important}
+            p,span,label{color:#d0d0d0!important}
+            body{border:0!important}
+            *::before,*::after{border-color:#383838!important;background-color:transparent!important}
+            [class*=icon]{background-color:transparent!important}
+            .m-icon{background-color:transparent!important}
+            .m-icon-at{background-color:#4b9fba!important}
+            .m-icon-comment{background-color:#58af80!important}
+            .m-icon-like{background-color:#d69a26!important}
+            .m-icon-notice{background-color:#579b9d!important}
+            [class*=at],[class*=comment],[class*=like],[class*=notice]{border-color:#383838!important}
+            a{color:#8ab4f8!important}
+            input,textarea,button{background-color:#292929!important;color:#d8d8d8!important;border-color:#454545!important}`;
+        })();
+    """.trimIndent()
+    webView.evaluateJavascript("try{$js}catch(e){}", null)
+}
+
 @Composable
 private fun WebTabLoginPlaceholder() {
     Box(
@@ -23818,12 +23979,16 @@ private fun WebTabLoginPlaceholder() {
 @Composable
 private fun MessagesScreen(
     onRootBack: () -> Unit,
+    onInboxRouteChanged: (Boolean) -> Unit,
     active: Boolean = true,
+    darkTheme: Boolean = isSystemInDarkTheme(),
 ) {
     MobileWeiboWebScreen(
         pageUrl = "https://m.weibo.cn/message",
         onRootBack = onRootBack,
+        onInboxRouteChanged = onInboxRouteChanged,
         active = active,
+        darkTheme = darkTheme,
     )
 }
 

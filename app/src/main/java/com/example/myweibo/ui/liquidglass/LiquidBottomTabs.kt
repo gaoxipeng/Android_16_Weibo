@@ -90,6 +90,7 @@ fun LiquidBottomTabs(
     tabsCount: Int,
     frostAmount: Float = 0f,
     glassAmount: Float = 1f,
+    forceDarkSurface: Boolean = false,
     backdropSnapshot: ImageBitmap? = null,
     backdropSnapshotAlpha: Float = 0f,
     modifier: Modifier = Modifier,
@@ -102,10 +103,11 @@ fun LiquidBottomTabs(
     val isLightTheme = isAppLightTheme()
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
-    val capsuleSurfaceColor = Color.White.copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+    val capsuleSurfaceColor = (if (forceDarkSurface || !isLightTheme) Color(0xFF121212) else Color.White)
+        .copy(alpha = if (forceDarkSurface) 1f else bottomBarGlassSurfaceAlpha(frost))
     val indicatorContainerColor =
-        if (isLightTheme) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
-        else Color(0xFF121212).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+        if (isLightTheme && !forceDarkSurface) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+        else Color(0xFF121212).copy(alpha = if (forceDarkSurface) 1f else bottomBarGlassSurfaceAlpha(frost))
     val tabsBackdrop = rememberLayerBackdrop()
     val indicatorBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
 
@@ -492,7 +494,7 @@ fun LiquidBottomTabs(
                         onDrawSurface = {
                             val press = animatedPressProgress.coerceIn(0f, 1f)
                             val gray = if (isLightTheme) Color.Black else Color.White
-                            drawRect(gray.copy(alpha = 0.14f * (1f - press)))
+                            drawRect(if (forceDarkSurface) Color.White.copy(alpha = 0.14f * (1f - press)) else gray.copy(alpha = 0.14f * (1f - press)))
                             drawRect(Color.Black.copy(alpha = 0.03f * press))
                         },
                     )
