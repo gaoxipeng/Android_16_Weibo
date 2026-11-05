@@ -8921,6 +8921,10 @@ fun WeiboApp() {
                             (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search)
                     },
                     onSourceCardHandoffReady = {
+                        // NavAnimatedOverlay keeps the captured return card over the
+                        // live feed for two frames after this callback. Reveal the
+                        // source now, inside that hold, so the snapshot hands off to
+                        // the real card without an extra delayed visibility toggle.
                         hiddenFeedCardId = null
                     },
                     onSwipeBack = {
