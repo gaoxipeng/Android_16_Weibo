@@ -103,11 +103,11 @@ fun LiquidBottomTabs(
     val isLightTheme = isAppLightTheme()
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
-    val capsuleSurfaceColor = (if (forceDarkSurface || !isLightTheme) Color(0xFF121212) else Color.White)
-        .copy(alpha = if (forceDarkSurface) 1f else bottomBarGlassSurfaceAlpha(frost))
+    val capsuleSurfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
+        .copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     val indicatorContainerColor =
-        if (isLightTheme && !forceDarkSurface) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
-        else Color(0xFF121212).copy(alpha = if (forceDarkSurface) 1f else bottomBarGlassSurfaceAlpha(frost))
+        if (isLightTheme) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+        else Color(0xFF121212).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     val tabsBackdrop = rememberLayerBackdrop()
     val indicatorBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
 
