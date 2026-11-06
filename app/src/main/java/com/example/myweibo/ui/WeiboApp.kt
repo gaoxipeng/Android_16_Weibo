@@ -37,7 +37,6 @@ import androidx.webkit.WebViewFeature
 import com.example.myweibo.data.useSafeWebRendering
 import android.widget.ImageView
 import android.widget.Toast
-import org.json.JSONObject
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24013,15 +24012,6 @@ private fun applyWebViewDarkMode(webView: WebView, darkTheme: Boolean) {
     webView.invalidate()
 }
 
-private const val MessageDarkReaderFixes = """
-.m-icon-at{background-color:#e09a3c!important}
-.m-icon-comment{background-color:#3db87a!important}
-.m-icon-like,.m-icon-liked{background-color:#e15b64!important}
-.m-icon-notice,.m-icon-chat{background-color:#3aa0a4!important}
-small,time,[class*=time],[class*=date],.m-gray,.lite-text-secondary{color:#8d8d8d!important}
-a{color:#8ab4f8!important}
-"""
-
 private class MessageDarkReaderController(private val bundle: String) {
     private var loadedForCurrentDocument = false
 
@@ -24039,17 +24029,10 @@ private class MessageDarkReaderController(private val bundle: String) {
             }
             append("var api=window.DarkReader;")
             append("if(!api){return;}")
-            append("if(window.__weiboBubbleTimer){clearInterval(window.__weiboBubbleTimer);window.__weiboBubbleTimer=null;}")
-            append("document.querySelectorAll('[data-weibo-dark-bubble=\\\"1\\\"]').forEach(function(el){")
-            append("el.style.removeProperty('background-color');el.style.removeProperty('color');")
-            append("el.style.removeProperty('border-color');el.removeAttribute('data-weibo-dark-bubble');});")
-            append("document.getElementById('__app_message_theme')?.remove();")
             if (darkTheme) {
                 append("api.enable({brightness:100,contrast:100,grayscale:0,sepia:0,")
-                append("darkSchemeBackgroundColor:'#161616',darkSchemeTextColor:'#d8d8d8',")
-                append("immediateModify:true,styleSystemControls:true},{css:")
-                append(JSONObject.quote(MessageDarkReaderFixes))
-                append("});")
+                append("darkSchemeBackgroundColor:'#181818',darkSchemeTextColor:'#e0e0e0',")
+                append("immediateModify:true,styleSystemControls:true});")
             } else {
                 append("api.disable();document.documentElement.style.colorScheme='light';")
             }

@@ -24,7 +24,7 @@
         android:theme="@style/Theme.MyWeibo">
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|uiMode"
             android:exported="true"
             android:label="@string/app_name"
             android:screenOrientation="user"
