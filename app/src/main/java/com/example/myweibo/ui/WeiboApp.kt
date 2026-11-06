@@ -417,6 +417,7 @@ import com.example.myweibo.ui.liquidglass.SurfaceLiquidMenuCard
 import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
 import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
 import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
+import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSlider
 import com.example.myweibo.ui.liquidglass.SettingsLiquidToggle
 import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
@@ -544,9 +545,14 @@ private val MediaPeekEnterAnimationSpec = tween<Float>(
     durationMillis = 480,
     easing = MediaPeekEnterEasing,
 )
-private val MediaPeekDismissAnimationSpec = tween<Float>(
-    durationMillis = 220,
-    easing = FastOutSlowInEasing,
+private val VideoPeekReturnEasing = CubicBezierEasing(0.22f, 0.78f, 0.24f, 1f)
+private val VideoPeekDragReturnAnimationSpec = tween<Float>(
+    durationMillis = 360,
+    easing = VideoPeekReturnEasing,
+)
+private val VideoPeekFullscreenReturnAnimationSpec = tween<Float>(
+    durationMillis = 400,
+    easing = VideoPeekReturnEasing,
 )
 private val ImagePeekMotionEasing = FastOutSlowInEasing
 private val ImagePeekEnterAnimationSpec = tween<Float>(
@@ -4175,7 +4181,8 @@ fun WeiboApp() {
     val bottomBarScrollConnection = remember(selectedTab, hideBottomBarOnFeedScroll, mineSettingsVisible) {
         object : NestedScrollConnection {
             override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                if ((selectedTab == MainTab.Mine && mineSettingsVisible) || selectedTab == MainTab.Search ||
+                if ((selectedTab == MainTab.Mine && mineSettingsVisible) ||
+                    (selectedTab == MainTab.Search && !hideBottomBarOnFeedScroll) ||
                     ((selectedTab == MainTab.Feed || selectedTab == MainTab.Mine) && !hideBottomBarOnFeedScroll)
                 ) {
                     bottomBarVisible = true
@@ -8098,12 +8105,6 @@ fun WeiboApp() {
             isAppearanceLightStatusBars = !darkTheme
             isAppearanceLightNavigationBars = !darkTheme
         }
-        if (Build.VERSION.SDK_INT >= 29) {
-            window.isNavigationBarContrastEnforced = false
-            window.isStatusBarContrastEnforced = false
-        }
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
-        window.statusBarColor = android.graphics.Color.TRANSPARENT
     }
     val themedColorScheme = MaterialTheme.colorScheme.copy(
         primary = selectedThemeColor.primary,
@@ -9257,6 +9258,13 @@ fun WeiboApp() {
                     .zIndex(3f)
                     .padding(innerPadding),
             ) {
+                val searchBarAutoHideVisible = selectedTab != MainTab.Search ||
+                    !hideBottomBarOnFeedScroll || bottomBarVisible
+                val searchBarAutoHideProgress by animateFloatAsState(
+                    targetValue = if (searchBarAutoHideVisible) 1f else 0f,
+                    animationSpec = tween(160, easing = FastOutSlowInEasing),
+                    label = "search-bar-auto-hide",
+                )
                 if (searchBarOverlay.active) {
                     val suggestionReserve = if (searchBarOverlay.suggestionsVisible) {
                         SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
@@ -9276,6 +9284,9 @@ fun WeiboApp() {
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
                             .zIndex(85f)
+                            .graphicsLayer {
+                                translationY = size.height * (1f - searchBarAutoHideProgress)
+                            }
                             .padding(
                                 start = 18.dp,
                                 end = 18.dp,
@@ -9301,6 +9312,8 @@ fun WeiboApp() {
                             onSearch = searchBarOverlay.onSearch,
                             onClear = searchBarOverlay.onClear,
                             backdrop = menuGlassBackdrop,
+                            frostAmount = bottomBarFrostAmount,
+                            glassAmount = bottomBarGlassAmount,
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
@@ -13491,6 +13504,8 @@ private fun VideoPeekOverlay(
     val fullscreenExpandProgress = remember(playbackKey) {
         Animatable(if (isFullscreenMode || fromFullscreen) 1f else 0f)
     }
+    var dismissFingerDragStart by remember(playbackKey) { mutableStateOf(Offset.Zero) }
+    val dismissFingerDragProgress = remember(playbackKey) { Animatable(1f) }
     var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
     var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
     var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
@@ -13506,9 +13521,12 @@ private fun VideoPeekOverlay(
         onRequestCancel()
     }
 
-    ImmersiveVideoChromeEffect(enabled = isFullscreenMode)
+    val fullscreenTransitionActive = isFullscreenMode ||
+        fullscreenExpandProgress.value > 0f ||
+        dismissReason == VideoPeekDismissReason.EnterFullscreen
+    ImmersiveVideoChromeEffect(enabled = fullscreenTransitionActive)
     FullscreenVideoOrientationEffect(
-        enabled = isFullscreenMode || dismissReason == VideoPeekDismissReason.EnterFullscreen,
+        enabled = fullscreenTransitionActive,
         aspectRatio = aspectRatio,
     )
 
@@ -13592,10 +13610,7 @@ private fun VideoPeekOverlay(
             if (fullscreenExpandProgress.value > 0f) {
                 fullscreenExpandProgress.animateTo(
                     targetValue = 0f,
-                    animationSpec = tween(
-                        durationMillis = NavTransitionDurationMs,
-                        easing = FastOutSlowInEasing,
-                    ),
+                    animationSpec = VideoPeekFullscreenReturnAnimationSpec,
                 )
             }
             if (dockImmediately) {
@@ -13619,8 +13634,10 @@ private fun VideoPeekOverlay(
             enterProgress.snapTo(1f)
             if (fullscreenExpandProgress.value > 0f) {
                 dockProgress.snapTo(0f)
-                fullscreenExpandProgress.animateTo(0f,
-                    tween(NavTransitionDurationMs, easing = FastOutSlowInEasing))
+                fullscreenExpandProgress.animateTo(
+                    0f,
+                    VideoPeekFullscreenReturnAnimationSpec,
+                )
             } else if (hasEnteredFloating) {
                 dockProgress.animateTo(0f, tween(110, easing = FastOutSlowInEasing))
             }
@@ -13651,12 +13668,22 @@ private fun VideoPeekOverlay(
                 videoPeekController.completeFullscreenExpand()
             }
             else -> {
-                fullscreenExpandProgress.snapTo(0f)
-                videoPeekController.resetFingerDragOffset()
                 if (videoPeekController.snapDismiss) {
+                    videoPeekController.resetFingerDragOffset()
                     onDismissComplete()
                     return@LaunchedEffect
                 }
+                val fullscreenReturning = fullscreenExpandProgress.value > 0f
+                val returnSpec = if (fullscreenReturning) {
+                    VideoPeekFullscreenReturnAnimationSpec
+                } else {
+                    VideoPeekDragReturnAnimationSpec
+                }
+                val fingerOffsetAtDismiss = videoPeekController.fingerDragOffset
+                val animateFingerReturn = fingerOffsetAtDismiss != Offset.Zero && !isFloating
+                dismissFingerDragStart = fingerOffsetAtDismiss.takeIf { animateFingerReturn } ?: Offset.Zero
+                dismissFingerDragProgress.snapTo(if (animateFingerReturn) 0f else 1f)
+                videoPeekController.resetFingerDragOffset()
                 if (isFloating) {
                     closingAnchorBounds = resolveAnchorBounds()
                     val statusBarTopPx = with(density) { statusBarTop.toPx() }
@@ -13686,19 +13713,38 @@ private fun VideoPeekOverlay(
                     peekDismissTargetBounds = targetBounds
                     peekDismissUseTopExit = useTopExit
                     peekDismissMorphProgress.snapTo(1f)
-                    peekDismissMorphProgress.animateTo(
-                        targetValue = 0f,
-                        animationSpec = spring(dampingRatio = 0.9f, stiffness = 520f),
-                    )
-                } else {
-                    if (dockProgress.value > 0f) {
-                        dockProgress.animateTo(0f, MediaPeekDismissAnimationSpec)
+                    coroutineScope {
+                        launch {
+                            peekDismissMorphProgress.animateTo(
+                                targetValue = 0f,
+                                animationSpec = if (fullscreenReturning) {
+                                    VideoPeekFullscreenReturnAnimationSpec
+                                } else {
+                                    spring(dampingRatio = 0.9f, stiffness = 520f)
+                                },
+                            )
+                        }
+                        if (fullscreenReturning) {
+                            launch {
+                                fullscreenExpandProgress.animateTo(0f, VideoPeekFullscreenReturnAnimationSpec)
+                            }
+                        }
                     }
-                    enterProgress.animateTo(
-                        targetValue = 0f,
-                        animationSpec = MediaPeekDismissAnimationSpec,
-                    )
+                } else {
+                    coroutineScope {
+                        if (dockProgress.value > 0f) {
+                            launch { dockProgress.animateTo(0f, returnSpec) }
+                        }
+                        launch { enterProgress.animateTo(0f, returnSpec) }
+                        if (fullscreenReturning) {
+                            launch { fullscreenExpandProgress.animateTo(0f, returnSpec) }
+                        }
+                        if (animateFingerReturn) {
+                            launch { dismissFingerDragProgress.animateTo(1f, returnSpec) }
+                        }
+                    }
                 }
+                dismissFingerDragStart = Offset.Zero
                 onDismissComplete()
             }
         }
@@ -13851,7 +13897,15 @@ private fun VideoPeekOverlay(
             .size(previewWidth, previewHeight)
             .mediaPeekMotionLayer(
                 motion = motion,
-                fingerDragOffset = { videoPeekController.fingerDragOffset },
+                fingerDragOffset = {
+                    val start = dismissFingerDragStart
+                    if (dismissReason != null && start != Offset.Zero) {
+                        val remaining = 1f - dismissFingerDragProgress.value.coerceIn(0f, 1f)
+                        Offset(start.x * remaining, start.y * remaining)
+                    } else {
+                        videoPeekController.fingerDragOffset
+                    }
+                },
                 shadowElevation = if (layoutProgress > 0.28f && expandProgress == 0f) {
                     if (isDocked) 8.dp else 16.dp
                 } else {
@@ -22060,6 +22114,8 @@ private fun SearchCapsuleField(
     onSearch: () -> Unit,
     onClear: () -> Unit,
     backdrop: Backdrop,
+    frostAmount: Float = 0f,
+    glassAmount: Float = 1f,
     modifier: Modifier = Modifier,
     placeholder: String = "搜索微博、话题和用户",
     userSearch: Boolean = false,
@@ -22081,15 +22137,16 @@ private fun SearchCapsuleField(
         lineHeight = 20.sp,
     )
     val placeholderStyle = fieldTextStyle.copy(color = hintCapsulePlaceholderColor())
-    TransparentLiquidCapsule(
-        modifier = modifier,
-        backdrop = backdrop,
-        pill = true,
-        surfaceColor = Color.White.copy(alpha = 0.2f),
-        borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
-        else Color.White.copy(alpha = 0.24f),
-        borderWidth = 0.75.dp,
-        frostedBlurRadius = 8.dp,
+    Box(
+        modifier = modifier
+            .graphicsLayer { clip = false }
+            .drawBottomBarGlassBackdrop(
+                backdrop = backdrop,
+                frostAmount = frostAmount,
+                glassAmount = glassAmount,
+                isLightTheme = isAppLightTheme(),
+            )
+            .height(44.dp),
     ) {
         Row(
             modifier = Modifier
@@ -23875,12 +23932,6 @@ private fun MobileWeiboWebScreen(
         val window = activity?.window
         if (active && window != null) {
             val pageColor = if (darkTheme) android.graphics.Color.rgb(22, 22, 22) else android.graphics.Color.WHITE
-            window.statusBarColor = android.graphics.Color.TRANSPARENT
-            window.navigationBarColor = android.graphics.Color.TRANSPARENT
-            if (Build.VERSION.SDK_INT >= 29) {
-                window.isNavigationBarContrastEnforced = false
-                window.isStatusBarContrastEnforced = false
-            }
             window.decorView.setBackgroundColor(pageColor)
             WindowCompat.getInsetsController(window, view).apply {
                 isAppearanceLightStatusBars = !darkTheme
@@ -23888,13 +23939,7 @@ private fun MobileWeiboWebScreen(
             }
         }
         onDispose {
-            val restore = activity?.window ?: return@onDispose
-            restore.navigationBarColor = android.graphics.Color.TRANSPARENT
-            restore.statusBarColor = android.graphics.Color.TRANSPARENT
-            if (Build.VERSION.SDK_INT >= 29) {
-                restore.isNavigationBarContrastEnforced = false
-                restore.isStatusBarContrastEnforced = false
-            }
+            activity?.window?.decorView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
         }
     }
     SideEffect {

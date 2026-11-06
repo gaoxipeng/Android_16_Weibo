@@ -81,6 +81,37 @@ private data class LiquidTabMotionSnapshot(
     val velocity: Float,
 )
 
+fun Modifier.drawBottomBarGlassBackdrop(
+    backdrop: Backdrop,
+    frostAmount: Float,
+    glassAmount: Float,
+    isLightTheme: Boolean,
+): Modifier {
+    val frost = normalizeBottomBarGlassAmount(frostAmount)
+    val glass = normalizeBottomBarGlassAmount(glassAmount)
+    val surfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
+        .copy(alpha = bottomBarGlassSurfaceAlpha(frost))
+    return drawBackdrop(
+        backdrop = backdrop,
+        shape = { RoundedCornerShape(percent = 50) },
+        effects = {
+            val radius = bottomBarGlassBlurDp(frost).dp.toPx()
+            val lensHeight = bottomBarGlassRefractionHeightDp(glass).dp.toPx()
+            if (radius > 0f) {
+                blur(radius, TileMode.Clamp)
+                padding = bottomBarBlurSamplingPadding(radius, lensHeight)
+            }
+            if (glass > 0f) lens(
+                lensHeight,
+                bottomBarGlassRefractionAmountDp(glass).dp.toPx(),
+            )
+        },
+        highlight = { Highlight.Default },
+        shadow = { Shadow.Default },
+        onDrawSurface = { drawRect(surfaceColor) },
+    )
+}
+
 @Composable
 fun LiquidBottomTabs(
     selectedTabIndex: () -> Int,
@@ -103,8 +134,6 @@ fun LiquidBottomTabs(
     val isLightTheme = isAppLightTheme()
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
-    val capsuleSurfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
-        .copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     val indicatorContainerColor =
         if (isLightTheme) Color(0xFFFAFAFA).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
         else Color(0xFF121212).copy(alpha = bottomBarGlassSurfaceAlpha(frost))
@@ -373,25 +402,7 @@ fun LiquidBottomTabs(
                     scaleX = scale
                     scaleY = scale
                 }
-                .drawBackdrop(
-                    backdrop = backdrop,
-                    shape = { barShape },
-                    effects = {
-                        val radius = bottomBarGlassBlurDp(frost).dp.toPx()
-                        val lensHeight = bottomBarGlassRefractionHeightDp(glass).dp.toPx()
-                        if (radius > 0f) {
-                            blur(radius, TileMode.Clamp)
-                            padding = bottomBarBlurSamplingPadding(radius, lensHeight)
-                        }
-                        if (glass > 0f) lens(
-                            lensHeight,
-                            bottomBarGlassRefractionAmountDp(glass).dp.toPx(),
-                        )
-                    },
-                    highlight = { Highlight.Default },
-                    shadow = { Shadow.Default },
-                    onDrawSurface = { drawRect(capsuleSurfaceColor) },
-                )
+                .drawBottomBarGlassBackdrop(backdrop, frost, glass, isLightTheme)
                 .height(64.dp)
                 .fillMaxWidth(),
         )
