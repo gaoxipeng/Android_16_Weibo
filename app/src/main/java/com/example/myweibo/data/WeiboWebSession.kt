@@ -1113,13 +1113,9 @@ class WeiboWebSession(context: Context) {
     suspend fun followUser(uid: String, current: UserProfile): UserProfile {
         val targetUid = uid.trim()
         require(targetUid.isNotBlank()) { "无效的用户 UID" }
-        val raw = postForm(
+        val raw = postJson(
             path = WeiboEndpoints.FOLLOW_CREATE,
-            params = linkedMapOf(
-                "friend_uid" to targetUid,
-                "page" to "profile",
-                "lpage" to "profile",
-            ),
+            json = JSONObject().put("friend_uid", targetUid),
             referer = "https://weibo.com/u/$targetUid",
         )
         return WeiboJsonParser.mergeFollowMutationProfile(

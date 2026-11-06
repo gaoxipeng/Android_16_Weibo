@@ -551,8 +551,8 @@ private val VideoPeekDragReturnAnimationSpec = tween<Float>(
     easing = VideoPeekReturnEasing,
 )
 private val VideoPeekFullscreenReturnAnimationSpec = tween<Float>(
-    durationMillis = 400,
-    easing = VideoPeekReturnEasing,
+    durationMillis = 460,
+    easing = FastOutSlowInEasing,
 )
 private val ImagePeekMotionEasing = FastOutSlowInEasing
 private val ImagePeekEnterAnimationSpec = tween<Float>(
@@ -13526,7 +13526,11 @@ private fun VideoPeekOverlay(
         dismissReason == VideoPeekDismissReason.EnterFullscreen
     ImmersiveVideoChromeEffect(enabled = fullscreenTransitionActive)
     FullscreenVideoOrientationEffect(
-        enabled = fullscreenTransitionActive,
+        // Restore the page orientation as soon as fullscreen starts closing. Keeping
+        // landscape locked until the scale animation reaches zero makes rotation happen
+        // as a separate jump after the video has already returned to card size.
+        enabled = (isFullscreenMode && dismissReason == null) ||
+            dismissReason == VideoPeekDismissReason.EnterFullscreen,
         aspectRatio = aspectRatio,
     )
 

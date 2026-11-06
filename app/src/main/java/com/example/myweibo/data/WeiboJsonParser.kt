@@ -889,7 +889,11 @@ object WeiboJsonParser {
     ): UserProfile {
         val root = JSONObject(raw)
         if (root.optInt("ok", 0) != 1 && !root.optBoolean("result", false)) {
-            throw IllegalStateException(root.optNullableString("msg") ?: "\u5173\u6CE8\u64CD\u4F5C\u5931\u8D25")
+            throw IllegalStateException(
+                root.optNullableString("msg")
+                    ?: root.optNullableString("message")
+                    ?: "\u5173\u6CE8\u64CD\u4F5C\u5931\u8D25",
+            )
         }
         val parsed = runCatching { parseUserProfile(raw) }.getOrNull()
         return if (parsed != null && parsed.id.isNotBlank()) {
