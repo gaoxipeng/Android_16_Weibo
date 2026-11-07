@@ -2991,6 +2991,9 @@ private class VideoPeekController {
 
     fun exitFullscreenToInline() {
         if (activeRequest != null && pendingDismiss == null && isFullscreenMode) {
+            if (activeRequest?.returnToOriginalInline == true) {
+                activeRequest = activeRequest?.copy(inlineHosted = true)
+            }
             isFullscreenMode = false
             isFloating = false
             isInlineAnchored = true
@@ -9878,7 +9881,10 @@ fun WeiboApp() {
                     isFullscreenMode = videoPeekController.isFullscreenMode,
                     dismissReason = videoPeekController.pendingDismiss,
                     onRequestCancel = {
-                        if (videoPeekController.isFullscreenMode && request.inlineHosted) {
+                        if (
+                            videoPeekController.isFullscreenMode &&
+                            (request.inlineHosted || request.returnToOriginalInline)
+                        ) {
                             videoPeekController.exitFullscreenToInline()
                         } else videoPeekController.cancel()
                     },
@@ -11206,7 +11212,11 @@ private fun FeedCard(
                     autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 )
             }
-            FeedPollCard(displayItem, onUrlEntityClick, Modifier.padding(horizontal = FeedCardContentHorizontalPadding))
+            // A repost can carry the original vote payload in its parsed display item.
+            // Render the poll once on the outer/original status card only.
+            if (displayItem.retweetedStatus == null) {
+                FeedPollCard(displayItem, onUrlEntityClick, Modifier.padding(horizontal = FeedCardContentHorizontalPadding))
+            }
             FeedLocationCapsule(
                 item = displayItem,
                 // Action labels are vertically centered in a 26.dp touch row. Balance
@@ -11723,7 +11733,9 @@ private fun QuotedStatus(
                 autoFloatingOnScrollAway = autoFloatingOnScrollAway,
                 showVideoTitle = false,
             )
-            FeedPollCard(displayItem, onUrlEntityClick)
+            if (displayItem.retweetedStatus == null) {
+                FeedPollCard(displayItem, onUrlEntityClick)
+            }
             FeedLocationCapsule(item = displayItem)
         }
     }
@@ -13688,7 +13700,7 @@ private fun VideoPeekOverlay(
                 dismissFingerDragStart = fingerOffsetAtDismiss.takeIf { animateFingerReturn } ?: Offset.Zero
                 dismissFingerDragProgress.snapTo(if (animateFingerReturn) 0f else 1f)
                 videoPeekController.resetFingerDragOffset()
-                if (isFloating) {
+                if (isFloating || (isInlineAnchored && fullscreenReturning)) {
                     closingAnchorBounds = resolveAnchorBounds()
                     val statusBarTopPx = with(density) { statusBarTop.toPx() }
                     val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
@@ -13711,7 +13723,10 @@ private fun VideoPeekOverlay(
                         statusBarTopPx = statusBarTopPx,
                         aspectRatio = aspectRatio,
                         overlayOriginInWindow = overlayWindowOrigin,
-                        forceTopExit = fromFullscreen,
+                        // Return to the original media card for both long-press entry
+                        // and the fullscreen button path. Forcing a top exit here made
+                        // long-press playback drift toward the status bar on return.
+                        forceTopExit = false,
                     )
                     peekDismissStartBounds = sourceBounds
                     peekDismissTargetBounds = targetBounds
@@ -13783,7 +13798,7 @@ private fun VideoPeekOverlay(
         val fingerFollowAlpha = if (isFloating || isDocked) 0f else (1f - expandProgressForBackdrop).coerceIn(0f, 1f)
         val expandProgress = expandProgressForBackdrop
         val dockedProgress = dockProgress.value.coerceIn(0f, 1f)
-        val useFloatingDismissMorph = isFloating &&
+        val useFloatingDismissMorph = (isFloating || (isInlineAnchored && fullscreenExpandProgress.value > 0f)) &&
             dismissReason != null &&
             dismissReason != VideoPeekDismissReason.EnterFullscreen
         val effectiveMaxHeight = if (maxHeight == Dp.Infinity) screenHeight else maxHeight
@@ -14187,10 +14202,27 @@ private fun VideoPeekOverlay(
                     modifier = when {
                         !useFloatingDismissMorph && (isFullscreenMode || fromFullscreen ||
                             dismissReason == VideoPeekDismissReason.EnterFullscreen || inlineFullscreenProgress > 0f) -> {
-                            val startLeft = if (inlineHosted && !isFloating && !isFullscreenMode) hostedLeft else dockLeft
-                            val startTop = if (inlineHosted && !isFloating && !isFullscreenMode) hostedTop else dockTop
-                            val startWidth = if (inlineHosted && !isFloating && !isFullscreenMode) hostedWidth else dockWidth
-                            val startHeight = if (inlineHosted && !isFloating && !isFullscreenMode) hostedHeight else dockHeight
+                            val startsFromHeldPreview = !inlineHosted && !isFloating && !isInlineAnchored
+                            val startLeft = when {
+                                inlineHosted && !isFloating && !isFullscreenMode -> hostedLeft
+                                startsFromHeldPreview -> holdLeft
+                                else -> dockLeft
+                            }
+                            val startTop = when {
+                                inlineHosted && !isFloating && !isFullscreenMode -> hostedTop
+                                startsFromHeldPreview -> holdTop
+                                else -> dockTop
+                            }
+                            val startWidth = when {
+                                inlineHosted && !isFloating && !isFullscreenMode -> hostedWidth
+                                startsFromHeldPreview -> previewWidth
+                                else -> dockWidth
+                            }
+                            val startHeight = when {
+                                inlineHosted && !isFloating && !isFullscreenMode -> hostedHeight
+                                startsFromHeldPreview -> previewHeight
+                                else -> dockHeight
+                            }
                             Modifier
                                 .offset {
                                     placedHostOffset(
@@ -16569,6 +16601,9 @@ private fun InlineVideoPlayer(
                 onRelease = {},
                 onPlaybackEnded = { resetPeekState() },
                 onOpenFullscreenBehind = {},
+                // A long-press preview promoted to fullscreen should return to its
+                // source card just like the inline fullscreen-button path.
+                returnToOriginalInline = !isDetailInlinePlayback,
                 onEnterFullscreenHandoffComplete = {
                     resetPeekState()
                 },
@@ -19934,8 +19969,12 @@ private fun CommentComposerDialog(
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
+    val imeVisible = WindowInsets.ime.asPaddingValues().calculateBottomPadding() > 0.dp
+    var imeWasVisible by remember(target) { mutableStateOf(false) }
+    var suppressImeDismiss by remember(target) { mutableStateOf(false) }
+    var dismissalRequested by remember(target) { mutableStateOf(false) }
     val canSubmit = (target.isRepost || text.text.trim().isNotEmpty() || selectedPhotoUris.isNotEmpty()) && !submitting
-    val sendColor = Color(0xFFFFB36B)
+    val sendColor = Color(0xFFF28C28)
     val cardColor = if (isLightAppearance()) Color(0xFFFFFBFF) else MaterialTheme.colorScheme.surface
     val inputColor = MaterialTheme.colorScheme.surfaceContainerHighest
     val inputTextStyle = MaterialTheme.typography.bodyMedium.copy(
@@ -19991,6 +20030,14 @@ private fun CommentComposerDialog(
         onEmoticonUsed(phrase)
     }
 
+    fun dismissComposer() {
+        if (dismissalRequested) return
+        dismissalRequested = true
+        focusManager.clearFocus()
+        keyboard?.hide()
+        onDismiss()
+    }
+
     fun insertMention() {
         insertAtCursor("@", requestKeyboard = true)
     }
@@ -20024,8 +20071,21 @@ private fun CommentComposerDialog(
     fun openEmoticons() {
         emoticonPanelVisible = !emoticonPanelVisible
         if (emoticonPanelVisible) {
+            if (imeVisible) suppressImeDismiss = true
             keyboard?.hide()
             focusManager.clearFocus()
+        }
+    }
+
+    LaunchedEffect(imeVisible) {
+        if (imeVisible) {
+            imeWasVisible = true
+        } else if (imeWasVisible && !dismissalRequested) {
+            if (suppressImeDismiss) {
+                suppressImeDismiss = false
+            } else {
+                dismissComposer()
+            }
         }
     }
 
@@ -20036,11 +20096,7 @@ private fun CommentComposerDialog(
     }
 
     Dialog(
-        onDismissRequest = {
-            focusManager.clearFocus()
-            keyboard?.hide()
-            onDismiss()
-        },
+        onDismissRequest = ::dismissComposer,
         properties = DialogProperties(
             usePlatformDefaultWidth = false,
             decorFitsSystemWindows = false,
@@ -20053,11 +20109,7 @@ private fun CommentComposerDialog(
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
-                    onClick = {
-                        focusManager.clearFocus()
-                        keyboard?.hide()
-                        onDismiss()
-                    },
+                    onClick = ::dismissComposer,
                 ),
             contentAlignment = Alignment.BottomCenter,
         ) {
@@ -25257,9 +25309,6 @@ private fun SettingsScreen(
                         selected = selectedThemeColor,
                         onSelected = onThemeColorChange,
                     )
-                }
-                item {
-                    SettingsHelpEntryCard(onOpen = { showHelp = true })
                 }
                 item { SettingsCacheCard() }
                 item {
