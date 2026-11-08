@@ -134,6 +134,7 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentHeight
@@ -3053,6 +3054,7 @@ private class VideoPeekController {
         // callback can cancel/release the player prepared for the destination.
         request?.onEnterFullscreenHandoffComplete?.invoke()
     }
+
 }
 
 private fun returnAnchoredVideoToCard(
@@ -4434,6 +4436,7 @@ fun WeiboApp() {
     val profileParentBackdrops = remember { mutableStateMapOf<Int, Bitmap>() }
     var profileReturnCapturing by remember { mutableStateOf(false) }
     val profileReturnProgress = remember { Animatable(0f) }
+    var albumDetailSwipeReturn by remember { mutableStateOf(false) }
     var profileEntryLaidOut by remember(visitedProfileLoadGeneration) { mutableStateOf(false) }
     var visitedListScrollResetGeneration by remember { mutableIntStateOf(-1) }
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
@@ -5253,6 +5256,39 @@ fun WeiboApp() {
     }
 
     fun navigateBack() {
+        val returningToAlbum = navOverlayStack.lastOrNull() is NavOverlayKind.Detail &&
+            navOverlayStack.dropLast(1).lastOrNull() == NavOverlayKind.AlbumViewer &&
+            navOverlayStack.dropLast(2).any { it is NavOverlayKind.Detail }
+        if (returningToAlbum && !albumDetailSwipeReturn && !profileReturnCapturing && profileReturnBitmap == null) {
+            val window = (context as? android.app.Activity)?.window
+            if (window != null && window.decorView.width > 0 && window.decorView.height > 0) {
+                profileReturnCapturing = true
+                val capturedStack = navOverlayStack
+                val bitmap = Bitmap.createBitmap(window.decorView.width, window.decorView.height, Bitmap.Config.ARGB_8888)
+                fun finishCapture(success: Boolean) {
+                    profileReturnCapturing = false
+                    if (capturedStack != navOverlayStack) return
+                    if (!success) { popNavigation(); return }
+                    profileReturnBitmap = bitmap
+                    popNavigation()
+                    scope.launch {
+                        profileReturnProgress.snapTo(0f)
+                        withFrameNanos { }
+                        profileReturnProgress.animateTo(1f, tween(DetailReturnDurationMs, easing = DetailMotionEasing))
+                        clearNavExitPendingKind()
+                        withFrameNanos { }
+                        profileReturnBitmap = null
+                        profileReturnProgress.snapTo(0f)
+                    }
+                }
+                runCatching {
+                    android.view.PixelCopy.request(window, bitmap, { result ->
+                        finishCapture(result == android.view.PixelCopy.SUCCESS)
+                    }, android.os.Handler(android.os.Looper.getMainLooper()))
+                }.onFailure { finishCapture(false) }
+                return
+            }
+        }
         popNavigation()
     }
 
@@ -5500,7 +5536,9 @@ fun WeiboApp() {
         }
         val previousPage = navStack.lastOrNull()
         if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
-            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
+            (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile ||
+                (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail &&
+                    navOverlayStack.dropLast(2).any { it is NavOverlayKind.VisitedProfile }))) {
             if (profileReturnCapturing || profileReturnBitmap != null) return
             val window = (context as? android.app.Activity)?.window
             if (window == null || window.decorView.width <= 0 || window.decorView.height <= 0) {
@@ -5789,7 +5827,7 @@ fun WeiboApp() {
             videoPlaybackCoordinator.activeKey = null
             videoPlaybackCoordinator.peekPlaybackKey = null
         }
-        popNavigation()
+        navigateBack()
     }
 
     fun prepareInlineVideoHandoffForDetail(item: FeedItem, hostItem: FeedItem? = null) {
@@ -8640,7 +8678,9 @@ fun WeiboApp() {
                     immediateEnter = true,
                     onSwipeBack = {
                         if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
-                            navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
+                            (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile ||
+                                (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail &&
+                                    navOverlayStack.dropLast(2).any { it is NavOverlayKind.VisitedProfile }))) {
                             // The gesture already moved the outgoing page fully offscreen.
                             // Restore its parent without starting a second exit animation.
                             navigateBack()
@@ -8933,7 +8973,10 @@ fun WeiboApp() {
                 }
 
                 albumDetailBackdrop?.let { bitmap ->
-                    if (albumDetailBackdropVisible && !bitmap.isRecycled) Image(
+                    if (albumDetailBackdropVisible &&
+                        overlayTop != OverlayTop.VisitedProfile &&
+                        navExitPendingKind !is NavOverlayKind.VisitedProfile &&
+                        !bitmap.isRecycled) Image(
                         bitmap = bitmap.asImageBitmap(), contentDescription = null,
                         contentScale = ContentScale.FillBounds,
                         modifier = Modifier.fillMaxSize().zIndex(589f).background(Color.Black),
@@ -8995,7 +9038,8 @@ fun WeiboApp() {
                         hiddenFeedCardId = null
                     },
                     onSwipeBack = {
-                        closeDetail()
+                        albumDetailSwipeReturn = true
+                        try { closeDetail() } finally { albumDetailSwipeReturn = false }
                         detailSwipeReturningHome = false
                         detailSystemBackInProgress = false
                         // The gesture already finished the card's return. Restore
@@ -10302,6 +10346,7 @@ private fun AppPullToRefreshBox(
 }
 
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FollowFeedScreen(
     session: WeiboWebSession,
@@ -10334,7 +10379,7 @@ private fun FollowFeedScreen(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     feedUiOnTop: Boolean = true,
 ) {
-    val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val topInset = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
 
     SideEffect {
         FeedEmoticonLinkDispatcher.onUserClick = onUserClick
@@ -13474,6 +13519,7 @@ private fun VideoPeekOverlay(
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
+    val coroutineScope = rememberCoroutineScope()
     val videoPeekController = LocalVideoPeekController.current
     val playbackKey = remember(media.streamUrl, media.downloadUrl, media.coverUrl, playbackOwnerId) {
         videoPlaybackKey(media, playbackOwnerId)
@@ -13994,7 +14040,19 @@ private fun VideoPeekOverlay(
                         isDocked -> null
                         else -> VideoPeekFloatingPlaybackSpeed
                     },
-                    onPlaybackEnded = onPlaybackEnded,
+                    onPlaybackEnded = {
+                        val returnsToInlineCard = isFullscreenMode &&
+                            (inlineHosted || videoPeekController.activeRequest?.returnToOriginalInline == true)
+                        if (returnsToInlineCard) {
+                            // Route natural completion through the exact same handler as
+                            // an explicit fullscreen return. That handler performs the
+                            // inline handoff and lets the shared anchored-return effect
+                            // own the animation and cleanup.
+                            onRequestCancel()
+                        } else {
+                            onPlaybackEnded()
+                        }
+                    },
                     onAspectRatio = { width, height ->
                         aspectRatio = width.toFloat() / height.toFloat()
                         videoPeekController.activeRequest?.takeIf {
@@ -14578,6 +14636,7 @@ private fun MediaStrip(
     var viewerIndex by remember { mutableStateOf(0) }
     var viewerActiveIndex by remember { mutableStateOf(0) }
     var viewerReturning by remember { mutableStateOf(false) }
+    var viewerOpeningReady by remember { mutableStateOf(false) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
@@ -14593,6 +14652,7 @@ private fun MediaStrip(
         viewerIndex = index
         viewerActiveIndex = index
         viewerReturning = false
+        viewerOpeningReady = false
         if (sourceBounds != null) {
             thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
         }
@@ -14627,7 +14687,7 @@ private fun MediaStrip(
                             allImages = images,
                             imageIndex = 0,
                             imageOwner = imageOwner,
-                            hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == 0,
+                            hiddenForViewer = viewerOpen && viewerOpeningReady && !viewerReturning && viewerActiveIndex == 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
@@ -14671,7 +14731,7 @@ private fun MediaStrip(
                                     allImages = images,
                                     imageIndex = cellIndex,
                                     imageOwner = imageOwner,
-                                    hiddenForViewer = viewerOpen && !viewerReturning && viewerActiveIndex == cellIndex,
+                                    hiddenForViewer = viewerOpen && viewerOpeningReady && !viewerReturning && viewerActiveIndex == cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
@@ -14720,6 +14780,7 @@ private fun MediaStrip(
                     onPageChanged = { viewerActiveIndex = it },
                     sourceBoundsByIndex = viewerSourceBoundsByIndex,
                     animateOpenFromSource = viewerAnimateOpenFromSource,
+                    onOpenTransitionReady = { viewerOpeningReady = true },
                     onReturnLanded = {
                         // Restore beneath the landed image before removing the dialog window.
                         viewerReturning = true
@@ -14730,6 +14791,7 @@ private fun MediaStrip(
                     onDismiss = {
                         viewerOpen = false
                         viewerReturning = false
+                        viewerOpeningReady = false
                         viewerSourceBoundsByIndex = emptyMap()
                         viewerAnimateOpenFromSource = true
                         viewerCloseHandoff?.invoke()
@@ -14962,6 +15024,7 @@ private fun FullscreenImageViewer(
     embedded: Boolean = false,
     viewerInteractive: Boolean = true,
     onViewerReady: () -> Unit = {},
+    onOpenTransitionReady: () -> Unit = {},
     onRetargetDuringClose: ((Int) -> Unit)? = null,
     onDismissWithIndex: ((Int) -> Unit)? = null,
     onPageChanged: (suspend (Int) -> Unit)? = null,
@@ -15099,10 +15162,12 @@ private fun FullscreenImageViewer(
                 }
             }
             if (initialTransitionBitmap == null) {
+                onOpenTransitionReady()
                 transitionProgress.snapTo(1f)
                 return@LaunchedEffect
             }
             viewerAspects.remove(initialIndex)
+            onOpenTransitionReady()
             withFrameNanos { }
             transitionProgress.animateTo(
                 targetValue = 1f,
@@ -17949,6 +18014,7 @@ private fun WeiboVideoSurface(
 
     val currentPeekMode = rememberUpdatedState(isPeekPlayback)
     val currentFullscreenMode = rememberUpdatedState(isFullscreen)
+    val currentPlaybackEnded = rememberUpdatedState(onPlaybackEnded)
 
     LaunchedEffect(player, playbackKey, isPeekPlayback, isFullscreen) {
         if (!ownsOutput()) return@LaunchedEffect
@@ -17978,7 +18044,7 @@ private fun WeiboVideoSurface(
                     player.seekTo(0L)
                     positionMs = 0L
                     isPlaying = false
-                    onPlaybackEnded?.invoke()
+                    currentPlaybackEnded.value?.invoke()
                 }
             }
 
@@ -22010,6 +22076,7 @@ private fun CommentImageStrip(
     var viewerOpen by remember { mutableStateOf(false) }
     var viewerIndex by remember { mutableStateOf(0) }
     var activeThumbnailIndex by remember { mutableStateOf(0) }
+    var viewerOpeningReady by remember { mutableStateOf(false) }
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
@@ -22021,6 +22088,7 @@ private fun CommentImageStrip(
         onClosed: (() -> Unit)? = null,
     ) {
         viewerIndex = index
+        viewerOpeningReady = false
         if (sourceBounds != null) {
             thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to sourceBounds)
         }
@@ -22048,7 +22116,7 @@ private fun CommentImageStrip(
                     allImages = images,
                     imageIndex = index,
                     modifier = Modifier.size(72.dp),
-                    hiddenForViewer = viewerOpen && activeThumbnailIndex == index,
+                    hiddenForViewer = viewerOpen && viewerOpeningReady && activeThumbnailIndex == index,
                     previewUrl = image.thumbnailUrl,
                     contentScale = ContentScale.Crop,
                     showLiveBadge = true,
@@ -22071,9 +22139,11 @@ private fun CommentImageStrip(
                 initialIndex = viewerIndex,
                 sourceBoundsByIndex = viewerSourceBoundsByIndex,
                 animateOpenFromSource = viewerAnimateOpenFromSource,
+                onOpenTransitionReady = { viewerOpeningReady = true },
                 onPageChanged = { activeThumbnailIndex = it },
                 onDismiss = {
                     viewerOpen = false
+                    viewerOpeningReady = false
                     viewerSourceBoundsByIndex = emptyMap()
                     viewerAnimateOpenFromSource = true
                     viewerDismissHook?.invoke()
