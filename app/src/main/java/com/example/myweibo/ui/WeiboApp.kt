@@ -831,6 +831,7 @@ private fun Modifier.mediaPeekMotionLayer(
     motion: MediaPeekGraphicsMotion,
     fingerDragOffset: () -> Offset,
     shadowElevation: Dp,
+    cropToVisualBounds: Boolean = false,
 ): Modifier {
     val cornerShape = RoundedCornerShape(motion.cornerRadius)
     return this
@@ -849,6 +850,18 @@ private fun Modifier.mediaPeekMotionLayer(
             scaleY = motion.scaleY
             alpha = motion.alpha.coerceIn(0f, 1f)
             transformOrigin = TransformOrigin(0.5f, 0.5f)
+            if (cropToVisualBounds) {
+                val cropWidth = (motion.visualBounds.width / motion.scaleX.coerceAtLeast(0.001f)).coerceAtMost(size.width)
+                val cropHeight = (motion.visualBounds.height / motion.scaleY.coerceAtLeast(0.001f)).coerceAtMost(size.height)
+                shape = androidx.compose.foundation.shape.GenericShape { _, _ ->
+                    addRoundRect(RoundRect(
+                        Rect((size.width - cropWidth) / 2f, (size.height - cropHeight) / 2f,
+                            (size.width + cropWidth) / 2f, (size.height + cropHeight) / 2f),
+                        androidx.compose.ui.geometry.CornerRadius(motion.cornerRadius.toPx()),
+                    ))
+                }
+                clip = true
+            }
         }
         .clip(cornerShape)
 }
@@ -1202,6 +1215,7 @@ private const val RemoteBytesMaxCachedEntry = 8 * 1024 * 1024
 private const val RemoteBytesAnimatedMaxRead = 64 * 1024 * 1024
 private const val RemoteDiskBytesCacheMaxTotal = 256 * 1024 * 1024
 private const val NavTransitionDurationMs = 280
+private val NavPageMotionEasing = CubicBezierEasing(0.18f, 0.72f, 0.22f, 1f)
 private const val DetailTransitionDurationMs = 250
 private const val DetailEntryDurationMs = 200
 private const val DetailReturnDurationMs = DetailTransitionDurationMs
@@ -1227,13 +1241,13 @@ private const val ImageAcceptHeader = "image/avif,image/webp,image/apng,image/sv
 
 private fun navStackEnterTransition() =
     slideInHorizontally(
-        animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+        animationSpec = tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
         initialOffsetX = { fullWidth -> fullWidth },
     )
 
 private fun navStackExitTransition() =
     slideOutHorizontally(
-        animationSpec = tween(NavTransitionDurationMs, easing = FastOutSlowInEasing),
+        animationSpec = tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
         targetOffsetX = { fullWidth -> fullWidth },
     )
 
@@ -1251,6 +1265,7 @@ private fun <T> NavAnimatedOverlay(
     navKind: NavOverlayKind? = null,
     pendingEnterKind: NavOverlayKind? = null,
     pendingExitKind: NavOverlayKind? = null,
+    pageStackSlide: Boolean = false,
     nestedDetailReturnAnimating: Boolean = false,
     sourceReturnZIndex: Float? = null,
     sourceBounds: Rect? = null,
@@ -1259,6 +1274,7 @@ private fun <T> NavAnimatedOverlay(
     returnBackground: Bitmap? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
+    swipeNavigationEnabled: Boolean = true,
     commitCardReturn: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
     onSourceCardHandoffReady: () -> Unit = {},
@@ -1346,7 +1362,7 @@ private fun <T> NavAnimatedOverlay(
         swipeSettling = true
         playCommittedCardReturn()
     }
-    val swipeEnabled = stackTop && overlayVisible && navKind != null && pageBack != null &&
+    val swipeEnabled = swipeNavigationEnabled && stackTop && overlayVisible && navKind != null && pageBack != null &&
         pendingEnterKind == null && pendingExitKind == null && !commitCardReturn
     val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity, interceptRightSwipe) {
         if (!swipeEnabled) return@pointerInput
@@ -1377,7 +1393,8 @@ private fun <T> NavAnimatedOverlay(
                 val displacement = change.position - down.position
                 if (!dragging) {
                     // Let vertical scrolling and child horizontal controls win first.
-                    if (change.isConsumed || abs(displacement.y) > viewConfiguration.touchSlop ||
+                    if (change.isConsumed || (abs(displacement.y) > viewConfiguration.touchSlop &&
+                            abs(displacement.y) > abs(displacement.x)) ||
                         displacement.x < -viewConfiguration.touchSlop
                     ) break
                     if (displacement.x <= viewConfiguration.touchSlop) continue
@@ -1385,6 +1402,16 @@ private fun <T> NavAnimatedOverlay(
                 }
                 change.consume()
                 swipeOffset = displacement.x.coerceIn(0f, overlayWidth.toFloat())
+                if (navKind is NavOverlayKind.VisitedProfile || navKind is NavOverlayKind.FollowList) {
+                    navTransitions.setStandardPageUnderlayOffset(
+                        -0.25f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f),
+                    )
+                }
+                if (navKind is NavOverlayKind.Detail && sourceBounds == null) {
+                    navTransitions.setStandardPageUnderlayOffset(
+                        -0.25f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f),
+                    )
+                }
             }
             if (dragging) {
                 val velocity = tracker.calculateVelocity().x
@@ -1399,12 +1426,26 @@ private fun <T> NavAnimatedOverlay(
                         val startOffset = swipeOffset
                         animate(0f, 1f, animationSpec = tween(180, easing = FastOutSlowInEasing)) { value, _ ->
                             swipeOffset = startOffset * (1f - value)
+                            if (navKind is NavOverlayKind.Detail && sourceBounds == null ||
+                                (navKind is NavOverlayKind.VisitedProfile || navKind is NavOverlayKind.FollowList)) {
+                                navTransitions.setStandardPageUnderlayOffset(
+                                    -0.25f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f),
+                                )
+                            }
                         }
                     } else animate(
                         initialValue = swipeOffset,
                         targetValue = if (commit) overlayWidth.toFloat() else 0f,
                         animationSpec = tween(180, easing = FastOutSlowInEasing),
-                    ) { value, _ -> swipeOffset = value }
+                    ) { value, _ ->
+                        swipeOffset = value
+                        if (navKind is NavOverlayKind.Detail && sourceBounds == null ||
+                            (navKind is NavOverlayKind.VisitedProfile || navKind is NavOverlayKind.FollowList)) {
+                            navTransitions.setStandardPageUnderlayOffset(
+                                -0.25f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f),
+                            )
+                        }
+                    }
                     if (commit) {
                         swipeCommitted = true
                         latestPageBack?.invoke()
@@ -1441,11 +1482,15 @@ private fun <T> NavAnimatedOverlay(
         overlayVisible &&
         transitionIdentity != null &&
         enteredKeys[transitionIdentity] != true &&
+        (navKind !is NavOverlayKind.Detail || pendingEnterKind is NavOverlayKind.Detail) &&
+        (navKind !is NavOverlayKind.FollowList || pendingEnterKind is NavOverlayKind.FollowList) &&
         (navKind == null || pendingEnterKind == null || navOverlayKindsMatch(pendingEnterKind, navKind))
     val shouldAnimateExit = stackAnimated &&
         !overlayVisible &&
         target == null &&
         (navKind == null || navOverlayKindsMatch(pendingExitKind, navKind))
+    val standardDetailStackMotion = stackAnimated && (navKind is NavOverlayKind.Detail || navKind is NavOverlayKind.FollowList) && sourceBounds == null &&
+        (pendingEnterKind is NavOverlayKind.Detail || pendingExitKind is NavOverlayKind.Detail || pendingEnterKind is NavOverlayKind.FollowList || pendingExitKind is NavOverlayKind.FollowList || pageStackSlide)
     var skipAnimationToken by remember { mutableIntStateOf(0) }
     // 进入/退出动画在 identity 或 pendingExit 生命周期内锁定，避免中途 effectiveEnter/Exit 变 None 导致动画被掐断。
     val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
@@ -1459,7 +1504,9 @@ private fun <T> NavAnimatedOverlay(
     val effectiveExit = remember(transitionIdentity, skipAnimationToken, pendingExitKind) {
         if (swipeCommitted || (sourceBounds != null && navKind is NavOverlayKind.Detail)) ExitTransition.None
         else if (shouldAnimateExit && navKind is NavOverlayKind.Detail) slideOutHorizontally(
-            animationSpec = tween(DetailReturnDurationMs, easing = DetailMotionEasing),
+            animationSpec = if (standardDetailStackMotion) {
+                tween(NavTransitionDurationMs, easing = NavPageMotionEasing)
+            } else tween(DetailReturnDurationMs, easing = DetailMotionEasing),
             targetOffsetX = { it },
         )
         else if (shouldAnimateExit) exit else ExitTransition.None
@@ -1467,20 +1514,26 @@ private fun <T> NavAnimatedOverlay(
     // Detail's visibility/reveal transition already owns the entire exit. A
     // second hold leaves an invisible full-screen pointer blocker over the feed.
     val effectiveExitHoldMillis = if (shouldAnimateExit && !swipeCommitted && sourceBounds == null &&
-        navKind !is NavOverlayKind.Detail) exitHoldMillis else 0L
+        navKind !is NavOverlayKind.Detail && navKind !is NavOverlayKind.VisitedProfile && navKind !is NavOverlayKind.FollowList) exitHoldMillis else 0L
     // Keep one visibility transition for the detail layer. Re-keying this state for
     // each detail disposes AnimatedContent's outgoing child before it can slide away.
     val transitionStateKey: Any? = if (navKind is NavOverlayKind.Detail) "detail-overlay" else transitionIdentity
     val transitionState = remember(skipAnimationToken, transitionStateKey, if (!stackAnimated) avVisible else null) {
         // Non-animated hosts must be visible in their first composition. Waiting
         // for SideEffect exposes the empty layer beneath for one frame.
-        MutableTransitionState(if (!stackAnimated || immediateEnter) avVisible else false)
+        val retainedDetail = (navKind is NavOverlayKind.Detail && pendingEnterKind !is NavOverlayKind.Detail) ||
+            (navKind is NavOverlayKind.FollowList && pendingEnterKind !is NavOverlayKind.FollowList)
+        MutableTransitionState(if (!stackAnimated || immediateEnter || retainedDetail) avVisible else false)
     }
     SideEffect {
         transitionState.targetState = avVisible
     }
-    LaunchedEffect(avVisible, transitionIdentity) {
-        if (!avVisible && transitionIdentity != null) {
+    val standardProfileStackExit = stackAnimated && navKind is NavOverlayKind.VisitedProfile &&
+        pendingExitKind is NavOverlayKind.VisitedProfile
+    LaunchedEffect(avVisible, transitionIdentity, pendingEnterKind, pendingExitKind) {
+        // A detail layer is merely covered while a profile sits above it. Keep its
+        // entered identity so revealing that retained layer cannot replay a push.
+        if (!avVisible && transitionIdentity != null && navKind !is NavOverlayKind.Detail) {
             enteredKeys.remove(transitionIdentity)
         }
     }
@@ -1494,6 +1547,9 @@ private fun <T> NavAnimatedOverlay(
         if (!overlayVisible || transitionIdentity == null) return@LaunchedEffect
         if (!transitionState.isIdle || !transitionState.currentState) return@LaunchedEffect
         enteredKeys[transitionIdentity] = true
+        if (enteredKeys.size > 8) {
+            enteredKeys.keys.firstOrNull { it != transitionIdentity }?.let(enteredKeys::remove)
+        }
         if (navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
             onClearPendingEnter()
         }
@@ -1551,7 +1607,22 @@ private fun <T> NavAnimatedOverlay(
     // `displayed` may outlive the visual exit for deferred navigation cleanup.
     if (avVisible || transitionState.currentState || !transitionState.isIdle ||
         detailExitHandoffHold || detailReturnHandoffPending) {
-    Box(modifier.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
+    Box(modifier.graphicsLayer {
+        val isRetainedPageUnderProfile = (navKind is NavOverlayKind.Detail || navKind is NavOverlayKind.FollowList) &&
+            (pendingEnterKind is NavOverlayKind.VisitedProfile || pendingExitKind is NavOverlayKind.VisitedProfile)
+        if (navKind != NavOverlayKind.AlbumViewer && !isExiting && stackAnimated &&
+            (!stackTop || isRetainedPageUnderProfile)) {
+            translationX = size.width * navTransitions.standardPageUnderlayOffsetFraction
+        }
+    }.drawWithContent {
+        drawContent()
+        val underProfile = (navKind is NavOverlayKind.Detail || navKind is NavOverlayKind.FollowList) &&
+            (pendingEnterKind is NavOverlayKind.VisitedProfile || pendingExitKind is NavOverlayKind.VisitedProfile)
+        if (navKind != NavOverlayKind.AlbumViewer && !isExiting && stackAnimated && (!stackTop || underProfile)) {
+            val dim = (-navTransitions.standardPageUnderlayOffsetFraction / 0.25f).coerceIn(0f, 1f)
+            drawRect(Color.Black.copy(alpha = 0.20f * dim))
+        }
+    }.zIndex(zIndex).onSizeChanged { overlayWidth = it.width.coerceAtLeast(1) }
         .onGloballyPositioned {
             overlayOrigin = it.boundsInRoot().topLeft
             horizontalSwipeExclusions.setRootOrigin(overlayOrigin)
@@ -1582,6 +1653,28 @@ private fun <T> NavAnimatedOverlay(
         exit = effectiveExit,
         label = "nav-stack-overlay",
     ) {
+        val pageMotionProgress by transition.animateFloat(
+            transitionSpec = { tween(NavTransitionDurationMs, easing = NavPageMotionEasing) },
+            label = "nav-page-motion-progress",
+        ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
+        LaunchedEffect(standardDetailStackMotion, standardProfileStackExit, transitionIdentity, shouldAnimateExit) {
+            if (!standardDetailStackMotion && !standardProfileStackExit) return@LaunchedEffect
+            // The interactive pop already brought the underlay all the way to zero.
+            // Do not restart its automatic -25% -> 0 motion after the finger releases.
+            if (swipeCommitted) return@LaunchedEffect
+            // A profile pop can restore another profile underneath the retained
+            // follow list. Its non-null target must not turn this pop into a push.
+            val exitingPageMotion = shouldAnimateExit || standardProfileStackExit
+            val startProgress = if (exitingPageMotion) {
+                (-navTransitions.standardPageUnderlayOffsetFraction / 0.25f).coerceIn(0f, 1f)
+            } else 0f
+            val endProgress = if (exitingPageMotion) 0f else 1f
+            animate(
+                startProgress,
+                endProgress,
+                animationSpec = tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
+            ) { value, _ -> navTransitions.setStandardPageUnderlayOffset(-0.25f * value) }
+        }
         val revealProgress by transition.animateFloat(
             transitionSpec = {
                 if (targetState == androidx.compose.animation.EnterExitState.PostExit) detailCardReturnSpec()
@@ -1647,7 +1740,7 @@ private fun <T> NavAnimatedOverlay(
             } else {
                 translationX = swipeOffset
                 shape = RoundedCornerShape((18f * swipeProgress).dp)
-                clip = swipeProgress > 0f
+                clip = false
             }
         }.drawWithContent {
             drawContent()
@@ -3120,6 +3213,11 @@ private val LocalWeiboCurrentUserId = staticCompositionLocalOf<String?> { null }
 
 private class NavTransitionCoordinator {
     var activeTransitions by mutableIntStateOf(0)
+    val standardPageUnderlayOffset = Animatable(0f)
+    var standardPageUnderlayOffsetFraction by mutableFloatStateOf(0f)
+    fun setStandardPageUnderlayOffset(value: Float) {
+        standardPageUnderlayOffsetFraction = value
+    }
     val isTransitioning: Boolean
         get() = activeTransitions > 0
     private val skipHandlers = mutableListOf<() -> Unit>()
@@ -3185,9 +3283,11 @@ private val LocalDetailReturnCardLayout = staticCompositionLocalOf<androidx.comp
 private val LocalDetailPageReveal = staticCompositionLocalOf { 1f }
 private val LocalDetailExitStarted = staticCompositionLocalOf { false }
 private val LocalHiddenFeedCardId = staticCompositionLocalOf<String?> { null }
+private val LocalImageReturnBarTop = staticCompositionLocalOf<() -> Float> { { Float.POSITIVE_INFINITY } }
 private val LocalOpenRetweetCard = staticCompositionLocalOf<((FeedItem, Rect?, FeedItem) -> Unit)?> { null }
 
 private class FeedListScrollCoordinator {
+    var scrollByAction: (suspend (Float) -> Float)? = null
     var isListScrolling by mutableStateOf(false)
     var stopScrollAction: (suspend () -> Unit)? = null
 
@@ -4251,7 +4351,9 @@ fun WeiboApp() {
     }
     var navEnterPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
     var navExitPendingKind by remember { mutableStateOf<NavOverlayKind?>(null) }
+    var imageReturnBarTop by remember { mutableFloatStateOf(Float.POSITIVE_INFINITY) }
     var nestedDetailReturnAnimating by remember { mutableStateOf(false) }
+    var albumDetailPageSlide by remember { mutableStateOf(false) }
     var nestedDetailReturnSnapshot by remember { mutableStateOf<DetailSnapshot?>(null) }
     var pendingDeferredNavRestore by remember { mutableStateOf<NavRestoreState?>(null) }
     var deferredNavRestoreGeneration by remember { mutableIntStateOf(0) }
@@ -4886,6 +4988,9 @@ fun WeiboApp() {
         // second DetailScreen over the retained one and attach both LazyColumns
         // to the same LazyListState, which drops the scroll position to item 0.
         val sameDetailStillComposed = selectedItem?.id == snapshot.item.id
+        // A retained page owns newer content and scroll state than its navigation
+        // snapshot. Replacing its comments can shrink the list and clamp it to top.
+        if (sameDetailStillComposed && detailOuterListStates.containsKey(snapshot.item.id)) return
         commentsRequestJob?.cancel()
         repostsRequestJob?.cancel()
         detailRequestGeneration += 1
@@ -5143,6 +5248,7 @@ fun WeiboApp() {
     fun clearNavExitPendingKind() {
         nestedDetailReturnAnimating = false
         nestedDetailReturnSnapshot = null
+        if (navExitPendingKind is NavOverlayKind.Detail) albumDetailPageSlide = false
         navExitPendingKind = null
         detailSystemBackInProgress = false
         flushDeferredNavRestore()
@@ -5157,6 +5263,7 @@ fun WeiboApp() {
     }
 
     fun finishVisitedProfileExit() {
+        navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
         // An old overlay exit callback must not erase a restored parent profile.
         if (navOverlayStack.none { it is NavOverlayKind.VisitedProfile }) clearVisitedProfileState()
         navExitPendingKind = null
@@ -5184,6 +5291,7 @@ fun WeiboApp() {
 
     fun pushNavigation(kind: NavOverlayKind, navigate: () -> Unit) {
         flushDeferredNavRestore()
+        navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
         deferredNavRestoreGeneration += 1
         nestedDetailReturnAnimating = false
         nestedDetailReturnSnapshot = null
@@ -5234,6 +5342,21 @@ fun WeiboApp() {
             applyNavRestoreState(previous)
             return true
         }
+        if (exitingKind is NavOverlayKind.VisitedProfile &&
+            navOverlayStack.lastOrNull() is NavOverlayKind.Detail &&
+            previous.detail != null && previous.detail.item.id == selectedItem?.id
+        ) {
+            // The detail page is still composed underneath the profile. Restoring its
+            // snapshot after the profile exit re-keys/re-enters that same page, which
+            // creates a second, unwanted rightward slide after a slow interactive pop.
+            pendingDeferredNavRestore = null
+            deferredNavRestoreGeneration += 1
+            selectedTab = previous.selectedTab
+            bottomBarVisible = previous.bottomBarVisible
+            minePagerPage = previous.minePagerPage
+            suppressNextBottomBarAutoShow = true
+            return true
+        }
         if (exitingKind is NavOverlayKind.Detail && previous.detail == null &&
             previous.visitedProfile == null && previous.selectedTab == MainTab.Feed
         ) returningHomeDirectly = true
@@ -5274,7 +5397,16 @@ fun WeiboApp() {
                     scope.launch {
                         profileReturnProgress.snapTo(0f)
                         withFrameNanos { }
-                        profileReturnProgress.animateTo(1f, tween(DetailReturnDurationMs, easing = DetailMotionEasing))
+                        coroutineScope {
+                            launch {
+                                profileReturnProgress.animateTo(1f, tween(DetailReturnDurationMs, easing = DetailMotionEasing))
+                            }
+                            animate(
+                                navTransitionCoordinator.standardPageUnderlayOffset.value,
+                                0f,
+                                animationSpec = tween(DetailReturnDurationMs, easing = DetailMotionEasing),
+                            ) { value, _ -> navTransitionCoordinator.setStandardPageUnderlayOffset(value) }
+                        }
                         clearNavExitPendingKind()
                         withFrameNanos { }
                         profileReturnBitmap = null
@@ -5395,6 +5527,7 @@ fun WeiboApp() {
     }
 
     fun pushAlbumViewer(viewer: AlbumViewerState) {
+        navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
         albumDismissScrollTarget = null
         pushNavigation(NavOverlayKind.AlbumViewer) {
             albumOverlayInstanceKey += 1
@@ -7240,7 +7373,10 @@ fun WeiboApp() {
             bottomBarImage: Bitmap? = null,
         ) {
             detailSourceCapturePending = false
-            if (sourceBounds != null && selectedItem == null) {
+            // Card morphs retain the complete source page; profile parallax must
+            // not leak into this separate transition (including the Likes tab).
+            navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
+            if (sourceBounds != null) {
                 hiddenFeedCardId = item.id
                 if (fromFeed) preservedFeedSourceItem = hostItem ?: item
             }
@@ -7409,6 +7545,7 @@ fun WeiboApp() {
         // the album for one frame even when both Compose states change together.
         withFrameNanos { }
         withFrameNanos { }
+        albumDetailPageSlide = true
         pushNavigation(NavOverlayKind.Detail(resolved.id)) {
             restoreProfilePagerFromViewer(viewer)
             albumViewerState = null
@@ -7916,6 +8053,7 @@ fun WeiboApp() {
             return@LaunchedEffect
         }
         feedListScrollCoordinator.stopScrollAction = { state.stopScroll(MutatePriority.UserInput) }
+        feedListScrollCoordinator.scrollByAction = { state.scrollBy(it) }
         try {
             snapshotFlow { state.isScrollInProgress }
                 .distinctUntilChanged()
@@ -7924,6 +8062,7 @@ fun WeiboApp() {
                 }
         } finally {
             feedListScrollCoordinator.stopScrollAction = null
+            feedListScrollCoordinator.scrollByAction = null
             feedListScrollCoordinator.isListScrolling = false
         }
     }
@@ -8247,6 +8386,8 @@ fun WeiboApp() {
             LocalNavTransitionCoordinator provides navTransitionCoordinator,
             LocalPageSwipeBack provides { navigateBack() },
             LocalOpenRetweetCard provides ::openDetailFromSource,
+            LocalImageReturnBarTop provides { imageReturnBarTop },
+            LocalHiddenFeedCardId provides hiddenFeedCardId,
             LocalRepostComposer provides { status ->
                 commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), isRepost = true)
             },
@@ -8465,6 +8606,14 @@ fun WeiboApp() {
                             .fillMaxSize()
                             .background(MaterialTheme.colorScheme.background)
                             .graphicsLayer { alpha = feedVisibleAlpha }
+                            .graphicsLayer {
+                                translationX = size.width * navTransitionCoordinator.standardPageUnderlayOffsetFraction
+                            }
+                            .drawWithContent {
+                                drawContent()
+                                val dim = (-navTransitionCoordinator.standardPageUnderlayOffsetFraction / 0.25f).coerceIn(0f, 1f)
+                                drawRect(Color.Black.copy(alpha = 0.20f * dim))
+                            }
                             .layerBackdrop(homeContentBackdrop)
                             .blockHiddenTouches(feedUiOnTop || composeWebVisible),
                     ) {
@@ -8529,11 +8678,14 @@ fun WeiboApp() {
                         .graphicsLayer { alpha = if (followListUiOnTop || followListExiting) 1f else 0f }
                         .blockHiddenTouches(followListUiOnTop || followListExiting),
                     stackTop = overlayTop == OverlayTop.FollowList && followListLayerActive,
-                    layerBaseZIndex = 550f,
+                    layerBaseZIndex = 585f,
                     visible = followListUiOnTop,
-                    stackAnimated = false,
+                    stackAnimated = true,
                     animationKey = followListOverlay?.instanceKey,
                     navKind = followListNavKind,
+                    interceptRightSwipe = true,
+                    swipeNavigationEnabled = followListOverlay?.tab == FriendListTab.Fans,
+                    onSwipeBack = ::closeFollowList,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     onClearPendingEnter = { navEnterPendingKind = null },
@@ -8628,12 +8780,26 @@ fun WeiboApp() {
                 val visitedProfileNavTarget = visitedProfileNavKind?.uid.takeIf { profileLayerActive }
                 LaunchedEffect(visitedProfileLoadGeneration, profileEntryLaidOut) {
                     if (!profileEntryLaidOut || visitedProfileNavTarget == null) return@LaunchedEffect
+                    // Restoring a parent profile beneath a follow list is not a push.
+                    // Replaying this motion leaves the visible list shifted and dimmed.
+                    if (navEnterPendingKind !is NavOverlayKind.VisitedProfile ||
+                        !navOverlayKindsMatch(navEnterPendingKind, visitedProfileNavKind)) return@LaunchedEffect
                     navTransitionCoordinator.onTransitionStart()
                     try {
                         // The incoming page has been laid out offscreen; keep the
                         // original page visible until that frame is drawable.
                         withFrameNanos { }
-                        profileEnterOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = FastOutSlowInEasing))
+                        coroutineScope {
+                            val underlayStart = navTransitionCoordinator.standardPageUnderlayOffset.value
+                            launch {
+                                profileEnterOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = NavPageMotionEasing))
+                            }
+                            animate(
+                                underlayStart,
+                                underlayStart - 0.25f,
+                                animationSpec = tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
+                            ) { value, _ -> navTransitionCoordinator.setStandardPageUnderlayOffset(value) }
+                        }
                         if (navOverlayKindsMatch(navEnterPendingKind, visitedProfileNavKind)) navEnterPendingKind = null
                     } finally {
                         navTransitionCoordinator.onTransitionEnd()
@@ -8664,13 +8830,21 @@ fun WeiboApp() {
                     target = visitedProfileNavTarget,
                     modifier = Modifier
                         .fillMaxSize()
-                        .blockHiddenTouches(visitedProfileVisible && !profileIsExiting),
+                        .blockHiddenTouches(visitedProfileVisible || profileIsExiting),
                     stackTop = visitedProfileVisible,
                     // The transparent photo dialog must reveal the retained album,
                     // not an older detail page (whose base layer is 570f).
                     // Keep input disabled while the dialog owns the foreground.
-                    layerBaseZIndex = if (
-                        albumViewerVisible || navExitPendingKind == NavOverlayKind.AlbumViewer
+                    layerBaseZIndex = if ((albumViewerVisible || navExitPendingKind == NavOverlayKind.AlbumViewer) &&
+                        !albumDetailBackdropVisible) {
+                        // The returning detail can retain an elevated source-card
+                        // layer. The album page must cover that layer beneath the Dialog.
+                        600f
+                    } else if (
+                        albumViewerVisible || navExitPendingKind == NavOverlayKind.AlbumViewer ||
+                            followListLayerActive || navExitPendingKind is NavOverlayKind.FollowList ||
+                            navOverlayStack.indexOfLast { it is NavOverlayKind.VisitedProfile } >
+                                navOverlayStack.indexOfLast { it is NavOverlayKind.Detail }
                     ) 580f else 540f,
                     visible = visitedProfileVisible,
                     animationKey = visitedProfileLoadGeneration,
@@ -8698,7 +8872,8 @@ fun WeiboApp() {
                     key(visitedProfileLoadGeneration) {
                         Box(Modifier.fillMaxSize()
                             .onGloballyPositioned { profileEntryLaidOut = true }
-                            .graphicsLayer { translationX = size.width * profileEnterOffset.value }) {
+                            .graphicsLayer { translationX = size.width * profileEnterOffset.value }
+) {
                             BackHandler(
                                 enabled = visitedProfileVisible,
                                 onBack = ::closeVisitedProfile,
@@ -8747,7 +8922,7 @@ fun WeiboApp() {
                                     onLoadMorePosts = { loadMoreVisitedPosts() },
                                     onLoadMoreAlbum = { loadMoreVisitedAlbum() },
                                     onSyncEmoticons = { syncEmoticons() },
-                                    onItemClick = ::openDetail,
+                                    onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                                     onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
                                      onCommentLongClick = ::openCommentComposer,
                                      onOpenAlbumViewer = ::pushAlbumViewer,
@@ -8884,7 +9059,7 @@ fun WeiboApp() {
                                 onLoadMorePosts = { loadMoreMinePosts() },
                                 onLoadMoreAlbum = { loadMoreMineAlbum() },
                                 onSyncEmoticons = { syncEmoticons() },
-                                onItemClick = ::openDetail,
+                                onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                                 onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
                                  onCommentLongClick = ::openCommentComposer,
                                  onOpenAlbumViewer = ::pushAlbumViewer,
@@ -8979,7 +9154,12 @@ fun WeiboApp() {
                         !bitmap.isRecycled) Image(
                         bitmap = bitmap.asImageBitmap(), contentDescription = null,
                         contentScale = ContentScale.FillBounds,
-                        modifier = Modifier.fillMaxSize().zIndex(589f).background(Color.Black),
+                        modifier = Modifier.fillMaxSize().graphicsLayer {
+                            if (albumDetailPageSlide || navExitPendingKind is NavOverlayKind.Detail &&
+                                navStack.lastOrNull()?.albumViewerState != null) {
+                                translationX = size.width * navTransitionCoordinator.standardPageUnderlayOffsetFraction
+                            }
+                        }.zIndex(589f).background(Color.Black),
                     )
                 }
                 profileReturnBitmap?.let { bitmap ->
@@ -9005,14 +9185,21 @@ fun WeiboApp() {
                         },
                     modifier = Modifier
                         .fillMaxSize()
+                        .graphicsLayer {
+                            if (albumViewerVisible &&
+                                navOverlayStack.indexOfLast { it is NavOverlayKind.VisitedProfile } >
+                                navOverlayStack.indexOfLast { it is NavOverlayKind.Detail }) alpha = 0f
+                        }
                         .blockHiddenTouches(detailOverlayVisible),
                     stackTop = detailOverlayVisible,
                     layerBaseZIndex = 570f,
                     visible = detailOverlayVisible,
                     animationKey = activeDetailInstanceKey,
                     navKind = detailNavKind,
+                    interceptRightSwipe = true,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
+                    pageStackSlide = albumDetailPageSlide,
                     nestedDetailReturnAnimating = nestedDetailReturnAnimating,
                     sourceReturnZIndex = 580f.takeIf { navStack.lastOrNull()?.visitedProfile != null },
                     sourceBounds = activeDetailSourceBounds,
@@ -9064,6 +9251,13 @@ fun WeiboApp() {
                     // outgoing subtree as soon as the parent snapshot is restored.
                     key(detailItem.id) {
                         var systemBackStarted by remember { mutableStateOf(false) }
+                        var detailRefreshGestureArmed by remember { mutableStateOf(false) }
+                        val refreshForeground by rememberUpdatedState(
+                            detailOverlayVisible && navEnterPendingKind == null && navExitPendingKind == null,
+                        )
+                        LaunchedEffect(detailOverlayVisible, navEnterPendingKind, navExitPendingKind) {
+                            detailRefreshGestureArmed = false
+                        }
                         LaunchedEffect(activeDetailInstanceKey) {
                             systemBackStarted = false
                             detailSystemBackInProgress = false
@@ -9081,6 +9275,7 @@ fun WeiboApp() {
                             detailScrollCoordinator.stopScrollAction = {
                                 detailListState.stopScroll(MutatePriority.UserInput)
                             }
+                            detailScrollCoordinator.scrollByAction = { detailListState.scrollBy(it) }
                             try {
                                 snapshotFlow { detailListState.isScrollInProgress }
                                     .distinctUntilChanged()
@@ -9147,7 +9342,15 @@ fun WeiboApp() {
                             }
                         }
                         Surface(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.fillMaxSize().pointerInput(detailItem.id) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    detailRefreshGestureArmed = refreshForeground
+                                    do {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            },
                             color = MaterialTheme.colorScheme.background.copy(alpha = LocalDetailPageReveal.current),
                         ) {
                             CompositionLocalProvider(
@@ -9185,14 +9388,18 @@ fun WeiboApp() {
                                 onToggleLike = ::toggleStatusLike,
                                 onLikeClick = { _, _ -> selectDetailContentSection(DetailContentSection.Likes) },
                                 onBack = { closeDetail() },
-                                onRefresh = { reloadDetailContent() },
+                                onRefresh = {
+                                    if (refreshForeground && detailRefreshGestureArmed) reloadDetailContent()
+                                },
                                 onCommentSortChange = ::changeCommentSort,
                                 onLoadMoreComments = { if (detailIsActive) loadMoreComments() },
                                 onLoadMoreReposts = { if (detailIsActive) loadMoreReposts() },
                                 commentsHasMore = detailSnapshot.commentsHasMore,
                                 repostsHasMore = detailSnapshot.repostsHasMore,
                                 onSelectContentSection = ::selectDetailContentSection,
-                                onRefreshComments = { reloadComments() },
+                                onRefreshComments = {
+                                    if (refreshForeground && detailRefreshGestureArmed) reloadComments()
+                                },
                                 onPrepareContentSection = { section ->
                                     if (section == DetailContentSection.Reposts && reposts.isEmpty() && !repostsLoading) reloadReposts()
                                     if (section == DetailContentSection.Likes && !likeUsersLoaded && !likeUsersLoading) reloadLikeUsers()
@@ -9519,6 +9726,10 @@ fun WeiboApp() {
                 exit = if (profileLayerActive) ExitTransition.None else slideOutVertically(tween(160)) { it },
                 modifier = Modifier
                     .align(Alignment.BottomStart)
+                    .onGloballyPositioned {
+                        imageReturnBarTop = if (bottomBarRequestedVisible) it.boundsInRoot().top
+                            else Float.POSITIVE_INFINITY
+                    }
                     .graphicsLayer {
                         translationY = size.height * (1f - bottomBarSlideProgress)
                         if (profileLayerActive && navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true) {
@@ -10036,7 +10247,7 @@ fun WeiboApp() {
                     onRetry = { loadArticleIntoOverlay(overlay.entity) },
                 )
             }
-            NavTransitionTouchShield(
+            if (navExitPendingKind !is NavOverlayKind.VisitedProfile) NavTransitionTouchShield(
                 coordinator = navTransitionCoordinator,
                 modifier = Modifier.zIndex(595f),
             )
@@ -12751,7 +12962,12 @@ private fun FeedImageCell(
             .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
                 anchorHolder.coordinates = coordinates
-                val bounds = coordinates.boundsInWindow()
+                // boundsInWindow clips at the viewport. Long thumbnails need
+                // their full layout height to compute a single return scroll.
+                val bounds = Rect(
+                    coordinates.localToWindow(Offset.Zero),
+                    androidx.compose.ui.geometry.Size(coordinates.size.width.toFloat(), coordinates.size.height.toFloat()),
+                )
                 if (bounds != lastReportedAnchorBounds) {
                     lastReportedAnchorBounds = bounds
                     onAnchorBoundsChanged(bounds)
@@ -12833,7 +13049,11 @@ private fun FeedImageCell(
                 detectTapGestures(
                     onTap = {
                         if (!imagePeekController.pointerInputBlocked) {
-                            val currentBounds = anchorHolder.boundsInWindow() ?: return@detectTapGestures
+                            val coordinates = anchorHolder.coordinates?.takeIf { it.isAttached } ?: return@detectTapGestures
+                            val currentBounds = Rect(
+                                coordinates.localToWindow(Offset.Zero),
+                                androidx.compose.ui.geometry.Size(coordinates.size.width.toFloat(), coordinates.size.height.toFloat()),
+                            )
                             onAnchorBoundsChanged(currentBounds)
                             onOpenViewer(imageIndex, currentBounds, null, null)
                         }
@@ -13412,6 +13632,7 @@ private fun ImageActionOverlay(
                     .size(previewWidth, previewHeight)
                     .mediaPeekMotionLayer(
                         motion = motion,
+                        cropToVisualBounds = true,
                         fingerDragOffset = { imagePeekController.fingerDragOffset },
                         shadowElevation = if (images.size > 1 && layoutProgress > 0.28f && expandProgress == 0f) {
                             16.dp
@@ -15044,6 +15265,8 @@ private fun FullscreenImageViewer(
 ) {
     val scope = rememberCoroutineScope()
     val viewerImages = images
+    val returnBarTop = LocalImageReturnBarTop.current
+    val returnScrollCoordinator = LocalFeedListScrollCoordinator.current
     val viewerLookup = remember(relatedPosts) { buildAlbumPostLookup(relatedPosts) }
     val resolvedPages = remember(images, viewerLookup, imageOwner) { mutableMapOf<Int, FeedImage>() }
     fun viewerImageAt(index: Int): FeedImage = resolvedPages.getOrPut(index) {
@@ -15077,6 +15300,7 @@ private fun FullscreenImageViewer(
     var closeAnimationJob by remember { mutableStateOf<Job?>(null) }
     var dragDismissProgress by remember { mutableFloatStateOf(0f) }
     var closeStartBounds by remember { mutableStateOf<Rect?>(null) }
+    var adjustedReturnBounds by remember { mutableStateOf<Rect?>(null) }
     var dismissBoundsProviders by remember { mutableStateOf<Map<Int, () -> Rect>>(emptyMap()) }
     val latestSourceBoundsByIndex = rememberUpdatedState(sourceBoundsByIndex)
     val latestDismissBoundsProviders = rememberUpdatedState(dismissBoundsProviders)
@@ -15089,7 +15313,7 @@ private fun FullscreenImageViewer(
         val page = pagerState.currentPage
         fun beginDismiss() {
             if (transitionClosing) return
-            val currentSourceBounds = latestSourceBoundsByIndex.value[page]
+            val currentSourceBounds = adjustedReturnBounds ?: latestSourceBoundsByIndex.value[page]
             val currentBoundsProvider = latestDismissBoundsProviders.value[page]
             val closeBounds = currentSourceBounds ?: currentBoundsProvider?.invoke()
             if (closeBounds != null) {
@@ -15113,13 +15337,23 @@ private fun FullscreenImageViewer(
                 finishDismiss()
             }
         }
-        if (onPrepareDismiss != null) {
+        if (onPrepareDismiss != null || returnScrollCoordinator.scrollByAction != null) {
             dismissPreparing = true
             scope.launch {
                 // Start the album list scroll and the image shrink in the same
                 // frame. The list publishes the real tile bounds while it moves;
                 // rememberUpdatedState then lets the morph target follow it.
-                onPrepareDismiss.invoke(page)
+                onPrepareDismiss?.invoke(page)
+                val bounds = latestSourceBoundsByIndex.value[page]
+                val barTop = returnBarTop()
+                if (bounds != null && barTop.isFinite() && bounds.bottom > barTop) {
+                    val consumed = returnScrollCoordinator.scrollByAction?.invoke(bounds.bottom - barTop) ?: 0f
+                    // The thumbnail can be hidden during the morph, delaying its
+                    // bounds callback. Use the actual consumed scroll immediately.
+                    adjustedReturnBounds = bounds.translate(Offset(0f, -consumed))
+                    withFrameNanos { }
+                    withFrameNanos { }
+                }
                 withFrameNanos { }
                 dismissPreparing = false
                 beginDismiss()
@@ -15258,7 +15492,7 @@ private fun FullscreenImageViewer(
                 else -> null
             }
             val morphTargetBounds = if (transitionClosing && closeStartBounds != null) {
-                sourceBoundsByIndex[pagerState.currentPage]
+                adjustedReturnBounds ?: sourceBoundsByIndex[pagerState.currentPage]
             } else {
                 null
             }
@@ -24371,8 +24605,8 @@ private fun MineScreen(
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
-    onItemClick: (FeedItem) -> Unit,
-    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
+    onItemClick: (FeedItem, Rect?) -> Unit,
+    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item, null) },
     onCommentLongClick: (FeedItem) -> Unit = {},
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onAlbumImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
@@ -24987,7 +25221,7 @@ private fun MineScreen(
                                             item = post,
                                             onClick = {
                                                 if (openCard != null && postBounds != null) openCard(post, postBounds, post)
-                                                else onItemClick(post)
+                                                else onItemClick(post, postBounds)
                                             },
                                             onBoundsChanged = { postBounds = it },
                                             onMediaClick = onMediaClick,
@@ -27492,8 +27726,8 @@ private fun VisitedUserProfileContent(
     onLoadMorePosts: () -> Unit,
     onLoadMoreAlbum: () -> Unit,
     onSyncEmoticons: () -> Unit,
-    onItemClick: (FeedItem) -> Unit,
-    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item) },
+    onItemClick: (FeedItem, Rect?) -> Unit,
+    onRetweetClick: (FeedItem, FeedItem) -> Unit = { item, _ -> onItemClick(item, null) },
     onCommentLongClick: (FeedItem) -> Unit,
     onOpenAlbumViewer: (AlbumViewerState) -> Unit,
     onAlbumImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
