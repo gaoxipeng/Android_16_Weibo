@@ -1393,8 +1393,8 @@ private fun <T> NavAnimatedOverlay(
                 val displacement = change.position - down.position
                 if (!dragging) {
                     // Let vertical scrolling and child horizontal controls win first.
-                    if (change.isConsumed || (abs(displacement.y) > viewConfiguration.touchSlop &&
-                            abs(displacement.y) > abs(displacement.x)) ||
+                    if ((!interceptRightSwipe && change.isConsumed) || (abs(displacement.y) > viewConfiguration.touchSlop &&
+                            abs(displacement.y) > abs(displacement.x) * 1.2f) ||
                         displacement.x < -viewConfiguration.touchSlop
                     ) break
                     if (displacement.x <= viewConfiguration.touchSlop) continue
@@ -1629,7 +1629,18 @@ private fun <T> NavAnimatedOverlay(
         }) {
     returnBackground?.let { bitmap ->
         Image(bitmap.asImageBitmap(), contentDescription = null,
-            modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
+            modifier = Modifier.fillMaxSize().graphicsLayer {
+                val fraction = if (swipeOffset > 0f) {
+                    -0.25f * (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f)
+                } else navTransitions.searchResultsUnderlayProgress()
+                translationX = size.width * fraction
+            }.drawWithContent {
+                drawContent()
+                val progress = if (swipeOffset > 0f) {
+                    (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f)
+                } else (-navTransitions.searchResultsUnderlayProgress() / 0.25f).coerceIn(0f, 1f)
+                drawRect(Color.Black.copy(alpha = progress * 0.20f))
+            }, contentScale = ContentScale.FillBounds)
     }
     if (navKind is NavOverlayKind.Detail && overlayVisible) {
         parentTarget?.let { parent ->
@@ -3215,6 +3226,7 @@ private class NavTransitionCoordinator {
     var activeTransitions by mutableIntStateOf(0)
     val standardPageUnderlayOffset = Animatable(0f)
     var standardPageUnderlayOffsetFraction by mutableFloatStateOf(0f)
+    var searchResultsUnderlayProgress: () -> Float = { 0f }
     fun setStandardPageUnderlayOffset(value: Float) {
         standardPageUnderlayOffsetFraction = value
     }
@@ -4380,6 +4392,8 @@ fun WeiboApp() {
             }
     }
     var hiddenFeedCardId by remember { mutableStateOf<String?>(null) }
+    var hiddenCardProfileGeneration by remember { mutableStateOf<Int?>(null) }
+    var hiddenCardFromMine by remember { mutableStateOf(false) }
     var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
     var activeDetailBottomBarImage by remember { mutableStateOf<Bitmap?>(null) }
     var detailSystemBackInProgress by remember { mutableStateOf(false) }
@@ -4990,7 +5004,16 @@ fun WeiboApp() {
         val sameDetailStillComposed = selectedItem?.id == snapshot.item.id
         // A retained page owns newer content and scroll state than its navigation
         // snapshot. Replacing its comments can shrink the list and clamp it to top.
-        if (sameDetailStillComposed && detailOuterListStates.containsKey(snapshot.item.id)) return
+        if (sameDetailStillComposed && detailOuterListStates.containsKey(snapshot.item.id)) {
+            // Equal status IDs can belong to different navigation entries.
+            // Restore route ownership even when retaining the live content/list.
+            activeDetailInstanceKey = snapshot.instanceKey
+            activeDetailSourceBounds = snapshot.sourceBounds
+            activeDetailSourceImage = snapshot.sourceImage
+            activeDetailSourceReturnImage = snapshot.sourceReturnImage
+            detailScrollPending = null
+            return
+        }
         commentsRequestJob?.cancel()
         repostsRequestJob?.cancel()
         detailRequestGeneration += 1
@@ -5334,6 +5357,20 @@ fun WeiboApp() {
         // clears its first layout while the profile exits, which briefly reveals a white page.
         navStack = navStack.dropLast(1)
         navOverlayStack = navOverlayStack.dropLast(1)
+        if (exitingKind is NavOverlayKind.Detail &&
+            navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+            previous.detail?.item?.id == selectedItem?.id
+        ) {
+            // Returning through a profile to the same status keeps the detail host
+            // mounted, so AnimatedVisibility cannot deliver its usual exit callback.
+            val returningStack = navOverlayStack
+            scope.launch {
+                delay(DetailReturnDurationMs.toLong() + 32L)
+                if (navOverlayStack == returningStack && navExitPendingKind == exitingKind) {
+                    clearNavExitPendingKind()
+                }
+            }
+        }
         if (exitingKind is NavOverlayKind.VisitedProfile &&
             navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile && previous.visitedProfile != null) {
             pendingDeferredNavRestore = null
@@ -7378,6 +7415,10 @@ fun WeiboApp() {
             navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
             if (sourceBounds != null) {
                 hiddenFeedCardId = item.id
+                hiddenCardProfileGeneration = visitedProfileLoadGeneration.takeIf {
+                    overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile
+                }
+                hiddenCardFromMine = visitedUserId == null && selectedItem == null && selectedTab == MainTab.Mine
                 if (fromFeed) preservedFeedSourceItem = hostItem ?: item
             }
             if (fromFeed && sourceBounds != null) {
@@ -8387,7 +8428,10 @@ fun WeiboApp() {
             LocalPageSwipeBack provides { navigateBack() },
             LocalOpenRetweetCard provides ::openDetailFromSource,
             LocalImageReturnBarTop provides { imageReturnBarTop },
-            LocalHiddenFeedCardId provides hiddenFeedCardId,
+            LocalHiddenFeedCardId provides hiddenFeedCardId.takeIf {
+                (visitedUserId != null && hiddenCardProfileGeneration == visitedProfileLoadGeneration) ||
+                    (visitedUserId == null && hiddenCardFromMine && selectedTab == MainTab.Mine)
+            },
             LocalRepostComposer provides { status ->
                 commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), isRepost = true)
             },
@@ -8714,6 +8758,9 @@ fun WeiboApp() {
                     target = MainTab.Search.takeIf { selectedTab == MainTab.Search && (searchUiOnTop || keepSearchAlive) },
                     modifier = Modifier.fillMaxSize().graphicsLayer {
                         alpha = if (selectedTab == MainTab.Search) 1f else 0f
+                        if (profileLayerActive || navExitPendingKind is NavOverlayKind.VisitedProfile) {
+                            translationX = size.width * navTransitionCoordinator.standardPageUnderlayOffsetFraction
+                        }
                     },
                     stackTop = searchUiOnTop,
                     visible = searchUiOnTop,
@@ -9197,6 +9244,7 @@ fun WeiboApp() {
                     animationKey = activeDetailInstanceKey,
                     navKind = detailNavKind,
                     interceptRightSwipe = true,
+                    swipeNavigationEnabled = detailContentSection == DetailContentSection.Comments,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     pageStackSlide = albumDetailPageSlide,
@@ -12982,7 +13030,6 @@ private fun FeedImageCell(
             .background(
                 if (actionOpen) Color.Black else MaterialTheme.colorScheme.surfaceContainerHighest,
             )
-            .excludeParentHorizontalSwipe("image:${imageOwner?.id.orEmpty()}:${image.id}:$imageIndex")
             .pointerInput(image.id) {
                 var previewOpened = false
                 var previewDismissStarted = false
@@ -23384,6 +23431,13 @@ private fun SearchScreen(
     var activeQuery by remember { mutableStateOf(initialTopicQuery) }
     val resultPageWidth = with(LocalDensity.current) { LocalConfiguration.current.screenWidthDp.dp.toPx() }
     val resultPageOffset = remember { Animatable(if (initialTopicQuery != null) resultPageWidth else 0f) }
+    val searchMotionCoordinator = LocalNavTransitionCoordinator.current
+    SideEffect {
+        searchMotionCoordinator.searchResultsUnderlayProgress = {
+            if (activeQuery != null) -0.25f * (1f - resultPageOffset.value / resultPageWidth).coerceIn(0f, 1f)
+            else 0f
+        }
+    }
     var preparedResultQuery by remember { mutableStateOf(initialTopicQuery) }
     var resultReturnAnimating by remember { mutableStateOf(false) }
     var resultLayoutHandoff by remember { mutableStateOf(false) }
@@ -23401,7 +23455,7 @@ private fun SearchScreen(
         } else {
             resultPageOffset.snapTo(resultPageWidth)
             preparedResultQuery = activeQuery
-            resultPageOffset.animateTo(0f, tween(250, easing = DetailMotionEasing))
+            resultPageOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = NavPageMotionEasing))
         }
     }
     var activeSearchMode by remember { mutableStateOf(pendingSearchMode ?: searchMode) }
@@ -23524,7 +23578,7 @@ private fun SearchScreen(
             resultReturnAnimating = true
             val returningQuery = activeQuery
             scope.launch {
-                resultPageOffset.animateTo(resultPageWidth, tween(250, easing = DetailMotionEasing))
+                resultPageOffset.animateTo(resultPageWidth, tween(NavTransitionDurationMs, easing = NavPageMotionEasing))
                 if (activeQuery == returningQuery) latestReturnFromResults()
             }
         }
