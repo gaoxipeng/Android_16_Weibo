@@ -24,8 +24,8 @@ android {
         applicationId = "com.example.myweibo"
         minSdk = 36
         targetSdk = 36
-        versionCode = 76
-        versionName = "20261110"
+        versionCode = 77
+        versionName = "20261111"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

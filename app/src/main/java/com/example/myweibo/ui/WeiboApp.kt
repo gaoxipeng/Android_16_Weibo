@@ -4392,6 +4392,8 @@ fun WeiboApp() {
             }
     }
     var hiddenFeedCardId by remember { mutableStateOf<String?>(null) }
+    // The home source outlives nested card transitions on a visited profile.
+    var hiddenHomeFeedCardId by remember { mutableStateOf<String?>(null) }
     var hiddenCardProfileGeneration by remember { mutableStateOf<Int?>(null) }
     var hiddenCardFromMine by remember { mutableStateOf(false) }
     var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
@@ -4420,9 +4422,6 @@ fun WeiboApp() {
     var commentSubmitting by remember { mutableStateOf(false) }
     var composeSubmitting by remember { mutableStateOf(false) }
     var composeSessionKey by remember { mutableIntStateOf(0) }
-    var messagesSessionKey by remember { mutableIntStateOf(0) }
-    var messagesInboxRoute by remember { mutableStateOf(true) }
-    var messagesGlassBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var commentSubmitJob by remember { mutableStateOf<Job?>(null) }
     var nestedCommentsLoadingIds by remember { mutableStateOf(setOf<String>()) }
     var detailContentSection by remember { mutableStateOf(DetailContentSection.Comments) }
@@ -4457,6 +4456,7 @@ fun WeiboApp() {
     var hasLoginCookie by remember { mutableStateOf(session.hasLoginCookie()) }
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
+    var messagesInboxRoute by remember(activeAccountId, hasLoginCookie) { mutableStateOf(true) }
     LaunchedEffect(hasLoginCookie, activeAccountId) {
         if (!hasLoginCookie) {
             timelineGroups = emptyList()
@@ -5277,6 +5277,7 @@ fun WeiboApp() {
         flushDeferredNavRestore()
         if (selectedItem == null) {
             hiddenFeedCardId = null
+            hiddenHomeFeedCardId = null
             activeDetailSourceImage = null
             activeDetailSourceReturnImage = null
             activeDetailSourceBounds = null
@@ -7419,7 +7420,10 @@ fun WeiboApp() {
                     overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile
                 }
                 hiddenCardFromMine = visitedUserId == null && selectedItem == null && selectedTab == MainTab.Mine
-                if (fromFeed) preservedFeedSourceItem = hostItem ?: item
+                if (fromFeed) {
+                    preservedFeedSourceItem = hostItem ?: item
+                    hiddenHomeFeedCardId = item.id
+                }
             }
             if (fromFeed && sourceBounds != null) {
                 // Preserve the already-painted home feed as the bottom bar's glass
@@ -8491,13 +8495,8 @@ fun WeiboApp() {
                     .matchParentSize()
                     .layerBackdrop(bottomBarBackdrop),
             ) {
-            messagesGlassBitmap?.takeUnless { it.isRecycled }?.let { bitmap ->
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.FillBounds,
-                    modifier = Modifier.matchParentSize(),
-                )
+            if (selectedTab == MainTab.Messages) {
+                Spacer(Modifier.matchParentSize().background(if (darkTheme) Color(0xFF161616) else Color.White))
             }
             Box(
                 Modifier
@@ -8527,17 +8526,6 @@ fun WeiboApp() {
                 if (activeAccountId == previousComposeAccountId) return@LaunchedEffect
                 previousComposeAccountId = activeAccountId
                 composeSessionKey += 1
-            }
-            var messagesWebAuthSnapshot by remember {
-                mutableStateOf<Triple<Boolean, String?, Boolean>?>(null)
-            }
-            LaunchedEffect(hasLoginCookie, activeAccountId, cacheLoaded) {
-                val snapshot = Triple(hasLoginCookie, activeAccountId, cacheLoaded)
-                if (snapshot == messagesWebAuthSnapshot) return@LaunchedEffect
-                messagesWebAuthSnapshot = snapshot
-                if (cacheLoaded && hasLoginCookie) {
-                    messagesSessionKey += 1
-                }
             }
             val webTabVisible = messagesWebVisible || composeWebVisible
 
@@ -8664,7 +8652,7 @@ fun WeiboApp() {
                         key(feedResumeGeneration) {
                             CompositionLocalProvider(
                                 LocalHomeThumbnailStore provides homeThumbnailStore,
-                                LocalHiddenFeedCardId provides hiddenFeedCardId,
+                                LocalHiddenFeedCardId provides hiddenHomeFeedCardId,
                             ) {
                             FollowFeedScreen(
                                 session = session,
@@ -9271,6 +9259,10 @@ fun WeiboApp() {
                         // source now, inside that hold, so the snapshot hands off to
                         // the real card without an extra delayed visibility toggle.
                         hiddenFeedCardId = null
+                        if (navOverlayStack.none { it is NavOverlayKind.VisitedProfile } &&
+                            navOverlayStack.count { it is NavOverlayKind.Detail } <= 1) {
+                            hiddenHomeFeedCardId = null
+                        }
                     },
                     onSwipeBack = {
                         albumDetailSwipeReturn = true
@@ -9523,28 +9515,16 @@ fun WeiboApp() {
                     .zIndex(if (messagesOverlayVisible) 2f else -10f)
                     .blockHiddenTouches(messagesOverlayVisible),
             ) {
-                if (!hasLoginCookie) {
+                // Wait for the restored cookie session before creating Chromium.
+                if (cacheLoaded && !hasLoginCookie) {
                     if (messagesOverlayVisible) WebTabLoginPlaceholder()
-                } else {
-                    key(messagesSessionKey) {
+                } else if (cacheLoaded) {
+                    key(activeAccountId) {
                         MessagesScreen(
                             onRootBack = ::handleRootBackPress,
                             active = messagesOverlayVisible,
                             darkTheme = darkTheme,
-                            onInboxRouteChanged = { inbox ->
-                                messagesInboxRoute = inbox
-                                if (!inbox) {
-                                    messagesGlassBitmap?.recycle()
-                                    messagesGlassBitmap = null
-                                }
-                            },
-                            onGlassFrame = { frame ->
-                                val previous = messagesGlassBitmap
-                                messagesGlassBitmap = frame
-                                if (previous != null && previous !== frame && !previous.isRecycled) {
-                                    previous.recycle()
-                                }
-                            },
+                            onInboxRouteChanged = { messagesInboxRoute = it },
                         )
                     }
                 }
@@ -24227,7 +24207,6 @@ private fun MobileWeiboWebScreen(
     pageUrl: String,
     onRootBack: () -> Unit,
     onInboxRouteChanged: (Boolean) -> Unit = {},
-    onGlassFrame: (Bitmap) -> Unit = {},
     userAgent: String? = null,
     active: Boolean = true,
     darkTheme: Boolean = isSystemInDarkTheme(),
@@ -24242,13 +24221,12 @@ private fun MobileWeiboWebScreen(
     val navigationBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     val fileUploadBridge = remember { MobileWebFileUploadBridge() }
     var messagePageLoaded by remember(pageUrl) { mutableStateOf(false) }
+    var messagePageInteracted by remember(pageUrl) { mutableStateOf(false) }
     var inboxRoute by remember { mutableStateOf(true) }
     val webViewBottomReserve = maxOf(imeBottom, navigationBottom) +
         if (inboxRoute) 84.dp else 0.dp
     val currentDarkTheme by rememberUpdatedState(darkTheme)
     val latestInboxRouteChanged by rememberUpdatedState(onInboxRouteChanged)
-    val latestGlassFrame by rememberUpdatedState(onGlassFrame)
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val darkReaderBundle = remember(context) {
         context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
     }
@@ -24268,6 +24246,7 @@ private fun MobileWeiboWebScreen(
 
     val webView = remember(pageUrl) {
         WebView(context).apply {
+            alpha = 0f
             setBackgroundColor(if (darkTheme) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -24279,8 +24258,9 @@ private fun MobileWeiboWebScreen(
             isFocusable = true
             isFocusableInTouchMode = true
             setOnTouchListener { view, event ->
-                if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && !view.hasFocus()) {
-                    view.requestFocus()
+                if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN && view.alpha > 0f) {
+                    messagePageInteracted = true
+                    if (!view.hasFocus()) view.requestFocus()
                 }
                 // Deliver this same first touch to the page's input normally.
                 false
@@ -24308,37 +24288,46 @@ private fun MobileWeiboWebScreen(
             // Leave DOM focus entirely to the site/browser. Intercepting focus
             // loses the user's first tap on the conversation composer.
             webViewClient = object : WebViewClient() {
+                private var documentGeneration = 0L
+                private var firstFrameReady = false
+
                 private fun reportRoute(view: WebView?, url: String?) {
-                    val inbox = isWeiboMessageInboxUrl(url ?: view?.url)
+                    if (!firstFrameReady) return
+                    val inbox = isWeiboMessageInboxUrl(url ?: view?.url, allowBareUserId = false)
+                    if (!inbox && !messagePageInteracted) return
+                    if (inbox == inboxRoute) return
                     inboxRoute = inbox
                     latestInboxRouteChanged(inbox)
                 }
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    documentGeneration += 1
                     darkReaderController.onPageStarted()
                     reportRoute(view, url)
-                    if (currentDarkTheme) view?.alpha = 0f
                 }
                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                     reportRoute(view, url)
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
                     view?.let { currentView ->
+                        if (url != currentView.url) return
+                        val generation = documentGeneration
                         reportRoute(currentView, url ?: currentView.url)
                         applyWebViewDarkMode(currentView, currentDarkTheme)
                         darkReaderController.apply(currentView, currentDarkTheme) {
-                            currentView.postDelayed({ currentView.alpha = 1f }, 80L)
+                            if (generation == documentGeneration && !firstFrameReady) {
+                                currentView.postVisualStateCallback(generation, object : WebView.VisualStateCallback() {
+                                    override fun onComplete(requestId: Long) {
+                                        if (requestId != documentGeneration) return
+                                        firstFrameReady = true
+                                        currentView.alpha = 1f
+                                    }
+                                })
+                            }
                         }
                     }
                 }
             }
-            addJavascriptInterface(
-                MessageRouteBridge(mainHandler) { inbox ->
-                    inboxRoute = inbox
-                    latestInboxRouteChanged(inbox)
-                },
-                "WeiboMessageRoute",
-            )
         }
     }
 
@@ -24356,7 +24345,7 @@ private fun MobileWeiboWebScreen(
             activity?.window?.decorView?.setBackgroundColor(android.graphics.Color.TRANSPARENT)
         }
     }
-    SideEffect {
+    LaunchedEffect(webView, darkTheme) {
         applyWebViewDarkMode(webView, darkTheme)
         webView.setBackgroundColor(
             if (darkTheme) android.graphics.Color.rgb(22, 22, 22) else android.graphics.Color.WHITE,
@@ -24397,18 +24386,23 @@ private fun MobileWeiboWebScreen(
             webView.visibility = View.VISIBLE
             webView.onResume()
             while (true) {
+                if (webView.alpha == 0f) {
+                    delay(100)
+                    continue
+                }
                 webView.evaluateJavascript(MessageInboxProbeJs) { result ->
                     val inbox = when (result?.trim()?.removeSurrounding("\"")) {
                         "false", "0" -> false
                         "true", "1" -> true
-                        else -> isWeiboMessageInboxUrl(webView.url)
+                        // A cold WebView can still be on about:blank. An unknown
+                        // document must not resize the inbox or hide its tab bar.
+                        else -> inboxRoute
                     }
-                    if (inbox != inboxRoute) {
+                    if (inbox != inboxRoute && (inbox || messagePageInteracted)) {
                         inboxRoute = inbox
                         latestInboxRouteChanged(inbox)
                     }
                 }
-                captureMessageGlassFrame(activity, webView, latestGlassFrame)
                 delay(400)
             }
         } else {
@@ -24432,7 +24426,8 @@ private fun MobileWeiboWebScreen(
             // even when the bottom capsule has a higher Compose zIndex. End the
             // WebView at the capsule's top edge; the dark root surface continues
             // behind the glass, while inbox CSS keeps the final rows scrollable.
-            .padding(top = topInset, bottom = webViewBottomReserve),
+            .padding(top = topInset, bottom = webViewBottomReserve)
+            .clipToBounds(),
     ) {
         AndroidView(
             modifier = Modifier.fillMaxSize().onSizeChanged { size ->
@@ -24501,42 +24496,6 @@ private class MessageDarkReaderController(private val bundle: String) {
     }
 }
 
-private class MessageRouteBridge(
-    private val mainHandler: Handler,
-    private val onInbox: (Boolean) -> Unit,
-) {
-    @JavascriptInterface
-    fun setInbox(inbox: Boolean) {
-        mainHandler.post { onInbox(inbox) }
-    }
-}
-
-private fun captureMessageGlassFrame(
-    activity: android.app.Activity?,
-    webView: WebView,
-    onFrame: (Bitmap) -> Unit,
-) {
-    val window = activity?.window ?: return
-    if (webView.width < 2 || webView.height < 2) return
-    val loc = IntArray(2)
-    webView.getLocationInWindow(loc)
-    val src = android.graphics.Rect(
-        loc[0],
-        loc[1],
-        loc[0] + webView.width,
-        loc[1] + webView.height,
-    )
-    if (src.width() < 2 || src.height() < 2) return
-    val bitmap = Bitmap.createBitmap(src.width(), src.height(), Bitmap.Config.ARGB_8888)
-    android.view.PixelCopy.request(window, src, bitmap, { result ->
-        if (result == android.view.PixelCopy.SUCCESS) {
-            onFrame(bitmap)
-        } else if (!bitmap.isRecycled) {
-            bitmap.recycle()
-        }
-    }, Handler(Looper.getMainLooper()))
-}
-
 private const val MessageInboxProbeJs = """
 (function(){
   function titleText(){
@@ -24545,19 +24504,19 @@ private const val MessageInboxProbeJs = """
   }
   function inbox(){
     var href=location.href||'';
+    if(!/^https?:\/\//i.test(href)) return null;
     var path=(location.pathname||'').toLowerCase();
     path=path.replace(/\/$/,'');
-    var privatePath=/\/(chat|conversation|dialog|private|directmessage)(\/|$)/.test(path);
-    if(privatePath||/[?&](uid|to_uid|toid|to_id|conversation_id)=/i.test(href)) return false;
+    var route=path+'/'+(location.hash||'').replace(/^#\/?/,'');
+    var privatePath=/\/(chat|conversation|dialog|private|directmessage)(\/|[?]|$)/i.test(route);
+    if(privatePath||/[?&](to_uid|toid|to_id|conversation_id)=/i.test(href)) return false;
     var t=titleText();
     if(t==='消息箱'||t==='消息'||t==='@我的'||t==='评论'||t==='赞'||t==='未关注人私信'||t==='提到我的') return true;
     if(t.indexOf('消息箱')>=0) return true;
-    if(path==='/message'||path==='/messages') return true;
     if(document.querySelector('textarea') && t && t!=='消息' && t!=='消息箱') return false;
-    return path===''||path==='/message'||path==='/messages'||path.indexOf('/message/')===0;
+    if(path==='/message'||path==='/messages') return true;
+    return path===''||path.indexOf('/message/')===0 ? true : null;
   }
-  window.__weiboMessageInboxProbe=inbox;
-  try{if(window.WeiboMessageRoute)WeiboMessageRoute.setInbox(inbox());}catch(e){}
   return inbox();
 })();
 """
@@ -24583,7 +24542,6 @@ private fun WebTabLoginPlaceholder() {
 private fun MessagesScreen(
     onRootBack: () -> Unit,
     onInboxRouteChanged: (Boolean) -> Unit,
-    onGlassFrame: (Bitmap) -> Unit = {},
     active: Boolean = true,
     darkTheme: Boolean = isSystemInDarkTheme(),
 ) {
@@ -24591,7 +24549,6 @@ private fun MessagesScreen(
         pageUrl = "https://m.weibo.cn/message",
         onRootBack = onRootBack,
         onInboxRouteChanged = onInboxRouteChanged,
-        onGlassFrame = onGlassFrame,
         active = active,
         darkTheme = darkTheme,
     )
