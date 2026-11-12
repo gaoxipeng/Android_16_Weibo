@@ -103,6 +103,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -420,6 +421,10 @@ import com.example.myweibo.ui.liquidglass.TransparentLiquidCapsule
 import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
 import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
+import com.example.myweibo.ui.liquidglass.SettingsLiquidSwitch
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSlider
 import com.example.myweibo.ui.liquidglass.SettingsLiquidToggle
 import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
@@ -3574,6 +3579,7 @@ private class SearchBarOverlayController {
     var queryInput by mutableStateOf(TextFieldValue(""))
     var mode by mutableStateOf(SearchMode.Weibo)
     var onModeChange: (SearchMode) -> Unit = {}
+    var onWeiboSortChange: (SearchWeiboSort) -> Unit = {}
     var onQueryInputChange: (TextFieldValue) -> Unit = { queryInput = it }
     var onSearch: () -> Unit = {}
     var onClear: () -> Unit = {}
@@ -4462,7 +4468,6 @@ fun WeiboApp() {
     var searchResultsBackAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     var searchReturnBackground by remember { mutableStateOf<Bitmap?>(null) }
     var searchCapturePending by remember { mutableStateOf(false) }
-    var searchViewportBounds by remember { mutableStateOf<Rect?>(null) }
     var searchPendingMode by remember { mutableStateOf<SearchMode?>(null) }
     var searchMode by remember { mutableStateOf(storedSearchMode(searchSettingsStore.readMode())) }
     var searchWeiboSort by remember { mutableStateOf(storedSearchWeiboSort(searchSettingsStore.readWeiboSort())) }
@@ -5781,40 +5786,26 @@ fun WeiboApp() {
 
     fun captureSearchBackground(onReady: () -> Unit) {
         if (searchCapturePending) return
-        val window = (context as? android.app.Activity)?.window
-        val view = detailCaptureView
-        if (window == null || view.width <= 0 || view.height <= 0) {
-            searchReturnBackground = null
-            onReady()
-            return
-        }
         searchCapturePending = true
-        val origin = IntArray(2)
-        view.getLocationInWindow(origin)
-        // Capture precisely the viewport where this bitmap will be drawn. A full
-        // window capture scaled into inset content shifts the source on frame one.
-        val bounds = searchViewportBounds
-        val crop = if (bounds != null) android.graphics.Rect(
-            bounds.left.roundToInt(), bounds.top.roundToInt(),
-            bounds.right.roundToInt(), bounds.bottom.roundToInt(),
-        ) else android.graphics.Rect(origin[0], origin[1], origin[0] + view.width, origin[1] + view.height)
-        if (crop.width() <= 0 || crop.height() <= 0) {
-            searchCapturePending = false
-            searchReturnBackground = null
-            onReady()
-            return
-        }
-        runCatching {
-            val bitmap = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
-            android.view.PixelCopy.request(window, crop, bitmap, { result ->
+        scope.launch {
+            // The search content layer excludes the fixed search field and
+            // navigation bar, so neither appears in the sliding background.
+            val layer = searchContentBackdrop.graphicsLayer
+            val background = try {
+                if (layer.size.width > 0 && layer.size.height > 0) {
+                    layer.toImageBitmap().asAndroidBitmap()
+                } else {
+                    null
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            } finally {
                 searchCapturePending = false
-                searchReturnBackground = bitmap.takeIf { result == android.view.PixelCopy.SUCCESS }
-                if (result != android.view.PixelCopy.SUCCESS) bitmap.recycle()
-                onReady()
-            }, android.os.Handler(android.os.Looper.getMainLooper()))
-        }.onFailure {
-            searchCapturePending = false
-            searchReturnBackground = null
+            }
+            if (selectedTab != MainTab.Search) return@launch
+            searchReturnBackground = background
             onReady()
         }
     }
@@ -8320,6 +8311,11 @@ fun WeiboApp() {
         SideEffect { homeContentBackdrop.isFrozen = feedBackdropFrozenForDetail }
         val menuGlassBackdrop = bottomBarBackdrop
         val searchBarOverlay = remember { SearchBarOverlayController() }
+        val searchTransitionBackdrop = rememberLayerBackdrop()
+        var modeMenuOpen by remember(selectedTab) { mutableStateOf(false) }
+        var searchMenuHost by remember { mutableStateOf<LayoutCoordinates?>(null) }
+        var searchMenuCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+        var searchMenuTriggerCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
         val searchHiddenCardBackdrop = rememberLayerBackdrop()
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
@@ -8400,7 +8396,31 @@ fun WeiboApp() {
             LocalFeedEmoticonInlineContent provides feedEmoticonInlineContent,
             LocalFeedImageUpgradeNotifier provides feedImageUpgradeNotifier,
         ) {
-            Box(Modifier.fillMaxSize()) {
+            Box(
+                Modifier.fillMaxSize()
+                    .onGloballyPositioned { searchMenuHost = it }
+                    .then(
+                        if (modeMenuOpen) Modifier.pointerInput(Unit) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                val host = searchMenuHost?.takeIf { it.isAttached } ?: return@awaitEachGesture
+                                fun hits(target: LayoutCoordinates?): Boolean =
+                                    target?.takeIf { it.isAttached }
+                                        ?.let { host.localBoundingBoxOf(it, clipBounds = false).contains(down.position) }
+                                        ?: false
+                                if (hits(searchMenuCoordinates) || hits(searchMenuTriggerCoordinates)) {
+                                    return@awaitEachGesture
+                                }
+                                // Keep the destination mounted through the entire
+                                // gesture. Its click or drag runs before dismissal.
+                                do {
+                                    val event = awaitPointerEvent(PointerEventPass.Final)
+                                } while (event.changes.any { it.id == down.id && it.pressed })
+                                modeMenuOpen = false
+                            }
+                        } else Modifier,
+                    ),
+            ) {
             val detailOverlayItem = selectedItem?.let(::resolveFeedItem)
             val overlayTop = overlayTopKind(navOverlayStack)
             val detailLayerActive = navOverlayStack.any { it is NavOverlayKind.Detail } && detailOverlayItem != null
@@ -8460,8 +8480,7 @@ fun WeiboApp() {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .padding(innerPadding)
-                    .onGloballyPositioned { searchViewportBounds = it.boundsInWindow() },
+                    .padding(innerPadding),
             ) {
             val mainContentClear = visitedUserId == null && selectedItem == null
             val messagesWebVisible = selectedTab == MainTab.Messages && mainContentClear
@@ -8700,7 +8719,7 @@ fun WeiboApp() {
                         if (profileLayerActive || navExitPendingKind is NavOverlayKind.VisitedProfile) {
                             translationX = size.width * navTransitionCoordinator.standardPageUnderlayOffsetFraction
                         }
-                    },
+                    }.layerBackdrop(searchTransitionBackdrop),
                     stackTop = searchUiOnTop,
                     visible = searchUiOnTop,
                     stackAnimated = false,
@@ -9548,8 +9567,10 @@ fun WeiboApp() {
                         (1f - bottomBarSlideProgress)
                 }
             }
-            val searchPageFieldBackdrop = remember(searchContentBackdrop, searchFieldSlideOffset) {
-                searchContentBackdrop.anchoredVertically(slideOffset = searchFieldSlideOffset)
+            // Sample the composed hot-search underlay and moving results together.
+            // The field and tab bar are siblings outside this layer.
+            val searchPageFieldBackdrop = remember(searchTransitionBackdrop, searchFieldSlideOffset) {
+                searchTransitionBackdrop.anchoredVertically(slideOffset = searchFieldSlideOffset)
             }
             val searchCardFieldBackdrop = remember(searchHiddenCardBackdrop, searchFieldSlideOffset) {
                 searchHiddenCardBackdrop.anchoredVertically(
@@ -9575,6 +9596,12 @@ fun WeiboApp() {
                 if (selectedTab == MainTab.Search) {
                     val showSearchBar = searchUiOnTop || keepSearchBarForDetail
                     val fieldBottom = searchBarOverlay.bottomPadding
+                    val menuEnabled = searchUiOnTop && bottomBarRequestedVisible
+                    val showModeMenu = menuEnabled && modeMenuOpen
+                    LaunchedEffect(menuEnabled) {
+                        if (!menuEnabled) modeMenuOpen = false
+                    }
+                    BackHandler(enabled = showModeMenu) { modeMenuOpen = false }
                     Column(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -9594,9 +9621,38 @@ fun WeiboApp() {
                                 bottom = fieldBottom,
                             ),
                     ) {
+                        AnimatedVisibility(
+                            visible = showModeMenu,
+                            modifier = Modifier.padding(bottom = SearchBarCompanionGap),
+                            enter = fadeIn(tween(120)),
+                            exit = fadeOut(tween(100)),
+                        ) {
+                            SearchMenuCapsule(
+                                enabled = showModeMenu,
+                                modifier = Modifier.onGloballyPositioned { searchMenuCoordinates = it },
+                                selected = when {
+                                    searchBarOverlay.mode == SearchMode.User -> SearchMenuOption.User
+                                    searchWeiboSort == SearchWeiboSort.Realtime -> SearchMenuOption.Realtime
+                                    else -> SearchMenuOption.Comprehensive
+                                },
+                                backdrop = searchFieldBackdrop,
+                                frostAmount = bottomBarFrostAmount,
+                                glassAmount = bottomBarGlassAmount,
+                                onSelectionSettled = { modeMenuOpen = false },
+                                onSelected = { option ->
+                                    val sort = option.sort
+                                    if (sort == null) {
+                                        searchBarOverlay.onModeChange(SearchMode.User)
+                                    } else {
+                                        searchBarOverlay.onModeChange(SearchMode.Weibo)
+                                        searchBarOverlay.onWeiboSortChange(sort)
+                                    }
+                                },
+                            )
+                        }
                         SearchSuggestionPanel(
                             suggestions = searchBarOverlay.suggestions,
-                            visible = searchBarOverlay.suggestionsVisible,
+                            visible = searchBarOverlay.suggestionsVisible && !showModeMenu,
                             loading = searchBarOverlay.suggestionsLoading,
                             onSuggestionClick = searchBarOverlay.onSuggestionClick,
                             onUserClick = searchBarOverlay.onSuggestionUserClick,
@@ -9609,7 +9665,10 @@ fun WeiboApp() {
                             value = searchBarOverlay.queryInput,
                             onValueChange = searchBarOverlay.onQueryInputChange,
                             mode = searchBarOverlay.mode,
-                            onModeChange = searchBarOverlay.onModeChange,
+                            weiboSort = searchWeiboSort,
+                            onModeMenuClick = { modeMenuOpen = !modeMenuOpen },
+                            onModeMenuPositioned = { searchMenuTriggerCoordinates = it },
+                            menuEnabled = menuEnabled,
                             onSearch = searchBarOverlay.onSearch,
                             onClear = searchBarOverlay.onClear,
                             backdrop = searchFieldBackdrop,
@@ -22397,65 +22456,101 @@ private fun CommentImageStrip(
 }
 
 @Composable
-private fun SearchModeToggle(
-    selected: SearchMode,
-    onSelected: (SearchMode) -> Unit,
+private fun SearchModeMenuTrigger(
+    label: String,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
 ) {
-    val metaColor = if (isAppLightTheme()) Color.Black else MaterialTheme.colorScheme.onSurface
-    val nextMode = if (selected == SearchMode.Weibo) SearchMode.User else SearchMode.Weibo
-
+    val color = MaterialTheme.colorScheme.onSurface
     Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() },
-                onClick = { onSelected(nextMode) },
-            )
-            .padding(horizontal = 4.dp, vertical = 2.dp),
+        modifier = modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .combinedClickable(enabled = enabled, onClick = onClick, onLongClick = onClick)
+            .padding(horizontal = 3.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        CommentSortLinesIcon(tint = metaColor)
-        Text(
-            text = selected.label,
-            style = MaterialTheme.typography.bodySmall,
-            color = metaColor,
-        )
+        CommentSortLinesIcon(tint = color)
+        Text(label, style = MaterialTheme.typography.bodySmall, color = color, maxLines = 1)
+    }
+}
+
+private enum class SearchMenuOption(val label: String, val sort: SearchWeiboSort?) {
+    Comprehensive("综合", SearchWeiboSort.Comprehensive),
+    Realtime("实时", SearchWeiboSort.Realtime),
+    User("用户", null),
+}
+
+@Composable
+private fun SearchMenuCapsule(
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    selected: SearchMenuOption,
+    backdrop: Backdrop,
+    frostAmount: Float,
+    glassAmount: Float,
+    onSelectionSettled: () -> Unit,
+    onSelected: (SearchMenuOption) -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    val options = SearchMenuOption.entries
+    val segmentWidth = 58.dp
+    SettingsLiquidSwitch(
+        selectedIndex = selected.ordinal,
+        optionCount = options.size,
+        trackWidth = segmentWidth * options.size + 4.dp,
+        trackHeight = 36.dp,
+        thumbWidth = segmentWidth,
+        thumbColor = colors.primary.copy(alpha = 0.32f),
+        glassTrack = Modifier.drawBottomBarGlassBackdrop(backdrop, frostAmount, glassAmount, isAppLightTheme()),
+        modifier = modifier.selectableGroup(),
+        enabled = enabled,
+        onSelected = { onSelected(options[it]) },
+        onSelectionSettled = onSelectionSettled,
+    ) { shownIndex, select ->
+        Row(Modifier.padding(horizontal = 2.dp)) {
+            options.forEachIndexed { index, option ->
+                Box(
+                    modifier = Modifier
+                        .width(segmentWidth)
+                        .height(36.dp)
+                        .semantics {
+                            this.selected = index == shownIndex
+                            onClick {
+                                select(index)
+                                true
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        option.label,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurface,
+                        fontWeight = if (index == shownIndex) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun SearchWeiboSortToggle(
-    selected: SearchWeiboSort,
-    onSelected: (SearchWeiboSort) -> Unit,
+private fun SearchFrostedPanel(
+    backdrop: Backdrop,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
 ) {
-    val metaColor = weiboMetaTextColor()
-    val nextSort = if (selected == SearchWeiboSort.Comprehensive) {
-        SearchWeiboSort.Realtime
-    } else {
-        SearchWeiboSort.Comprehensive
-    }
-
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() },
-                onClick = { onSelected(nextSort) },
-            )
-            .padding(horizontal = 4.dp, vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        CommentSortLinesIcon(tint = metaColor)
-        Text(
-            text = selected.label,
-            style = MaterialTheme.typography.bodySmall,
-            color = metaColor,
-        )
-    }
+    TransparentLiquidCapsule(
+        modifier = modifier.clip(RoundedCornerShape(14.dp)),
+        backdrop = backdrop,
+        surfaceColor = Color.White.copy(alpha = 0.2f),
+        borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
+        else Color.White.copy(alpha = 0.24f),
+        borderWidth = 0.75.dp,
+        frostedBlurRadius = 8.dp,
+    ) { content() }
 }
 
 @Composable
@@ -22478,7 +22573,6 @@ private fun SearchCapsuleField(
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     mode: SearchMode,
-    onModeChange: (SearchMode) -> Unit,
     onSearch: () -> Unit,
     onClear: () -> Unit,
     backdrop: Backdrop,
@@ -22489,6 +22583,10 @@ private fun SearchCapsuleField(
     userSearch: Boolean = false,
     autoFocus: Boolean = false,
     fixedPrefix: String = "",
+    weiboSort: SearchWeiboSort? = null,
+    onModeMenuClick: () -> Unit = {},
+    onModeMenuPositioned: (LayoutCoordinates) -> Unit = {},
+    menuEnabled: Boolean = true,
 ) {
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -22520,17 +22618,27 @@ private fun SearchCapsuleField(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(44.dp)
-                .padding(start = 16.dp, end = 4.dp),
+                .padding(
+                    start = if (userSearch) 16.dp else 8.dp,
+                    end = if (userSearch) 4.dp else 2.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (userSearch) UserSearchIcon(
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(22.dp),
-            ) else SearchModeToggle(
-                selected = mode,
-                onSelected = onModeChange,
+            ) else SearchModeMenuTrigger(
+                label = if (mode == SearchMode.Weibo) {
+                    (weiboSort ?: SearchWeiboSort.Comprehensive).label
+                } else mode.label,
+                enabled = menuEnabled,
+                modifier = Modifier.onGloballyPositioned(onModeMenuPositioned),
+                onClick = {
+                    keyboard?.hide()
+                    onModeMenuClick()
+                },
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(if (userSearch) 8.dp else 4.dp))
             if (fixedPrefix.isNotEmpty()) {
                 Text(
                     text = fixedPrefix,
@@ -22579,7 +22687,8 @@ private fun SearchCapsuleField(
             if (value.text.isNotEmpty()) {
                 TextButton(
                     onClick = onClear,
-                    contentPadding = PaddingValues(horizontal = 8.dp),
+                    modifier = if (userSearch) Modifier else Modifier.width(42.dp),
+                    contentPadding = PaddingValues(horizontal = if (userSearch) 8.dp else 4.dp),
                 ) {
                     Text(
                         text = "清除",
@@ -22611,17 +22720,7 @@ private fun SearchSuggestionPanel(
         exit = fadeOut(tween(100)),
         modifier = modifier,
     ) {
-        TransparentLiquidCapsule(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp)),
-            backdrop = backdrop,
-            surfaceColor = Color.White.copy(alpha = 0.2f),
-            borderColor = if (isAppLightTheme()) Color.Black.copy(alpha = 0.16f)
-            else Color.White.copy(alpha = 0.24f),
-            borderWidth = 0.75.dp,
-            frostedBlurRadius = 8.dp,
-        ) {
+        SearchFrostedPanel(backdrop = backdrop, modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -23331,7 +23430,6 @@ private fun UserPostsSearchScreen(
         value = draft,
         onValueChange = { draft = it },
         mode = SearchMode.Weibo,
-        onModeChange = {},
         onSearch = { search(draft.text) },
         onClear = { draft = TextFieldValue("") },
         backdrop = searchBackdrop,
@@ -23566,6 +23664,7 @@ private fun SearchScreen(
         if (sort == weiboSort) return
         onWeiboSortChange(sort)
         if (activeSearchMode == SearchMode.Weibo && activeQuery != null) {
+            listState.requestScrollToItem(0)
             resultItems = emptyList()
             resultError = null
             resultNextPage = null
@@ -23802,8 +23901,6 @@ private fun SearchScreen(
         activeQuery == null -> hotSearchLoading
         else -> searchPullRefreshing
     }
-    var searchHeaderHeight by remember { mutableStateOf(0.dp) }
-    val density = LocalDensity.current
     val searchBarGap = SearchBarBottomGap
     val searchCompanionGap = SearchBarCompanionGap
     val searchFieldHeight = 44.dp
@@ -23838,6 +23935,7 @@ private fun SearchScreen(
     SideEffect {
         searchBarOverlay.queryInput = searchDraft
         searchBarOverlay.mode = searchMode
+        searchBarOverlay.onWeiboSortChange = ::changeWeiboSort
         searchBarOverlay.onModeChange = { mode ->
             if (mode != searchMode) {
                 onSearchModeChange(mode)
@@ -23946,10 +24044,7 @@ private fun SearchScreen(
                         flingBehavior = rememberWeiboListFlingBehavior(),
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
-                            top = when {
-                                activeQuery != null -> searchHeaderHeight + 4.dp
-                                else -> topInset + 8.dp
-                            },
+                            top = topInset + if (activeQuery == null) 8.dp else 4.dp,
                             start = if (activeQuery == null) 16.dp else 0.dp,
                             end = if (activeQuery == null) 16.dp else 0.dp,
                             bottom = listBottomInset,
@@ -24128,50 +24223,6 @@ private fun SearchScreen(
                     }
                     if (resultLoadingMore && !searchPullRefreshing) {
                         item { MineLoadingMoreIndicator() }
-                    }
-                }
-            }
-            // Keep the result header laid out beneath detail while it returns.
-            // Hiding it with the search input causes a late header pop/reflow.
-            if (activeQuery != null) {
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.background)
-                        .onGloballyPositioned { coordinates ->
-                            searchHeaderHeight = with(density) { coordinates.size.height.toDp() }
-                        }
-                        .padding(
-                            top = topInset + 4.dp,
-                            start = 16.dp,
-                            end = 16.dp,
-                            bottom = 4.dp,
-                        ),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    Text(
-                        text = activeQuery.orEmpty(),
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = WeiboTopicBlue,
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "${activeSearchMode.label}搜索结果",
-                            modifier = Modifier.weight(1f),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        if (activeSearchMode == SearchMode.Weibo) {
-                            SearchWeiboSortToggle(
-                                selected = weiboSort,
-                                onSelected = ::changeWeiboSort,
-                            )
-                        }
                     }
                 }
             }

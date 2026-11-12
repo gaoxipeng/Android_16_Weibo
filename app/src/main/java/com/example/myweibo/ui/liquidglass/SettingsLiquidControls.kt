@@ -18,6 +18,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,6 +39,7 @@ import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.fastCoerceIn
 import androidx.compose.ui.util.fastRoundToInt
@@ -53,6 +55,8 @@ import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
+import kotlin.math.abs
 
 /** Backdrop Catalog-style toggle: elastic glass thumb over a liquid track. */
 @Composable
@@ -61,19 +65,57 @@ fun SettingsLiquidToggle(
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    SettingsLiquidSwitch(
+        selectedIndex = if (checked) 1 else 0,
+        onSelected = { onCheckedChange(it == 1) },
+        modifier = modifier,
+    )
+}
+
+@Composable
+internal fun SettingsLiquidSwitch(
+    selectedIndex: Int,
+    onSelected: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    optionCount: Int = 2,
+    trackWidth: Dp = 56.dp,
+    trackHeight: Dp = 24.dp,
+    thumbWidth: Dp = 32.dp,
+    thumbColor: Color = Color.White,
+    glassTrack: Modifier? = null,
+    enabled: Boolean = true,
+    onSelectionSettled: (() -> Unit)? = null,
+    labels: (@Composable (Int, (Int) -> Unit) -> Unit)? = null,
+) {
     val isLightTheme = isAppLightTheme()
     val accentColor = if (isLightTheme) Color(0xFF34C759) else Color(0xFF30D158)
     val trackColor = if (isLightTheme) Color(0xFF787878).copy(alpha = 0.2f)
     else Color(0xFF787880).copy(alpha = 0.36f)
+    val shape = androidx.compose.foundation.shape.RoundedCornerShape(percent = 50)
     val isLtr = LocalLayoutDirection.current == LayoutDirection.Ltr
     val density = LocalDensity.current
-    val dragWidth = 20f.dp
+    val lastIndex = optionCount - 1
+    val dragWidth = trackWidth - thumbWidth - 4.dp
+    val thumbHeight = trackHeight - 4.dp
     val scope = rememberCoroutineScope()
-    val latestChecked by rememberUpdatedState(checked)
-    val latestOnCheckedChange by rememberUpdatedState(onCheckedChange)
+    val latestIndex by rememberUpdatedState(selectedIndex)
+    val latestOnSelected by rememberUpdatedState(onSelected)
+    val latestOnSettled by rememberUpdatedState(onSelectionSettled)
+    val latestEnabled by rememberUpdatedState(enabled)
     var didDrag by remember { mutableStateOf(false) }
-    var fraction by remember { mutableFloatStateOf(if (checked) 1f else 0f) }
-    val damped = remember(scope) {
+    var pressedIndex by remember { mutableStateOf(selectedIndex) }
+    var settlingIndex by remember { mutableStateOf<Int?>(null) }
+    var fraction by remember { mutableFloatStateOf(selectedIndex.toFloat() / lastIndex) }
+
+    fun select(index: Int) {
+        fraction = index.toFloat() / lastIndex
+        if (latestOnSettled != null) {
+            settlingIndex = index
+        }
+        latestOnSelected(index)
+    }
+
+    val damped = remember(scope, dragWidth, isLtr, density, optionCount) {
         DampedDragAnimation(
             animationScope = scope,
             initialValue = fraction,
@@ -81,60 +123,94 @@ fun SettingsLiquidToggle(
             visibilityThreshold = 0.001f,
             initialScale = 1f,
             pressedScale = 1.5f,
-            onDragStarted = {},
+            onDragStarted = { position ->
+                didDrag = false
+                val width = with(density) { trackWidth.toPx() }
+                val x = if (isLtr) position.x else width - position.x
+                pressedIndex = (x / width * optionCount).toInt().coerceIn(0, lastIndex)
+            },
             onDragStopped = {
-                val next = if (didDrag) targetValue >= 0.5f else !latestChecked
-                fraction = if (next) 1f else 0f
-                latestOnCheckedChange(next)
+                if (latestEnabled && settlingIndex == null) {
+                    val next = when {
+                        didDrag -> (fraction * lastIndex).fastRoundToInt().coerceIn(0, lastIndex)
+                        optionCount == 2 -> 1 - latestIndex
+                        else -> pressedIndex
+                    }
+                    select(next)
+                }
                 didDrag = false
             },
             onDrag = { _, amount, _ ->
-                didDrag = didDrag || amount.x != 0f
-                val delta = amount.x / with(density) { dragWidth.toPx() }
-                fraction = (fraction + if (isLtr) delta else -delta).fastCoerceIn(0f, 1f)
+                if (latestEnabled && settlingIndex == null) {
+                    didDrag = didDrag || amount.x != 0f
+                    val delta = amount.x / with(density) { dragWidth.toPx() }
+                    fraction = (fraction + if (isLtr) delta else -delta).fastCoerceIn(0f, 1f)
+                }
             },
         )
     }
     LaunchedEffect(damped) {
         snapshotFlow { fraction }.collectLatest(damped::updateValue)
     }
-    LaunchedEffect(damped, checked) {
-        val target = if (checked) 1f else 0f
+    LaunchedEffect(damped, selectedIndex) {
+        val target = selectedIndex.toFloat() / lastIndex
         if (target != fraction) {
             fraction = target
             damped.animateToValue(target)
         }
     }
+    LaunchedEffect(damped, settlingIndex, enabled) {
+        if (!enabled) {
+            settlingIndex = null
+            return@LaunchedEffect
+        }
+        val index = settlingIndex ?: return@LaunchedEffect
+        // Let the shared gesture release schedule its spring before checking rest.
+        withFrameNanos { }
+        withFrameNanos { }
+        val target = index.toFloat() / lastIndex
+        snapshotFlow {
+            abs(damped.value - target) <= 0.001f && damped.pressProgress <= 0.001f &&
+                abs(damped.scaleX - 1f) <= 0.001f && abs(damped.scaleY - 1f) <= 0.001f
+        }.first { it }
+        latestOnSettled?.invoke()
+        settlingIndex = null
+    }
 
     val trackBackdrop = rememberLayerBackdrop {
-        drawRoundRect(
+        if (glassTrack != null) drawContent() else drawRoundRect(
             color = lerp(trackColor, accentColor, damped.value),
             cornerRadius = CornerRadius(size.height / 2f),
         )
     }
-    Box(modifier, contentAlignment = Alignment.CenterStart) {
+    val canInteract = enabled && settlingIndex == null
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.CenterStart,
+    ) {
         Box(
-            Modifier.layerBackdrop(trackBackdrop)
-                .clip(androidx.compose.foundation.shape.RoundedCornerShape(percent = 50))
-                .size(56.dp, 24.dp)
+            Modifier
+                .then(if (glassTrack == null) Modifier.layerBackdrop(trackBackdrop) else Modifier)
+                .clip(shape)
+                .size(trackWidth, trackHeight)
                 .drawWithCache {
                     val aperture = Path()
-                    onDrawBehind {
+                    onDrawWithContent {
                         val progress = damped.pressProgress
                         val velocity = damped.velocity / 50f
                         var scaleX = damped.scaleX
                         var scaleY = damped.scaleY
                         scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
                         scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
-                        val thumbWidth = 32.dp.toPx() * scaleX
-                        val thumbHeight = 20.dp.toPx() * scaleY
+                        val scaledThumbWidth = thumbWidth.toPx() * scaleX
+                        val scaledThumbHeight = thumbHeight.toPx() * scaleY
                         val padding = 2.dp.toPx()
                         val drag = with(density) { dragWidth.toPx() } * damped.value
-                        val centerX = if (isLtr) padding + 16.dp.toPx() + drag
-                        else size.width - padding - 16.dp.toPx() - drag
+                        val centerX = if (isLtr) padding + thumbWidth.toPx() / 2f + drag
+                        else size.width - padding - thumbWidth.toPx() / 2f - drag
                         val centerY = size.height / 2f
-                        val apertureWidth = thumbWidth * progress
-                        val apertureHeight = thumbHeight * progress
+                        val apertureWidth = scaledThumbWidth * progress
+                        val apertureHeight = scaledThumbHeight * progress
                         aperture.reset()
                         aperture.addRoundRect(
                             RoundRect(
@@ -148,13 +224,20 @@ fun SettingsLiquidToggle(
                             ),
                         )
                         clipPath(aperture, clipOp = ClipOp.Difference) {
-                            drawRoundRect(
-                                color = lerp(trackColor, accentColor, damped.value),
-                                cornerRadius = CornerRadius(size.height / 2f),
-                            )
+                            if (glassTrack == null) {
+                                drawRoundRect(
+                                    color = lerp(trackColor, accentColor, damped.value),
+                                    cornerRadius = CornerRadius(size.height / 2f),
+                                )
+                            } else {
+                                this@onDrawWithContent.drawContent()
+                            }
                         }
                     }
-                },
+                }
+                // Record the full glass track for the thumb before the visible
+                // pass cuts its opening during a press.
+                .then(if (glassTrack != null) Modifier.layerBackdrop(trackBackdrop).then(glassTrack) else Modifier),
         )
         Box(
             Modifier.graphicsLayer {
@@ -163,13 +246,13 @@ fun SettingsLiquidToggle(
                 translationX = if (isLtr) androidx.compose.ui.util.lerp(padding, padding + dx, damped.value)
                 else -androidx.compose.ui.util.lerp(padding, padding + dx, damped.value)
             }
-                .then(damped.modifier)
+                .then(if (optionCount == 2 && canInteract) damped.modifier else Modifier)
                 .drawBackdrop(
                     backdrop = rememberBackdrop(trackBackdrop) { draw ->
                         val p = damped.pressProgress
                         scale(androidx.compose.ui.util.lerp(2f / 3f, 0.75f, p), androidx.compose.ui.util.lerp(0f, 0.75f, p)) { draw() }
                     },
-                    shape = { androidx.compose.foundation.shape.RoundedCornerShape(percent = 50) },
+                    shape = { shape },
                     effects = {
                         val p = damped.pressProgress
                         blur(8f.dp.toPx() * (1f - p))
@@ -197,10 +280,21 @@ fun SettingsLiquidToggle(
                         scaleX /= 1f - (velocity * 0.75f).fastCoerceIn(-0.2f, 0.2f)
                         scaleY *= 1f - (velocity * 0.25f).fastCoerceIn(-0.2f, 0.2f)
                     },
-                    onDrawSurface = { drawRect(Color.White.copy(alpha = 1f - damped.pressProgress)) },
+                    onDrawSurface = { drawRect(thumbColor.copy(alpha = thumbColor.alpha * (1f - damped.pressProgress))) },
                 )
-                .size(32.dp, 20.dp),
+                .size(thumbWidth, thumbHeight),
         )
+        labels?.invoke(settlingIndex ?: selectedIndex) { index ->
+            if (canInteract) {
+                select(index)
+                damped.animateToValue(index.toFloat() / lastIndex)
+            }
+        }
+        if (optionCount > 2 && canInteract) {
+            // Clip the touch target separately so the pressed thumb can grow
+            // past the track without being cropped.
+            Box(Modifier.matchParentSize().clip(shape).then(damped.modifier))
+        }
     }
 }
 
