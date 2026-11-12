@@ -17214,9 +17214,15 @@ private fun InlineVideoPlayer(
                     scaleX = holdScale
                     scaleY = holdScale
                     alpha = if (actionOpen) 0f else 1f
+                    shape = RoundedCornerShape(cornerRadius)
+                    clip = true
+                    if (showInlineVideoSurface) {
+                        // Blend the video and its black underlay before clipping
+                        // the rounded edge, so they do not leave separate fringes.
+                        compositingStrategy = CompositingStrategy.Offscreen
+                    }
                 }
-                .clip(RoundedCornerShape(cornerRadius))
-                .background(Color.Black)
+                .then(if (showInlineVideoSurface) Modifier else Modifier.background(Color.Black))
                 .pointerInput(media.streamUrl, media.type) {
                 awaitEachGesture {
                     val bounds = anchorHolder.boundsInWindow() ?: return@awaitEachGesture
