@@ -46,10 +46,35 @@ class LayerBackdrop internal constructor(
 
     private var inverseLayerScope: InverseLayerScope? = null
 
+    /** Sample the resting position even when the glass itself slides vertically. */
+    internal fun anchoredVertically(
+        enabled: () -> Boolean = { true },
+        slideOffset: () -> Float,
+    ): Backdrop = object : Backdrop {
+        override val isCoordinatesDependent = true
+
+        override fun DrawScope.drawBackdrop(
+            density: Density,
+            coordinates: LayoutCoordinates?,
+            layerBlock: (GraphicsLayerScope.() -> Unit)?,
+        ) {
+            if (enabled()) drawLayerBackdrop(density, coordinates, layerBlock, slideOffset())
+        }
+    }
+
     override fun DrawScope.drawBackdrop(
         density: Density,
         coordinates: LayoutCoordinates?,
         layerBlock: (GraphicsLayerScope.() -> Unit)?
+    ) {
+        drawLayerBackdrop(density, coordinates, layerBlock, slideOffset = 0f)
+    }
+
+    private fun DrawScope.drawLayerBackdrop(
+        density: Density,
+        coordinates: LayoutCoordinates?,
+        layerBlock: (GraphicsLayerScope.() -> Unit)?,
+        slideOffset: Float,
     ) {
         val coordinates = coordinates ?: return
         val layerCoordinates = layerCoordinates
@@ -74,7 +99,7 @@ class LayerBackdrop internal constructor(
                 // window position instead of exposing an empty/transparent backdrop.
                 coordinates.positionInWindow() - sourcePositionInWindow
             }
-            translate(-offset.x, -offset.y)
+            translate(-offset.x, -offset.y + slideOffset)
         }) {
             drawLayer(graphicsLayer)
         }

@@ -245,6 +245,7 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.graphicsLayer
@@ -426,6 +427,8 @@ import com.example.myweibo.ui.liquidglass.liquidRegularMenuGlassEffects
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.LayerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
 import androidx.compose.foundation.MutatePriority
 import androidx.compose.foundation.gestures.stopScroll
 import kotlinx.coroutines.CancellationException
@@ -1271,6 +1274,7 @@ private fun <T> NavAnimatedOverlay(
     sourceBounds: Rect? = null,
     sourceImage: Bitmap? = null,
     sourceReturnImage: Bitmap? = sourceImage,
+    quickSourceReturnHandoff: Boolean = false,
     returnBackground: Bitmap? = null,
     onSwipeBack: (() -> Unit)? = null,
     interceptRightSwipe: Boolean = false,
@@ -1350,11 +1354,13 @@ private fun <T> NavAnimatedOverlay(
             // Let the real home card refresh its backdrop while the captured
             // card still fully covers it. This keeps the bottom bar's glass
             // source current when the overlay exits.
+            detailExitHandoffHold = true
             latestSourceCardHandoffReady()
             withFrameNanos { }
             withFrameNanos { }
         }
         swipeCommitted = true
+        detailExitHandoffHold = false
         latestPageBack?.invoke()
     }
     LaunchedEffect(commitCardReturn, transitionIdentity) {
@@ -1708,10 +1714,12 @@ private fun <T> NavAnimatedOverlay(
         // Only hand off the source-card pixels once return has been committed.
         val sourceLayoutHandoff = if (returningPage && !nestedDetailReturnAnimating &&
             (pendingExitKind is NavOverlayKind.Detail || swipeCardReturn > 0f)) {
-            ((1f - pageReveal - 0.35f) / 0.50f).coerceIn(0f, 1f)
+            val start = if (quickSourceReturnHandoff) 0.72f else 0.35f
+            val duration = if (quickSourceReturnHandoff) 0.14f else 0.50f
+            ((1f - pageReveal - start) / duration).coerceIn(0f, 1f)
         } else 0f
         Box(Modifier.fillMaxSize().graphicsLayer {
-            alpha = if (swipeCommitted) 0f else 1f
+            alpha = if (swipeCommitted || detailExitHandoffHold) 0f else 1f
             val swipeProgress = (swipeOffset / overlayWidth).coerceIn(0f, 1f)
             val bounds = sourceBounds
             if (bounds != null && navKind is NavOverlayKind.Detail && size.width >= 1f && size.height >= 1f) {
@@ -1828,13 +1836,9 @@ private fun <T> NavAnimatedOverlay(
         Canvas(Modifier.matchParentSize()) {
             drawImage(
                 sourceHandoffBitmap,
-                dstOffset = IntOffset(
-                    (sourceBounds.left - overlayOrigin.x).roundToInt(),
-                    (sourceBounds.top - overlayOrigin.y).roundToInt(),
-                ),
-                dstSize = IntSize(
-                    sourceBounds.width.roundToInt().coerceAtLeast(1),
-                    sourceBounds.height.roundToInt().coerceAtLeast(1),
+                topLeft = Offset(
+                    sourceBounds.left.coerceAtLeast(0f) - overlayOrigin.x,
+                    sourceBounds.top.coerceAtLeast(0f) - overlayOrigin.y,
                 ),
             )
         }
@@ -3295,6 +3299,14 @@ private val LocalDetailReturnCardLayout = staticCompositionLocalOf<androidx.comp
 private val LocalDetailPageReveal = staticCompositionLocalOf { 1f }
 private val LocalDetailExitStarted = staticCompositionLocalOf { false }
 private val LocalHiddenFeedCardId = staticCompositionLocalOf<String?> { null }
+private val LocalHiddenCardBackdrop = staticCompositionLocalOf<LayerBackdrop?> { null }
+
+private fun Modifier.detailSourceVisibility(hidden: Boolean, backdrop: LayerBackdrop?): Modifier =
+    when {
+        !hidden -> this
+        backdrop != null -> layerBackdrop(backdrop, drawSource = false)
+        else -> graphicsLayer { alpha = 0f }
+    }
 private val LocalImageReturnBarTop = staticCompositionLocalOf<() -> Float> { { Float.POSITIVE_INFINITY } }
 private val LocalOpenRetweetCard = staticCompositionLocalOf<((FeedItem, Rect?, FeedItem) -> Unit)?> { null }
 
@@ -3559,7 +3571,6 @@ private fun NavTransitionTouchShield(
 }
 
 private class SearchBarOverlayController {
-    var active by mutableStateOf(false)
     var queryInput by mutableStateOf(TextFieldValue(""))
     var mode by mutableStateOf(SearchMode.Weibo)
     var onModeChange: (SearchMode) -> Unit = {}
@@ -4381,6 +4392,10 @@ fun WeiboApp() {
     var detailSwipeReturningHome by remember { mutableStateOf(false) }
     var feedBackdropFrozenForDetail by remember { mutableStateOf(false) }
     val homeContentBackdrop = rememberLayerBackdrop()
+    val homeHiddenCardBackdrop = rememberLayerBackdrop()
+    val searchContentBackdrop = rememberLayerBackdrop()
+    val mineContentBackdrop = rememberLayerBackdrop()
+    val mineHiddenCardBackdrop = rememberLayerBackdrop()
     var preservedFeedSourceItem by remember { mutableStateOf<FeedItem?>(null) }
     LaunchedEffect(feedListState) {
         snapshotFlow { feedListState.layoutInfo.visibleItemsInfo.map { it.key } }
@@ -4397,7 +4412,6 @@ fun WeiboApp() {
     var hiddenCardProfileGeneration by remember { mutableStateOf<Int?>(null) }
     var hiddenCardFromMine by remember { mutableStateOf(false) }
     var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
-    var activeDetailBottomBarImage by remember { mutableStateOf<Bitmap?>(null) }
     var detailSystemBackInProgress by remember { mutableStateOf(false) }
     LaunchedEffect(feedListState, selectedItem, navExitPendingKind) {
         snapshotFlow { feedListState.isScrollInProgress }.collect { scrolling ->
@@ -5282,6 +5296,7 @@ fun WeiboApp() {
             activeDetailSourceReturnImage = null
             activeDetailSourceBounds = null
             homeContentBackdrop.isFrozen = false
+            mineContentBackdrop.isFrozen = false
             feedBackdropFrozenForDetail = false
         }
     }
@@ -7404,11 +7419,13 @@ fun WeiboApp() {
             return
         }
         if (detailSourceCapturePending) return
+        val sourceTab = selectedTab
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
+        val fromSearch = selectedItem == null && selectedTab == MainTab.Search && visitedUserId == null
+        val fromMine = selectedItem == null && selectedTab == MainTab.Mine && visitedUserId == null
         fun navigateWithSource(
             image: Bitmap?,
             returnImage: Bitmap? = image,
-            bottomBarImage: Bitmap? = null,
         ) {
             detailSourceCapturePending = false
             // Card morphs retain the complete source page; profile parallax must
@@ -7419,7 +7436,7 @@ fun WeiboApp() {
                 hiddenCardProfileGeneration = visitedProfileLoadGeneration.takeIf {
                     overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile
                 }
-                hiddenCardFromMine = visitedUserId == null && selectedItem == null && selectedTab == MainTab.Mine
+                hiddenCardFromMine = fromMine
                 if (fromFeed) {
                     preservedFeedSourceItem = hostItem ?: item
                     hiddenHomeFeedCardId = item.id
@@ -7431,7 +7448,7 @@ fun WeiboApp() {
                 homeContentBackdrop.isFrozen = true
                 feedBackdropFrozenForDetail = true
             }
-            activeDetailBottomBarImage = bottomBarImage
+            if (fromMine && sourceBounds != null) mineContentBackdrop.isFrozen = true
             if (sourceBounds != null && selectedItem == null &&
                 selectedTab == MainTab.Search && visitedUserId == null) {
                 hiddenFeedCardId = item.id
@@ -7459,118 +7476,50 @@ fun WeiboApp() {
             navigateWithSource(null)
             return
         }
-        val barBoundsToCapture = bottomBarBoundsInRoot?.takeIf { bounds ->
-            fromFeed && bottomBarVisible &&
-                sourceBounds.left < bounds.right && sourceBounds.right > bounds.left &&
-                sourceBounds.top < bounds.bottom && sourceBounds.bottom > bounds.top
-        }
-        val barCrop = barBoundsToCapture?.let { bounds ->
-            android.graphics.Rect(
-                (bounds.left + rootInWindow[0]).roundToInt(),
-                (bounds.top + rootInWindow[1]).roundToInt(),
-                (bounds.right + rootInWindow[0]).roundToInt(),
-                (bounds.bottom + rootInWindow[1]).roundToInt(),
-            ).takeIf { it.intersect(0, 0, decor.width, decor.height) && !it.isEmpty }
-        }
-        val captureRect = android.graphics.Rect(crop).apply { barCrop?.let(::union) }
-        val barMaskInBitmap = if (fromFeed && bottomBarVisible) {
-            bottomBarBoundsInRoot?.let { bounds ->
-                android.graphics.RectF(
-                    bounds.left + rootInWindow[0] - crop.left,
-                    bounds.top + rootInWindow[1] - crop.top,
-                    bounds.right + rootInWindow[0] - crop.left,
-                    bounds.bottom + rootInWindow[1] - crop.top,
-                ).takeIf { it.intersect(0f, 0f, crop.width().toFloat(), crop.height().toFloat()) }
-            }
-        } else null
+        val overlapsHomeBar = fromFeed && bottomBarVisible &&
+            bottomBarBoundsInRoot?.let { bar ->
+                sourceBounds.left < bar.right && sourceBounds.right > bar.left &&
+                    sourceBounds.top < bar.bottom && sourceBounds.bottom > bar.top
+            } == true
         detailSourceCapturePending = true
+        val sourcePageBackdrop = when {
+            fromSearch -> searchContentBackdrop
+            fromMine -> mineContentBackdrop
+            overlapsHomeBar -> homeContentBackdrop
+            else -> null
+        }
+        if (sourcePageBackdrop != null) {
+            // Read the page before its glass controls are composited over it.
+            scope.launch {
+                val image = runCatching {
+                    val origin = sourcePageBackdrop.lastLayerPositionInWindow ?: return@runCatching null
+                    val layer = sourcePageBackdrop.graphicsLayer
+                    val left = crop.left - origin.x.roundToInt()
+                    val top = crop.top - origin.y.roundToInt()
+                    if (left < 0 || top < 0 || left + crop.width() > layer.size.width ||
+                        top + crop.height() > layer.size.height) return@runCatching null
+                    val feed = layer.toImageBitmap().asAndroidBitmap()
+                    Bitmap.createBitmap(feed, left, top, crop.width(), crop.height())
+                }.getOrNull()
+                if (selectedTab != sourceTab || visitedUserId != null || selectedItem != null) {
+                    detailSourceCapturePending = false
+                    return@launch
+                }
+                navigateWithSource(image)
+            }
+            return
+        }
         runCatching {
-            val frame = Bitmap.createBitmap(captureRect.width(), captureRect.height(), Bitmap.Config.ARGB_8888)
-            android.view.PixelCopy.request(window, captureRect, frame, { result ->
-                if (result != android.view.PixelCopy.SUCCESS) {
+            val frame = Bitmap.createBitmap(crop.width(), crop.height(), Bitmap.Config.ARGB_8888)
+            android.view.PixelCopy.request(window, crop, frame, { result ->
+                if (result == android.view.PixelCopy.SUCCESS) {
+                    navigateWithSource(frame)
+                } else {
                     frame.recycle()
                     navigateWithSource(null)
-                } else {
-                    val image = Bitmap.createBitmap(
-                        frame,
-                        crop.left - captureRect.left,
-                        crop.top - captureRect.top,
-                        crop.width(),
-                        crop.height(),
-                    )
-                    val bottomBarImage = barCrop?.let {
-                        val capturedBar = Bitmap.createBitmap(
-                            frame,
-                            it.left - captureRect.left,
-                            it.top - captureRect.top,
-                            it.width(),
-                            it.height(),
-                        )
-                        Bitmap.createBitmap(capturedBar.width, capturedBar.height, Bitmap.Config.ARGB_8888).also { clippedBar ->
-                            val roundedShape = android.graphics.Path().apply {
-                                addRoundRect(
-                                    android.graphics.RectF(
-                                        0f,
-                                        0f,
-                                        clippedBar.width.toFloat(),
-                                        clippedBar.height.toFloat(),
-                                    ),
-                                    clippedBar.height / 2f,
-                                    clippedBar.height / 2f,
-                                    android.graphics.Path.Direction.CW,
-                                )
-                            }
-                            android.graphics.Canvas(clippedBar).apply {
-                                save()
-                                clipPath(roundedShape)
-                                drawBitmap(capturedBar, 0f, 0f, null)
-                                restore()
-                            }
-                            if (capturedBar !== frame && !capturedBar.isRecycled) capturedBar.recycle()
-                        }
-                    }
-                    val returnImage = image.copy(Bitmap.Config.ARGB_8888, true) ?: image
-                    frame.recycle()
-                    if (returnImage !== image) {
-                        barMaskInBitmap?.let { mask ->
-                            // The return bitmap moves with the card. Remove the
-                            // captured bar and its large soft shadow from that
-                            // moving layer; the stationary live bar supplies both.
-                            val shadowRadius = 48f * context.resources.displayMetrics.density
-                            val movingBarAndShadow = android.graphics.RectF(mask).apply {
-                                inset(-shadowRadius, -shadowRadius)
-                                intersect(0f, 0f, returnImage.width.toFloat(), returnImage.height.toFloat())
-                            }
-                            if (!movingBarAndShadow.isEmpty) {
-                                val clearPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                                    xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-                                }
-                                android.graphics.Canvas(returnImage).drawRect(movingBarAndShadow, clearPaint)
-                            }
-                        }
-                    }
-                    barMaskInBitmap?.let { mask ->
-                        val maskPath = android.graphics.Path().apply {
-                            addRoundRect(
-                                mask,
-                                mask.height() / 2f,
-                                mask.height() / 2f,
-                                android.graphics.Path.Direction.CW,
-                            )
-                        }
-                        val clearPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                            xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-                        }
-                        android.graphics.Canvas(image).drawPath(maskPath, clearPaint)
-                    }
-                    navigateWithSource(image, returnImage, bottomBarImage)
                 }
             }, android.os.Handler(android.os.Looper.getMainLooper()))
         }.onFailure { navigateWithSource(null) }
-    }
-
-    openDetailFromSourceAction = { item, bounds, section ->
-        openDetailFromSource(item, bounds, section = section)
     }
 
     fun openDetailFromAlbumViewer(item: FeedItem, viewer: AlbumViewerState) {
@@ -8371,6 +8320,7 @@ fun WeiboApp() {
         SideEffect { homeContentBackdrop.isFrozen = feedBackdropFrozenForDetail }
         val menuGlassBackdrop = bottomBarBackdrop
         val searchBarOverlay = remember { SearchBarOverlayController() }
+        val searchHiddenCardBackdrop = rememberLayerBackdrop()
         var timelineMenuExpanded by remember { mutableStateOf(false) }
         val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
@@ -8489,6 +8439,15 @@ fun WeiboApp() {
             val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
+            val topicSearchOnTop = selectedTab == MainTab.Search &&
+                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
+            val searchUiOnTop = selectedTab == MainTab.Search && (topicSearchOnTop || (
+                visitedUserId == null &&
+                detailOverlayItem == null &&
+                followListOverlay == null &&
+                articleOverlay == null &&
+                mediaPreview == null &&
+                albumViewerState == null))
             Box(Modifier.matchParentSize()) {
             Box(
                 Modifier
@@ -8600,15 +8559,6 @@ fun WeiboApp() {
             )
             val feedLayerVisible = (selectedTab == MainTab.Feed || retainFeedBehindSearch) && (feedUiOnTop || keepFeedAlive)
             val feedVisibleAlpha = if (feedUiOnTop || keepFeedAlive) 1f else 0f
-            val topicSearchOnTop = selectedTab == MainTab.Search &&
-                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
-            val searchUiOnTop = selectedTab == MainTab.Search && (topicSearchOnTop || (
-                visitedUserId == null &&
-                detailOverlayItem == null &&
-                followListOverlay == null &&
-                articleOverlay == null &&
-                mediaPreview == null &&
-                albumViewerState == null))
             val keepSearchAlive = selectedTab == MainTab.Search &&
                 (visitedUserId != null ||
                     detailOverlayItem != null ||
@@ -8653,6 +8603,7 @@ fun WeiboApp() {
                             CompositionLocalProvider(
                                 LocalHomeThumbnailStore provides homeThumbnailStore,
                                 LocalHiddenFeedCardId provides hiddenHomeFeedCardId,
+                                LocalHiddenCardBackdrop provides homeHiddenCardBackdrop,
                             ) {
                             FollowFeedScreen(
                                 session = session,
@@ -8760,6 +8711,8 @@ fun WeiboApp() {
                     navKind = NavOverlayKind.TabSwitch.takeIf { searchResultsBackAction != null },
                     onSwipeBack = { searchResultsBackAction?.invoke() },
                 ) {
+                    Box(Modifier.fillMaxSize().layerBackdrop(searchContentBackdrop)) {
+                    CompositionLocalProvider(LocalHiddenCardBackdrop provides searchHiddenCardBackdrop) {
                     SearchScreen(
                             session = session,
                             searchBarOverlay = searchBarOverlay,
@@ -8808,6 +8761,8 @@ fun WeiboApp() {
                                 searchSettingsStore.writeWeiboSort(sort.storageValue())
                             },
                         )
+                    }
+                    }
                 }
 
                 // The route is stable even when a screen name resolves to a numeric UID.
@@ -9053,6 +9008,8 @@ fun WeiboApp() {
                             refreshMineProfile()
                         }
                     }
+                    Box(Modifier.fillMaxSize().layerBackdrop(mineContentBackdrop)) {
+                    CompositionLocalProvider(LocalHiddenCardBackdrop provides mineHiddenCardBackdrop) {
                     MineScreen(
                                 session = session,
                                 onSettingsOpened = {
@@ -9180,6 +9137,8 @@ fun WeiboApp() {
                                     themeSettingsStore.writeAppearanceMode(mode)
                                 },
                             )
+                    }
+                    }
                 }
 
                 albumDetailBackdrop?.let { bitmap ->
@@ -9240,6 +9199,9 @@ fun WeiboApp() {
                     sourceReturnZIndex = 580f.takeIf { navStack.lastOrNull()?.visitedProfile != null },
                     sourceBounds = activeDetailSourceBounds,
                     sourceImage = activeDetailSourceImage,
+                    sourceReturnImage = activeDetailSourceReturnImage ?: activeDetailSourceImage,
+                    quickSourceReturnHandoff = feedBackdropFrozenForDetail ||
+                        (hiddenCardFromMine && visitedUserId == null && mineContentBackdrop.isFrozen),
                     commitCardReturn = detailSystemBackInProgress &&
                         activeDetailSourceBounds != null &&
                         !nestedDetailReturnAnimating,
@@ -9251,7 +9213,8 @@ fun WeiboApp() {
                         if (previous != null) bottomBarVisible = previous.bottomBarVisible
                         detailSwipeReturningHome = previous != null && previous.detail == null &&
                             previous.visitedProfile == null &&
-                            (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search)
+                            (previous.selectedTab == MainTab.Feed || previous.selectedTab == MainTab.Search ||
+                                previous.selectedTab == MainTab.Mine)
                     },
                     onSourceCardHandoffReady = {
                         // NavAnimatedOverlay keeps the captured return card over the
@@ -9532,47 +9495,103 @@ fun WeiboApp() {
                     Spacer(Modifier.fillMaxWidth().height(WindowInsets.statusBars.asPaddingValues().calculateTopPadding()).background(Color(0xFF161616)))
                 }
             }
+            // A nested detail pop returns to another detail and keeps the main controls hidden.
+            val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
+            val topicSearchForeground = topicSearchOnTop
+            // Keep the source bar intact until the incoming profile has covered it.
+            val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
+                navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
+            val bottomBarNavVisible = if (selectedTab == MainTab.Messages) {
+                messagesInboxRoute
+            } else {
+                !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
+                    ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
+                        (selectedItem == null || detailExiting || detailSwipeReturningHome)))
+            }
+            val bottomBarRequestedVisible = bottomBarNavVisible &&
+                (bottomBarVisible || (selectedTab == MainTab.Messages && messagesInboxRoute))
+            val bottomBarSlideProgress by animateFloatAsState(
+                targetValue = if (bottomBarRequestedVisible) 1f else 0f,
+                animationSpec = tween(160, easing = FastOutSlowInEasing),
+                label = "bottom-bar-visibility-slide",
+            )
+            var bottomBarHeightPx by remember { mutableIntStateOf(0) }
+            val homeFeedBarBackdrop = remember(homeContentBackdrop) {
+                homeContentBackdrop.anchoredVertically {
+                    bottomBarHeightPx * (1f - bottomBarSlideProgress)
+                }
+            }
+            val homeSourceCardBarBackdrop = remember(homeHiddenCardBackdrop) {
+                homeHiddenCardBackdrop.anchoredVertically(
+                    enabled = { hiddenHomeFeedCardId != null && homeHiddenCardBackdrop.layerCoordinates != null },
+                    slideOffset = { bottomBarHeightPx * (1f - bottomBarSlideProgress) },
+                )
+            }
+            val homeBottomBarBackdrop = rememberCombinedBackdrop(homeFeedBarBackdrop, homeSourceCardBarBackdrop)
+            val minePageBarBackdrop = remember(mineContentBackdrop) {
+                mineContentBackdrop.anchoredVertically {
+                    bottomBarHeightPx * (1f - bottomBarSlideProgress)
+                }
+            }
+            val mineCardBarBackdrop = remember(mineHiddenCardBackdrop) {
+                mineHiddenCardBackdrop.anchoredVertically(
+                    enabled = { mineHiddenCardBackdrop.layerCoordinates != null },
+                    slideOffset = { bottomBarHeightPx * (1f - bottomBarSlideProgress) },
+                )
+            }
+            val mineBottomBarBackdrop = rememberCombinedBackdrop(minePageBarBackdrop, mineCardBarBackdrop)
+            val searchFieldHeight = 44.dp
+            val searchFieldDensity = LocalDensity.current
+            val searchFieldSlideOffset = remember(searchBarOverlay, searchFieldDensity) {
+                {
+                    with(searchFieldDensity) { (searchBarOverlay.bottomPadding + searchFieldHeight).toPx() } *
+                        (1f - bottomBarSlideProgress)
+                }
+            }
+            val searchPageFieldBackdrop = remember(searchContentBackdrop, searchFieldSlideOffset) {
+                searchContentBackdrop.anchoredVertically(slideOffset = searchFieldSlideOffset)
+            }
+            val searchCardFieldBackdrop = remember(searchHiddenCardBackdrop, searchFieldSlideOffset) {
+                searchHiddenCardBackdrop.anchoredVertically(
+                    enabled = { hiddenFeedCardId != null && searchHiddenCardBackdrop.layerCoordinates != null },
+                    slideOffset = searchFieldSlideOffset,
+                )
+            }
+            val searchFieldBackdrop = rememberCombinedBackdrop(searchPageFieldBackdrop, searchCardFieldBackdrop)
+            val keepSearchBarForDetail = selectedTab == MainTab.Search && visitedUserId == null &&
+                (detailLayerActive || detailExiting || detailSwipeReturningHome)
+
             // Keep the search glass outside the layerBackdrop it samples. If it is inside
             // bottomBarBackdrop's captured subtree, it samples itself and can stall RenderThread.
             Box(
                 Modifier
                     .fillMaxSize()
                     .zIndex(3f)
-                    .padding(innerPadding),
+                    .padding(innerPadding)
+                    .clipToBounds(),
             ) {
-                val searchBarAutoHideVisible = selectedTab != MainTab.Search ||
-                    !hideBottomBarOnFeedScroll || bottomBarVisible
-                val searchBarAutoHideProgress by animateFloatAsState(
-                    targetValue = if (searchBarAutoHideVisible) 1f else 0f,
-                    animationSpec = tween(160, easing = FastOutSlowInEasing),
-                    label = "search-bar-auto-hide",
-                )
-                if (searchBarOverlay.active) {
-                    val suggestionReserve = if (searchBarOverlay.suggestionsVisible) {
-                        SearchSuggestionPanelMaxHeight + SearchBarCompanionGap
-                    } else {
-                        0.dp
-                    }
-                    val searchFieldHeight = 44.dp
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .height(searchBarOverlay.bottomPadding + searchFieldHeight + suggestionReserve)
-                            .zIndex(84f),
-                    )
+                // Keep the field mounted while Search owns the tab. The screen's
+                // active flag is updated after composition when detail hands back.
+                if (selectedTab == MainTab.Search) {
+                    val showSearchBar = searchUiOnTop || keepSearchBarForDetail
+                    val fieldBottom = searchBarOverlay.bottomPadding
                     Column(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .fillMaxWidth()
                             .zIndex(85f)
                             .graphicsLayer {
-                                translationY = size.height * (1f - searchBarAutoHideProgress)
+                                val progress = if (showSearchBar) bottomBarSlideProgress else 0f
+                                // Suggestions can enter or exit during the slide.
+                                // Their height must not move the field's trajectory.
+                                translationY = (fieldBottom + searchFieldHeight).toPx() * (1f - progress)
+                                alpha = if (progress > 0f) 1f else 0f
                             }
+                            .blockHiddenTouches(searchUiOnTop && bottomBarRequestedVisible)
                             .padding(
                                 start = 18.dp,
                                 end = 18.dp,
-                                bottom = searchBarOverlay.bottomPadding,
+                                bottom = fieldBottom,
                             ),
                     ) {
                         SearchSuggestionPanel(
@@ -9593,7 +9612,7 @@ fun WeiboApp() {
                             onModeChange = searchBarOverlay.onModeChange,
                             onSearch = searchBarOverlay.onSearch,
                             onClear = searchBarOverlay.onClear,
-                            backdrop = menuGlassBackdrop,
+                            backdrop = searchFieldBackdrop,
                             frostAmount = bottomBarFrostAmount,
                             glassAmount = bottomBarGlassAmount,
                             modifier = Modifier.fillMaxWidth(),
@@ -9667,49 +9686,6 @@ fun WeiboApp() {
                     )
                 }
             }
-            // A nested detail pop returns to another detail; it must not expose the
-            }
-            // main navigation bar during that in-layer transition.
-            val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
-            val topicSearchForeground = selectedTab == MainTab.Search &&
-                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
-            // Keep the source bar intact until the incoming profile has covered
-            // it. Its own exit must not precede the page's first animated frame.
-            val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
-                navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
-            val bottomBarNavVisible = if (selectedTab == MainTab.Messages) {
-                messagesInboxRoute
-            } else {
-                !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
-                    ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
-                        (selectedItem == null || detailExiting || detailSwipeReturningHome)))
-            }
-            val bottomBarRequestedVisible = bottomBarNavVisible &&
-                (bottomBarVisible || (selectedTab == MainTab.Messages && messagesInboxRoute))
-            val bottomBarSlideProgress by animateFloatAsState(
-                targetValue = if (bottomBarRequestedVisible) 1f else 0f,
-                animationSpec = tween(160, easing = FastOutSlowInEasing),
-                label = "bottom-bar-visibility-slide",
-            )
-            val detailPageTransitionActive = detailLayerActive || detailExiting || detailSwipeReturningHome
-            val showDetailBottomBarSnapshot = activeDetailBottomBarImage != null && detailPageTransitionActive
-            val detailBottomBarSnapshotAlpha by animateFloatAsState(
-                targetValue = if (showDetailBottomBarSnapshot) 1f else 0f,
-                animationSpec = tween(if (showDetailBottomBarSnapshot) 0 else 180),
-                label = "detail-return-bottom-bar-snapshot",
-            )
-            LaunchedEffect(activeDetailBottomBarImage, showDetailBottomBarSnapshot) {
-                val snapshot = activeDetailBottomBarImage ?: return@LaunchedEffect
-                if (showDetailBottomBarSnapshot) return@LaunchedEffect
-                delay(220)
-                if (activeDetailBottomBarImage === snapshot && !detailPageTransitionActive) {
-                    activeDetailBottomBarImage = null
-                    withFrameNanos { }
-                    if (!snapshot.isRecycled) snapshot.recycle()
-                }
-            }
-            val detailBottomBarImageBitmap = remember(activeDetailBottomBarImage) {
-                activeDetailBottomBarImage?.takeUnless { it.isRecycled }?.asImageBitmap()
             }
             LaunchedEffect(bottomBarNavVisible, bottomBarVisible, returningHomeDirectly) {
                 if (returningHomeDirectly && bottomBarNavVisible && bottomBarVisible) {
@@ -9754,12 +9730,17 @@ fun WeiboApp() {
                 exit = if (profileLayerActive) ExitTransition.None else slideOutVertically(tween(160)) { it },
                 modifier = Modifier
                     .align(Alignment.BottomStart)
+                    .onSizeChanged { bottomBarHeightPx = it.height }
                     .onGloballyPositioned {
                         imageReturnBarTop = if (bottomBarRequestedVisible) it.boundsInRoot().top
                             else Float.POSITIVE_INFINITY
                     }
                     .graphicsLayer {
-                        translationY = size.height * (1f - bottomBarSlideProgress)
+                        translationY = if (selectedTab == MainTab.Search) {
+                            searchFieldSlideOffset()
+                        } else {
+                            size.height * (1f - bottomBarSlideProgress)
+                        }
                         if (profileLayerActive && navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true) {
                             translationY += size.height * (1f - profileEnterOffset.value)
                         }
@@ -9770,13 +9751,13 @@ fun WeiboApp() {
                     selectedTab = selectedTab,
                     darkSurfaceOverride = darkTheme && selectedTab == MainTab.Messages && messagesInboxRoute,
                     backdrop = when {
-                        selectedTab == MainTab.Feed -> homeContentBackdrop
+                        selectedTab == MainTab.Feed -> homeBottomBarBackdrop
+                        selectedTab == MainTab.Search -> searchFieldBackdrop
+                        selectedTab == MainTab.Mine -> mineBottomBarBackdrop
                         else -> bottomBarBackdrop
                     },
                     frostAmount = bottomBarFrostAmount,
                     glassAmount = bottomBarGlassAmount,
-                    backdropSnapshot = detailBottomBarImageBitmap,
-                    backdropSnapshotAlpha = detailBottomBarSnapshotAlpha,
                     timelineMenuExpanded = timelineMenuExpanded,
                     onBarBoundsChanged = { bottomBarBoundsInRoot = it },
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
@@ -11522,7 +11503,7 @@ private fun FeedCard(
         }
     }
     Box(
-        modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = if (hideSourceCard) 0f else 1f }.onGloballyPositioned { coordinates ->
+        modifier = Modifier.fillMaxWidth().detailSourceVisibility(hideSourceCard, LocalHiddenCardBackdrop.current).onGloballyPositioned { coordinates ->
             cardMotionBounds = coordinates.boundsInRoot()
             onBoundsChanged?.invoke(coordinates.boundsInRoot())
         },
@@ -11962,7 +11943,7 @@ private fun QuotedStatus(
     ElevatedCard(
         modifier = modifier
             .fillMaxWidth()
-            .graphicsLayer { alpha = if (hideQuotedSource) 0f else 1f }
+            .detailSourceVisibility(hideQuotedSource, LocalHiddenCardBackdrop.current)
             .then(
                 if (onClick != null) {
                     Modifier.clickable(
@@ -23856,7 +23837,6 @@ private fun SearchScreen(
 
     SideEffect {
         searchBarOverlay.queryInput = searchDraft
-        searchBarOverlay.active = searchBarVisible
         searchBarOverlay.mode = searchMode
         searchBarOverlay.onModeChange = { mode ->
             if (mode != searchMode) {
@@ -23902,7 +23882,6 @@ private fun SearchScreen(
     }
     DisposableEffect(Unit) {
         onDispose {
-            searchBarOverlay.active = false
             searchBarOverlay.onQueryInputChange = { searchBarOverlay.queryInput = it }
             searchBarOverlay.onSuggestionUserClick = {}
             searchBarOverlay.suggestionsVisible = false

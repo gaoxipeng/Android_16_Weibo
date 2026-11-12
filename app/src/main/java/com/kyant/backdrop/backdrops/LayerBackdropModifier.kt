@@ -11,15 +11,16 @@ import androidx.compose.ui.node.invalidateDraw
 import androidx.compose.ui.platform.InspectorInfo
 import com.kyant.backdrop.internal.recordLayer
 
-fun Modifier.layerBackdrop(backdrop: LayerBackdrop): Modifier =
-    this then LayerBackdropElement(backdrop)
+fun Modifier.layerBackdrop(backdrop: LayerBackdrop, drawSource: Boolean = true): Modifier =
+    this then LayerBackdropElement(backdrop, drawSource)
 
 private class LayerBackdropElement(
-    val backdrop: LayerBackdrop
+    val backdrop: LayerBackdrop,
+    val drawSource: Boolean,
 ) : ModifierNodeElement<LayerBackdropNode>() {
 
     override fun create(): LayerBackdropNode {
-        return LayerBackdropNode(backdrop)
+        return LayerBackdropNode(backdrop, drawSource)
     }
 
     override fun update(node: LayerBackdropNode) {
@@ -27,6 +28,7 @@ private class LayerBackdropElement(
             node.backdrop.layerCoordinates = null
             node.backdrop = backdrop
         }
+        node.drawSource = drawSource
         node.invalidateDraw()
     }
 
@@ -37,24 +39,21 @@ private class LayerBackdropElement(
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
-        if (other !is LayerBackdropElement) return false
-
-        if (backdrop != other.backdrop) return false
-
-        return true
+        return other is LayerBackdropElement && backdrop == other.backdrop && drawSource == other.drawSource
     }
 
     override fun hashCode(): Int {
-        return backdrop.hashCode()
+        return 31 * backdrop.hashCode() + drawSource.hashCode()
     }
 }
 
 private class LayerBackdropNode(
-    var backdrop: LayerBackdrop
+    var backdrop: LayerBackdrop,
+    var drawSource: Boolean,
 ) : DrawModifierNode, GlobalPositionAwareModifierNode, Modifier.Node() {
 
     override fun ContentDrawScope.draw() {
-        drawContent()
+        if (drawSource) drawContent()
         if (!backdrop.isFrozen) {
             recordLayer(backdrop.graphicsLayer) { backdrop.onDraw(this@draw) }
         }
