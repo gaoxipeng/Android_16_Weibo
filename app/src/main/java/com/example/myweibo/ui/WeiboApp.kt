@@ -4283,6 +4283,12 @@ fun WeiboApp() {
     val followListFollowingListState = rememberLazyListState()
     val followListFansListState = rememberLazyListState()
     val searchListState = rememberLazyListState()
+    val searchImageReturnScroll = remember(searchListState) {
+        FeedListScrollCoordinator().apply {
+            scrollByAction = { distance -> searchListState.scrollBy(distance) }
+        }
+    }
+    var searchImageReturnFieldTop by remember { mutableFloatStateOf(Float.POSITIVE_INFINITY) }
     val hotSearchListState = rememberLazyListState()
     val videoPlaybackCoordinator = remember { VideoPlaybackCoordinator() }
     val feedCardActionMenuController = remember { FeedCardActionMenuController() }
@@ -8731,7 +8737,19 @@ fun WeiboApp() {
                     onSwipeBack = { searchResultsBackAction?.invoke() },
                 ) {
                     Box(Modifier.fillMaxSize().layerBackdrop(searchContentBackdrop)) {
-                    CompositionLocalProvider(LocalHiddenCardBackdrop provides searchHiddenCardBackdrop) {
+                    CompositionLocalProvider(
+                        LocalHiddenCardBackdrop provides searchHiddenCardBackdrop,
+                        LocalFeedListScrollCoordinator provides searchImageReturnScroll,
+                        // The search field sits above the tab bar, so its top
+                        // edge is the first obstruction for a returning image.
+                        LocalImageReturnBarTop provides {
+                            minOf(
+                                imageReturnBarTop,
+                                if (searchUiOnTop && bottomBarVisible) searchImageReturnFieldTop
+                                else Float.POSITIVE_INFINITY,
+                            )
+                        },
+                    ) {
                     SearchScreen(
                             session = session,
                             searchBarOverlay = searchBarOverlay,
@@ -9674,7 +9692,11 @@ fun WeiboApp() {
                             backdrop = searchFieldBackdrop,
                             frostAmount = bottomBarFrostAmount,
                             glassAmount = bottomBarGlassAmount,
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().onGloballyPositioned { coordinates ->
+                                val bounds = coordinates.boundsInRoot()
+                                searchImageReturnFieldTop = if (bounds.height > 0f) bounds.top
+                                else Float.POSITIVE_INFINITY
+                            },
                         )
                     }
                 }
