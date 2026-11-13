@@ -100,7 +100,6 @@ import androidx.compose.foundation.gestures.animateTo
 import androidx.compose.foundation.gestures.anchoredDraggable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.selection.selectableGroup
@@ -152,7 +151,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.PagerDefaults
-import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -563,16 +561,6 @@ private val VideoPeekFullscreenReturnAnimationSpec = tween<Float>(
     durationMillis = 460,
     easing = FastOutSlowInEasing,
 )
-private val ImagePeekMotionEasing = FastOutSlowInEasing
-private val ImagePeekEnterAnimationSpec = tween<Float>(
-    durationMillis = 360,
-    easing = ImagePeekMotionEasing,
-)
-private val ImagePeekDismissAnimationSpec = tween<Float>(
-    durationMillis = 260,
-    easing = ImagePeekMotionEasing,
-)
-
 private enum class MediaPeekHapticStage {
     Compress,
 }
@@ -745,17 +733,6 @@ private fun mediaPeekLayoutProgress(rawProgress: Float): Float {
     if (t <= layoutStart) return 0f
     val phase = ((t - layoutStart) / (1f - layoutStart)).coerceIn(0f, 1f)
     return MediaPeekLayoutEasing.transform(phase)
-}
-
-private fun imagePeekLayoutProgress(rawProgress: Float): Float =
-    ImagePeekMotionEasing.transform(rawProgress.coerceIn(0f, 1f))
-
-private fun imagePeekEnterScale(rawProgress: Float): Float {
-    val progress = rawProgress.coerceIn(0f, 1f)
-    // A restrained lift at the midpoint keeps the thumbnail-to-preview morph
-    // dimensional without the abrupt overshoot used by the video peek.
-    val lift = 0.018f * (4f * progress * (1f - progress))
-    return 1f + lift
 }
 
 private fun computeMediaPeekGraphicsMotion(
@@ -3591,137 +3568,6 @@ private class SearchBarOverlayController {
     var bottomPadding by mutableStateOf(SearchBottomBarClearance + SearchBarBottomGap)
 }
 
-private enum class ImagePeekDismissReason {
-    Cancel,
-    Release,
-    EnterFullscreen,
-}
-
-private data class ImagePeekRequest(
-    val image: FeedImage,
-    val allImages: List<FeedImage>,
-    val imageIndex: Int,
-    val anchorBounds: Rect,
-    val resolveAnchorBounds: () -> Rect,
-    val resolveAnchorBoundsForIndex: (Int) -> Rect? = { null },
-    val statusItem: FeedItem? = null,
-    val onCancel: () -> Unit,
-    val onRelease: () -> Unit,
-    val onOpenFullscreenBehind: (Int) -> Unit,
-    val onEnterFullscreenHandoffComplete: () -> Unit,
-)
-
-private class ImagePeekController {
-    var activeRequest by mutableStateOf<ImagePeekRequest?>(null)
-    var pendingDismiss by mutableStateOf<ImagePeekDismissReason?>(null)
-    var isFloating by mutableStateOf(false)
-    @Volatile
-    var pointerInputBlocked: Boolean = false
-        private set
-    @Volatile
-    var pointerDismissPending: Boolean = false
-        private set
-    @Volatile
-    var pointerImageSwitchOccurred: Boolean = false
-        private set
-    var fingerDragOffset by mutableStateOf(Offset.Zero)
-        private set
-
-    fun updateFingerDragOffset(offset: Offset) {
-        fingerDragOffset = offset
-    }
-
-    fun resetFingerDragOffset() {
-        fingerDragOffset = Offset.Zero
-    }
-
-    private var horizontalDragHandler: ((Float) -> Unit)? = null
-
-    fun bindHorizontalDragHandler(handler: ((Float) -> Unit)?) {
-        horizontalDragHandler = handler
-    }
-
-    fun dispatchHorizontalDrag(deltaX: Float) {
-        horizontalDragHandler?.invoke(deltaX)
-    }
-
-    fun open(request: ImagePeekRequest) {
-        pointerInputBlocked = true
-        pointerDismissPending = false
-        pointerImageSwitchOccurred = false
-        pendingDismiss = null
-        isFloating = false
-        fingerDragOffset = Offset.Zero
-        activeRequest = request
-    }
-
-    fun markImageSwitchOccurred() {
-        pointerImageSwitchOccurred = true
-    }
-
-    fun cancel() {
-        if (pointerInputBlocked && !pointerDismissPending) {
-            pointerDismissPending = true
-            pendingDismiss = ImagePeekDismissReason.Cancel
-        }
-    }
-
-    fun release(keepFloating: Boolean = false) {
-        if (pointerInputBlocked && !pointerDismissPending) {
-            isFloating = true
-            if (!keepFloating) {
-                pointerDismissPending = true
-                pendingDismiss = ImagePeekDismissReason.Release
-            }
-        }
-    }
-
-    fun enterFullscreen() {
-        if (pointerInputBlocked && !pointerDismissPending) {
-            pointerDismissPending = true
-            pendingDismiss = ImagePeekDismissReason.EnterFullscreen
-        }
-    }
-
-    fun completeDismiss() {
-        val request = activeRequest
-        val reason = pendingDismiss
-        activeRequest = null
-        pendingDismiss = null
-        isFloating = false
-        pointerInputBlocked = false
-        pointerDismissPending = false
-        pointerImageSwitchOccurred = false
-        fingerDragOffset = Offset.Zero
-        horizontalDragHandler = null
-        when (reason) {
-            ImagePeekDismissReason.Cancel -> request?.onCancel?.invoke()
-            ImagePeekDismissReason.Release -> request?.onRelease?.invoke()
-            ImagePeekDismissReason.EnterFullscreen -> Unit
-            null -> Unit
-        }
-    }
-
-    fun completeEnterFullscreenHandoff() {
-        val request = activeRequest
-        activeRequest = null
-        pendingDismiss = null
-        isFloating = false
-        pointerInputBlocked = false
-        pointerDismissPending = false
-        pointerImageSwitchOccurred = false
-        fingerDragOffset = Offset.Zero
-        horizontalDragHandler = null
-        request?.onEnterFullscreenHandoffComplete?.invoke()
-    }
-
-    fun finishFullscreenHandoff() {
-        if (pendingDismiss != ImagePeekDismissReason.EnterFullscreen) return
-        completeEnterFullscreenHandoff()
-    }
-}
-
-private val LocalImagePeekController = staticCompositionLocalOf { ImagePeekController() }
 private val LocalVideoPeekController = staticCompositionLocalOf { VideoPeekController() }
 private val LocalFeedThumbnailQuality = staticCompositionLocalOf { FeedThumbnailQuality.Medium }
 private val LocalFeedImageUpgradeNotifier = staticCompositionLocalOf { FeedImageUpgradeNotifier() }
@@ -4406,6 +4252,7 @@ fun WeiboApp() {
     val homeContentBackdrop = rememberLayerBackdrop()
     val homeHiddenCardBackdrop = rememberLayerBackdrop()
     val searchContentBackdrop = rememberLayerBackdrop()
+    val bottomBarBackdrop = rememberLayerBackdrop()
     val mineContentBackdrop = rememberLayerBackdrop()
     val mineHiddenCardBackdrop = rememberLayerBackdrop()
     var preservedFeedSourceItem by remember { mutableStateOf<FeedItem?>(null) }
@@ -5790,13 +5637,18 @@ fun WeiboApp() {
         navigateBack()
     }
 
-    fun captureSearchBackground(onReady: () -> Unit) {
+    fun captureSearchBackground(
+        sourceBackdrop: LayerBackdrop = searchContentBackdrop,
+        onReady: () -> Unit,
+    ) {
         if (searchCapturePending) return
+        val sourceTab = selectedTab
+        val sourceStack = navOverlayStack
         searchCapturePending = true
         scope.launch {
             // The search content layer excludes the fixed search field and
             // navigation bar, so neither appears in the sliding background.
-            val layer = searchContentBackdrop.graphicsLayer
+            val layer = sourceBackdrop.graphicsLayer
             val background = try {
                 if (layer.size.width > 0 && layer.size.height > 0) {
                     layer.toImageBitmap().asAndroidBitmap()
@@ -5810,7 +5662,7 @@ fun WeiboApp() {
             } finally {
                 searchCapturePending = false
             }
-            if (selectedTab != MainTab.Search) return@launch
+            if (selectedTab != sourceTab || navOverlayStack != sourceStack) return@launch
             searchReturnBackground = background
             onReady()
         }
@@ -5826,14 +5678,14 @@ fun WeiboApp() {
             bottomBarVisible = true
             return
         }
-        captureSearchBackground {
-        pushNavigation(NavOverlayKind.TabSwitch) {
-            // Leave the source detail/profile mounted behind the search overlay.
-            searchPendingQuery = normalized
-            searchPendingMode = SearchMode.Weibo
-            selectedTab = MainTab.Search
-            bottomBarVisible = true
-        }
+        captureSearchBackground(sourceBackdrop = bottomBarBackdrop) {
+            pushNavigation(NavOverlayKind.TabSwitch) {
+                // Leave the source detail/profile mounted behind the search overlay.
+                searchPendingQuery = normalized
+                searchPendingMode = SearchMode.Weibo
+                selectedTab = MainTab.Search
+                bottomBarVisible = true
+            }
         }
     }
 
@@ -8312,7 +8164,6 @@ fun WeiboApp() {
     MediaLongPressConfiguration {
     MyWeiboScaffold { innerPadding ->
         val hazeState = rememberHazeState()
-        val bottomBarBackdrop = rememberLayerBackdrop()
         // The feed bar must never sample the detail page or its return scrim.
         SideEffect { homeContentBackdrop.isFrozen = feedBackdropFrozenForDetail }
         val menuGlassBackdrop = bottomBarBackdrop
@@ -8324,7 +8175,6 @@ fun WeiboApp() {
         var searchMenuTriggerCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
         val searchHiddenCardBackdrop = rememberLayerBackdrop()
         var timelineMenuExpanded by remember { mutableStateOf(false) }
-        val imagePeekController = remember { ImagePeekController() }
         val feedImageUpgradeNotifier = remember { FeedImageUpgradeNotifier() }
         val imageSaveHintController = remember(scope) { ImageSaveHintController(scope) }
         val voiceAudioController = remember(context) { VoiceAudioController(context) }
@@ -8392,7 +8242,6 @@ fun WeiboApp() {
                 commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), isRepost = true)
             },
             LocalFeedListScrollCoordinator provides feedListScrollCoordinator,
-            LocalImagePeekController provides imagePeekController,
             LocalImageSaveHint provides imageSaveHintController,
             LocalVoiceAudioController provides voiceAudioController,
             LocalVideoPeekController provides videoPeekController,
@@ -8773,7 +8622,7 @@ fun WeiboApp() {
                             onResultsBackActionChange = { searchResultsBackAction = it },
                             onCaptureResultsBackground = { ready ->
                                 if (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch) ready()
-                                else captureSearchBackground(ready)
+                                else captureSearchBackground(onReady = ready)
                             },
                             onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
                             hiddenSourceCardId = hiddenFeedCardId,
@@ -10148,23 +9997,6 @@ fun WeiboApp() {
                 )
             }
             }
-            }
-            imagePeekController.activeRequest?.let { request ->
-                ImageActionOverlay(
-                    image = request.image,
-                    allImages = request.allImages,
-                    initialImageIndex = request.imageIndex,
-                    anchorBounds = request.anchorBounds,
-                    resolveAnchorBounds = request.resolveAnchorBounds,
-                    resolveAnchorBoundsForIndex = request.resolveAnchorBoundsForIndex,
-                    statusItem = request.statusItem,
-                    isFloating = imagePeekController.isFloating,
-                    dismissReason = imagePeekController.pendingDismiss,
-                    onRequestCancel = { imagePeekController.cancel() },
-                    onDismissComplete = { imagePeekController.completeDismiss() },
-                    onOpenFullscreenBehind = { request.onOpenFullscreenBehind(it) },
-                    onEnterFullscreenHandoffComplete = { imagePeekController.completeEnterFullscreenHandoff() },
-                )
             }
             }
             val overlayTop = overlayTopKind(navOverlayStack)
@@ -12985,9 +12817,7 @@ private enum class LivePhotoMirrorCorrection {
 @Composable
 private fun FeedImageCell(
     image: FeedImage,
-    allImages: List<FeedImage>,
     imageIndex: Int = 0,
-    imageOwner: FeedItem? = null,
     modifier: Modifier = Modifier,
     previewUrl: String? = null,
     contentScale: ContentScale = ContentScale.Crop,
@@ -12995,61 +12825,13 @@ private fun FeedImageCell(
     cornerRadius: Dp = 4.dp,
     maxDecodeDimOverride: Int? = null,
     hiddenForViewer: Boolean = false,
-    onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
+    onOpenViewer: (Int, Rect?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
-    resolveAnchorBoundsForIndex: (Int) -> Rect? = { null },
 ) {
-    var actionOpen by remember(image.id) { mutableStateOf(false) }
-    var peekActive by remember(image.id) { mutableStateOf(false) }
-    var pressHoldProgress by remember(image.id) { mutableFloatStateOf(0f) }
     var lastReportedAnchorBounds by remember(image.id) { mutableStateOf<Rect?>(null) }
     val anchorHolder = remember(image.id) { LayoutAnchorHolder() }
-    val imagePeekController = LocalImagePeekController.current
-    val mediaHaptics = rememberMediaPeekHaptics()
-    val density = LocalDensity.current
-    val horizontalSwipeThresholdPx = with(density) { 48.dp.toPx() }
-    val verticalGestureThresholdPx = with(density) { 56.dp.toPx() }
-    val holdScale = mediaPeekHoldScale(if (actionOpen) 0f else pressHoldProgress)
-
-    fun resetPeekState() {
-        actionOpen = false
-        peekActive = false
-        pressHoldProgress = 0f
-        imagePeekController.resetFingerDragOffset()
-    }
-
-    fun openImagePeek() {
-        val bounds = anchorHolder.boundsInWindow() ?: return
-        actionOpen = true
-        peekActive = true
-        pressHoldProgress = 1f
-        imagePeekController.open(
-            ImagePeekRequest(
-                image = image,
-                allImages = allImages,
-                imageIndex = imageIndex,
-                anchorBounds = bounds,
-                statusItem = imageOwner,
-                resolveAnchorBoundsForIndex = resolveAnchorBoundsForIndex,
-                resolveAnchorBounds = {
-                    anchorHolder.boundsInWindow() ?: bounds
-                },
-                onCancel = { resetPeekState() },
-                onRelease = { resetPeekState() },
-                onOpenFullscreenBehind = { index ->
-                    onOpenViewer(index, null, {
-                        resetPeekState()
-                        imagePeekController.finishFullscreenHandoff()
-                    }, null)
-                },
-                onEnterFullscreenHandoffComplete = { peekActive = false },
-            ),
-        )
-    }
-
     Box(
         modifier = modifier
-            .zIndex(if (actionOpen || peekActive) 10f else 0f)
             .onGloballyPositioned { coordinates ->
                 anchorHolder.coordinates = coordinates
                 // boundsInWindow clips at the viewport. Long thumbnails need
@@ -13063,91 +12845,19 @@ private fun FeedImageCell(
                     onAnchorBoundsChanged(bounds)
                 }
             }
-            .graphicsLayer {
-                scaleX = holdScale
-                scaleY = holdScale
-                alpha = if (actionOpen || hiddenForViewer) 0f else 1f
-            }
+            .graphicsLayer { alpha = if (hiddenForViewer) 0f else 1f }
             .clip(RoundedCornerShape(cornerRadius))
-            .background(
-                if (actionOpen) Color.Black else MaterialTheme.colorScheme.surfaceContainerHighest,
-            )
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
             .pointerInput(image.id) {
-                var previewOpened = false
-                var previewDismissStarted = false
-                var fullscreenHandoffStarted = false
-                var horizontalSwipeTriggered = false
-                var totalDrag = Offset.Zero
-                detectDragGesturesAfterLongPress(
-                    onDragStart = { _ ->
-                        if (!imagePeekController.pointerInputBlocked) {
-                            previewOpened = true
-                            previewDismissStarted = false
-                            fullscreenHandoffStarted = false
-                            horizontalSwipeTriggered = false
-                            totalDrag = Offset.Zero
-                            pressHoldProgress = 1f
-                            mediaHaptics.perform(MediaPeekHapticStage.Compress)
-                            openImagePeek()
-                        }
-                    },
-                    onDragEnd = {
-                        if (previewOpened) {
-                            peekActive = false
-                            imagePeekController.resetFingerDragOffset()
-                            if (!previewDismissStarted && !fullscreenHandoffStarted) {
-                                imagePeekController.release(
-                                    keepFloating = imagePeekController.pointerImageSwitchOccurred,
-                                )
-                            }
-                        }
-                        pressHoldProgress = 0f
-                    },
-                    onDragCancel = {
-                        if (previewOpened && !fullscreenHandoffStarted) {
-                            peekActive = false
-                            imagePeekController.cancel()
-                        }
-                        pressHoldProgress = 0f
-                    },
-                    onDrag = { change, dragAmount ->
-                        if (!previewOpened) return@detectDragGesturesAfterLongPress
-                        change.consume()
-                        totalDrag += dragAmount
-                        val horizontalDominant = abs(totalDrag.x) > abs(totalDrag.y) * 1.15f
-                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                        if (allImages.size > 1 && horizontalDominant) {
-                            if (!horizontalSwipeTriggered && abs(totalDrag.x) >= horizontalSwipeThresholdPx) {
-                                horizontalSwipeTriggered = true
-                                imagePeekController.dispatchHorizontalDrag(totalDrag.x)
-                            }
-                            return@detectDragGesturesAfterLongPress
-                        }
-                        imagePeekController.updateFingerDragOffset(totalDrag)
-                        if (verticalDominant && totalDrag.y >= verticalGestureThresholdPx && !previewDismissStarted) {
-                            previewDismissStarted = true
-                            imagePeekController.release()
-                        } else if (verticalDominant && totalDrag.y <= -verticalGestureThresholdPx && !fullscreenHandoffStarted) {
-                            fullscreenHandoffStarted = true
-                            imagePeekController.enterFullscreen()
-                        }
-                    },
-                )
-            }
-            .pointerInput(image.id) {
-                detectTapGestures(
-                    onTap = {
-                        if (!imagePeekController.pointerInputBlocked) {
-                            val coordinates = anchorHolder.coordinates?.takeIf { it.isAttached } ?: return@detectTapGestures
-                            val currentBounds = Rect(
-                                coordinates.localToWindow(Offset.Zero),
-                                androidx.compose.ui.geometry.Size(coordinates.size.width.toFloat(), coordinates.size.height.toFloat()),
-                            )
-                            onAnchorBoundsChanged(currentBounds)
-                            onOpenViewer(imageIndex, currentBounds, null, null)
-                        }
-                    },
-                )
+                detectTapGestures(onTap = {
+                    val coordinates = anchorHolder.coordinates?.takeIf { it.isAttached } ?: return@detectTapGestures
+                    val bounds = Rect(
+                        coordinates.localToWindow(Offset.Zero),
+                        Size(coordinates.size.width.toFloat(), coordinates.size.height.toFloat()),
+                    )
+                    onAnchorBoundsChanged(bounds)
+                    onOpenViewer(imageIndex, bounds)
+                })
             },
     ) {
         FeedImageThumbnailContent(
@@ -13338,473 +13048,6 @@ private fun ImageActionFrostedCard(
             }
         }
     }
-}
-
-@Composable
-private fun ImageActionOverlay(
-    image: FeedImage,
-    allImages: List<FeedImage>,
-    initialImageIndex: Int,
-    anchorBounds: Rect,
-    resolveAnchorBounds: () -> Rect,
-    resolveAnchorBoundsForIndex: (Int) -> Rect?,
-    statusItem: FeedItem? = null,
-    isFloating: Boolean,
-    dismissReason: ImagePeekDismissReason?,
-    onRequestCancel: () -> Unit,
-    onDismissComplete: () -> Unit,
-    onOpenFullscreenBehind: (Int) -> Unit,
-    onEnterFullscreenHandoffComplete: () -> Unit,
-) {
-    val scope = rememberCoroutineScope()
-    val density = LocalDensity.current
-    val imagePeekController = LocalImagePeekController.current
-    val images = allImages.ifEmpty { listOf(image) }
-    val resolvedImages = remember(images, statusItem) {
-        images.map { it.resolveForSave(statusItem, images) }
-    }
-    val safeInitialIndex = initialImageIndex.coerceIn(0, images.lastIndex)
-    val pagerState = rememberPagerState(initialPage = safeInitialIndex) { images.size }
-    val pagerFlingBehavior = PagerDefaults.flingBehavior(
-        state = pagerState,
-        snapAnimationSpec = tween(
-            durationMillis = 280,
-            easing = MediaPeekEnterEasing,
-        ),
-    )
-    val currentImage = resolvedImages[pagerState.currentPage]
-    val enterProgress = remember { Animatable(0f) }
-    val fullscreenExpandProgress = remember { Animatable(0f) }
-    var fullscreenOpened by remember { mutableStateOf(false) }
-    var closingAnchorBounds by remember(anchorBounds) { mutableStateOf(anchorBounds) }
-    var peekDismissStartBounds by remember { mutableStateOf<Rect?>(null) }
-    var peekDismissTargetBounds by remember { mutableStateOf<Rect?>(null) }
-    var overlayWindowOrigin by remember { mutableStateOf(Offset.Zero) }
-    val peekDismissMorphProgress = remember { Animatable(1f) }
-
-    fun resolveCurrentAnchorBounds(): Rect =
-        resolveAnchorBoundsForIndex(pagerState.currentPage)
-            ?.takeIf { it.width > 0f && it.height > 0f }
-            ?: resolveAnchorBounds()
-
-    fun requestDismiss(handoffBounds: Rect? = null) {
-        if (isFloating && dismissReason == null) {
-            closingAnchorBounds = resolveCurrentAnchorBounds()
-            peekDismissStartBounds = handoffBounds
-            peekDismissTargetBounds = closingAnchorBounds
-                .takeIf { it.width > 0f && it.height > 0f }
-                ?.toOverlayLocal(overlayWindowOrigin)
-        }
-        onRequestCancel()
-    }
-
-    LaunchedEffect(Unit) {
-        enterProgress.snapTo(0f)
-        enterProgress.animateTo(
-            targetValue = 1f,
-            animationSpec = ImagePeekEnterAnimationSpec,
-        )
-    }
-
-    DisposableEffect(pagerState, scope) {
-        if (images.size > 1) {
-            var horizontalPageSwitchTriggered = false
-            imagePeekController.bindHorizontalDragHandler { deltaX ->
-                if (deltaX == 0f) {
-                    horizontalPageSwitchTriggered = false
-                } else if (!horizontalPageSwitchTriggered) {
-                    horizontalPageSwitchTriggered = true
-                    val targetPage = (
-                        pagerState.currentPage + if (deltaX < 0f) 1 else -1
-                        ).coerceIn(0, images.lastIndex)
-                    if (targetPage != pagerState.currentPage) {
-                        imagePeekController.markImageSwitchOccurred()
-                        scope.launch {
-                            pagerState.animateScrollToPage(targetPage)
-                        }
-                    }
-                }
-            }
-        }
-        onDispose {
-            imagePeekController.bindHorizontalDragHandler(null)
-        }
-    }
-
-    LaunchedEffect(dismissReason) {
-        when (dismissReason) {
-            null -> return@LaunchedEffect
-            ImagePeekDismissReason.EnterFullscreen -> {
-                if (enterProgress.value < 1f) {
-                    enterProgress.snapTo(1f)
-                }
-                fullscreenExpandProgress.snapTo(0f)
-                fullscreenExpandProgress.animateTo(
-                    targetValue = 1f,
-                    animationSpec = tween(
-                        durationMillis = NavTransitionDurationMs,
-                        easing = FastOutSlowInEasing,
-                    ),
-                )
-                if (!fullscreenOpened) {
-                    fullscreenOpened = true
-                    onOpenFullscreenBehind(pagerState.currentPage)
-                }
-                withFrameMillis { }
-                onEnterFullscreenHandoffComplete()
-            }
-            else -> {
-                fullscreenExpandProgress.snapTo(0f)
-                closingAnchorBounds = resolveCurrentAnchorBounds()
-                if (isFloating) {
-                    peekDismissTargetBounds = closingAnchorBounds
-                        .takeIf { it.width > 0f && it.height > 0f }
-                        ?.toOverlayLocal(overlayWindowOrigin)
-                    peekDismissMorphProgress.snapTo(1f)
-                    peekDismissMorphProgress.animateTo(
-                        targetValue = 0f,
-                        animationSpec = ImagePeekDismissAnimationSpec,
-                    )
-                } else {
-                    enterProgress.animateTo(
-                        targetValue = 0f,
-                        animationSpec = ImagePeekDismissAnimationSpec,
-                    )
-                }
-                onDismissComplete()
-            }
-        }
-    }
-
-    BackHandler(enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen) {
-        requestDismiss()
-    }
-    val expandProgressForBackdrop = fullscreenExpandProgress.value.coerceIn(0f, 1f)
-    val expandingToFullscreen = expandProgressForBackdrop > 0f ||
-        fullscreenOpened ||
-        dismissReason == ImagePeekDismissReason.EnterFullscreen
-    BoxWithConstraints(
-        Modifier
-            .fillMaxSize()
-            .onGloballyPositioned { coordinates ->
-                val windowBounds = coordinates.boundsInWindow()
-                overlayWindowOrigin = Offset(windowBounds.left, windowBounds.top)
-            }
-            .then(
-                if (expandingToFullscreen) {
-                    Modifier.background(Color.Black)
-                } else {
-                    Modifier
-                },
-            )
-            .pointerInput(isFloating, dismissReason, images.size) {
-                if (!isFloating || dismissReason != null) return@pointerInput
-                val dragGestureThreshold = with(density) { 56.dp.toPx() }
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false)
-                    var totalDrag = Offset.Zero
-                    var handled = false
-                    while (true) {
-                        val event = awaitPointerEvent(PointerEventPass.Initial)
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                            ?: event.changes.firstOrNull()
-                            ?: break
-                        if (!change.pressed) {
-                            if (!handled) {
-                                val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                                if (totalDrag.y > dragGestureThreshold && verticalDominant) {
-                                    requestDismiss()
-                                } else if (totalDrag.y < -dragGestureThreshold && verticalDominant) {
-                                    imagePeekController.enterFullscreen()
-                                }
-                            }
-                            break
-                        }
-                        val delta = change.position - change.previousPosition
-                        totalDrag += delta
-                        val verticalDominant = abs(totalDrag.y) > abs(totalDrag.x) * 1.15f
-                        if (!verticalDominant) continue
-                        if (totalDrag.y > dragGestureThreshold) {
-                            change.consume()
-                            requestDismiss()
-                            handled = true
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                        if (totalDrag.y < -dragGestureThreshold) {
-                            change.consume()
-                            imagePeekController.enterFullscreen()
-                            handled = true
-                            while (true) {
-                                val consumeEvent = awaitPointerEvent(PointerEventPass.Initial)
-                                consumeEvent.changes.forEach { it.consume() }
-                                if (consumeEvent.changes.all { !it.pressed }) break
-                            }
-                            break
-                        }
-                    }
-                }
-            }
-            // The active media gesture must sit above the visited-profile page
-            // swipe layer, otherwise a rightward image swipe becomes navigation.
-            .zIndex(650f),
-    ) {
-        val rawProgress = enterProgress.value.coerceIn(0f, 1f)
-        val layoutProgress = imagePeekLayoutProgress(rawProgress)
-        val enterScale = imagePeekEnterScale(rawProgress)
-        val fingerFollowAlpha = if (isFloating) 0f else (1f - expandProgressForBackdrop).coerceIn(0f, 1f)
-        val expandProgress = expandProgressForBackdrop
-        val useFloatingDismissMorph = isFloating &&
-            dismissReason != null &&
-            dismissReason != ImagePeekDismissReason.EnterFullscreen
-        val scrimAlpha = if (expandingToFullscreen) {
-            1f
-        } else if (useFloatingDismissMorph) {
-            0.42f * peekDismissMorphProgress.value.coerceIn(0f, 1f)
-        } else {
-            0.42f * layoutProgress
-        }
-        val previewTapModifier = if (isFloating && dismissReason == null) {
-            Modifier.pointerInput(pagerState.currentPage) {
-                detectTapGestures(
-                    onTap = { imagePeekController.enterFullscreen() },
-                )
-            }
-        } else {
-            Modifier
-        }
-
-            val previewAspect = feedImagePreviewAspectRatio(currentImage)
-            val previewWidth = minOf(maxWidth * 0.88f, 340.dp)
-            val previewHeight = previewWidth / previewAspect
-            val targetLeft = (maxWidth - previewWidth) / 2
-            val targetTop = maxHeight * 0.18f
-            val targetLeftPx = with(density) { targetLeft.toPx() }
-            val targetTopPx = with(density) { targetTop.toPx() }
-            val targetWidthPx = with(density) { previewWidth.toPx() }
-            val targetHeightPx = with(density) { previewHeight.toPx() }
-            val maxWidthPx = with(density) { maxWidth.toPx() }
-            val maxHeightPx = with(density) { maxHeight.toPx() }
-            val safeImageAspect = previewAspect.coerceIn(0.25f, 4f)
-
-            if (useFloatingDismissMorph) {
-                val transition = peekDismissMorphProgress.value.coerceIn(0f, 1f)
-                val floatingBounds = Rect(
-                    left = targetLeftPx,
-                    top = targetTopPx,
-                    right = targetLeftPx + targetWidthPx,
-                    bottom = targetTopPx + targetHeightPx,
-                )
-                val morphSourceBounds = peekDismissStartBounds ?: floatingBounds
-                val morphTargetBounds = peekDismissTargetBounds
-                    ?: closingAnchorBounds.toOverlayLocal(overlayWindowOrigin)
-                val morphWidth = lerp(morphTargetBounds.width, morphSourceBounds.width, transition)
-                val morphHeight = lerp(morphTargetBounds.height, morphSourceBounds.height, transition)
-                val morphCenterX = lerp(morphTargetBounds.center.x, morphSourceBounds.center.x, transition)
-                val morphCenterY = lerp(morphTargetBounds.center.y, morphSourceBounds.center.y, transition)
-                val uniformScale = computeMorphCoverScale(
-                    morphWidthPx = morphWidth,
-                    morphHeightPx = morphHeight,
-                    contentWidthPx = targetWidthPx,
-                    contentHeightPx = targetHeightPx,
-                )
-                val morphLeft = morphCenterX - morphWidth / 2f
-                val morphTop = morphCenterY - morphHeight / 2f
-                val morphRight = morphCenterX + morphWidth / 2f
-                val morphBottom = morphCenterY + morphHeight / 2f
-                val morphCornerRadiusPx = with(density) {
-                    lerpDp(ThumbnailMorphCornerRadius, 18.dp, transition).toPx()
-                }
-                MorphRevealScrim(
-                    morphLeft = morphLeft,
-                    morphTop = morphTop,
-                    morphRight = morphRight,
-                    morphBottom = morphBottom,
-                    cornerRadiusPx = morphCornerRadiusPx,
-                    scrimColor = Color.Black.copy(alpha = scrimAlpha),
-                )
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .morphRevealClip(
-                            morphLeft = morphLeft,
-                            morphTop = morphTop,
-                            morphRight = morphRight,
-                            morphBottom = morphBottom,
-                            cornerRadiusPx = morphCornerRadiusPx,
-                        )
-                        .graphicsLayer {
-                            translationX = morphCenterX - maxWidthPx / 2f
-                            translationY = morphCenterY - maxHeightPx / 2f
-                            scaleX = uniformScale
-                            scaleY = uniformScale
-                            transformOrigin = TransformOrigin.Center
-                        },
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .size(previewWidth, previewHeight)
-                            .background(Color.Black),
-                    ) {
-                        if (images.size > 1) {
-                            HorizontalPager(
-                                state = pagerState,
-                                modifier = Modifier.fillMaxSize(),
-                                userScrollEnabled = false,
-                                beyondViewportPageCount = 1,
-                                flingBehavior = pagerFlingBehavior,
-                            ) { page ->
-                                ImageActionPreviewImage(
-                                    image = images[page],
-                                    isActive = page == pagerState.currentPage,
-                                    imageOwner = statusItem,
-                                    modifier = Modifier.fillMaxSize(),
-                                )
-                            }
-                        } else {
-                            ImageActionPreviewImage(
-                                image = currentImage,
-                                imageOwner = statusItem,
-                                modifier = Modifier.fillMaxSize(),
-                            )
-                        }
-                    }
-                }
-            } else {
-            val screenAspect = maxWidthPx / maxHeightPx.coerceAtLeast(1f)
-            val fullscreenImageWidthPx: Float
-            val fullscreenImageHeightPx: Float
-            if (screenAspect > safeImageAspect) {
-                fullscreenImageHeightPx = maxHeightPx
-                fullscreenImageWidthPx = fullscreenImageHeightPx * safeImageAspect
-            } else {
-                fullscreenImageWidthPx = maxWidthPx
-                fullscreenImageHeightPx = fullscreenImageWidthPx / safeImageAspect
-            }
-            val motion = computeMediaPeekGraphicsMotion(
-                anchorBounds = closingAnchorBounds,
-                layoutOriginLeftPx = targetLeftPx,
-                layoutOriginTopPx = targetTopPx,
-                layoutWidthPx = targetWidthPx,
-                layoutHeightPx = targetHeightPx,
-                layoutProgress = layoutProgress,
-                enterScale = enterScale,
-                fingerFollowAlpha = fingerFollowAlpha,
-                expandProgress = expandProgress,
-                expandWidthPx = fullscreenImageWidthPx,
-                expandHeightPx = fullscreenImageHeightPx,
-                expandCenterX = maxWidthPx / 2f,
-                expandCenterY = maxHeightPx / 2f,
-            )
-            Box(
-                Modifier.fillMaxSize(),
-            ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(if (expandingToFullscreen) Color.Black else Color.Black.copy(alpha = scrimAlpha))
-                    .clickable(
-                        enabled = dismissReason != ImagePeekDismissReason.EnterFullscreen,
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() },
-                        onClick = { requestDismiss() },
-                    ),
-            )
-            Box(
-                modifier = Modifier
-                    .offset(x = targetLeft, y = targetTop)
-                    .size(previewWidth, previewHeight)
-                    .mediaPeekMotionLayer(
-                        motion = motion,
-                        cropToVisualBounds = true,
-                        fingerDragOffset = { imagePeekController.fingerDragOffset },
-                        shadowElevation = if (images.size > 1 && layoutProgress > 0.28f && expandProgress == 0f) {
-                            16.dp
-                        } else {
-                            0.dp
-                        },
-                    )
-                    .background(Color.Black),
-            ) {
-                if (images.size > 1) {
-                    HorizontalPager(
-                        state = pagerState,
-                        modifier = Modifier.fillMaxSize(),
-                        userScrollEnabled = dismissReason == null,
-                        beyondViewportPageCount = 1,
-                        flingBehavior = pagerFlingBehavior,
-                    ) { page ->
-                        ImageActionPreviewImage(
-                            image = images[page],
-                            isActive = page == pagerState.currentPage,
-                            imageOwner = statusItem,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .then(previewTapModifier),
-                        )
-                    }
-                } else {
-                    ImageActionPreviewImage(
-                        image = currentImage,
-                        imageOwner = statusItem,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .then(previewTapModifier),
-                    )
-                }
-
-                if (images.size > 1) {
-                    ImagePeekPageIndicator(
-                        pageCount = images.size,
-                        pagerState = pagerState,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 10.dp),
-                    )
-                }
-            }
-            }
-            }
-    }
-}
-
-@Composable
-private fun ImagePeekPageIndicator(
-    pageCount: Int,
-    pagerState: PagerState,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-    ) {
-        repeat(pageCount) { index ->
-            val offset = (pagerState.currentPage - index) + pagerState.currentPageOffsetFraction
-            val proximity = (1f - abs(offset).coerceIn(0f, 1f))
-            Box(
-                modifier = Modifier
-                    .size(lerpDp(6.dp, 7.dp, proximity))
-                    .clip(CircleShape)
-                    .background(
-                        Color.White.copy(alpha = lerp(0.42f, 0.95f, proximity)),
-                    ),
-            )
-        }
-    }
-}
-
-private fun feedImagePreviewAspectRatio(image: FeedImage): Float {
-    val width = image.width ?: 0
-    val height = image.height ?: 0
-    if (width > 0 && height > 0) {
-        return (width.toFloat() / height.toFloat()).coerceIn(0.45f, 2.2f)
-    }
-    return 1f
 }
 
 @Composable
@@ -14709,51 +13952,6 @@ private fun imagesReferToSamePhoto(a: FeedImage, b: FeedImage): Boolean {
     return aKeys.isNotEmpty() && aKeys.any { it in bKeys }
 }
 
-@Composable
-private fun ImageActionPreviewImage(
-    image: FeedImage,
-    modifier: Modifier = Modifier,
-    isActive: Boolean = true,
-    imageOwner: FeedItem? = null,
-    relatedPosts: List<FeedItem> = emptyList(),
-) {
-    val resolvedImage = remember(image, imageOwner, relatedPosts) {
-        resolveFeedImageForViewer(image, imageOwner, relatedPosts)
-    }
-    val thumbnailQuality = LocalFeedThumbnailQuality.current
-    val thumbnailBitmap = remember(resolvedImage, thumbnailQuality) {
-        FeedBitmapCache.get(feedImageCacheCandidates(resolvedImage, thumbnailQuality))
-            ?: FeedBitmapCache.get(feedImageUrlCandidates(resolvedImage))
-    }
-    var qualityBitmap by remember(resolvedImage.largeUrl) { mutableStateOf<Bitmap?>(null) }
-    LaunchedEffect(resolvedImage, isActive) {
-        qualityBitmap = null
-        if (isActive && !resolvedImage.isGif) {
-            qualityBitmap = loadFloatingPeekBitmap(resolvedImage)
-        }
-    }
-    var livePlaying by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
-    LaunchedEffect(isActive, resolvedImage.isLivePhoto, qualityBitmap) {
-        // The floating peek is a lightweight still-image preview. Starting a
-        // Live Photo decoder while the still image is still loading can allocate
-        // a second surface and stall the UI under memory pressure. Start motion
-        // only after the sharper still is ready, and only for the active page.
-        livePlaying = isActive && resolvedImage.isLivePhoto && qualityBitmap != null
-    }
-    Box(modifier) {
-    FeedImagePreviewContent(
-        image = resolvedImage,
-        livePlaying = livePlaying,
-        onLiveEnded = { livePlaying = false },
-        isActive = isActive,
-        isFullscreen = false,
-        modifier = Modifier.fillMaxSize(),
-        placeholderBitmap = thumbnailBitmap,
-        qualityBitmap = qualityBitmap,
-    )
-    }
-}
-
 private data class ActionMenuPlacement(
     val offset: IntOffset,
     val belowAnchor: Boolean,
@@ -14870,65 +14068,6 @@ private fun ImageActionRow(
 }
 
 @Composable
-private fun FeedImagePreviewContent(
-    image: FeedImage,
-    livePlaying: Boolean,
-    onLiveEnded: () -> Unit,
-    modifier: Modifier = Modifier,
-    isActive: Boolean = true,
-    isFullscreen: Boolean = false,
-    placeholderBitmap: Bitmap? = null,
-    qualityBitmap: Bitmap? = null,
-) {
-    Box(
-        modifier = modifier.background(Color.Black),
-        contentAlignment = Alignment.Center,
-    ) {
-        placeholderBitmap?.takeIfDrawable()?.let { bitmap ->
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit,
-            )
-        }
-        if (image.isGif) {
-            AnimatedRemoteImage(
-                url = image.downloadUrls.firstOrNull { it.isNotBlank() } ?: image.largeUrl,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit,
-                placeholderBackground = if (placeholderBitmap == null) Color.Black else Color.Transparent,
-            )
-        } else {
-            RemoteImage(
-                url = image.largeUrl,
-                fallbackUrls = image.downloadUrls.drop(1),
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit,
-                placeholderBackground = if (placeholderBitmap == null) Color.Black else Color.Transparent,
-            )
-        }
-        qualityBitmap?.takeIfDrawable()?.let { bitmap ->
-            Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Fit,
-            )
-        }
-        if (image.isLivePhoto && livePlaying) {
-            LivePhotoOverlay(
-                image = image,
-                modifier = Modifier.fillMaxSize(),
-                isActive = isActive,
-                isInFullscreen = isFullscreen,
-                onEnded = onLiveEnded,
-            )
-        }
-    }
-}
-
-@Composable
 private fun MediaStrip(
     images: List<FeedImage>,
     medias: List<FeedMedia> = emptyList(),
@@ -14950,14 +14089,10 @@ private fun MediaStrip(
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
-    var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
-    var viewerCloseHandoff by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun openImageViewer(
         index: Int,
         sourceBounds: Rect?,
-        onClosed: (() -> Unit)? = null,
-        onCloseStart: (() -> Unit)? = null,
     ) {
         viewerIndex = index
         viewerActiveIndex = index
@@ -14968,8 +14103,6 @@ private fun MediaStrip(
         }
         viewerSourceBoundsByIndex = thumbnailBoundsByIndex
         viewerAnimateOpenFromSource = sourceBounds != null
-        viewerDismissHook = onClosed
-        viewerCloseHandoff = onCloseStart
         viewerOpen = true
     }
 
@@ -14994,17 +14127,15 @@ private fun MediaStrip(
                     Box(modifier = Modifier.fillMaxWidth()) {
                         FeedImageCell(
                             image = image,
-                            allImages = images,
                             imageIndex = 0,
-                            imageOwner = imageOwner,
                             hiddenForViewer = viewerOpen && viewerOpeningReady && !viewerReturning && viewerActiveIndex == 0,
                             modifier = Modifier
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
                                 .aspectRatio(layout.aspectRatio),
                             contentScale = ContentScale.Fit,
-                            onOpenViewer = { index, bounds, onClosed, _ ->
-                                openImageViewer(index, bounds, onClosed)
+                            onOpenViewer = { index, bounds ->
+                                openImageViewer(index, bounds)
                             },
                             onAnchorBoundsChanged = { bounds ->
                                 thumbnailBoundsByIndex = thumbnailBoundsByIndex + (0 to bounds)
@@ -15038,25 +14169,20 @@ private fun MediaStrip(
                                 val cellIndex = rowIndex * gridColumns + indexInRow
                                 FeedImageCell(
                                     image = image,
-                                    allImages = images,
                                     imageIndex = cellIndex,
-                                    imageOwner = imageOwner,
                                     hiddenForViewer = viewerOpen && viewerOpeningReady && !viewerReturning && viewerActiveIndex == cellIndex,
                                     modifier = Modifier
                                         .weight(1f)
                                         .aspectRatio(1f),
                                     contentScale = ContentScale.Crop,
-                                    onOpenViewer = { index, bounds, onClosed, _ ->
-                                        openImageViewer(index, bounds, onClosed)
+                                    onOpenViewer = { index, bounds ->
+                                        openImageViewer(index, bounds)
                                     },
                                     onAnchorBoundsChanged = { bounds ->
                                         thumbnailBoundsByIndex = thumbnailBoundsByIndex + (cellIndex to bounds)
                                         if (viewerOpen) {
                                             viewerSourceBoundsByIndex = viewerSourceBoundsByIndex + (cellIndex to bounds)
                                         }
-                                    },
-                                    resolveAnchorBoundsForIndex = { targetIndex ->
-                                        thumbnailBoundsByIndex[targetIndex]
                                     },
                                 )
                             }
@@ -15094,8 +14220,6 @@ private fun MediaStrip(
                     onReturnLanded = {
                         // Restore beneath the landed image before removing the dialog window.
                         viewerReturning = true
-                        viewerDismissHook?.invoke()
-                        viewerDismissHook = null
                     },
                     imageOwner = imageOwner,
                     onDismiss = {
@@ -15104,10 +14228,6 @@ private fun MediaStrip(
                         viewerOpeningReady = false
                         viewerSourceBoundsByIndex = emptyMap()
                         viewerAnimateOpenFromSource = true
-                        viewerCloseHandoff?.invoke()
-                        viewerCloseHandoff = null
-                        viewerDismissHook?.invoke()
-                        viewerDismissHook = null
                     },
                 )
             }
@@ -15343,7 +14463,6 @@ private fun FullscreenImageViewer(
     animateOpenFromSource: Boolean = true,
     sourceCornerRadius: Dp = ThumbnailMorphCornerRadius,
     avoidOpeningCropForExtremeAspect: Boolean = false,
-    onCloseStart: (() -> Unit)? = null,
     onReturnLanded: (() -> Unit)? = null,
     imageOwner: FeedItem? = null,
     session: WeiboWebSession? = null,
@@ -15408,7 +14527,6 @@ private fun FullscreenImageViewer(
             if (closeBounds != null) {
                 closeStartBounds = startBounds ?: currentBoundsProvider?.invoke() ?: currentSourceBounds
                 transitionClosing = true
-                onCloseStart?.invoke()
                 closeAnimationJob = scope.launch {
                     transitionProgress.animateTo(
                         targetValue = 0f,
@@ -15422,7 +14540,6 @@ private fun FullscreenImageViewer(
                     finishDismiss()
                 }
             } else {
-                onCloseStart?.invoke()
                 finishDismiss()
             }
         }
@@ -22409,12 +21526,10 @@ private fun CommentImageStrip(
     var thumbnailBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerSourceBoundsByIndex by remember { mutableStateOf<Map<Int, Rect>>(emptyMap()) }
     var viewerAnimateOpenFromSource by remember { mutableStateOf(true) }
-    var viewerDismissHook by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     fun openImageViewer(
         index: Int,
         sourceBounds: Rect?,
-        onClosed: (() -> Unit)? = null,
     ) {
         viewerIndex = index
         viewerOpeningReady = false
@@ -22423,7 +21538,6 @@ private fun CommentImageStrip(
         }
         viewerSourceBoundsByIndex = thumbnailBoundsByIndex
         viewerAnimateOpenFromSource = sourceBounds != null
-        viewerDismissHook = onClosed
         viewerOpen = true
     }
 
@@ -22442,15 +21556,14 @@ private fun CommentImageStrip(
             images.forEachIndexed { index, image ->
                 FeedImageCell(
                     image = image,
-                    allImages = images,
                     imageIndex = index,
                     modifier = Modifier.size(72.dp),
                     hiddenForViewer = viewerOpen && viewerOpeningReady && activeThumbnailIndex == index,
                     previewUrl = image.thumbnailUrl,
                     contentScale = ContentScale.Crop,
                     showLiveBadge = true,
-                    onOpenViewer = { cellIndex, bounds, onClosed, _ ->
-                        openImageViewer(cellIndex, bounds, onClosed)
+                    onOpenViewer = { cellIndex, bounds ->
+                        openImageViewer(cellIndex, bounds)
                     },
                     onAnchorBoundsChanged = { bounds ->
                         thumbnailBoundsByIndex = thumbnailBoundsByIndex + (index to bounds)
@@ -22475,8 +21588,6 @@ private fun CommentImageStrip(
                     viewerOpeningReady = false
                     viewerSourceBoundsByIndex = emptyMap()
                     viewerAnimateOpenFromSource = true
-                    viewerDismissHook?.invoke()
-                    viewerDismissHook = null
                 },
             )
         }
@@ -25330,7 +24441,6 @@ private fun MineScreen(
                             val visibleMedia = remember(albumImages, videoPage) {
                                 profileAlbumMedia(albumImages, videos = videoPage)
                             }
-                            val albumPostLookup = remember(posts) { buildAlbumPostLookup(posts) }
                             val albumRows = remember(visibleMedia) {
                                 buildAlbumGridRows(groupAlbumImagesByMonth(visibleMedia))
                             }
@@ -25391,8 +24501,6 @@ private fun MineScreen(
                                                 monthImages = row.monthImages,
                                                 rowImages = row.rowImages,
                                                 rowStartIndex = row.rowStartIndex,
-                                                relatedPosts = posts,
-                                                postLookup = albumPostLookup,
                                                 modifier = Modifier
                                                     .padding(horizontal = 12.dp)
                                                     .padding(bottom = 6.dp),
@@ -25752,7 +24860,7 @@ private val appHelpSections = listOf(
         title = "图片查看与保存",
         items = listOf(
             "点击图片查看大图，多图可左右切换；支持双指缩放、拖动以及下拉关闭。",
-            "「查看图片」文字入口同样可打开图片；长按图片或大图可使用保存、保存全部、分享等菜单。",
+            "「查看图片」文字入口同样可打开图片；长按大图可使用保存、保存全部、分享等菜单。",
             "高清图未完成时先显示已有预览；加载速度与原图大小、网络和微博服务器有关。",
             "支持的动态照片可在大图中查看动态效果，保存结果受原始媒体格式及系统相册支持情况影响。",
         ),
@@ -28969,8 +28077,6 @@ private fun MineAlbumGridRow(
     monthImages: List<FeedImage>,
     rowImages: List<FeedImage>,
     rowStartIndex: Int,
-    relatedPosts: List<FeedItem>,
-    postLookup: AlbumPostLookup,
     onImageClick: (List<FeedImage>, Int, Rect?) -> Unit,
     onImageAnchorBoundsChanged: (String, Rect) -> Unit = { _, _ -> },
     onVideoClick: (FeedMedia, String) -> Unit,
@@ -28999,11 +28105,8 @@ private fun MineAlbumGridRow(
                     MineAlbumTile(
                         image = image,
                         size = cellSize,
-                        allImages = monthImages,
                         imageIndex = imageIndex,
-                        relatedPosts = relatedPosts,
-                        postLookup = postLookup,
-                        onOpenViewer = { index, bounds, _, _ -> onImageClick(monthImages, index, bounds) },
+                        onOpenViewer = { index, bounds -> onImageClick(monthImages, index, bounds) },
                         onAnchorBoundsChanged = { bounds ->
                             onImageAnchorBoundsChanged(image.albumAnchorKey(), bounds)
                         },
@@ -29019,18 +28122,12 @@ private fun MineAlbumGridRow(
 private fun MineAlbumTile(
     image: FeedImage,
     size: androidx.compose.ui.unit.Dp,
-    allImages: List<FeedImage>,
     imageIndex: Int,
-    relatedPosts: List<FeedItem>,
-    postLookup: AlbumPostLookup,
-    onOpenViewer: (Int, Rect?, (() -> Unit)?, (() -> Unit)?) -> Unit,
+    onOpenViewer: (Int, Rect?) -> Unit,
     onAnchorBoundsChanged: (Rect) -> Unit = {},
     onVideoClick: (FeedMedia, String) -> Unit,
 ) {
     val albumVideoDetailOpener = LocalAlbumVideoDetailOpener.current
-    val imageOwner = remember(image.id, image.largeUrl, relatedPosts) {
-        findPostForAlbumImage(postLookup, image)
-    }
     val albumMedia = remember(image.id, image.largeUrl, image.videoStreamUrl) {
         image.toAlbumFeedMedia()
     }
@@ -29055,9 +28152,7 @@ private fun MineAlbumTile(
     } else {
         FeedImageCell(
             image = image,
-            allImages = allImages,
             imageIndex = imageIndex,
-            imageOwner = imageOwner,
             modifier = Modifier.size(size),
             cornerRadius = ThumbnailMorphCornerRadius,
             maxDecodeDimOverride = AlbumGridMaxDecodeDim,
@@ -30548,23 +29643,6 @@ private suspend fun loadFullscreenPreviewBitmap(image: FeedImage): Bitmap? {
         }
     }
     return null
-}
-
-private suspend fun loadFloatingPeekBitmap(image: FeedImage): Bitmap? = withContext(Dispatchers.IO) {
-    // A 2K decode is noticeably sharper than feed thumbnails while keeping the
-    // floating preview well below the memory cost of decoding a full 4K/8K scan.
-    for (url in fullscreenImageUrlCandidates(image)) {
-        val bitmap = runCatching {
-            loadRemoteBitmap(
-                url = url,
-                maxDecodeDim = 2048,
-                connectTimeoutMs = 5_000,
-                readTimeoutMs = 10_000,
-            )
-        }.getOrNull()
-        if (bitmap != null) return@withContext bitmap
-    }
-    null
 }
 
 private fun loadFullscreenBitmap(image: FeedImage, forceNetwork: Boolean = false): android.graphics.Bitmap? {
