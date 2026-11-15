@@ -214,6 +214,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -4272,9 +4273,11 @@ fun WeiboApp() {
     var hiddenCardFromMine by remember { mutableStateOf(false) }
     var bottomBarBoundsInRoot by remember { mutableStateOf<Rect?>(null) }
     var detailSystemBackInProgress by remember { mutableStateOf(false) }
-    LaunchedEffect(feedListState, selectedItem, navExitPendingKind) {
+    LaunchedEffect(feedListState, selectedTab, selectedItem, navExitPendingKind) {
         snapshotFlow { feedListState.isScrollInProgress }.collect { scrolling ->
-            if (scrolling && selectedItem == null && navExitPendingKind == null) homeThumbnailStore.releaseSnapshot()
+            if (scrolling && selectedTab == MainTab.Feed && selectedItem == null && navExitPendingKind == null) {
+                homeThumbnailStore.releaseSnapshot()
+            }
         }
     }
     var albumOverlayInstanceKey by remember { mutableIntStateOf(0) }
@@ -5233,10 +5236,11 @@ fun WeiboApp() {
         navOverlayStack = navOverlayStack.dropLast(1)
         if (exitingKind is NavOverlayKind.Detail &&
             navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
-            previous.detail?.item?.id == selectedItem?.id
+            previous.detail != null
         ) {
-            // Returning through a profile to the same status keeps the detail host
-            // mounted, so AnimatedVisibility cannot deliver its usual exit callback.
+            // The earlier detail keeps this host mounted beneath the profile,
+            // even when the two details are for different posts. The host
+            // therefore cannot deliver its usual visibility exit callback.
             val returningStack = navOverlayStack
             scope.launch {
                 delay(DetailReturnDurationMs.toLong() + 32L)
@@ -9699,6 +9703,11 @@ fun WeiboApp() {
                         switchTimelineKind(kind)
                     },
                     onTabChange = { tab ->
+                        if (selectedTab == MainTab.Feed && tab == MainTab.Mine) {
+                            // Retain decoded thumbnails before the feed's lazy rows unmount.
+                            homeThumbnailStore.releaseSnapshot()
+                            homeThumbnailStore.freezeVisible()
+                        }
                         bottomBarVisible = true
                         bottomBarScrollDistance[0] = 0f
                         if (tab != selectedTab && topicSearchForeground) {
@@ -12779,7 +12788,10 @@ private fun FeedImageThumbnailContent(
         feedImageCacheCandidates(image, thumbnailQuality)
     }
     val displayUrl = remember(image, thumbnailQuality) { thumbnailQuality.displayUrl(image) }
-    val fallbackUrl = remember(image, thumbnailQuality) { thumbnailQuality.fallbackUrl(image) }
+    val fallbackUrls = remember(image, thumbnailQuality, previewUrl, displayUrl) {
+        ImageUrlResolver.feedDisplayCandidates(image, thumbnailQuality)
+            .filterNot { it == (previewUrl ?: displayUrl) }
+    }
     val decodeDim = maxDecodeDimOverride ?: thumbnailQuality.maxDecodeDim
 
     if (maxDecodeDimOverride != null) {
@@ -12794,11 +12806,7 @@ private fun FeedImageThumbnailContent(
         RemoteImage(
             url = previewUrl ?: displayUrl,
             stableThumbnailKey = ImageUrlResolver.thumbnailCacheKey(image, thumbnailQuality, previewUrl),
-            fallbackUrls = if (previewUrl != null) {
-                emptyList()
-            } else {
-                listOfNotNull(fallbackUrl)
-            },
+            fallbackUrls = fallbackUrls,
             cacheLookupUrls = feedCacheCandidates,
             maxDecodeDim = decodeDim,
             modifier = modifier,
@@ -14120,9 +14128,12 @@ private fun MediaStrip(
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (images.size == 1) {
                     val image = images.first()
+                    val width = image.width ?: 0
+                    val height = image.height ?: 0
+                    val cropLongPreview = width > 0 && height.toLong() > width * 2L
                     val layout = singleImageFeedLayout(
-                        width = image.width ?: 0,
-                        height = image.height ?: 0,
+                        width = width,
+                        height = if (cropLongPreview) (width * 2L).toInt() else height,
                     )
                     Box(modifier = Modifier.fillMaxWidth()) {
                         FeedImageCell(
@@ -14133,7 +14144,7 @@ private fun MediaStrip(
                                 .align(Alignment.TopStart)
                                 .fillMaxWidth(layout.widthFraction)
                                 .aspectRatio(layout.aspectRatio),
-                            contentScale = ContentScale.Fit,
+                            contentScale = if (cropLongPreview) ContentScale.Crop else ContentScale.Fit,
                             onOpenViewer = { index, bounds ->
                                 openImageViewer(index, bounds)
                             },
@@ -14710,6 +14721,10 @@ private fun FullscreenImageViewer(
                 scale = 1f,
             )
             val transition = transitionProgress.value.coerceIn(0f, 1f)
+            val openingLongImage = !transitionClosing && imageAspect < 0.5f &&
+                imageAspect < containerWidthPx / containerHeightPx
+            val openingWidth = if (openingLongImage) containerWidthPx else fitLayout.fitWidthPx
+            val openingHeight = if (openingLongImage) containerHeightPx else fitLayout.fitHeightPx
             val backdropAlpha = (1f - dragDismissProgress).coerceIn(0f, 1f)
             val morphWidth: Float
             val morphHeight: Float
@@ -14724,20 +14739,20 @@ private fun FullscreenImageViewer(
                     morphCenterX = lerp(targetBounds.center.x, morphSourceBounds.center.x, transition)
                     morphCenterY = lerp(targetBounds.center.y, morphSourceBounds.center.y, transition)
                 } else {
-                    morphWidth = lerp(morphSourceBounds.width, fitLayout.fitWidthPx, transition)
-                    morphHeight = lerp(morphSourceBounds.height, fitLayout.fitHeightPx, transition)
+                    morphWidth = lerp(morphSourceBounds.width, openingWidth, transition)
+                    morphHeight = lerp(morphSourceBounds.height, openingHeight, transition)
                     morphCenterX = lerp(morphSourceBounds.center.x, containerWidthPx / 2f, transition)
                     morphCenterY = lerp(morphSourceBounds.center.y, containerHeightPx / 2f, transition)
                 }
                 val coverScale = maxOf(
-                    morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
-                    morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
+                    morphWidth / openingWidth.coerceAtLeast(1f),
+                    morphHeight / openingHeight.coerceAtLeast(1f),
                 )
                 val containScale = minOf(
                     morphWidth / fitLayout.fitWidthPx.coerceAtLeast(1f),
                     morphHeight / fitLayout.fitHeightPx.coerceAtLeast(1f),
                 )
-                val useContainScale = !transitionClosing &&
+                val useContainScale = !transitionClosing && !openingLongImage &&
                     avoidOpeningCropForExtremeAspect &&
                     (imageAspect <= 0.7f || imageAspect >= 1.43f)
                 uniformScale = (if (useContainScale) containScale else coverScale)
@@ -14811,6 +14826,7 @@ private fun FullscreenImageViewer(
                     resolvedForViewer = true,
                     imageTransitionRunning = activeMorph,
                     transitionPreviewBitmap = initialTransitionBitmap.takeIf { page == initialIndex },
+                    openingLongImageProgress = transition.takeIf { activeMorph && openingLongImage },
                     transitionPreviewSize = if (activeMorph) androidx.compose.ui.geometry.Size(
                         morphWidth / uniformScale.coerceAtLeast(0.01f),
                         morphHeight / uniformScale.coerceAtLeast(0.01f),
@@ -15061,6 +15077,7 @@ private fun ZoomableFullscreenImage(
     imageTransitionRunning: Boolean = false,
     transitionPreviewBitmap: Bitmap? = null,
     transitionPreviewSize: androidx.compose.ui.geometry.Size? = null,
+    openingLongImageProgress: Float? = null,
     resolvedForViewer: Boolean = false,
     onDismiss: () -> Unit,
     onDismissFromBounds: (Rect) -> Unit = { onDismiss() },
@@ -15077,9 +15094,7 @@ private fun ZoomableFullscreenImage(
     val resolvedImage = remember(image, imageOwner, relatedPosts) {
         if (resolvedForViewer) image else resolveFeedImageForViewer(image, imageOwner, relatedPosts)
     }
-    var scale by remember(resolvedImage.largeUrl) { mutableFloatStateOf(1f) }
     var panOffsetX by remember(resolvedImage.largeUrl) { mutableFloatStateOf(0f) }
-    var panOffsetY by remember(resolvedImage.largeUrl) { mutableFloatStateOf(0f) }
     var dismissTranslationY by remember(resolvedImage.largeUrl) { mutableStateOf(0f) }
     var panInertiaJob by remember(resolvedImage.largeUrl) { mutableStateOf<Job?>(null) }
     var zoomAnimationJob by remember(resolvedImage.largeUrl) { mutableStateOf<Job?>(null) }
@@ -15110,8 +15125,6 @@ private fun ZoomableFullscreenImage(
         zoomAnimationJob?.cancel()
         zoomAnimationJob = null
         panOffsetX = 0f
-        panOffsetY = 0f
-        scale = 1f
         onBlockPagerScroll(false)
         onDragDismissProgress(0f)
         actionMenuOffset = null
@@ -15196,6 +15209,13 @@ private fun ZoomableFullscreenImage(
         val imageAspect = remember(layoutAspectRatio, loadedBitmap.width, loadedBitmap.height) {
             layoutAspectRatio ?: (loadedBitmap.width.toFloat() / loadedBitmap.height.coerceAtLeast(1).toFloat())
         }
+        val opensAtFullWidth = imageAspect < 0.5f && imageAspect < containerAspect
+        val initialScale = if (opensAtFullWidth) containerAspect / imageAspect else 1f
+        val initialPanY = computeFitImageLayout(
+            containerWidthPx, containerHeightPx, imageAspect, initialScale,
+        ).maxPanY
+        var scale by remember(resolvedImage.largeUrl, initialScale) { mutableFloatStateOf(initialScale) }
+        var panOffsetY by remember(resolvedImage.largeUrl, initialPanY) { mutableFloatStateOf(initialPanY) }
         val rawFillScreenScale = remember(containerAspect, imageAspect) {
             maxOf(imageAspect / containerAspect, containerAspect / imageAspect)
                 .coerceAtLeast(1f)
@@ -15336,7 +15356,7 @@ private fun ZoomableFullscreenImage(
                                 val distance = hypot(first.x - second.x, first.y - second.y)
                                 if (lastDistance > 0f) {
                                     val oldScale = gestureScale.coerceAtLeast(0.01f)
-                                    val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, maxZoomScale)
+                                    val newScale = (oldScale * (distance / lastDistance)).coerceIn(1f, maxOf(initialScale, maxZoomScale))
                                     gesturePanOffsetX = centroid.x - boxCenterX -
                                         (centroid.x - boxCenterX - gesturePanOffsetX) * (newScale / oldScale)
                                     gesturePanOffsetY = centroid.y - boxCenterY -
@@ -15645,15 +15665,18 @@ private fun ZoomableFullscreenImage(
                         contentDescription = null,
                         modifier = Modifier.align(Alignment.Center).size(
                             with(density) {
-                                (transitionPreviewSize?.width?.takeIf { loadedBitmap !== fullscreenBitmap }
+                                (transitionPreviewSize?.width?.takeIf { loadedBitmap !== fullscreenBitmap || openingLongImageProgress != null }
                                     ?: layoutFor(1f).fitWidthPx).toDp()
                             },
                             with(density) {
-                                (transitionPreviewSize?.height?.takeIf { loadedBitmap !== fullscreenBitmap }
+                                (transitionPreviewSize?.height?.takeIf { loadedBitmap !== fullscreenBitmap || openingLongImageProgress != null }
                                     ?: layoutFor(1f).fitHeightPx).toDp()
                             },
                         ),
-                        contentScale = if (loadedBitmap === fullscreenBitmap) ContentScale.Fit else ContentScale.Crop,
+                        alignment = openingLongImageProgress?.let { BiasAlignment(0f, -it) } ?: Alignment.Center,
+                        contentScale = if (loadedBitmap === fullscreenBitmap && openingLongImageProgress == null) {
+                            ContentScale.Fit
+                        } else ContentScale.Crop,
                     )
                 }
                 if (resolvedImage.isLivePhoto) {

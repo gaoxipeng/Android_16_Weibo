@@ -62,10 +62,12 @@ object ImageUrlResolver {
         image: FeedImage,
         quality: FeedThumbnailQuality,
     ): List<String> =
-        listOfNotNull(
+        (listOfNotNull(
             quality.displayUrl(image).takeIf { it.isNotBlank() },
             quality.fallbackUrl(image),
-        ).distinct()
+        ) + image.thumbnailUrl + image.largeUrl + image.downloadUrls)
+            .filter { it.isNotBlank() }
+            .distinct()
 
     fun fullscreenCandidates(image: FeedImage): List<String> {
         val highQuality = (image.downloadUrls + listOf(image.largeUrl))
