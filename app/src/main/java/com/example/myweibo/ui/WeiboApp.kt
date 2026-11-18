@@ -19136,12 +19136,7 @@ private fun DetailScreen(
             onSelectContentSection(section)
         }
     }
-    var commentTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
-    var repostTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
-    var likesTabCenter by remember(item.id) { mutableFloatStateOf(0f) }
-    var commentTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
-    var repostTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
-    var likesTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
+    val sectionTabBounds = remember(item.id) { mutableStateMapOf<Int, Rect>() }
     val commentVisibility = Modifier
     val showingReposts = detailPager.currentPage == 1
     val showingLikes = detailPager.currentPage == 2
@@ -19357,7 +19352,38 @@ private fun DetailScreen(
                     }
                 }
                 stickyHeader(key = "detail-section-header") {
-                    Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
+                    var headerCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+                    fun recordTabBounds(index: Int, coordinates: LayoutCoordinates) {
+                        val header = headerCoordinates?.takeIf { it.isAttached } ?: return
+                        val position = header.localPositionOf(coordinates, Offset.Zero)
+                        sectionTabBounds[index] = Rect(
+                            position,
+                            androidx.compose.ui.geometry.Size(coordinates.size.width.toFloat(), coordinates.size.height.toFloat()),
+                        )
+                    }
+                    val indicatorColor = MaterialTheme.colorScheme.primary
+                    Box(
+                        Modifier.fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.surface)
+                            .onPlaced { headerCoordinates = it }
+                            .drawWithContent {
+                                drawContent()
+                                val leftIndex = visualTabProgress.toInt().coerceAtMost(1)
+                                val start = sectionTabBounds[leftIndex] ?: return@drawWithContent
+                                val end = sectionTabBounds[leftIndex + 1] ?: return@drawWithContent
+                                val fraction = visualTabProgress - leftIndex
+                                val height = 3.dp.toPx()
+                                drawRoundRect(
+                                    color = indicatorColor,
+                                    topLeft = Offset(
+                                        lerp(start.left, end.left, fraction),
+                                        lerp(start.bottom, end.bottom, fraction) + 1.dp.toPx(),
+                                    ),
+                                    size = androidx.compose.ui.geometry.Size(lerp(start.width, end.width, fraction), height),
+                                    cornerRadius = CornerRadius(height / 2f),
+                                )
+                            },
+                    ) {
                     Row(
                         modifier = Modifier
                             .onGloballyPositioned {
@@ -19371,23 +19397,20 @@ private fun DetailScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         DetailSectionTab("评论 ${item.commentsCount}", !showingReposts && !showingLikes,
-                            onWidthChanged = { commentTabWidth = it },
                             onLongClick = { onComposeComment?.invoke(item, null) },
-                            onCenterChanged = { commentTabCenter = it }) {
+                            onPositioned = { recordTabBounds(0, it) }) {
                             selectPagerSection(DetailContentSection.Comments)
                         }
                         Spacer(Modifier.width(20.dp))
                         DetailSectionTab("转发 ${item.repostsCount}", showingReposts,
                             onLongClick = { repostComposer?.invoke(item) },
-                            onWidthChanged = { repostTabWidth = it },
-                            onCenterChanged = { repostTabCenter = it }) {
+                            onPositioned = { recordTabBounds(1, it) }) {
                             selectPagerSection(DetailContentSection.Reposts)
                         }
                         Spacer(Modifier.width(20.dp))
                         DetailSectionTab("赞 ${item.likesCount}", showingLikes,
                             onLongClick = { onToggleLike?.invoke(item) },
-                            onWidthChanged = { likesTabWidth = it },
-                            onCenterChanged = { likesTabCenter = it },
+                            onPositioned = { recordTabBounds(2, it) },
                             liked = item.liked,
                             showLikeIcon = true) {
                             selectPagerSection(DetailContentSection.Likes)
@@ -19402,25 +19425,6 @@ private fun DetailScreen(
                             }
                         }
                     }
-                    val indicatorDensity = LocalDensity.current
-                    val indicatorProgress = if (visualTabProgress <= 1f) visualTabProgress else visualTabProgress - 1f
-                    val indicatorWidthPx = if (visualTabProgress <= 1f) {
-                        lerp(commentTabWidth, repostTabWidth, indicatorProgress)
-                    } else {
-                        lerp(repostTabWidth, likesTabWidth, indicatorProgress)
-                    }
-                    val indicatorCenter = if (visualTabProgress <= 1f) {
-                        lerp(commentTabCenter, repostTabCenter, indicatorProgress)
-                    } else {
-                        lerp(repostTabCenter, likesTabCenter, indicatorProgress)
-                    }
-                    Box(Modifier.align(Alignment.BottomStart)
-                        .offset { IntOffset(
-                            (indicatorCenter - indicatorWidthPx / 2f).roundToInt(),
-                            -with(indicatorDensity) { 7.dp.toPx() }.roundToInt(),
-                        ) }
-                        .width(with(indicatorDensity) { indicatorWidthPx.toDp() }).height(3.dp)
-                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(50)))
                     }
                 }
 
@@ -19655,14 +19659,11 @@ private fun DetailScreen(
 }
 
 @Composable
-private fun DetailSectionTab(label: String, selected: Boolean, onWidthChanged: (Float) -> Unit,
-    onLongClick: (() -> Unit)? = null, onCenterChanged: (Float) -> Unit,
+private fun DetailSectionTab(label: String, selected: Boolean, onPositioned: (LayoutCoordinates) -> Unit,
+    onLongClick: (() -> Unit)? = null,
     liked: Boolean = false, showLikeIcon: Boolean = false, onClick: () -> Unit) {
     Column(
-        modifier = Modifier.onPlaced {
-            onCenterChanged(it.positionInParent().x + it.size.width / 2f)
-            onWidthChanged(it.size.width.toFloat())
-        }.combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(vertical = 3.dp),
+        modifier = Modifier.onPlaced(onPositioned).combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(vertical = 3.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
