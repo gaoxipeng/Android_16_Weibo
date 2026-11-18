@@ -649,7 +649,7 @@ class WeiboWebSession(context: Context) {
                 "isGetLongText" to "1",
             ),
         )
-        return WeiboJsonParser.parseStatusDetail(raw)
+        return withContext(Dispatchers.Default) { WeiboJsonParser.parseStatusDetail(raw) }
     }
 
     private suspend fun loadVoteBootstrap(voteId: String): JSONObject {

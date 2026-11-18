@@ -189,6 +189,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.runtime.DisposableEffect
 import androidx.lifecycle.Lifecycle
@@ -198,6 +199,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -221,7 +223,6 @@ import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.border
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeStyle
@@ -240,6 +241,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.luminance
@@ -248,6 +250,9 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.inset
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.graphics.graphicsLayer
 import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.highlight.Highlight
@@ -306,6 +311,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.TextRange
@@ -1204,6 +1210,11 @@ private const val NavTransitionDurationMs = 280
 private val NavPageMotionEasing = CubicBezierEasing(0.18f, 0.72f, 0.22f, 1f)
 private const val DetailTransitionDurationMs = 250
 private const val DetailEntryDurationMs = 200
+private const val BodyLinkPlaceholderPrefix = "body-link-loading:"
+private const val ProfileCardSlideHeightFraction = 1.5f
+private const val ProfileCardSlideLinkCount = 10
+private const val ProfileCardSlideTextLength = 1000
+private val ProfileCardWebLink = Regex("https?://", RegexOption.IGNORE_CASE)
 private const val DetailReturnDurationMs = DetailTransitionDurationMs
 // Reach most of the travel early, leaving a gentler, longer deceleration tail.
 private val DetailMotionEasing = CubicBezierEasing(0.20f, 0.68f, 0.30f, 1f)
@@ -1248,6 +1259,8 @@ private fun <T> NavAnimatedOverlay(
     visible: Boolean? = null,
     stackAnimated: Boolean = true,
     immediateEnter: Boolean = false,
+    preparePageEnter: Boolean = false,
+    quickPageSwipeReturn: Boolean = false,
     navKind: NavOverlayKind? = null,
     pendingEnterKind: NavOverlayKind? = null,
     pendingExitKind: NavOverlayKind? = null,
@@ -1263,6 +1276,7 @@ private fun <T> NavAnimatedOverlay(
     interceptRightSwipe: Boolean = false,
     swipeNavigationEnabled: Boolean = true,
     commitCardReturn: Boolean = false,
+    commitPageReturn: Boolean = false,
     onSwipeReturnCommit: () -> Unit = {},
     onSourceCardHandoffReady: () -> Unit = {},
     onClearPendingEnter: () -> Unit = {},
@@ -1276,17 +1290,20 @@ private fun <T> NavAnimatedOverlay(
     val navTransitions = LocalNavTransitionCoordinator.current
     val pageBack = onSwipeBack ?: LocalPageSwipeBack.current
     val latestPageBack by rememberUpdatedState(pageBack)
+    val latestClearPendingEnter by rememberUpdatedState(onClearPendingEnter)
     val latestSwipeReturnCommit by rememberUpdatedState(onSwipeReturnCommit)
     val latestSourceCardHandoffReady by rememberUpdatedState(onSourceCardHandoffReady)
     val latestNestedDetailReturnAnimating by rememberUpdatedState(nestedDetailReturnAnimating)
     val swipeScope = rememberCoroutineScope()
-    // A returning profile leaves gesture values in this retained host.
-    // Reset during composition, not in LaunchedEffect after its first draw.
-    val profileGestureIdentity = animationKey.takeIf { navKind is NavOverlayKind.VisitedProfile }
-    var swipeOffset by remember(profileGestureIdentity) { mutableFloatStateOf(0f) }
-    var swipeSettling by remember(profileGestureIdentity) { mutableStateOf(false) }
-    var swipeCommitted by remember(profileGestureIdentity) { mutableStateOf(false) }
-    var swipeCardReturn by remember(profileGestureIdentity) { mutableFloatStateOf(0f) }
+    val gestureIdentity = animationKey.takeIf {
+        navKind is NavOverlayKind.VisitedProfile || navKind is NavOverlayKind.Detail
+    }
+    var swipeOffset by remember(gestureIdentity) { mutableFloatStateOf(0f) }
+    var swipeSettling by remember(gestureIdentity) { mutableStateOf(false) }
+    var swipeCommitted by remember(gestureIdentity) { mutableStateOf(false) }
+    var swipeCardReturn by remember(gestureIdentity) { mutableFloatStateOf(0f) }
+    val isSwiping by remember(gestureIdentity) { derivedStateOf { swipeOffset > 0f || swipeSettling } }
+    val isReturningCard by remember(gestureIdentity) { derivedStateOf { swipeCardReturn > 0f } }
     val sourceHandoffBitmap = remember(sourceReturnImage) {
         sourceReturnImage?.takeUnless { it.isRecycled }?.asImageBitmap()
     }
@@ -1305,7 +1322,7 @@ private fun <T> NavAnimatedOverlay(
     val avVisible = target != null || overlayVisible
     val transitionIdentity = animationKey ?: target
     var detailExitHandoffHold by remember(transitionIdentity) { mutableStateOf(false) }
-    var entrySnapshotProgress by remember(transitionIdentity) { mutableFloatStateOf(0f) }
+    var entrySnapshotProgress by remember(transitionIdentity) { mutableStateOf<() -> Float>({ 0f }) }
     val nestedCardEntry = remember(transitionIdentity) {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
             pendingEnterKind is NavOverlayKind.Detail && previousDetailIdentity != null &&
@@ -1351,9 +1368,30 @@ private fun <T> NavAnimatedOverlay(
         swipeSettling = true
         playCommittedCardReturn()
     }
+    suspend fun playCommittedPageReturn() {
+        swipeSettling = true
+        // Match the interactive page return: finish sliding before popping, so
+        // restoring an older detail under the profile cannot animate this one again.
+        animate(
+            initialValue = swipeOffset,
+            targetValue = overlayWidth.toFloat(),
+            animationSpec = tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
+        ) { offset, _ ->
+            swipeOffset = offset
+            navTransitions.setStandardPageUnderlayOffset(
+                -0.25f * (1f - offset / overlayWidth).coerceIn(0f, 1f),
+            )
+        }
+        swipeCommitted = true
+        latestPageBack?.invoke()
+    }
+    LaunchedEffect(commitPageReturn, transitionIdentity) {
+        if (!commitPageReturn || swipeSettling || swipeCommitted) return@LaunchedEffect
+        playCommittedPageReturn()
+    }
     val swipeEnabled = swipeNavigationEnabled && stackTop && overlayVisible && navKind != null && pageBack != null &&
-        pendingEnterKind == null && pendingExitKind == null && !commitCardReturn
-    val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity, interceptRightSwipe) {
+        pendingEnterKind == null && pendingExitKind == null && !commitCardReturn && !commitPageReturn
+    val swipeModifier = Modifier.pointerInput(swipeEnabled, transitionIdentity, interceptRightSwipe, quickPageSwipeReturn) {
         if (!swipeEnabled) return@pointerInput
         awaitEachGesture {
             val gesturePass = if (interceptRightSwipe) PointerEventPass.Initial else PointerEventPass.Main
@@ -1404,12 +1442,16 @@ private fun <T> NavAnimatedOverlay(
             }
             if (dragging) {
                 val velocity = tracker.calculateVelocity().x
-                val commit = released && (swipeOffset > overlayWidth * 0.32f ||
+                val commitFraction = if (quickPageSwipeReturn) 0.24f else 0.32f
+                val commit = released && (swipeOffset > overlayWidth * commitFraction ||
                     (swipeOffset > viewConfiguration.touchSlop * 3 && velocity > 900f))
                 swipeSettling = true
                 swipeScope.launch {
                     if (commit && sourceBounds != null) {
                         playCommittedCardReturn()
+                        return@launch
+                    } else if (commit && navKind is NavOverlayKind.Detail) {
+                        playCommittedPageReturn()
                         return@launch
                     } else if (!commit) {
                         val startOffset = swipeOffset
@@ -1424,8 +1466,8 @@ private fun <T> NavAnimatedOverlay(
                         }
                     } else animate(
                         initialValue = swipeOffset,
-                        targetValue = if (commit) overlayWidth.toFloat() else 0f,
-                        animationSpec = tween(180, easing = FastOutSlowInEasing),
+                        targetValue = overlayWidth.toFloat(),
+                        animationSpec = tween(if (quickPageSwipeReturn) 120 else 180, easing = FastOutSlowInEasing),
                     ) { value, _ ->
                         swipeOffset = value
                         if (navKind is NavOverlayKind.Detail && sourceBounds == null ||
@@ -1483,7 +1525,7 @@ private fun <T> NavAnimatedOverlay(
     var skipAnimationToken by remember { mutableIntStateOf(0) }
     // 进入/退出动画在 identity 或 pendingExit 生命周期内锁定，避免中途 effectiveEnter/Exit 变 None 导致动画被掐断。
     val effectiveEnter = remember(transitionIdentity, skipAnimationToken, pendingEnterKind) {
-        if (immediateEnter || sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
+        if (immediateEnter || preparePageEnter || sourceBounds != null && navKind is NavOverlayKind.Detail) EnterTransition.None
         else if (wantsEnterAnimation && navKind is NavOverlayKind.Detail) slideInHorizontally(
             animationSpec = tween(DetailEntryDurationMs, easing = DetailEntryEasing),
             initialOffsetX = { it },
@@ -1539,7 +1581,7 @@ private fun <T> NavAnimatedOverlay(
         if (enteredKeys.size > 8) {
             enteredKeys.keys.firstOrNull { it != transitionIdentity }?.let(enteredKeys::remove)
         }
-        if (navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
+        if (!preparePageEnter && navKind != null && navOverlayKindsMatch(pendingEnterKind, navKind)) {
             onClearPendingEnter()
         }
     }
@@ -1547,8 +1589,7 @@ private fun <T> NavAnimatedOverlay(
     val isExiting = isAnimating && !transitionState.targetState
     val zIndex = when {
         navKind is NavOverlayKind.Detail && sourceBounds != null &&
-            (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f || swipeSettling ||
-                swipeCardReturn > 0f || commitCardReturn) ->
+            (pendingExitKind is NavOverlayKind.Detail || isSwiping || isReturningCard || commitCardReturn) ->
             sourceReturnZIndex ?: 90f
         isExiting -> NavOverlayExitZIndex
         stackTop -> NavOverlayTopZIndex
@@ -1633,18 +1674,21 @@ private fun <T> NavAnimatedOverlay(
     }
     if (navKind is NavOverlayKind.Detail && overlayVisible) {
         parentTarget?.let { parent ->
-            Box(Modifier.fillMaxSize()) { content(parent) }
+            Box(Modifier.fillMaxSize()) {
+                CompositionLocalProvider(LocalDetailTransitionBackdrop provides true) { content(parent) }
+            }
         }
     }
     // Use the same background as the full detail page, including while a
     // cancelled gesture settles to zero. The opaque endpoints then match.
     if (overlayVisible && navKind is NavOverlayKind.Detail &&
-        (swipeOffset > 0f || swipeSettling) && !swipeCommitted) {
-        val scrimAlpha = (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f) *
-            (1f - swipeCardReturn).coerceIn(0f, 1f)
-        Box(Modifier.fillMaxSize().background(
-            MaterialTheme.colorScheme.background.copy(alpha = scrimAlpha),
-        ))
+        isSwiping && !swipeCommitted && parentTarget == null) {
+        val scrimColor = MaterialTheme.colorScheme.background
+        Canvas(Modifier.fillMaxSize()) {
+            val alpha = (1f - swipeOffset / overlayWidth).coerceIn(0f, 1f) *
+                (1f - swipeCardReturn).coerceIn(0f, 1f)
+            drawRect(scrimColor, alpha = alpha)
+        }
     }
     AnimatedVisibility(
         visibleState = transitionState,
@@ -1657,8 +1701,26 @@ private fun <T> NavAnimatedOverlay(
             transitionSpec = { tween(NavTransitionDurationMs, easing = NavPageMotionEasing) },
             label = "nav-page-motion-progress",
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
-        LaunchedEffect(standardDetailStackMotion, standardProfileStackExit, transitionIdentity, shouldAnimateExit) {
-            if (!standardDetailStackMotion && !standardProfileStackExit) return@LaunchedEffect
+        val preparedEnterOffset = remember(transitionIdentity) { Animatable(if (preparePageEnter) 1f else 0f) }
+        var preparedPageLaidOut by remember(transitionIdentity) { mutableStateOf(false) }
+        LaunchedEffect(preparePageEnter, transitionIdentity, preparedPageLaidOut) {
+            if (!preparePageEnter || !preparedPageLaidOut) return@LaunchedEffect
+            navTransitions.onTransitionStart()
+            try {
+                // The live detail is already measured offscreen. Give it a drawn frame
+                // before moving it and the underlying profile in the same animation.
+                withFrameNanos { }
+                withFrameNanos { }
+                preparedEnterOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = NavPageMotionEasing)) {
+                    navTransitions.setStandardPageUnderlayOffset(-0.25f * (1f - value))
+                }
+                latestClearPendingEnter()
+            } finally {
+                navTransitions.onTransitionEnd()
+            }
+        }
+        LaunchedEffect(standardDetailStackMotion, standardProfileStackExit, transitionIdentity, shouldAnimateExit, preparePageEnter) {
+            if (preparePageEnter || !standardDetailStackMotion && !standardProfileStackExit) return@LaunchedEffect
             // The interactive pop already brought the underlay all the way to zero.
             // Do not restart its automatic -25% -> 0 motion after the finger releases.
             if (swipeCommitted) return@LaunchedEffect
@@ -1682,26 +1744,32 @@ private fun <T> NavAnimatedOverlay(
             },
             label = "card-detail-reveal",
         ) { state -> if (state == androidx.compose.animation.EnterExitState.Visible) 1f else 0f }
-        val pageReveal = if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
-        SideEffect { entrySnapshotProgress = pageReveal }
-        val returningPage = pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f ||
-            swipeSettling || (commitCardReturn && sourceBounds != null && !swipeCommitted)
+        fun pageReveal(): Float =
+            if (sourceBounds != null) revealProgress * nestedCardProgress.value * (1f - swipeCardReturn) else 1f
+        val returningPage = pendingExitKind is NavOverlayKind.Detail || isSwiping ||
+            (commitCardReturn && sourceBounds != null && !swipeCommitted)
+        // Return motion only changes how the viewport is drawn. Keep its rich text
+        // and inline link layout independent of the frame-by-frame animation state.
+        val entryReveal: () -> Float = if (returningPage) ({ 1f }) else ::pageReveal
+        SideEffect { entrySnapshotProgress = entryReveal }
         val returnSnapshot = remember(sourceReturnImage) { sourceReturnImage?.asImageBitmap() }
         // The original feed card is hidden as navigation starts. Keep its
         // captured pixels in place until the detail card is laid out, then hand
         // off only the opening moments of the existing card motion.
-        val sourceHandoff = if (!returningPage && sourceBounds != null && returnSnapshot != null) {
-            detailEntrySnapshotAlpha(pageReveal, returnCardLayout.value != null)
+        fun sourceHandoff(): Float = if (!returningPage && sourceBounds != null && returnSnapshot != null) {
+            detailEntrySnapshotAlpha(entryReveal(), returnCardLayout.value != null)
         } else 0f
         // Keep the complete viewport (including comments) during interactive drag.
         // Only hand off the source-card pixels once return has been committed.
-        val sourceLayoutHandoff = if (returningPage && !nestedDetailReturnAnimating &&
-            (pendingExitKind is NavOverlayKind.Detail || swipeCardReturn > 0f)) {
+        fun sourceLayoutHandoff(): Float = if (returningPage && !nestedDetailReturnAnimating &&
+            (pendingExitKind is NavOverlayKind.Detail || isReturningCard)) {
             val start = if (quickSourceReturnHandoff) 0.72f else 0.35f
             val duration = if (quickSourceReturnHandoff) 0.14f else 0.50f
-            ((1f - pageReveal - start) / duration).coerceIn(0f, 1f)
+            ((1f - pageReveal() - start) / duration).coerceIn(0f, 1f)
         } else 0f
-        Box(Modifier.fillMaxSize().graphicsLayer {
+        Box(Modifier.fillMaxSize().onGloballyPositioned {
+            if (preparePageEnter) preparedPageLaidOut = true
+        }.graphicsLayer {
             alpha = if (swipeCommitted || detailExitHandoffHold) 0f else 1f
             val swipeProgress = (swipeOffset / overlayWidth).coerceIn(0f, 1f)
             val bounds = sourceBounds
@@ -1710,7 +1778,7 @@ private fun <T> NavAnimatedOverlay(
                 // scrolled into comments. Never warp text or remove its contents.
                 transformOrigin = TransformOrigin(0f, 0f)
                 val amount = if (returningPage) {
-                    detailCardReturnAmount(pageReveal)
+                    detailCardReturnAmount(pageReveal())
                 } else 0f
                 val width = bounds.width.coerceAtLeast(1f)
                 val height = bounds.height.coerceAtLeast(1f)
@@ -1740,12 +1808,13 @@ private fun <T> NavAnimatedOverlay(
                 }
                 clip = true
             } else {
-                translationX = swipeOffset
+                translationX = swipeOffset + if (preparePageEnter) size.width * preparedEnterOffset.value else 0f
                 shape = RoundedCornerShape((18f * swipeProgress).dp)
                 clip = false
             }
         }.drawWithContent {
             drawContent()
+            val sourceLayoutHandoff = sourceLayoutHandoff()
             if (sourceLayoutHandoff > 0f && returnSnapshot != null && sourceBounds != null) {
                 // Never clear the rest of the detail card to white. The source
                 // occupies only its own bounds while the viewport crop contracts.
@@ -1761,11 +1830,11 @@ private fun <T> NavAnimatedOverlay(
         CompositionLocalProvider(
             LocalHorizontalSwipeExclusionRegistry provides horizontalSwipeExclusions,
             LocalDetailReturnCardLayout provides returnCardLayout,
-            LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || swipeOffset > 0f ||
-                swipeSettling || commitCardReturn),
-            LocalDetailPageReveal provides if (returningPage) 1f else pageReveal.coerceIn(0f, 1f),
+            LocalDetailExitStarted provides (pendingExitKind is NavOverlayKind.Detail || isSwiping || commitCardReturn),
+            LocalDetailPageReveal provides entryReveal,
+            LocalDeferDetailUrlLinks provides preparePageEnter,
             LocalDetailCardMotion provides sourceBounds?.takeUnless { returningPage }?.let {
-                DetailCardMotion(it, pageReveal, swipeOffset * (1f - swipeCardReturn), sourceHandoff)
+                DetailCardMotion(it, entryReveal, ::sourceHandoff)
             },
         ) {
         if (navKind is NavOverlayKind.Detail && transitionIdentity != null) {
@@ -1774,7 +1843,7 @@ private fun <T> NavAnimatedOverlay(
                 transitionSpec = {
                     if (swipeCommitted) {
                         EnterTransition.None togetherWith ExitTransition.None
-                    } else if (nestedCardEntry) {
+                    } else if (nestedCardEntry || preparePageEnter) {
                         EnterTransition.None togetherWith ExitTransition.None
                     } else if (nestedDetailReturnAnimating && pendingExitKind is NavOverlayKind.Detail) {
                         (EnterTransition.None togetherWith slideOutHorizontally(
@@ -1829,10 +1898,10 @@ private fun <T> NavAnimatedOverlay(
     if (navKind is NavOverlayKind.Detail && overlayVisible &&
         navOverlayKindsMatch(pendingEnterKind, navKind) &&
         sourceBounds != null && sourceImage != null && !sourceImage.isRecycled) {
-        val handoff = detailEntrySnapshotAlpha(entrySnapshotProgress, returnCardLayout.value != null)
-        if (handoff > 0f) {
-            val capturedCard = remember(sourceImage) { sourceImage.asImageBitmap() }
-            Canvas(Modifier.matchParentSize()) {
+        val capturedCard = remember(sourceImage) { sourceImage.asImageBitmap() }
+        Canvas(Modifier.matchParentSize()) {
+            val handoff = detailEntrySnapshotAlpha(entrySnapshotProgress(), returnCardLayout.value != null)
+            if (handoff > 0f) {
                 drawImage(capturedCard, topLeft = Offset(
                     sourceBounds.left.coerceAtLeast(0f) - overlayOrigin.x,
                     sourceBounds.top.coerceAtLeast(0f) - overlayOrigin.y,
@@ -2393,7 +2462,22 @@ private class VideoPlaybackCoordinator {
     }
 }
 
+private class VisitedProfileMount(
+    val postsList: LazyListState = LazyListState(),
+    val albumList: LazyListState = LazyListState(),
+    val separateRetainedUi: MutableMap<String, ProfileRetainedUi>? = null,
+) {
+    val content = movableContentOf<@Composable () -> Unit> { body -> body() }
+}
+
 private data class VisitedProfileSnapshot(
+    val mount: VisitedProfileMount,
+    val loading: Boolean,
+    val postsLoadingMore: Boolean,
+    val albumLoading: Boolean,
+    val albumLoadingMore: Boolean,
+    val albumError: String?,
+    val followLoading: Boolean,
     val userId: String?,
     val screenName: String,
     val profile: UserProfile?,
@@ -2622,6 +2706,7 @@ private fun upgradeWeiboWebUrl(url: String): String {
 
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalProfileInlineVideoPlayback = staticCompositionLocalOf { false }
+private val LocalProfileUnderlay = staticCompositionLocalOf { false }
 private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
@@ -3276,13 +3361,21 @@ private fun Modifier.excludeParentHorizontalSwipe(key: Any): Modifier {
         registry.update(key, coordinates.boundsInRoot())
     }
 }
-private data class DetailCardMotion(val source: Rect, val progress: Float, val pageX: Float, val sourceHandoff: Float)
+private data class DetailCardMotion(val source: Rect, val progress: () -> Float, val sourceHandoff: () -> Float)
 private val LocalDetailCardMotion = staticCompositionLocalOf<DetailCardMotion?> { null }
 private val LocalDetailReturnCardLayout = staticCompositionLocalOf<androidx.compose.runtime.MutableState<Rect?>?> { null }
-private val LocalDetailPageReveal = staticCompositionLocalOf { 1f }
+private val LocalDetailPageReveal = staticCompositionLocalOf<() -> Float> { { 1f } }
 private val LocalDetailExitStarted = staticCompositionLocalOf { false }
-private val LocalHiddenFeedCardId = staticCompositionLocalOf<String?> { null }
+private val LocalDeferDetailUrlLinks = compositionLocalOf { false }
+private val LocalDetailTransitionBackdrop = compositionLocalOf { false }
+private val LocalHiddenFeedCardId = staticCompositionLocalOf<() -> String?> { { null } }
 private val LocalHiddenCardBackdrop = staticCompositionLocalOf<LayerBackdrop?> { null }
+
+@Composable
+private fun isHiddenDetailSource(itemId: String): Boolean {
+    val hiddenId = LocalHiddenFeedCardId.current
+    return remember(hiddenId, itemId) { derivedStateOf { hiddenId() == itemId } }.value
+}
 
 private fun Modifier.detailSourceVisibility(hidden: Boolean, backdrop: LayerBackdrop?): Modifier =
     when {
@@ -3633,7 +3726,8 @@ private fun emojiInlineContent(
 
 private fun urlLinkIconInlineContent(
     size: TextUnit,
-    color: Color,
+    painter: androidx.compose.ui.graphics.painter.Painter,
+    tint: ColorFilter,
 ): InlineTextContent =
     InlineTextContent(
         Placeholder(
@@ -3642,15 +3736,14 @@ private fun urlLinkIconInlineContent(
             placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
         ),
     ) {
-        Icon(
-            imageVector = Icons.Outlined.Link,
-            contentDescription = null,
-            tint = color,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(1.dp)
-                .rotate(135f),
-        )
+        Canvas(Modifier.fillMaxSize()) {
+            val padding = 1.dp.toPx().coerceAtMost(this.size.minDimension / 2f)
+            inset(padding) {
+                rotate(135f) {
+                    with(painter) { draw(size = this@rotate.size, colorFilter = tint) }
+                }
+            }
+        }
     }
 
 private fun mentionInlineContent(
@@ -4125,8 +4218,9 @@ fun WeiboApp() {
     val homeThumbnailStore = remember { HomeThumbnailStore() }
     val minePostsListState = rememberLazyListState()
     val mineAlbumListState = rememberLazyListState()
-    val visitedPostsListState = rememberLazyListState()
-    val visitedAlbumListState = rememberLazyListState()
+    var visitedProfileMount by remember { mutableStateOf(VisitedProfileMount()) }
+    val visitedPostsListState by remember { derivedStateOf { visitedProfileMount.postsList } }
+    val visitedAlbumListState by remember { derivedStateOf { visitedProfileMount.albumList } }
     val followListFollowingListState = rememberLazyListState()
     val followListFansListState = rememberLazyListState()
     val searchListState = rememberLazyListState()
@@ -4243,6 +4337,9 @@ fun WeiboApp() {
     var detailScrollPending by remember { mutableStateOf<Pair<String, ScrollRestore>?>(null) }
     var detailScrollRestoreToken by remember { mutableIntStateOf(0) }
     var activeDetailInstanceKey by remember { mutableIntStateOf(0) }
+    var nextDetailInstanceKey by remember { mutableIntStateOf(0) }
+    var preparedDetailEntryKey by remember { mutableStateOf<Int?>(null) }
+    val bodyLinkDetails = remember { android.util.LruCache<List<String>, FeedItem>(16) }
     var activeDetailSourceBounds by remember { mutableStateOf<Rect?>(null) }
     var activeDetailSourceImage by remember { mutableStateOf<Bitmap?>(null) }
     var activeDetailSourceReturnImage by remember { mutableStateOf<Bitmap?>(null) }
@@ -4367,10 +4464,19 @@ fun WeiboApp() {
     // Detail content can leave composition while a profile overlay is shown.
     // Keep each detail's outer and section list states above that overlay so
     // returning does not recreate them at item zero.
-    val detailOuterListStates = remember { mutableMapOf<String, LazyListState>() }
-    val detailCommentsListStates = remember { mutableMapOf<String, LazyListState>() }
-    val detailRepostsListStates = remember { mutableMapOf<String, LazyListState>() }
-    val detailLikesListStates = remember { mutableMapOf<String, LazyListState>() }
+    val detailOuterListStates = remember { mutableMapOf<Int, LazyListState>() }
+    val detailCommentsListStates = remember { mutableMapOf<Int, LazyListState>() }
+    val detailRepostsListStates = remember { mutableMapOf<Int, LazyListState>() }
+    val detailLikesListStates = remember { mutableMapOf<Int, LazyListState>() }
+    LaunchedEffect(navStack, activeDetailInstanceKey, selectedItem?.id, navExitPendingKind, pendingDeferredNavRestore) {
+        if (navExitPendingKind != null || pendingDeferredNavRestore != null) return@LaunchedEffect
+        val retainedKeys = navStack.mapNotNull { it.detail?.instanceKey }.toMutableSet()
+        if (selectedItem != null) retainedKeys.add(activeDetailInstanceKey)
+        detailOuterListStates.keys.retainAll(retainedKeys)
+        detailCommentsListStates.keys.retainAll(retainedKeys)
+        detailRepostsListStates.keys.retainAll(retainedKeys)
+        detailLikesListStates.keys.retainAll(retainedKeys)
+    }
     var detailLikesListGeneration by remember { mutableIntStateOf(0) }
     val retainedLikeUsersByStatus = remember { mutableStateMapOf<String, RetainedLikeUsersState>() }
     var mineProfile by remember { mutableStateOf<UserProfile?>(null) }
@@ -4424,12 +4530,11 @@ fun WeiboApp() {
         Animatable(if (navEnterPendingKind is NavOverlayKind.VisitedProfile) 1f else 0f)
     }
     var profileReturnBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    val profileParentBackdrops = remember { mutableStateMapOf<Int, Bitmap>() }
     var profileReturnCapturing by remember { mutableStateOf(false) }
     val profileReturnProgress = remember { Animatable(0f) }
     var albumDetailSwipeReturn by remember { mutableStateOf(false) }
     var profileEntryLaidOut by remember(visitedProfileLoadGeneration) { mutableStateOf(false) }
-    var visitedListScrollResetGeneration by remember { mutableIntStateOf(-1) }
+    var nestedProfileReturnRunning by remember { mutableStateOf(false) }
     var lastHomeBackPressAt by remember { mutableStateOf(0L) }
     var exitHintVisible by remember { mutableStateOf(false) }
     var exitHintToken by remember { mutableIntStateOf(0) }
@@ -4566,6 +4671,13 @@ fun WeiboApp() {
     fun currentVisitedProfileSnapshot(): VisitedProfileSnapshot? {
         if (visitedUserId == null && visitedProfile == null) return null
         return VisitedProfileSnapshot(
+            mount = visitedProfileMount,
+            loading = visitedProfileLoading,
+            postsLoadingMore = visitedPostsLoadingMore,
+            albumLoading = visitedAlbumLoading,
+            albumLoadingMore = visitedAlbumLoadingMore,
+            albumError = visitedAlbumError,
+            followLoading = visitedFollowLoading,
             userId = visitedUserId,
             screenName = visitedUserScreenName,
             profile = visitedProfile,
@@ -4584,29 +4696,31 @@ fun WeiboApp() {
     }
 
     fun restoreVisitedProfileScroll(snapshot: VisitedProfileSnapshot) {
+        val postsState = visitedPostsListState
+        val albumState = visitedAlbumListState
         scope.launch {
             var attempts = 0
-            while (attempts < 24 && visitedPostsListState.layoutInfo.totalItemsCount == 0) {
+            while (attempts < 24 && postsState.layoutInfo.totalItemsCount == 0) {
                 delay(16)
                 attempts++
             }
-            if (visitedPostsListState.firstVisibleItemIndex != snapshot.postsScrollIndex ||
-                visitedPostsListState.firstVisibleItemScrollOffset != snapshot.postsScrollOffset
+            if (postsState.firstVisibleItemIndex != snapshot.postsScrollIndex ||
+                postsState.firstVisibleItemScrollOffset != snapshot.postsScrollOffset
             ) {
                 runCatching {
-                    visitedPostsListState.scrollToItem(snapshot.postsScrollIndex, snapshot.postsScrollOffset)
+                    postsState.scrollToItem(snapshot.postsScrollIndex, snapshot.postsScrollOffset)
                 }
             }
             attempts = 0
-            while (attempts < 24 && visitedAlbumListState.layoutInfo.totalItemsCount == 0) {
+            while (attempts < 24 && albumState.layoutInfo.totalItemsCount == 0) {
                 delay(16)
                 attempts++
             }
-            if (visitedAlbumListState.firstVisibleItemIndex != snapshot.albumScrollIndex ||
-                visitedAlbumListState.firstVisibleItemScrollOffset != snapshot.albumScrollOffset
+            if (albumState.firstVisibleItemIndex != snapshot.albumScrollIndex ||
+                albumState.firstVisibleItemScrollOffset != snapshot.albumScrollOffset
             ) {
                 runCatching {
-                    visitedAlbumListState.scrollToItem(snapshot.albumScrollIndex, snapshot.albumScrollOffset)
+                    albumState.scrollToItem(snapshot.albumScrollIndex, snapshot.albumScrollOffset)
                 }
             }
         }
@@ -4615,17 +4729,18 @@ fun WeiboApp() {
     fun restoreVisitedProfileSnapshot(
         snapshot: VisitedProfileSnapshot,
         incrementGeneration: Boolean = true,
+        retainMount: Boolean = false,
     ) {
         visitedAlbumJob?.cancel()
-        if (!incrementGeneration && snapshot.userId != visitedUserId) {
-            // Ignore outstanding requests for the page being left after a stack pop.
+        val switchingProfiles = incrementGeneration || snapshot.userId != visitedUserId
+        if (switchingProfiles) {
+            // Isolate the incoming layout from the previous profile's scroll and requests.
             visitedProfileLoadGeneration += 1
-        }
-        if (incrementGeneration) {
-            visitedProfileLoadGeneration += 1
-            visitedListScrollResetGeneration = visitedProfileLoadGeneration
-        } else {
-            visitedListScrollResetGeneration = visitedProfileLoadGeneration
+            visitedProfileMount = if (retainMount) snapshot.mount else VisitedProfileMount(
+                postsList = LazyListState(snapshot.postsScrollIndex, snapshot.postsScrollOffset),
+                albumList = LazyListState(snapshot.albumScrollIndex, snapshot.albumScrollOffset),
+                separateRetainedUi = snapshot.mount.separateRetainedUi,
+            )
         }
         val sameProfileContext = !incrementGeneration &&
             snapshot.userId == visitedUserId &&
@@ -4652,7 +4767,7 @@ fun WeiboApp() {
         visitedAlbumLoading = false
         visitedAlbumError = null
         visitedMinePagerPage = snapshot.pagerPage
-        restoreVisitedProfileScroll(snapshot)
+        if (!switchingProfiles) restoreVisitedProfileScroll(snapshot)
     }
 
     fun clearVisitedProfileState() {
@@ -4661,7 +4776,6 @@ fun WeiboApp() {
             videoPlaybackCoordinator.activeKey = null
         }
         visitedAlbumJob?.cancel()
-        visitedListScrollResetGeneration = -1
         visitedUserId = null
         visitedUserScreenName = ""
         visitedProfile = null
@@ -4739,9 +4853,11 @@ fun WeiboApp() {
         }
         if (!keepContent) {
             visitedProfileLoadGeneration = loadGeneration
-        }
-
-        if (!keepContent) {
+            val uid = preparedProfile?.id
+            val alreadyInStack = uid != null && navStack.any { it.visitedProfile?.profile?.id == uid }
+            visitedProfileMount = VisitedProfileMount(
+                separateRetainedUi = if (alreadyInStack) mutableMapOf() else null,
+            )
             visitedProfile = null
             visitedPosts = emptyList()
             visitedPostsPage = 1
@@ -4830,7 +4946,7 @@ fun WeiboApp() {
 
     fun retainCurrentLikeUsers(item: FeedItem) {
         if (!likeUsersLoaded) return
-        val listState = detailLikesListStates[item.id]
+        val listState = detailLikesListStates[activeDetailInstanceKey]
         retainedLikeUsersByStatus[item.id] = RetainedLikeUsersState(
             users = likeUsers,
             nextPage = likeUsersNextPage,
@@ -4857,9 +4973,9 @@ fun WeiboApp() {
             likeUsersNextPage = if (retainedLikes != null) retainedLikes.nextPage else likeUsersNextPage,
             likeUsersLoaded = retainedLikes?.loaded ?: likeUsersLoaded,
             likesScrollIndex = retainedLikes?.scrollIndex
-                ?: detailLikesListStates[item.id]?.firstVisibleItemIndex ?: 0,
+                ?: detailLikesListStates[activeDetailInstanceKey]?.firstVisibleItemIndex ?: 0,
             likesScrollOffset = retainedLikes?.scrollOffset
-                ?: detailLikesListStates[item.id]?.firstVisibleItemScrollOffset ?: 0,
+                ?: detailLikesListStates[activeDetailInstanceKey]?.firstVisibleItemScrollOffset ?: 0,
             likesListGeneration = detailLikesListGeneration,
             scrollIndex = lastDetailScroll.index,
             scrollOffset = lastDetailScroll.offset,
@@ -4876,10 +4992,10 @@ fun WeiboApp() {
         // detail page composed underneath. Re-keying it here would compose a
         // second DetailScreen over the retained one and attach both LazyColumns
         // to the same LazyListState, which drops the scroll position to item 0.
-        val sameDetailStillComposed = selectedItem?.id == snapshot.item.id
+        val sameDetailStillComposed = activeDetailInstanceKey == snapshot.instanceKey && selectedItem?.id == snapshot.item.id
         // A retained page owns newer content and scroll state than its navigation
         // snapshot. Replacing its comments can shrink the list and clamp it to top.
-        if (sameDetailStillComposed && detailOuterListStates.containsKey(snapshot.item.id)) {
+        if (sameDetailStillComposed && detailOuterListStates.containsKey(snapshot.instanceKey)) {
             // Equal status IDs can belong to different navigation entries.
             // Restore route ownership even when retaining the live content/list.
             activeDetailInstanceKey = snapshot.instanceKey
@@ -4910,7 +5026,7 @@ fun WeiboApp() {
         likeUsers = retainedLikes?.users ?: snapshot.likeUsers
         likeUsersNextPage = if (retainedLikes != null) retainedLikes.nextPage else snapshot.likeUsersNextPage
         likeUsersLoaded = retainedLikes?.loaded ?: snapshot.likeUsersLoaded
-        detailLikesListStates.getOrPut(snapshot.item.id) {
+        detailLikesListStates.getOrPut(snapshot.instanceKey) {
             LazyListState(snapshot.likesScrollIndex, snapshot.likesScrollOffset)
         }
         detailLikesListGeneration = snapshot.likesListGeneration
@@ -4924,16 +5040,11 @@ fun WeiboApp() {
             )
         }
         albumViewerState = snapshot.albumViewerState
-        if (!sameDetailStillComposed) {
-            // A genuinely different (parent) detail needs a fresh visible transition.
-            // Reusing its old key makes NavAnimatedOverlay's entered-key cache skip
-            // the return animation.
-            activeDetailInstanceKey = maxOf(activeDetailInstanceKey, snapshot.instanceKey) + 1
-        }
+        activeDetailInstanceKey = snapshot.instanceKey
         activeDetailSourceBounds = snapshot.sourceBounds
         activeDetailSourceImage = snapshot.sourceImage
         activeDetailSourceReturnImage = snapshot.sourceReturnImage
-        val retainedOuterState = detailOuterListStates[snapshot.item.id]
+        val retainedOuterState = detailOuterListStates[snapshot.instanceKey]
         if (retainedOuterState == null) {
             lastDetailScroll = ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
             detailScrollPending = snapshot.item.id to ScrollRestore(snapshot.scrollIndex, snapshot.scrollOffset)
@@ -4952,15 +5063,17 @@ fun WeiboApp() {
     fun loadMoreVisitedPosts() {
         val uid = visitedUserId?.takeIf { it.all(Char::isDigit) } ?: return
         if (visitedPostsLoadingMore || visitedProfileLoading || !visitedPostsHasMore) return
+        val generation = visitedProfileLoadGeneration
+        visitedPostsLoadingMore = true
         scope.launch {
-            visitedPostsLoadingMore = true
             val next = visitedPostsPage + 1
-            runCatching { session.loadUserTimeline(uid, next) }
-                .onSuccess { page ->
-                    visitedPosts = (visitedPosts + page.items).distinctBy { it.id }
-                    visitedPostsPage = next
-                    visitedPostsHasMore = page.nextCursor != null
-                }
+            val result = runCatching { session.loadUserTimeline(uid, next) }
+            if (generation != visitedProfileLoadGeneration || uid != visitedUserId) return@launch
+            result.onSuccess { page ->
+                visitedPosts = (visitedPosts + page.items).distinctBy { it.id }
+                visitedPostsPage = next
+                visitedPostsHasMore = page.nextCursor != null
+            }
             visitedPostsLoadingMore = false
         }
     }
@@ -4968,23 +5081,25 @@ fun WeiboApp() {
     fun loadMoreVisitedAlbum() {
         val uid = visitedUserId?.takeIf { it.all(Char::isDigit) } ?: return
         if (visitedAlbumLoadingMore || visitedProfileLoading || !visitedAlbumHasMore) return
+        val generation = visitedProfileLoadGeneration
+        visitedAlbumLoadingMore = true
         scope.launch {
-            visitedAlbumLoadingMore = true
             val cursor = visitedAlbumNextCursor
-            runCatching {
+            val result = runCatching {
                 session.loadMoreUserAlbumImages(
                     uid = uid,
                     cursor = cursor,
                     existingLargeUrls = visitedAlbumImages.mapTo(mutableSetOf()) { it.largeUrl },
                 )
             }
-                .onSuccess { page ->
-                    val lookup = buildAlbumPostLookup(visitedPosts)
-                    val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
-                    visitedAlbumImages = (visitedAlbumImages + enrichedPage).distinctBy { it.largeUrl }
-                    visitedAlbumNextCursor = page.nextCursor
-                    visitedAlbumHasMore = page.nextCursor != null
-                }
+            if (generation != visitedProfileLoadGeneration || uid != visitedUserId) return@launch
+            result.onSuccess { page ->
+                val lookup = buildAlbumPostLookup(visitedPosts)
+                val enrichedPage = enrichAlbumImagesFromPosts(page.images, lookup)
+                visitedAlbumImages = (visitedAlbumImages + enrichedPage).distinctBy { it.largeUrl }
+                visitedAlbumNextCursor = page.nextCursor
+                visitedAlbumHasMore = page.nextCursor != null
+            }
             visitedAlbumLoadingMore = false
         }
     }
@@ -5060,7 +5175,7 @@ fun WeiboApp() {
         mediaPreview = mediaPreview,
     )
 
-    fun applyDeferredNavRestore(state: NavRestoreState) {
+    fun applyDeferredNavRestore(state: NavRestoreState, retainProfileMount: Boolean = false) {
         // Navigation restores the saved bar state. The foreground-page effect
         // must not immediately overwrite a hidden bar with its auto-show default.
         suppressNextBottomBarAutoShow = true
@@ -5079,7 +5194,11 @@ fun WeiboApp() {
         albumViewerState = null
 
         if (state.visitedProfile != null) {
-            restoreVisitedProfileSnapshot(state.visitedProfile, incrementGeneration = false)
+            restoreVisitedProfileSnapshot(
+                state.visitedProfile,
+                incrementGeneration = false,
+                retainMount = retainProfileMount,
+            )
         } else if (visitedUserId != null || visitedProfile != null) {
             // A retained home/detail stack has no profile to clear. Clearing it
             // anyway pauses the shared player and changes all video cards at the
@@ -5133,12 +5252,19 @@ fun WeiboApp() {
 
     fun scheduleDeferredNavRestore(state: NavRestoreState) {
         pendingDeferredNavRestore = state
+        val exitingKind = navExitPendingKind
         val generation = deferredNavRestoreGeneration + 1
         deferredNavRestoreGeneration = generation
         scope.launch {
             delay(maxOf(NavTransitionDurationMs, DetailTransitionDurationMs).toLong() + 32L)
             if (deferredNavRestoreGeneration == generation && pendingDeferredNavRestore === state) {
-                flushDeferredNavRestore()
+                if (exitingKind is NavOverlayKind.VisitedProfile && navExitPendingKind == exitingKind) {
+                    navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
+                    navExitPendingKind = null
+                    flushDeferredNavRestore()
+                } else {
+                    flushDeferredNavRestore()
+                }
             }
         }
     }
@@ -5170,7 +5296,7 @@ fun WeiboApp() {
         flushDeferredNavRestore()
     }
 
-    fun applyNavRestoreState(state: NavRestoreState) {
+    fun applyNavRestoreState(state: NavRestoreState, retainProfileMount: Boolean = false) {
         selectedTab = state.selectedTab
         bottomBarVisible = state.bottomBarVisible
         minePagerPage = state.minePagerPage
@@ -5185,7 +5311,7 @@ fun WeiboApp() {
         } else {
             pendingDeferredNavRestore = null
             followListOverlay = state.followListOverlay
-            applyDeferredNavRestore(state)
+            applyDeferredNavRestore(state, retainProfileMount)
         }
     }
 
@@ -5204,13 +5330,18 @@ fun WeiboApp() {
 
     fun popNavigation(): Boolean {
         if (navStack.isEmpty()) return false
+        preparedDetailEntryKey = null
         val exitingKind = navOverlayStack.lastOrNull()
-        nestedDetailReturnAnimating = exitingKind is NavOverlayKind.Detail &&
+        nestedDetailReturnAnimating = !albumDetailSwipeReturn && exitingKind is NavOverlayKind.Detail &&
             navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
         // TabSwitch records the page to restore after opening a topic search, but it
         // has no NavAnimatedOverlay to finish an exit and clear this pending state.
         // Leaving it pending makes feedUiOnTop permanently false when returning home.
-        navExitPendingKind = exitingKind?.takeUnless { it == NavOverlayKind.TabSwitch }
+        navExitPendingKind = exitingKind?.takeUnless {
+            it == NavOverlayKind.TabSwitch ||
+                (albumDetailSwipeReturn && it is NavOverlayKind.Detail &&
+                    navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail)
+        }
         navEnterPendingKind = null
         val previous = navStack.last().let { state ->
             val target = albumDismissScrollTarget
@@ -5251,21 +5382,23 @@ fun WeiboApp() {
         }
         if (exitingKind is NavOverlayKind.VisitedProfile &&
             navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile && previous.visitedProfile != null) {
+            navTransitionCoordinator.setStandardPageUnderlayOffset(0f)
             pendingDeferredNavRestore = null
             deferredNavRestoreGeneration += 1
             navExitPendingKind = null
-            applyNavRestoreState(previous)
+            // The parent still owns its laid-out lists and decoded thumbnails.
+            applyNavRestoreState(previous, retainProfileMount = true)
             return true
         }
         if (exitingKind is NavOverlayKind.VisitedProfile &&
             navOverlayStack.lastOrNull() is NavOverlayKind.Detail &&
-            previous.detail != null && previous.detail.item.id == selectedItem?.id
+            previous.detail != null && previous.detail.instanceKey == activeDetailInstanceKey &&
+            previous.detail.item.id == selectedItem?.id
         ) {
             // The detail page is still composed underneath the profile. Restoring its
             // snapshot after the profile exit re-keys/re-enters that same page, which
             // creates a second, unwanted rightward slide after a slow interactive pop.
-            pendingDeferredNavRestore = null
-            deferredNavRestoreGeneration += 1
+            scheduleDeferredNavRestore(previous)
             selectedTab = previous.selectedTab
             bottomBarVisible = previous.bottomBarVisible
             minePagerPage = previous.minePagerPage
@@ -5583,10 +5716,34 @@ fun WeiboApp() {
             videoPlaybackCoordinator.activeKey = null
         }
         val previousPage = navStack.lastOrNull()
-        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
-            (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile ||
-                (navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail &&
-                    navOverlayStack.dropLast(2).any { it is NavOverlayKind.VisitedProfile }))) {
+        val closingStack = navOverlayStack
+        val parentKind = closingStack.getOrNull(closingStack.lastIndex - 1)
+        if (closingStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+            parentKind is NavOverlayKind.VisitedProfile
+        ) {
+            if (nestedProfileReturnRunning) return
+            nestedProfileReturnRunning = true
+            scope.launch {
+                navTransitionCoordinator.onTransitionStart()
+                try {
+                    profileEnterOffset.animateTo(
+                        1f,
+                        tween(NavTransitionDurationMs, easing = NavPageMotionEasing),
+                    ) {
+                        navTransitionCoordinator.setStandardPageUnderlayOffset(-0.25f * (1f - value))
+                    }
+                    if (closingStack == navOverlayStack) navigateBack()
+                } finally {
+                    nestedProfileReturnRunning = false
+                    navTransitionCoordinator.onTransitionEnd()
+                }
+            }
+            return
+        }
+        if (closingStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+            parentKind is NavOverlayKind.Detail &&
+            closingStack.dropLast(2).any { it is NavOverlayKind.VisitedProfile }
+        ) {
             if (profileReturnCapturing || profileReturnBitmap != null) return
             val window = (context as? android.app.Activity)?.window
             if (window == null || window.decorView.width <= 0 || window.decorView.height <= 0) {
@@ -5721,7 +5878,7 @@ fun WeiboApp() {
                 value == visitedUserScreenName ||
                 value == visitedUserId
         }
-        if (isCurrentUser) return
+        if (isCurrentUser && navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile) return
 
         val lookup = if (value.all { it.isDigit() }) ProfileLookup.Uid(value) else ProfileLookup.ScreenName(value)
         val knownPosts = buildList<FeedItem> {
@@ -5750,7 +5907,6 @@ fun WeiboApp() {
             videoPeekController.cancel(snap = true)
         }
 
-        fun navigateToPreparedProfile() {
         pushNavigation(NavOverlayKind.VisitedProfile(value)) {
             if (selectedItem == null) {
                 comments = emptyList()
@@ -5760,30 +5916,14 @@ fun WeiboApp() {
             loadVisitedUserProfile(
                 lookup,
                 preparedProfile = preparedProfile,
-                // The tapped status may be old. Do not seed the profile timeline
-                // with it; fetch the user's current page 1 (which includes pins).
+                // Fetch page one and its pins instead of seeding it with the tapped status.
                 preparedPosts = null,
                 refreshPrepared = false,
                 reloadProfile = false,
             )
         }
         }
-        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile) {
-            val window = (context as? android.app.Activity)?.window
-            val sourceStack = navOverlayStack
-            if (window != null && window.decorView.width > 0 && window.decorView.height > 0) {
-                val bitmap = Bitmap.createBitmap(window.decorView.width, window.decorView.height, Bitmap.Config.ARGB_8888)
-                runCatching {
-                    android.view.PixelCopy.request(window, bitmap, { result ->
-                        if (navOverlayStack == sourceStack) {
-                            if (result == android.view.PixelCopy.SUCCESS) profileParentBackdrops[sourceStack.size + 1] = bitmap
-                            navigateToPreparedProfile()
-                        }
-                    }, android.os.Handler(android.os.Looper.getMainLooper()))
-                }.onFailure { navigateToPreparedProfile() }
-            } else navigateToPreparedProfile()
-        } else navigateToPreparedProfile()
-        }
+
         profileOpeningJob?.cancel()
         val cached = profilePreviewCache[value]
         if (cached != null) {
@@ -5904,6 +6044,13 @@ fun WeiboApp() {
     BackHandler(enabled = true) {
         if (albumViewerState != null) {
             dismissAlbumViewer()
+            lastHomeBackPressAt = 0L
+            return@BackHandler
+        }
+        if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
+            navOverlayStack.getOrNull(navOverlayStack.lastIndex - 1) is NavOverlayKind.VisitedProfile
+        ) {
+            closeVisitedProfile()
             lastHomeBackPressAt = 0L
             return@BackHandler
         }
@@ -7120,7 +7267,7 @@ fun WeiboApp() {
         likeUsersLoading = false
         likeUsersLoadingMore = false
         detailLikesListGeneration += 1
-        selectedItem?.id?.let { id ->
+        activeDetailInstanceKey.let { id ->
             detailLikesListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
             detailCommentsListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
             detailRepostsListStates[id]?.let { state -> scope.launch { state.scrollToItem(0) } }
@@ -7132,18 +7279,21 @@ fun WeiboApp() {
         item: FeedItem,
         initialSection: DetailContentSection,
         scrollToContentSection: Boolean,
+        deferInitialLoad: Boolean = false,
+        replacePlaceholder: Boolean = false,
     ) {
+        val isBodyLinkPlaceholder = item.id.startsWith(BodyLinkPlaceholderPrefix)
         feedRefreshHintGeneration += 1
         feedRefreshHint = null
-        homeThumbnailStore.freezeVisible()
-        val resolved = resolveFeedItem(item)
+        if (!isBodyLinkPlaceholder && !replacePlaceholder) homeThumbnailStore.freezeVisible()
+        val resolved = if (isBodyLinkPlaceholder) item else resolveFeedItem(item)
         retainedLikeUsersByStatus.remove(resolved.id)
         activeDetailSourceBounds = null
         activeDetailSourceImage = null
         activeDetailSourceReturnImage = null
-        prepareInlineVideoHandoffForDetail(resolved)
+        if (!isBodyLinkPlaceholder) prepareInlineVideoHandoffForDetail(resolved)
         feedCardActionMenuController.dismiss()
-        activeDetailInstanceKey += 1
+        if (!replacePlaceholder) activeDetailInstanceKey = ++nextDetailInstanceKey
         val scroll = if (scrollToContentSection) {
             ScrollRestore(index = DETAIL_SECTION_HEADER_INDEX)
         } else {
@@ -7153,18 +7303,44 @@ fun WeiboApp() {
         detailScrollPending = resolved.id to scroll
         selectedItem = resolved
         resetDetailContentState(initialSection)
-        if (resolved.requiresLongTextFetch) {
-            loadLongText(resolved)
+        if (isBodyLinkPlaceholder) return
+        fun loadInitialContent() {
+            if (resolved.requiresLongTextFetch) loadLongText(resolved)
+            resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let { loadLongText(it) }
+            when (initialSection) {
+                DetailContentSection.Comments -> reloadComments()
+                DetailContentSection.Reposts -> reloadReposts()
+                DetailContentSection.Likes -> reloadLikeUsers()
+            }
         }
-        resolved.retweetedStatus?.takeIf { it.requiresLongTextFetch }?.let { loadLongText(it) }
-        when (initialSection) {
-            DetailContentSection.Comments -> reloadComments()
-            DetailContentSection.Reposts -> reloadReposts()
-            DetailContentSection.Likes -> reloadLikeUsers()
+        if (deferInitialLoad) {
+            val instance = activeDetailInstanceKey
+            commentsLoading = true
+            scope.launch {
+                // Lay out and animate the tapped card before new text and comments change its height.
+                snapshotFlow {
+                    activeDetailInstanceKey != instance || navEnterPendingKind !is NavOverlayKind.Detail
+                }.first { it }
+                if (activeDetailInstanceKey == instance && selectedItem?.id == resolved.id &&
+                    navOverlayStack.lastOrNull() == NavOverlayKind.Detail(resolved.id) &&
+                    navExitPendingKind == null && detailContentSection == initialSection
+                ) {
+                    loadInitialContent()
+                } else if (activeDetailInstanceKey == instance && selectedItem?.id == resolved.id) {
+                    commentsLoading = false
+                }
+            }
+        } else {
+            loadInitialContent()
         }
     }
 
-    fun openDetailInternal(item: FeedItem, hostItem: FeedItem? = null, section: DetailContentSection? = null) {
+    fun openDetailInternal(
+        item: FeedItem,
+        hostItem: FeedItem? = null,
+        section: DetailContentSection? = null,
+        deferInitialLoad: Boolean = false,
+    ) {
         prepareInlineVideoHandoffForDetail(
             resolveFeedItem(item),
             hostItem?.let(::resolveFeedItem),
@@ -7174,45 +7350,60 @@ fun WeiboApp() {
                 item = item,
                 initialSection = section ?: DetailContentSection.Comments,
                 scrollToContentSection = section != null,
+                deferInitialLoad = deferInitialLoad,
             )
         }
     }
 
-    fun openUrlEntity(entity: FeedUrlEntity) {
-        if (listOf(entity.url, entity.shortUrl).any {
-                com.example.myweibo.data.openWeiboShoppingCard(context, it)
-            }) return
-        if (listOf(entity.nativeUrl.orEmpty(), entity.url, entity.shortUrl).any {
-                com.example.myweibo.data.openShoppingApp(context, it)
-            }) return
-        if (WeiboStatusActions.openSuperTopicInWeiboApp(
-                context,
-                entity.nativeUrl.orEmpty(),
-                entity.url,
-                entity.shortUrl,
-            )
-        ) {
-            return
-        }
-        val articleId = resolveArticleId(entity.url) ?: resolveArticleId(entity.shortUrl)
-        if (articleId != null) {
-            pushNavigation(NavOverlayKind.Article) {
-                loadArticleIntoOverlay(entity)
-            }
-            return
-        }
-        val statusCandidates = WeiboLinkResolver.statusIdCandidates(
-            entity.nativeUrl.orEmpty(),
-            entity.url,
-            entity.shortUrl,
-        )
+    fun openStatusUrlEntity(entity: FeedUrlEntity, statusCandidates: List<String>) {
         if (statusCandidates.isNotEmpty()) {
-            scope.launch {
-                val item = statusCandidates.firstNotNullOfOrNull { candidate ->
-                    runCatching { session.loadStatusDetail(candidate) }.getOrNull()
+            val sourceDetailInstance = activeDetailInstanceKey.takeIf {
+                navOverlayStack.lastOrNull() is NavOverlayKind.Detail
+            }
+            val cacheKey = statusCandidates.toList()
+            val cached = bodyLinkDetails.get(cacheKey)
+            val placeholder = if (sourceDetailInstance != null && cached == null) {
+                FeedItem(
+                    id = BodyLinkPlaceholderPrefix + statusCandidates.first(),
+                    statusId = "", authorId = "", authorName = "", authorAvatarUrl = null,
+                    createdAt = null, source = null, ipLocation = null, text = "",
+                    repostsCount = "", commentsCount = "", likesCount = "", images = emptyList(),
+                ).also {
+                    pushNavigation(NavOverlayKind.Detail(it.id)) {
+                        openDetailPrepared(it, DetailContentSection.Comments, false)
+                    }
+                    preparedDetailEntryKey = activeDetailInstanceKey
                 }
+            } else null
+            val destinationInstance = activeDetailInstanceKey
+            scope.launch {
+                val item = cached ?: statusCandidates.firstNotNullOfOrNull { candidate ->
+                    runCatching { session.loadStatusDetail(candidate) }.getOrNull()
+                }?.also { bodyLinkDetails.put(cacheKey, it) }
+                if (placeholder != null) {
+                    snapshotFlow {
+                        activeDetailInstanceKey != destinationInstance || navEnterPendingKind == null
+                    }.first { it }
+                    if (activeDetailInstanceKey != destinationInstance || selectedItem?.id != placeholder.id ||
+                        navOverlayStack.lastOrNull() != NavOverlayKind.Detail(placeholder.id) ||
+                        detailSystemBackInProgress || navExitPendingKind != null
+                    ) return@launch
+                    if (item == null) {
+                        selectedItem = placeholder.copy(text = "\u52A0\u8F7D\u5931\u8D25\uFF0C\u8BF7\u8FD4\u56DE\u91CD\u8BD5")
+                    } else {
+                        navOverlayStack = navOverlayStack.dropLast(1) + NavOverlayKind.Detail(resolveFeedItem(item).id)
+                        openDetailPrepared(item, DetailContentSection.Comments, false, replacePlaceholder = true)
+                    }
+                    return@launch
+                }
+                if (sourceDetailInstance != null &&
+                    (activeDetailInstanceKey != sourceDetailInstance ||
+                        navOverlayStack.lastOrNull() !is NavOverlayKind.Detail ||
+                        detailSystemBackInProgress || navExitPendingKind != null)
+                ) return@launch
                 if (item != null) {
-                    openDetailInternal(item)
+                    openDetailInternal(item, deferInitialLoad = sourceDetailInstance != null)
+                    if (sourceDetailInstance != null) preparedDetailEntryKey = activeDetailInstanceKey
                 } else {
                     pushNavigation(NavOverlayKind.Article) {
                 loadArticleIntoOverlay(entity)
@@ -7222,6 +7413,28 @@ fun WeiboApp() {
             return
         }
         pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
+    }
+
+    fun openUrlEntity(entity: FeedUrlEntity) {
+        val nativeUrl = entity.nativeUrl.orEmpty()
+        fun statusCandidates() = WeiboLinkResolver.statusIdCandidates(nativeUrl, entity.url, entity.shortUrl)
+        val bodyStatusCandidates = if (entity.title.trim() == "\u5FAE\u535A\u6B63\u6587") statusCandidates() else null
+        if (!bodyStatusCandidates.isNullOrEmpty()) {
+            openStatusUrlEntity(entity, bodyStatusCandidates)
+            return
+        }
+        if (listOf(entity.url, entity.shortUrl).any {
+                com.example.myweibo.data.openWeiboShoppingCard(context, it)
+            }) return
+        if (listOf(nativeUrl, entity.url, entity.shortUrl).any {
+                com.example.myweibo.data.openShoppingApp(context, it)
+            }) return
+        if (WeiboStatusActions.openSuperTopicInWeiboApp(context, nativeUrl, entity.url, entity.shortUrl)) return
+        if (resolveArticleId(entity.url) != null || resolveArticleId(entity.shortUrl) != null) {
+            pushNavigation(NavOverlayKind.Article) { loadArticleIntoOverlay(entity) }
+            return
+        }
+        openStatusUrlEntity(entity, bodyStatusCandidates ?: statusCandidates())
     }
 
     fun openDetailToSection(item: FeedItem, section: DetailContentSection) {
@@ -7276,6 +7489,26 @@ fun WeiboApp() {
         val fromFeed = selectedItem == null && selectedTab == MainTab.Feed && visitedUserId == null
         val fromSearch = selectedItem == null && selectedTab == MainTab.Search && visitedUserId == null
         val fromMine = selectedItem == null && selectedTab == MainTab.Mine && visitedUserId == null
+        val fromProfileCard = sourceBounds != null && navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile
+        if (fromProfileCard) {
+            val sourceItem = hostItem ?: item
+            val quoted = sourceItem.retweetedStatus
+            val textLength = sourceItem.text.length + (quoted?.text?.length ?: 0)
+            val links = sourceItem.urlEntities.size + (quoted?.urlEntities?.size ?: 0)
+            val rawLinks = sequenceOf(sourceItem.text, quoted?.text.orEmpty())
+                .flatMap { ProfileCardWebLink.findAll(it) }
+                .take(ProfileCardSlideLinkCount)
+                .count()
+            val viewportHeight = detailCaptureView.height
+            val tall = viewportHeight > 0 && sourceBounds.height >= viewportHeight * ProfileCardSlideHeightFraction
+            if (tall || textLength >= ProfileCardSlideTextLength || maxOf(links, rawLinks) >= ProfileCardSlideLinkCount) {
+                // Avoid capturing and morphing a viewport-sized or link-heavy card.
+                // The standard detail slide leaves its source list mounted and visible.
+                openDetailInternal(item, hostItem, section, deferInitialLoad = section == null)
+                preparedDetailEntryKey = activeDetailInstanceKey
+                return
+            }
+        }
         fun navigateWithSource(
             image: Bitmap?,
             returnImage: Bitmap? = image,
@@ -7306,7 +7539,7 @@ fun WeiboApp() {
                 selectedTab == MainTab.Search && visitedUserId == null) {
                 hiddenFeedCardId = item.id
             }
-            openDetailInternal(item, hostItem, section = section)
+            openDetailInternal(item, hostItem, section = section, deferInitialLoad = fromProfileCard && section == null)
             activeDetailSourceBounds = sourceBounds
             activeDetailSourceImage = image
             activeDetailSourceReturnImage = returnImage
@@ -7399,7 +7632,7 @@ fun WeiboApp() {
             activeDetailSourceBounds = null
             activeDetailSourceImage = null
             activeDetailSourceReturnImage = null
-            activeDetailInstanceKey += 1
+            activeDetailInstanceKey = ++nextDetailInstanceKey
             lastDetailScroll = ScrollRestore()
             detailScrollPending = resolved.id to ScrollRestore()
             selectedItem = resolved
@@ -8238,9 +8471,13 @@ fun WeiboApp() {
             LocalPageSwipeBack provides { navigateBack() },
             LocalOpenRetweetCard provides ::openDetailFromSource,
             LocalImageReturnBarTop provides { imageReturnBarTop },
-            LocalHiddenFeedCardId provides hiddenFeedCardId.takeIf {
-                (visitedUserId != null && hiddenCardProfileGeneration == visitedProfileLoadGeneration) ||
-                    (visitedUserId == null && hiddenCardFromMine && selectedTab == MainTab.Mine)
+            LocalHiddenFeedCardId provides remember {
+                {
+                    hiddenFeedCardId.takeIf {
+                        (visitedUserId != null && hiddenCardProfileGeneration == visitedProfileLoadGeneration) ||
+                            (visitedUserId == null && hiddenCardFromMine && selectedTab == MainTab.Mine)
+                    }
+                }
             },
             LocalRepostComposer provides { status ->
                 commentComposeTarget = CommentComposeTarget(resolveFeedItem(status), isRepost = true)
@@ -8480,7 +8717,7 @@ fun WeiboApp() {
                         key(feedResumeGeneration) {
                             CompositionLocalProvider(
                                 LocalHomeThumbnailStore provides homeThumbnailStore,
-                                LocalHiddenFeedCardId provides hiddenHomeFeedCardId,
+                                LocalHiddenFeedCardId provides remember { { hiddenHomeFeedCardId } },
                                 LocalHiddenCardBackdrop provides homeHiddenCardBackdrop,
                             ) {
                             FollowFeedScreen(
@@ -8670,7 +8907,7 @@ fun WeiboApp() {
                         // original page visible until that frame is drawable.
                         withFrameNanos { }
                         coroutineScope {
-                            val underlayStart = navTransitionCoordinator.standardPageUnderlayOffset.value
+                            val underlayStart = navTransitionCoordinator.standardPageUnderlayOffsetFraction
                             launch {
                                 profileEnterOffset.animateTo(0f, tween(NavTransitionDurationMs, easing = NavPageMotionEasing))
                             }
@@ -8685,26 +8922,132 @@ fun WeiboApp() {
                         navTransitionCoordinator.onTransitionEnd()
                     }
                 }
-                if (visitedProfileNavTarget != null && visitedProfileVisible) {
-                    LaunchedEffect(visitedProfileLoadGeneration) {
-                        if (visitedListScrollResetGeneration == visitedProfileLoadGeneration) return@LaunchedEffect
-                        visitedListScrollResetGeneration = visitedProfileLoadGeneration
-                        runCatching {
-                            visitedPostsListState.scrollToItem(0)
-                            visitedAlbumListState.scrollToItem(0)
+                val renderVisitedProfile: @Composable (String, VisitedProfileSnapshot?) -> Unit = { uid, retained ->
+                    val mount = retained?.mount ?: visitedProfileMount
+                    val profile = if (retained == null) visitedProfile else retained.profile
+                    mount.content {
+                        CompositionLocalProvider(
+                            LocalFeedCardActionMenuController provides visitedProfileActionMenuController,
+                            LocalProfileRetainedUi provides (mount.separateRetainedUi ?: LocalProfileRetainedUi.current),
+                            LocalProfileUnderlay provides (retained != null),
+                        ) {
+                            VisitedUserProfileContent(
+                                session = session,
+                                profile = profile,
+                                profileHeaderHeight = profileHeaderHeights[uid] ?: 0.dp,
+                                onProfileHeaderHeightChange = { height ->
+                                    profileHeaderHeights[uid] = height
+                                },
+                                isLoading = retained?.loading ?: visitedProfileLoading,
+                                hasLoginCookie = hasLoginCookie,
+                                posts = retained?.posts ?: visitedPosts,
+                                postsLoadingMore = retained?.postsLoadingMore ?: visitedPostsLoadingMore,
+                                albumImages = retained?.albumImages ?: visitedAlbumImages,
+                                albumLoading = retained?.albumLoading ?: visitedAlbumLoading,
+                                albumLoadingMore = retained?.albumLoadingMore ?: visitedAlbumLoadingMore,
+                                postsHasMore = retained?.postsHasMore ?: visitedPostsHasMore,
+                                albumHasMore = retained?.albumHasMore ?: visitedAlbumHasMore,
+                                emoticonMap = emoticonMap,
+                                emoticonCount = emoticonMap.size,
+                                emoticonSyncing = emoticonSyncing,
+                                postsListState = mount.postsList,
+                                albumListState = mount.albumList,
+                                albumError = if (retained == null) visitedAlbumError else retained.albumError,
+                                initialPagerPage = retained?.pagerPage ?: visitedMinePagerPage,
+                                onMinePagerPageChanged = { if (visitedProfileMount === mount) visitedMinePagerPage = it },
+                                onAlbumTabSelected = { if (visitedProfileMount === mount) ensureVisitedAlbumLoaded() },
+                                onRefresh = {
+                                    when {
+                                        visitedProfile != null ->
+                                            loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
+                                        uid.all(Char::isDigit) ->
+                                            loadVisitedUserProfile(ProfileLookup.Uid(uid), keepContent = true)
+                                        visitedUserScreenName.isNotBlank() ->
+                                            loadVisitedUserProfile(
+                                                ProfileLookup.ScreenName(visitedUserScreenName),
+                                                keepContent = true,
+                                            )
+                                    }
+                                },
+                                onLoadMorePosts = { if (visitedProfileMount === mount) loadMoreVisitedPosts() },
+                                onLoadMoreAlbum = { if (visitedProfileMount === mount) loadMoreVisitedAlbum() },
+                                onSyncEmoticons = { syncEmoticons() },
+                                onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
+                                onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
+                                onCommentLongClick = ::openCommentComposer,
+                                onOpenAlbumViewer = ::pushAlbumViewer,
+                                onAlbumImageAnchorBoundsChanged = { imageKey, bounds ->
+                                    if (visitedProfileMount === mount) updateAlbumViewerAnchor(imageKey, bounds)
+                                },
+                                onMediaClick = ::pushMediaPreview,
+                                onUserClick = ::openUser,
+                                isLongTextLoading = { it.statusId in longTextLoadingIds },
+                                onLoadLongText = ::loadLongText,
+                                onToggleLike = ::toggleStatusLike,
+                                onLikeClick = ::openLikeUsers,
+                                onUrlEntityClick = ::openUrlEntity,
+                                onSearchUserPosts = { profile, query ->
+                                    openUserPostsSearch(profile, query)
+                                },
+                                onOpenFollowList = ::openFollowList,
+                                showFollowActions = hasLoginCookie &&
+                                    profile?.id?.isNotBlank() == true &&
+                                    profile?.id != mineProfile?.id,
+                                followLoading = retained?.followLoading ?: visitedFollowLoading,
+                                onFollowClick = { toggleVisitedFollow() },
+                                onOpenOfficialProfile = { profile, anchor ->
+                                    profileActionsFor = ProfileActionRequest(profile, anchor)
+                                    scope.launch {
+                                        runCatching { session.isUserBlocked(profile.id) }
+                                            .onSuccess { blocked ->
+                                                profileActionsFor
+                                                    ?.takeIf { it.profile.id == profile.id }
+                                                    ?.let { current ->
+                                                        profileActionsFor = current.copy(
+                                                            profile = current.profile.copy(blockedByMe = blocked),
+                                                        )
+                                                    }
+                                            }
+                                    }
+                                },
+                            )
                         }
                     }
                 }
-                val nestedProfileBackdrop = if (profileReturnBitmap != null) {
-                    profileParentBackdrops[navOverlayStack.size + 1]
-                } else if (navOverlayStack.lastOrNull() is NavOverlayKind.VisitedProfile &&
-                    navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.VisitedProfile) {
-                    profileParentBackdrops[navOverlayStack.size]
-                } else null
-                nestedProfileBackdrop?.let { bitmap ->
-                    Image(bitmap.asImageBitmap(), contentDescription = null,
-                        contentScale = ContentScale.FillBounds,
-                        modifier = Modifier.fillMaxSize().zIndex(589f))
+                // Keep the original composition, including its visible media, below each nested profile.
+                navOverlayStack.forEachIndexed { index, child ->
+                    val parent = navOverlayStack.getOrNull(index - 1) as? NavOverlayKind.VisitedProfile
+                    if (child is NavOverlayKind.VisitedProfile && parent != null) {
+                        val retained = navStack.getOrNull(index)?.visitedProfile
+                        if (retained != null && retained.mount !== visitedProfileMount) {
+                            key(retained.mount) {
+                                val revealed = visitedProfileVisible && index == navOverlayStack.lastIndex
+                                Box(
+                                    Modifier.fillMaxSize()
+                                        .zIndex(if (revealed) 589f else -1f)
+                                        .pointerInput(Unit) {
+                                            awaitPointerEventScope {
+                                                while (true) {
+                                                    awaitPointerEvent(PointerEventPass.Initial).changes.forEach { it.consume() }
+                                                }
+                                            }
+                                        }
+                                        .graphicsLayer {
+                                            alpha = if (revealed) 1f else 0f
+                                            translationX = size.width * navTransitionCoordinator.standardPageUnderlayOffsetFraction
+                                        }
+                                        .drawWithContent {
+                                            drawContent()
+                                            val dim = (-navTransitionCoordinator.standardPageUnderlayOffsetFraction / 0.25f)
+                                                .coerceIn(0f, 1f)
+                                            drawRect(Color.Black.copy(alpha = 0.20f * dim))
+                                        },
+                                ) {
+                                    renderVisitedProfile(parent.uid, retained)
+                                }
+                            }
+                        }
+                    }
                 }
                 NavAnimatedOverlay(
                     target = visitedProfileNavTarget,
@@ -8744,6 +9087,7 @@ fun WeiboApp() {
                     // exclude media thumbnails and seek bars through the bounds
                     // registry so their horizontal gestures stay local.
                     interceptRightSwipe = visitedMinePagerPage == MineContentTab.Posts.ordinal,
+                    swipeNavigationEnabled = !nestedProfileReturnRunning,
                     pendingEnterKind = navEnterPendingKind,
                     pendingExitKind = navExitPendingKind,
                     onClearPendingEnter = {}, // The page/bar motion owns entry completion.
@@ -8758,88 +9102,7 @@ fun WeiboApp() {
                                 enabled = visitedProfileVisible,
                                 onBack = ::closeVisitedProfile,
                             )
-                            CompositionLocalProvider(
-                                LocalFeedCardActionMenuController provides visitedProfileActionMenuController,
-                            ) {
-                            VisitedUserProfileContent(
-                                    session = session,
-                                    profile = visitedProfile,
-                                    profileHeaderHeight = profileHeaderHeights[uid] ?: 0.dp,
-                                    onProfileHeaderHeightChange = { height ->
-                                        profileHeaderHeights[uid] = height
-                                    },
-                                    isLoading = visitedProfileLoading,
-                                    hasLoginCookie = hasLoginCookie,
-                                    posts = visitedPosts,
-                                    postsLoadingMore = visitedPostsLoadingMore,
-                                    albumImages = visitedAlbumImages,
-                                    albumLoading = visitedAlbumLoading,
-                                    albumLoadingMore = visitedAlbumLoadingMore,
-                                    postsHasMore = visitedPostsHasMore,
-                                    albumHasMore = visitedAlbumHasMore,
-                                    emoticonMap = emoticonMap,
-                                    emoticonCount = emoticonMap.size,
-                                    emoticonSyncing = emoticonSyncing,
-                                    postsListState = visitedPostsListState,
-                                    albumListState = visitedAlbumListState,
-                                    albumError = visitedAlbumError,
-                                    initialPagerPage = visitedMinePagerPage,
-                                    onMinePagerPageChanged = { visitedMinePagerPage = it },
-                                    onAlbumTabSelected = ::ensureVisitedAlbumLoaded,
-                                    onRefresh = {
-                                        when {
-                                            visitedProfile != null ->
-                                                loadVisitedUserProfile(ProfileLookup.Uid(visitedProfile!!.id), keepContent = true)
-                                            uid.all(Char::isDigit) ->
-                                                loadVisitedUserProfile(ProfileLookup.Uid(uid), keepContent = true)
-                                            visitedUserScreenName.isNotBlank() ->
-                                                loadVisitedUserProfile(
-                                                    ProfileLookup.ScreenName(visitedUserScreenName),
-                                                    keepContent = true,
-                                                )
-                                        }
-                                    },
-                                    onLoadMorePosts = { loadMoreVisitedPosts() },
-                                    onLoadMoreAlbum = { loadMoreVisitedAlbum() },
-                                    onSyncEmoticons = { syncEmoticons() },
-                                    onItemClick = { item, bounds -> openDetailFromSource(item, bounds) },
-                                    onRetweetClick = { retweeted, host -> openDetail(retweeted, host) },
-                                     onCommentLongClick = ::openCommentComposer,
-                                     onOpenAlbumViewer = ::pushAlbumViewer,
-                                     onAlbumImageAnchorBoundsChanged = ::updateAlbumViewerAnchor,
-                                     onMediaClick = ::pushMediaPreview,
-                                    onUserClick = ::openUser,
-                                    isLongTextLoading = { it.statusId in longTextLoadingIds },
-                                    onLoadLongText = ::loadLongText,
-                                    onToggleLike = ::toggleStatusLike,
-                                    onLikeClick = ::openLikeUsers,
-                                    onUrlEntityClick = ::openUrlEntity,
-                                    onSearchUserPosts = { profile, query ->
-                                        openUserPostsSearch(profile, query)
-                                    },
-                                    onOpenFollowList = ::openFollowList,
-                                    showFollowActions = hasLoginCookie &&
-                                        visitedProfile?.id?.isNotBlank() == true &&
-                                        visitedProfile?.id != mineProfile?.id,
-                                    followLoading = visitedFollowLoading,
-                                    onFollowClick = { toggleVisitedFollow() },
-                                    onOpenOfficialProfile = { profile, anchor ->
-                                        profileActionsFor = ProfileActionRequest(profile, anchor)
-                                        scope.launch {
-                                            runCatching { session.isUserBlocked(profile.id) }
-                                                .onSuccess { blocked ->
-                                                    profileActionsFor
-                                                        ?.takeIf { it.profile.id == profile.id }
-                                                        ?.let { current ->
-                                                            profileActionsFor = current.copy(
-                                                                profile = current.profile.copy(blockedByMe = blocked),
-                                                            )
-                                                        }
-                                                }
-                                        }
-                                    },
-                                )
-                            }
+                            renderVisitedProfile(uid, null)
                         }
                     }
                 }
@@ -9080,10 +9343,13 @@ fun WeiboApp() {
                     visible = detailOverlayVisible,
                     animationKey = activeDetailInstanceKey,
                     navKind = detailNavKind,
+                    preparePageEnter = preparedDetailEntryKey == activeDetailInstanceKey &&
+                        navEnterPendingKind is NavOverlayKind.Detail,
+                    quickPageSwipeReturn = preparedDetailEntryKey == activeDetailInstanceKey,
                     interceptRightSwipe = true,
                     swipeNavigationEnabled = detailContentSection == DetailContentSection.Comments,
                     pendingEnterKind = navEnterPendingKind,
-                    pendingExitKind = navExitPendingKind,
+                    pendingExitKind = navExitPendingKind.takeUnless { it is NavOverlayKind.VisitedProfile },
                     pageStackSlide = albumDetailPageSlide,
                     nestedDetailReturnAnimating = nestedDetailReturnAnimating,
                     sourceReturnZIndex = 580f.takeIf { navStack.lastOrNull()?.visitedProfile != null },
@@ -9095,6 +9361,8 @@ fun WeiboApp() {
                     commitCardReturn = detailSystemBackInProgress &&
                         activeDetailSourceBounds != null &&
                         !nestedDetailReturnAnimating,
+                    commitPageReturn = detailSystemBackInProgress &&
+                        activeDetailSourceBounds == null && !nestedDetailReturnAnimating,
                     onSwipeReturnCommit = {
                         // Keep the real source card hidden until the return motion
                         // completes; the detail snapshot supplies its pixels during
@@ -9138,11 +9406,12 @@ fun WeiboApp() {
                     },
                 ) { detailSnapshot ->
                     val detailItem = detailSnapshot.item
-                    val detailIsActive = detailSnapshot.instanceKey == activeDetailInstanceKey
+                    val isTransitionBackdrop = LocalDetailTransitionBackdrop.current
+                    val detailIsActive = !isTransitionBackdrop && detailSnapshot.instanceKey == activeDetailInstanceKey
                     // AnimatedContent retains the outgoing detail during nested pops.
                     // Re-keying it with the global instance counter tears down that
                     // outgoing subtree as soon as the parent snapshot is restored.
-                    key(detailItem.id) {
+                    key(detailSnapshot.instanceKey, detailItem.id) {
                         var systemBackStarted by remember { mutableStateOf(false) }
                         var detailRefreshGestureArmed by remember { mutableStateOf(false) }
                         val refreshForeground by rememberUpdatedState(
@@ -9151,18 +9420,27 @@ fun WeiboApp() {
                         LaunchedEffect(detailOverlayVisible, navEnterPendingKind, navExitPendingKind) {
                             detailRefreshGestureArmed = false
                         }
-                        LaunchedEffect(activeDetailInstanceKey) {
+                        LaunchedEffect(detailIsActive) {
+                            if (!detailIsActive) return@LaunchedEffect
                             systemBackStarted = false
                             detailSystemBackInProgress = false
                         }
-                        val detailListState = detailOuterListStates.getOrPut(detailItem.id) {
-                            LazyListState(detailSnapshot.scrollIndex, detailSnapshot.scrollOffset)
+                        fun listStateFor(states: MutableMap<Int, LazyListState>, index: Int = 0, offset: Int = 0): LazyListState {
+                            return states.getOrPut(detailSnapshot.instanceKey) { LazyListState(index, offset) }
                         }
-                        val detailCommentsListState = detailCommentsListStates.getOrPut(detailItem.id) { LazyListState() }
-                        val detailRepostsListState = detailRepostsListStates.getOrPut(detailItem.id) { LazyListState() }
-                        val detailLikesListState = detailLikesListStates.getOrPut(detailItem.id) {
-                            LazyListState(detailSnapshot.likesScrollIndex, detailSnapshot.likesScrollOffset)
+                        @Composable
+                        fun retainedListState(states: MutableMap<Int, LazyListState>, index: Int = 0, offset: Int = 0): LazyListState {
+                            val retained = listStateFor(states, index, offset)
+                            return if (isTransitionBackdrop) {
+                                remember(retained) {
+                                    LazyListState(retained.firstVisibleItemIndex, retained.firstVisibleItemScrollOffset)
+                                }
+                            } else retained
                         }
+                        val detailListState = retainedListState(detailOuterListStates, detailSnapshot.scrollIndex, detailSnapshot.scrollOffset)
+                        val detailCommentsListState = retainedListState(detailCommentsListStates)
+                        val detailRepostsListState = retainedListState(detailRepostsListStates)
+                        val detailLikesListState = retainedListState(detailLikesListStates, detailSnapshot.likesScrollIndex, detailSnapshot.likesScrollOffset)
                         val detailScrollCoordinator = remember { FeedListScrollCoordinator() }
                         LaunchedEffect(detailListState, detailScrollCoordinator) {
                             detailScrollCoordinator.stopScrollAction = {
@@ -9187,7 +9465,7 @@ fun WeiboApp() {
                                     detailListState.firstVisibleItemScrollOffset,
                                 )
                             }.collect { scroll ->
-                                if (detailSnapshot.instanceKey == activeDetailInstanceKey) lastDetailScroll = scroll
+                                if (!isTransitionBackdrop && detailSnapshot.instanceKey == activeDetailInstanceKey) lastDetailScroll = scroll
                             }
                         }
                         LaunchedEffect(
@@ -9195,7 +9473,7 @@ fun WeiboApp() {
                             activeDetailInstanceKey,
                             detailScrollRestoreToken,
                         ) {
-                            if (detailSnapshot.instanceKey != activeDetailInstanceKey) return@LaunchedEffect
+                            if (!detailIsActive) return@LaunchedEffect
                             val pending = detailScrollPending ?: return@LaunchedEffect
                             if (pending.first != detailItem.id) return@LaunchedEffect
                             val target = pending.second
@@ -9220,10 +9498,8 @@ fun WeiboApp() {
                                     systemBackStarted = true
                                 }
                                 systemBackStarted = true
-                                if (activeDetailSourceBounds != null && !nestedDetailReturnAnimating) {
-                                    // Play the same card-return motion as a mid-screen
-                                    // swipe, then pop. Closing first would expose the
-                                    // hidden source card for a frame.
+                                if (!nestedDetailReturnAnimating && navExitPendingKind == null) {
+                                    // Complete the same return as a mid-screen swipe before popping.
                                     detailSystemBackInProgress = true
                                 } else {
                                     closeDetail()
@@ -9234,8 +9510,12 @@ fun WeiboApp() {
                                 throw cancelled
                             }
                         }
+                        val pageReveal = LocalDetailPageReveal.current
+                        val detailBackground = MaterialTheme.colorScheme.background
                         Surface(
-                            modifier = Modifier.fillMaxSize().pointerInput(detailItem.id) {
+                            modifier = Modifier.fillMaxSize().drawBehind {
+                                drawRect(detailBackground, alpha = pageReveal().coerceIn(0f, 1f))
+                            }.pointerInput(detailItem.id) {
                                 awaitEachGesture {
                                     awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
                                     detailRefreshGestureArmed = refreshForeground
@@ -9244,9 +9524,15 @@ fun WeiboApp() {
                                     } while (event.changes.any { it.pressed })
                                 }
                             },
-                            color = MaterialTheme.colorScheme.background.copy(alpha = LocalDetailPageReveal.current),
+                            color = Color.Transparent,
+                            contentColor = MaterialTheme.colorScheme.onBackground,
                         ) {
-                            CompositionLocalProvider(
+                            if (detailItem.id.startsWith(BodyLinkPlaceholderPrefix)) {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    if (detailItem.text.isEmpty()) CircularProgressIndicator()
+                                    else Text(detailItem.text)
+                                }
+                            } else CompositionLocalProvider(
                                 LocalDetailExitStarted provides (
                                     systemBackStarted || (LocalDetailExitStarted.current &&
                                         ((navExitPendingKind as? NavOverlayKind.Detail)?.itemId
@@ -10646,6 +10932,11 @@ private fun buildStatusTokenRegex(
 @Composable
 private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
 
+private class RichTextGeometry {
+    var layout: TextLayoutResult? = null
+    var coordinates: LayoutCoordinates? = null
+}
+
 @Composable
 private fun EmoticonText(
     text: String,
@@ -10736,12 +11027,8 @@ private fun EmoticonText(
             .sorted()
             .toList()
     }
-    val missingEmoticonTokens = remember(text, emoticonMap, sharedInlineContent, tokenRegex) {
-        tokenRegex.findAll(text)
-            .map { it.value }
-            .filter { token -> emoticonMap.containsKey(token) && !sharedInlineContent.containsKey(token) }
-            .distinct()
-            .toList()
+    val missingEmoticonTokens = remember(emoticonTokensInText, sharedInlineContent) {
+        emoticonTokensInText.filterNot(sharedInlineContent::containsKey)
     }
     val missingInlineContent = rememberMissingEmoticonInlineContent(
         tokens = missingEmoticonTokens,
@@ -10757,19 +11044,28 @@ private fun EmoticonText(
             }
         }
     }
-    val inlineContent = remember(usedSharedInlineContent, missingInlineContent, style.fontSize, primaryColor) {
+    val linkIconPainter = rememberVectorPainter(Icons.Outlined.Link)
+    val linkIconTint = remember(primaryColor) { ColorFilter.tint(primaryColor) }
+    val hasLocation = !trailingLocation.isNullOrBlank()
+    val inlineContent = remember(usedSharedInlineContent, missingInlineContent, hasLocation, style.fontSize, linkIconPainter, linkIconTint) {
         val withEmoticons = if (missingInlineContent.isEmpty()) {
             usedSharedInlineContent
         } else {
             usedSharedInlineContent + missingInlineContent
         }
-        withEmoticons + (UrlLinkIconInlineContentKey to urlLinkIconInlineContent(style.fontSize, primaryColor))
+        if (hasLocation) {
+            withEmoticons + (UrlLinkIconInlineContentKey to urlLinkIconInlineContent(style.fontSize, linkIconPainter, linkIconTint))
+        } else {
+            withEmoticons
+        }
     }
     val hasTrailingLink = trailingLabel != null && onTrailingClick != null
     val hasLocationLink = trailingLocation != null && onLocationClick != null
     val hasLeadingLink = leadingAuthorName != null && onLeadingAuthorClick != null
     val hasScopedInlineImageLinks = inlineImageLinks.isNotEmpty() && onInlineImageClick != null
-    val hasScopedUrlLinks = urlEntities.isNotEmpty() && onUrlEntityClick != null
+    // The offscreen first layout and slide need the final text and icon positions.
+    // Install the per-link interaction nodes after the slide has settled.
+    val hasScopedUrlLinks = urlEntities.isNotEmpty() && onUrlEntityClick != null && !LocalDeferDetailUrlLinks.current
     val annotatedString = remember(
         text,
         leadingAuthorName,
@@ -10826,13 +11122,13 @@ private fun EmoticonText(
         ).also { FeedEmoticonTextCache.put(cacheKey, it) }
     }
 
-    var inlineImageLayoutResult by remember(annotatedString) { mutableStateOf<TextLayoutResult?>(null) }
+    val textGeometry = remember(annotatedString) { RichTextGeometry() }
     var exactTouchPosition by remember(linkScopeKey) { mutableStateOf<Offset?>(null) }
     val bodyClickState by rememberUpdatedState(onBodyClick)
     SideEffect {
         FeedEmoticonLinkDispatcher.registerExactLinkHit(linkScopeKey) { tag ->
             val position = exactTouchPosition
-            val layout = inlineImageLayoutResult
+            val layout = textGeometry.layout
             val hit = position != null && layout != null &&
                 annotatedString.getLinkAnnotations(0, annotatedString.length).any { range ->
                     (range.item as? LinkAnnotation.Clickable)?.tag == tag &&
@@ -10844,7 +11140,6 @@ private fun EmoticonText(
             hit
         }
     }
-    var inlineImageCoordinates by remember(annotatedString) { mutableStateOf<LayoutCoordinates?>(null) }
     val locationAnnotation = remember(annotatedString, trailingLocation) {
         annotatedString
             .getStringAnnotations(LocationAnchorAnnotationTag, 0, annotatedString.length)
@@ -10852,7 +11147,6 @@ private fun EmoticonText(
     }
     val locationStart = locationAnnotation?.start ?: -1
     val locationEnd = locationAnnotation?.end
-    val locationLayoutState = rememberUpdatedState(inlineImageLayoutResult)
     val inlineImageAnchorRanges = remember(annotatedString, inlineImageLinks) {
         annotatedString
             .getStringAnnotations(InlineImageAnchorAnnotationTag, 0, annotatedString.length)
@@ -10860,8 +11154,8 @@ private fun EmoticonText(
     }
     val inlineImageAnchorResolver = rememberUpdatedState<(String) -> Rect?> { token ->
         val range = inlineImageAnchorRanges[token] ?: return@rememberUpdatedState null
-        val layout = inlineImageLayoutResult ?: return@rememberUpdatedState null
-        val coordinates = inlineImageCoordinates ?: return@rememberUpdatedState null
+        val layout = textGeometry.layout ?: return@rememberUpdatedState null
+        val coordinates = textGeometry.coordinates ?: return@rememberUpdatedState null
         textRangeBoundsInWindow(layout, coordinates, range.first, range.second)
     }
     SideEffect {
@@ -10885,13 +11179,13 @@ private fun EmoticonText(
                     waitForUpOrCancellation(pass = PointerEventPass.Initial)
                 }
             }
-            .onGloballyPositioned { coordinates -> inlineImageCoordinates = coordinates }
+            .onGloballyPositioned { coordinates -> textGeometry.coordinates = coordinates }
             .then(
                 if (locationStart >= 0 && locationEnd != null && onLocationClick != null) {
-                    Modifier.pointerInput(linkScopeKey, locationStart, locationEnd) {
+                    Modifier.pointerInput(linkScopeKey, locationStart, locationEnd, textGeometry) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                            val layout = locationLayoutState.value
+                            val layout = textGeometry.layout
                             val offset = layout?.getOffsetForPosition(down.position)
                             val isLocation = offset != null &&
                                 offset >= locationStart &&
@@ -10918,7 +11212,7 @@ private fun EmoticonText(
                     Modifier
                 },
             ),
-        onTextLayout = { result -> inlineImageLayoutResult = result },
+        onTextLayout = { result -> textGeometry.layout = result },
         maxLines = maxLines,
         overflow = overflow,
     )
@@ -11023,13 +11317,13 @@ private fun buildEmoticonAnnotatedString(
                         },
                     )
                     if (entity.title.contains("微博正文")) {
-                        appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                        append("\uD83D\uDD17\uFE0E\u202F")
                         withLink(urlLink) {
                             withStyle(linkStyle) { append(entity.title) }
                         }
                     } else withLink(urlLink) {
                         withStyle(linkStyle) {
-                            appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                            append("\uD83D\uDD17\uFE0E\u202F")
                             append(entity.title)
                         }
                     }
@@ -11037,7 +11331,7 @@ private fun buildEmoticonAnnotatedString(
                 urlEntities.containsKey(token) -> {
                     val entity = urlEntities.getValue(token)
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
-                        appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                        append("\uD83D\uDD17\uFE0E\u202F")
                         append(entity.title)
                     }
                 }
@@ -11261,7 +11555,7 @@ private fun FeedCard(
 ) {
     val displayItem = remember(item) { WeiboJsonParser.sanitizeRepostVideoLinks(item) }
     val cardMotion = LocalDetailCardMotion.current
-    val hideSourceCard = !insetRounded && LocalHiddenFeedCardId.current == item.id
+    val hideSourceCard = !insetRounded && isHiddenDetailSource(item.id)
     val openRetweetCard = LocalOpenRetweetCard.current
     var cardMotionBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
     val resolvedEmoticonMap = remember(emoticonMap, displayItem.emoticons, displayItem.retweetedStatus?.emoticons) {
@@ -11442,8 +11736,8 @@ private fun FeedCard(
                     .graphicsLayer {
                         val target = cardMotionBounds
                         if (cardMotion != null && target != null) {
-                            alpha = 1f - cardMotion.sourceHandoff
-                            val remaining = 1f - cardMotion.progress.coerceIn(-0.05f, 1.05f)
+                            alpha = 1f - cardMotion.sourceHandoff()
+                            val remaining = 1f - cardMotion.progress().coerceIn(-0.05f, 1.05f)
                             scaleX = 1f
                             scaleY = 1f
                             translationX = (cardMotion.source.left - target.left - 8.dp.toPx()) * remaining
@@ -11759,11 +12053,36 @@ private fun FeedPollCard(item: FeedItem, onUrlEntityClick: ((FeedUrlEntity) -> U
                     .padding(horizontal = 10.dp, vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(option.text, Modifier.weight(1f), fontSize = 14.sp)
                 val votes = if (poll.hasVoted) option.count?.toString() ?: option.countText else null
-                votes?.let {
-                    Text(if (it.endsWith("票")) it else "${it}票", modifier = Modifier.padding(start = 8.dp),
-                        fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Layout(
+                    modifier = Modifier.fillMaxWidth(),
+                    content = {
+                        Text(option.text, fontSize = 14.sp, textAlign = TextAlign.Center)
+                        votes?.let {
+                            Text(
+                                if (it.endsWith("票")) it else "${it}票",
+                                modifier = Modifier.padding(start = 8.dp),
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                ) { measurables, constraints ->
+                    val width = constraints.maxWidth
+                    val count = measurables.getOrNull(1)?.measure(
+                        constraints.copy(minWidth = 0, maxWidth = width / 3, minHeight = 0),
+                    )
+                    // Reserve the same space on both sides so the label stays centered after voting.
+                    val sideWidth = count?.width ?: 0
+                    val labelWidth = width - 2 * sideWidth
+                    val label = measurables[0].measure(
+                        constraints.copy(minWidth = labelWidth, maxWidth = labelWidth, minHeight = 0),
+                    )
+                    val height = maxOf(constraints.minHeight, label.height, count?.height ?: 0)
+                    layout(width, height) {
+                        label.placeRelative(sideWidth, (height - label.height) / 2)
+                        count?.placeRelative(width - count.width, (height - count.height) / 2)
+                    }
                 }
             }
         }
@@ -11861,7 +12180,7 @@ private fun QuotedStatus(
     val resolvedMap = resolveEmoticonMap(emoticonMap, displayItem.collectEmoticons())
     val userTarget = item.authorId.takeIf { it.isNotBlank() } ?: item.authorName
     val quotedShape = RoundedCornerShape(8.dp)
-    val hideQuotedSource = LocalHiddenFeedCardId.current == item.id
+    val hideQuotedSource = isHiddenDetailSource(item.id)
     ElevatedCard(
         modifier = modifier
             .fillMaxWidth()
@@ -12215,7 +12534,7 @@ private fun EditHistoryViewer(
         ) {
         Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
             .statusBarsPadding().navigationBarsPadding()) {
-            CompositionLocalProvider(LocalHiddenFeedCardId provides null, LocalDetailCardMotion provides null) {
+            CompositionLocalProvider(LocalHiddenFeedCardId provides { null }, LocalDetailCardMotion provides null) {
                 LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(top = 8.dp, bottom = 16.dp)) {
                     items(revisions.size, key = { it }) { index ->
                         Column(Modifier.padding(bottom = 8.dp)) {
@@ -15408,10 +15727,12 @@ private fun ZoomableFullscreenImage(
                                     gestureScale,
                                     containerHeightPx,
                                 )
-                                val canDismissDown = blackTop >= blackBarThresholdPx && delta.y > 0
+                                val atLongImageTop = opensAtFullWidth && gestureScale <= initialScale * 1.01f &&
+                                    gesturePanOffsetY >= layout.maxPanY - touchSlop
+                                val canDismissDown = delta.y > 0 && (blackTop >= blackBarThresholdPx || atLongImageTop)
                                 val canDismissUp = blackBottom >= blackBarThresholdPx && delta.y < 0
                                 val canDismissVertically = lockedAxis == FullscreenDragAxis.Vertical &&
-                                    (canDismissDown || canDismissUp ||
+                                    (dismissing || canDismissDown || canDismissUp ||
                                     (
                                         gestureScale <= 1.01f &&
                                             abs(totalDrag.y) > 48f &&
@@ -15993,7 +16314,7 @@ private fun InlineVideoPlayer(
     val isDetailInlinePlayback = LocalDetailInlineVideoPlayback.current
     val suppressedByDetailOverlay = !isDetailInlinePlayback &&
         videoCoordinator.shouldSuppressInlineForDetailOverlay(playbackKey)
-    val inlinePlaying = !suppressedByDetailOverlay &&
+    val inlinePlaying = !LocalProfileUnderlay.current && !suppressedByDetailOverlay &&
         (
             videoCoordinator.isPlaybackKeyActive(playbackKey) ||
                 videoCoordinator.isPlaybackKeyHandoffPending(playbackKey) ||
@@ -18821,7 +19142,6 @@ private fun DetailScreen(
     var commentTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
     var repostTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
     var likesTabWidth by remember(item.id) { mutableFloatStateOf(0f) }
-    var sectionHeaderLeft by remember(item.id) { mutableFloatStateOf(0f) }
     val commentVisibility = Modifier
     val showingReposts = detailPager.currentPage == 1
     val showingLikes = detailPager.currentPage == 2
@@ -18832,6 +19152,7 @@ private fun DetailScreen(
     }
     var pullRefreshing by remember { mutableStateOf(false) }
     var detailVideoViewport by remember { mutableStateOf(DetailVideoViewport()) }
+    var detailViewportHeightPx by remember { mutableIntStateOf(0) }
     var sectionHeaderTop by remember(item.id) { mutableFloatStateOf(Float.MAX_VALUE) }
     val currentSectionHeaderTop by rememberUpdatedState(sectionHeaderTop)
     val currentDetailViewport by rememberUpdatedState(detailVideoViewport)
@@ -18901,8 +19222,8 @@ private fun DetailScreen(
             .graphicsLayer {
                 val target = sharedCardBounds
                 if (sharedCardMotion != null && target != null) {
-                    alpha = 1f - sharedCardMotion.sourceHandoff
-                    val progress = sharedCardMotion.progress.coerceIn(-0.05f, 1.05f)
+                    alpha = 1f - sharedCardMotion.sourceHandoff()
+                    val progress = sharedCardMotion.progress().coerceIn(-0.05f, 1.05f)
                     val remaining = 1f - progress
                     val deltaX = sharedCardMotion.source.left - target.left
                     val deltaY = sharedCardMotion.source.top - target.top
@@ -18912,7 +19233,7 @@ private fun DetailScreen(
                     translationX = if (progress > 1f) kotlin.math.sign(deltaX) * rebound else deltaX * remaining
                     translationY = if (progress > 1f) kotlin.math.sign(deltaY) * rebound else deltaY * remaining
                 }
-                else if (sharedCardMotion != null) alpha = 1f - sharedCardMotion.sourceHandoff
+                else if (sharedCardMotion != null) alpha = 1f - sharedCardMotion.sourceHandoff()
             },
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -18999,6 +19320,7 @@ private fun DetailScreen(
                         }
                     }
                     .onGloballyPositioned { coordinates ->
+                        detailViewportHeightPx = coordinates.size.height
                         val bounds = coordinates.boundsInWindow()
                         val next = DetailVideoViewport(
                             headerBottomPx = bounds.top,
@@ -19041,7 +19363,6 @@ private fun DetailScreen(
                             .onGloballyPositioned {
                                 sectionHeaderTop = it.boundsInWindow().top
                                 sectionHeaderHeightPx = it.size.height
-                                sectionHeaderLeft = it.boundsInWindow().left
                             }
                             .fillMaxWidth()
                             .background(MaterialTheme.colorScheme.surface)
@@ -19095,8 +19416,7 @@ private fun DetailScreen(
                     }
                     Box(Modifier.align(Alignment.BottomStart)
                         .offset { IntOffset(
-                            (indicatorCenter - sectionHeaderLeft -
-                                indicatorWidthPx / 2f).roundToInt(),
+                            (indicatorCenter - indicatorWidthPx / 2f).roundToInt(),
                             -with(indicatorDensity) { 7.dp.toPx() }.roundToInt(),
                         ) }
                         .width(with(indicatorDensity) { indicatorWidthPx.toDp() }).height(3.dp)
@@ -19105,12 +19425,16 @@ private fun DetailScreen(
                 }
 
                 item(key = "detail-section-pages") {
-                    val height = with(LocalDensity.current) {
-                        (detailVideoViewport.viewportBottomPx - detailVideoViewport.headerBottomPx - sectionHeaderHeightPx)
-                            .coerceAtLeast(0f).toDp()
-                    }.coerceAtLeast(1.dp)
+                    val pageHeight = if (detailViewportHeightPx > 0) {
+                        val height = with(LocalDensity.current) {
+                            (detailViewportHeightPx - sectionHeaderHeightPx).coerceAtLeast(1).toDp()
+                        }
+                        Modifier.height(height)
+                    } else {
+                        Modifier.fillParentMaxHeight()
+                    }
                     HorizontalPager(state = detailPager, userScrollEnabled = false,
-                        beyondViewportPageCount = 1, modifier = Modifier.fillMaxWidth().height(height)) { page ->
+                        beyondViewportPageCount = 1, modifier = Modifier.fillMaxWidth().then(pageHeight)) { page ->
                         if (page == 2) {
                             val pageList = likesScrollState
                             val collapseBody = remember(listState, pageList) {
@@ -19216,7 +19540,8 @@ private fun DetailScreen(
                         LaunchedEffect(pageList, sectionItems.size, isLoadingSection, loadingMore, hasMore) {
                             snapshotFlow {
                                 val info = pageList.layoutInfo
-                                info.totalItemsCount > 0 && (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 3
+                                pageList.isScrollInProgress && info.totalItemsCount > 0 &&
+                                    (info.visibleItemsInfo.lastOrNull()?.index ?: -1) >= info.totalItemsCount - 3
                             }.distinctUntilChanged().collect { nearEnd ->
                                 if (nearEnd && hasMore && !isLoadingSection && !loadingMore && sectionItems.isNotEmpty()) loadMore()
                             }
@@ -19248,7 +19573,7 @@ private fun DetailScreen(
                         LazyColumn(state = pageList, flingBehavior = rememberWeiboListFlingBehavior(),
                             modifier = Modifier.fillMaxSize().nestedScroll(collapseBody),
                             contentPadding = PaddingValues(bottom = 24.dp)) {
-                if (isLoadingSection && sectionItems.isNotEmpty() && !pullRefreshing &&
+                if (isLoadingSection && !loadingMore && sectionItems.isNotEmpty() && !pullRefreshing &&
                     (showingReposts || showCommentsLoadingIndicator)) {
                     item(key = "section-refresh") {
                         Box(Modifier.fillMaxWidth().padding(vertical = 12.dp), contentAlignment = Alignment.TopCenter) {
@@ -19334,8 +19659,8 @@ private fun DetailSectionTab(label: String, selected: Boolean, onWidthChanged: (
     onLongClick: (() -> Unit)? = null, onCenterChanged: (Float) -> Unit,
     liked: Boolean = false, showLikeIcon: Boolean = false, onClick: () -> Unit) {
     Column(
-        modifier = Modifier.onGloballyPositioned {
-            onCenterChanged(it.boundsInWindow().center.x)
+        modifier = Modifier.onPlaced {
+            onCenterChanged(it.positionInParent().x + it.size.width / 2f)
             onWidthChanged(it.size.width.toFloat())
         }.combinedClickable(onClick = onClick, onLongClick = onLongClick).padding(vertical = 3.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -23359,7 +23684,7 @@ private fun SearchScreen(
                                 // the neighboring results. The detail entry point resolves the
                                 // latest item independently.
                                 var cardBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
-                                CompositionLocalProvider(LocalHiddenFeedCardId provides hiddenSourceCardId) {
+                                CompositionLocalProvider(LocalHiddenFeedCardId provides remember { { hiddenSourceCardId } }) {
                                 FeedCard(
                                     item = item,
                                     onClick = { onItemClick(item, cardBounds) },
@@ -24086,8 +24411,10 @@ private fun MineScreen(
 
     val topInset = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
+    val profileContentActive = !LocalProfileUnderlay.current
     // Infinite scroll for Posts
-    LaunchedEffect(postsListState) {
+    LaunchedEffect(postsListState, profileContentActive) {
+        if (!profileContentActive) return@LaunchedEffect
         snapshotFlow {
             val layoutInfo = postsListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
@@ -24106,7 +24433,8 @@ private fun MineScreen(
     val activeAlbumListState = if (pagerState.currentPage == MineContentTab.Videos.ordinal)
         videoAlbumListState else albumListState
     // Photos and videos keep independent scroll positions but share pagination.
-    LaunchedEffect(activeAlbumListState) {
+    LaunchedEffect(activeAlbumListState, profileContentActive) {
+        if (!profileContentActive) return@LaunchedEffect
         snapshotFlow {
             val layoutInfo = activeAlbumListState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
