@@ -2240,10 +2240,10 @@ private class VideoPlaybackCoordinator {
         candidate == reference || playbackKeysShareMedia(candidate, reference)
 
     fun isPlaybackKeyActive(playbackKey: String): Boolean =
-        activeKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+        activeKey == playbackKey
 
     fun isPlaybackKeyHandoffPending(playbackKey: String): Boolean =
-        pendingPeekHandoffKey?.let { matchesPlaybackKey(it, playbackKey) } == true
+        pendingPeekHandoffKey == playbackKey
 
     fun shouldResumeInlineHandoff(playbackKey: String): Boolean =
         inlineHandoffResumeKeys.any { matchesPlaybackKey(it, playbackKey) }
@@ -4143,6 +4143,9 @@ private fun isMediaInlineExpanded(
 private fun feedItemPlaybackOwnerId(item: FeedItem): String =
     item.statusId.ifBlank { item.id }
 
+private fun quotedPlaybackOwnerId(item: FeedItem): String =
+    "${feedItemPlaybackOwnerId(item)}:quoted:${item.retweetedStatus?.statusId.orEmpty()}"
+
 private fun feedItemInlinePlaybackKeys(item: FeedItem): Set<String> {
     val keys = mutableSetOf<String>()
     fun register(medias: List<FeedMedia>, ownerId: String) {
@@ -4152,7 +4155,7 @@ private fun feedItemInlinePlaybackKeys(item: FeedItem): Set<String> {
     }
     register(item.medias, feedItemPlaybackOwnerId(item))
     item.retweetedStatus?.let { retweeted ->
-        val retweetOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) }
+        val retweetOwnerId = quotedPlaybackOwnerId(item)
         register(retweeted.medias, retweetOwnerId)
     }
     return keys
@@ -11317,13 +11320,13 @@ private fun buildEmoticonAnnotatedString(
                         },
                     )
                     if (entity.title.contains("微博正文")) {
-                        append("\uD83D\uDD17\uFE0E\u202F")
+                        if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                         withLink(urlLink) {
                             withStyle(linkStyle) { append(entity.title) }
                         }
                     } else withLink(urlLink) {
                         withStyle(linkStyle) {
-                            append("\uD83D\uDD17\uFE0E\u202F")
+                            if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                             append(entity.title)
                         }
                     }
@@ -11331,7 +11334,7 @@ private fun buildEmoticonAnnotatedString(
                 urlEntities.containsKey(token) -> {
                     val entity = urlEntities.getValue(token)
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
-                        append("\uD83D\uDD17\uFE0E\u202F")
+                        if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
                         append(entity.title)
                     }
                 }
@@ -11664,7 +11667,7 @@ private fun FeedCard(
                         modifier = Modifier.padding(horizontal = FeedCardContentHorizontalPadding)
                             .onGloballyPositioned { quotedBounds = it.boundsInRoot() },
                         item = retweeted,
-                        playbackOwnerId = retweeted.statusId.ifBlank { feedItemPlaybackOwnerId(item) },
+                        playbackOwnerId = quotedPlaybackOwnerId(item),
                         onMediaClick = onMediaClick,
                         emoticonMap = emoticonMap,
                         onClick = onRetweetCardClick?.let { cb -> { cb(retweeted, item, quotedBounds) } }
@@ -16697,6 +16700,7 @@ private fun InlineVideoPlayer(
                         viewConfiguration = viewConfiguration,
                         onHoldProgress = { pressHoldProgress = it },
                         onHaptic = mediaHaptics::perform,
+                        consumeTap = true,
                     )
 
                     if (pressResult != MediaLongPressResult.LongPress) {
@@ -16708,15 +16712,16 @@ private fun InlineVideoPlayer(
                             if (isDoubleTap) {
                                 lastTapUptimeMs = 0L
                                 if (media.isStreamPlayable()) {
-                                    // 双击播放封面/卡片直接进入浮窗；单击仍由播放按钮启动卡片内播放。
+                                    // Double-tapping the cover promotes playback to a floating window.
                                     openInlineFloatingPlayback(pressWindowOffset)
                                 } else {
                                     onClick()
                                 }
                             } else {
-                                if (gridCell && media.isStreamPlayable() && !inlinePlaying) {
+                                if (media.isStreamPlayable() && !inlinePlaying) {
                                     // 详情页直接锚定到被点中的宫格，避免先取得内联播放权、
                                     // 再由 LaunchedEffect 二次交接时卡片短暂失去视频 Surface。
+                                    lastTapUptimeMs = tapUptime
                                     openAnchoredInlinePlayback()
                                     return@awaitEachGesture
                                 }
