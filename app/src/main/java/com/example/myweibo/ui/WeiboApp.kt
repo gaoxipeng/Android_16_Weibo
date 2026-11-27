@@ -291,6 +291,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.KeyboardActions
@@ -344,6 +345,8 @@ import com.example.myweibo.data.CommentItem
 import com.example.myweibo.data.CommentSort
 import com.example.myweibo.data.CommentSortStore
 import com.example.myweibo.data.FeedDisplaySettingsStore
+import com.example.myweibo.data.ReadingPreferences
+import com.example.myweibo.data.ReadingPreferencesStore
 import com.example.myweibo.data.EmoticonCacheStore
 import com.example.myweibo.data.MentionSuggestionCacheStore
 import com.example.myweibo.data.SearchHistoryStore
@@ -412,7 +415,12 @@ import com.example.myweibo.data.parseWeiboCreatedAtMillis
 import com.example.myweibo.data.collectEmoticons
 import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
+import com.example.myweibo.data.FeedTimelineGap
+import com.example.myweibo.data.FeedTimelineRefreshProjection
+import com.example.myweibo.data.feedItemSortKey
 import com.example.myweibo.data.mergeFeedTimelinePages
+import com.example.myweibo.data.mergeFeedTimelineRefresh
+import com.example.myweibo.data.projectFeedTimelineRefresh
 import com.example.myweibo.data.sortFeedTimelineItems
 import com.example.myweibo.data.completeBareUrlEntities
 import com.example.myweibo.ui.theme.MyWeiboTheme
@@ -427,9 +435,11 @@ import com.example.myweibo.ui.liquidglass.TransparentLiquidIconButton
 import com.example.myweibo.ui.liquidglass.TransparentLiquidTextButton
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSwitch
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import com.example.myweibo.ui.liquidglass.SettingsLiquidSlider
 import com.example.myweibo.ui.liquidglass.SettingsLiquidToggle
 import com.example.myweibo.ui.liquidglass.liquidLargeCapsuleSurfaceColor
@@ -530,6 +540,57 @@ private fun feedRefreshHintMessage(
 
 private const val BottomBarHideGestureThresholdPx = 36f
 private const val ListLoadMoreItemsFromBottom = 3
+private const val FeedReverseBrowseGapKey = "feed-reverse-browse-gap"
+
+private fun TimelineKind.hasOrderedRefresh(groupId: String?, current: List<FeedItem>): Boolean = when (this) {
+    TimelineKind.Following, TimelineKind.FriendsCircle -> true
+    TimelineKind.SpecialFollowing -> {
+        // User group snapshots are already sorted by the home feed. The standalone
+        // Special Following route keeps server order; only compare a chronological snapshot.
+        groupId != null || current.filterNot { it.isPinned }.map(::feedItemSortKey).let { dates ->
+            dates.all { it > 0 } && dates.zipWithNext().all { (newer, older) -> newer >= older }
+        }
+    }
+    TimelineKind.Hot, TimelineKind.Nearby, TimelineKind.Favorites, TimelineKind.Liked -> false
+}
+
+private fun projectHomeTimeline(
+    items: List<FeedItem>,
+    previousHeadId: String?,
+    limit: Int,
+    gapExpanded: Boolean,
+): FeedTimelineRefreshProjection {
+    val folded = projectFeedTimelineRefresh(items, previousHeadId, limit)
+    val gap = folded.gap ?: return folded
+    if (!gapExpanded) return folded
+
+    val visibleIds = folded.visibleItems.mapTo(HashSet()) { it.id }
+    val overflow = items.filterNot { it.id in visibleIds }
+    // The divider and every row above it stay in place; expanded cached posts are
+    // inserted immediately below it, before the same old-history boundary.
+    val rows = folded.visibleItems.take(gap.insertionIndex) + overflow +
+        folded.visibleItems.drop(gap.insertionIndex)
+    return FeedTimelineRefreshProjection(rows, gap)
+}
+
+private fun LazyListState.retainHomeViewportIfKeyRemoved(posts: List<FeedItem>, gap: FeedTimelineGap?) {
+    val layout = layoutInfo
+    val visible = layout.visibleItemsInfo.dropWhile { it.index < firstVisibleItemIndex }
+    val first = visible.firstOrNull() ?: return
+    // Compose retains the first key and exact pixel offset, including during a drag/fling.
+    // A collapsed row has no new index: choose the next surviving visible post instead.
+    if (first.key == FeedReverseBrowseGapKey && gap != null) return
+    val postIndices = posts.mapIndexed { index, post -> post.id to index }.toMap()
+    val firstPostKey = first.key as? String
+    if (isScrollInProgress || (firstPostKey != null && postIndices.containsKey(firstPostKey))) return
+    val fallback = visible.firstNotNullOfOrNull { row ->
+        val key = row.key as? String ?: return@firstNotNullOfOrNull null
+        val index = postIndices[key] ?: return@firstNotNullOfOrNull null
+        val lazyIndex = index + if (gap != null && index >= gap.insertionIndex) 1 else 0
+        lazyIndex to -row.offset
+    }
+    requestScrollToItem(fallback?.first ?: gap?.insertionIndex ?: 0, fallback?.second ?: 0)
+}
 private const val ListScrollToTopMaxDurationMillis = 500L
 
 private inline fun <T> runCatchingPreservingCancellation(block: () -> T): Result<T> =
@@ -2707,6 +2768,7 @@ private fun upgradeWeiboWebUrl(url: String): String {
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalProfileInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalProfileUnderlay = staticCompositionLocalOf { false }
+private val LocalHomeTimelineReadingState = staticCompositionLocalOf<HomeTimelineReadingState?> { null }
 private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
@@ -4180,18 +4242,132 @@ private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     )
 }
 
+private fun validTimelineAccountId(id: String?): String? = id?.takeIf {
+    it.isNotEmpty() && it != "0" && it.all { digit -> digit in '0'..'9' }
+}
+
+// A selected ID alone does not identify a newer WebView login. Accept the saved
+// account offline only when its authenticated cookie matches the live one.
+private fun accountMatchingTimelineCookie(account: StoredWeiboAccount?): String? {
+    account ?: return null
+    val uid = validTimelineAccountId(account.id) ?: return null
+    fun subCookie(header: String?): String? = header?.split(';')
+        ?.firstOrNull { it.trimStart().startsWith("SUB=") }
+        ?.trim()?.substringAfter('=')?.takeIf { it.isNotBlank() }
+    val manager = CookieManager.getInstance()
+    val origin = "https://weibo.com/"
+    val fallback = "https://www.weibo.com/"
+    val liveSub = subCookie(manager.getCookie(origin) ?: manager.getCookie(fallback)) ?: return null
+    val savedSub = subCookie(account.cookies[origin] ?: account.cookies[fallback])
+    return uid.takeIf { liveSub == savedSub }
+}
+
+// Keep home timeline snapshots behind one capture in WeiboApp's navigation lambdas.
+@Stable
+private class HomeTimelineReadingState(
+    private val preferencesStore: ReadingPreferencesStore,
+    val cacheStore: TimelineCacheStore,
+    initialKind: TimelineKind,
+) {
+    var preferences by mutableStateOf(preferencesStore.read())
+        private set
+    var timelineKind by mutableStateOf(initialKind)
+    var timelineGroups by mutableStateOf<List<TimelineGroup>>(emptyList())
+    var selectedTimelineGroupId by mutableStateOf<String?>(null)
+    var items by mutableStateOf<List<FeedItem>>(emptyList())
+    var reverseBrowsePreviousHeadId by mutableStateOf<String?>(null)
+    var reverseBrowseGapExpanded by mutableStateOf(false)
+        private set
+    // A cold disk page has not yet been confirmed by a successful network refresh.
+    var timelineVerifiedFromNetwork by mutableStateOf(false)
+    var nextCursor by mutableStateOf<String?>(null)
+    var isLoading by mutableStateOf(false)
+    var feedLoadingMore by mutableStateOf(false)
+    var timelineRefreshJob by mutableStateOf<Job?>(null)
+    var timelineLoadMoreJob by mutableStateOf<Job?>(null)
+    var timelineRequestGeneration by mutableIntStateOf(0)
+    var feedRefreshHint by mutableStateOf<String?>(null)
+    var feedRefreshHintGeneration by mutableIntStateOf(0)
+    var feedCacheLoaded by mutableStateOf(false)
+    var feedInitialScrollTarget by mutableStateOf<ScrollRestore?>(null)
+    var feedInitialScrollReconciled by mutableStateOf(false)
+    var followingDiskIds by mutableStateOf<Set<String>>(emptySet())
+    var timelineCacheSessionGeneration by mutableIntStateOf(0)
+    var timelineCacheAccountId by mutableStateOf<String?>(null)
+
+    val feedProjection by derivedStateOf {
+        projectHomeTimeline(
+            items,
+            reverseBrowsePreviousHeadId.takeIf { preferences.reverseReading },
+            preferences.newPostLimit,
+            reverseBrowseGapExpanded,
+        )
+    }
+
+    fun updatePreferences(update: (ReadingPreferences) -> ReadingPreferences) {
+        val updated = update(preferences)
+        if (preferencesStore.write(updated)) preferences = updated
+    }
+
+    fun resetGap() {
+        reverseBrowsePreviousHeadId = null
+        reverseBrowseGapExpanded = false
+    }
+
+    fun toggleTimelineGap() {
+        if (feedProjection.gap == null) return
+        // Rows above the keyed divider keep their position; no scroll or fetch is needed.
+        reverseBrowseGapExpanded = !reverseBrowseGapExpanded
+    }
+
+    fun currentFollowingCacheAccount(
+        accountStore: WeiboAccountStore,
+        kind: TimelineKind,
+        groupId: String?,
+        requestedAccountId: String?,
+    ): String? =
+        timelineCacheAccountId?.takeIf {
+            kind == TimelineKind.Following && groupId == null && it == requestedAccountId &&
+                it == accountMatchingTimelineCookie(accountStore.getAccount(it))
+        }
+
+    fun forgetTimelineCacheAccount() {
+        timelineCacheSessionGeneration += 1
+        timelineCacheAccountId = null
+        followingDiskIds = emptySet()
+    }
+
+    fun resetTimelineReadingSession() {
+        timelineRefreshJob?.cancel()
+        timelineLoadMoreJob?.cancel()
+        timelineRequestGeneration += 1
+        resetGap()
+        timelineVerifiedFromNetwork = false
+        items = emptyList()
+        nextCursor = null
+        isLoading = false
+        feedLoadingMore = false
+        feedRefreshHint = null
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun WeiboApp() {
     val context = LocalContext.current
     val session = remember { WeiboWebSession(context) }
-    val timelineCacheStore = remember { TimelineCacheStore(context) }
     val mineCacheStore = remember { MineCacheStore(context) }
     val emoticonCacheStore = remember { EmoticonCacheStore(context) }
     val mentionSuggestionCacheStore = remember { MentionSuggestionCacheStore(context) }
     val accountStore = remember { WeiboAccountStore(context) }
     val commentSortStore = remember { CommentSortStore(context) }
     val feedDisplaySettingsStore = remember { FeedDisplaySettingsStore(context) }
+    val homeTimeline = remember {
+        HomeTimelineReadingState(
+            ReadingPreferencesStore(context), TimelineCacheStore(context), feedDisplaySettingsStore.readTimelineKind(),
+        )
+    }
+    val reverseBrowsingEnabled = homeTimeline.preferences.reverseReading
     var showCommentLikeCount by remember { mutableStateOf(feedDisplaySettingsStore.readShowCommentLikeCount()) }
     val searchSettingsStore = remember { SearchSettingsStore(context) }
     val searchHistoryStore = remember { SearchHistoryStore(context) }
@@ -4213,11 +4389,7 @@ fun WeiboApp() {
     }
     val scope = rememberCoroutineScope()
     val detailCaptureView = LocalView.current
-    val initialFollowingScroll = remember { timelineCacheStore.readFollowingScroll() }
-    val feedListState = rememberLazyListState(
-        initialFirstVisibleItemIndex = initialFollowingScroll.first,
-        initialFirstVisibleItemScrollOffset = initialFollowingScroll.second,
-    )
+    val feedListState = rememberLazyListState()
     val homeThumbnailStore = remember { HomeThumbnailStore() }
     val minePostsListState = rememberLazyListState()
     val mineAlbumListState = rememberLazyListState()
@@ -4298,20 +4470,11 @@ fun WeiboApp() {
     }
     var minePagerPage by remember { mutableStateOf(0) }
     var visitedMinePagerPage by remember { mutableStateOf(0) }
-    var feedRefreshHint by remember { mutableStateOf<String?>(null) }
-    var feedRefreshHintGeneration by remember { mutableIntStateOf(0) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
-    var timelineKind by remember { mutableStateOf(feedDisplaySettingsStore.readTimelineKind()) }
-    var timelineGroups by remember { mutableStateOf<List<TimelineGroup>>(emptyList()) }
-    var selectedTimelineGroupId by remember { mutableStateOf<String?>(null) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
-    var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
-    var nextCursor by remember { mutableStateOf<String?>(null) }
-    var isLoading by remember { mutableStateOf(false) }
-    var feedLoadingMore by remember { mutableStateOf(false) }
-    var timelineRefreshJob by remember { mutableStateOf<Job?>(null) }
-    var timelineLoadMoreJob by remember { mutableStateOf<Job?>(null) }
-    var timelineRequestGeneration by remember { mutableIntStateOf(0) }
+    LaunchedEffect(reverseBrowsingEnabled) {
+        if (!reverseBrowsingEnabled) homeTimeline.resetGap()
+    }
     var selectedItem by remember { mutableStateOf<FeedItem?>(null) }
 
     LaunchedEffect(selectedItem?.actionMenuKey()) {
@@ -4434,17 +4597,14 @@ fun WeiboApp() {
     var messagesInboxRoute by remember(activeAccountId, hasLoginCookie) { mutableStateOf(true) }
     LaunchedEffect(hasLoginCookie, activeAccountId) {
         if (!hasLoginCookie) {
-            timelineGroups = emptyList()
+            homeTimeline.timelineGroups = emptyList()
             return@LaunchedEffect
         }
         runCatching { session.loadTimelineGroups() }
-            .onSuccess { timelineGroups = it }
+            .onSuccess { homeTimeline.timelineGroups = it }
     }
     var cacheLoaded by remember { mutableStateOf(false) }
-    var feedCacheLoaded by remember { mutableStateOf(false) }
     var feedScrollRestoreApplied by remember { mutableStateOf(false) }
-    var feedInitialScrollTarget by remember { mutableStateOf<ScrollRestore?>(null) }
-    var feedInitialScrollReconciled by remember { mutableStateOf(false) }
     var feedResumeGeneration by remember { mutableIntStateOf(0) }
     var lastFeedResumeRefreshAt by remember { mutableStateOf(0L) }
     var expandedFeedItems by remember { mutableStateOf<Map<String, FeedItem>>(emptyMap()) }
@@ -4643,6 +4803,13 @@ fun WeiboApp() {
         storedAccounts = accountStore.readAccounts()
         activeAccountId = accountStore.readActiveAccountId()
         if (previousActiveAccountId != activeAccountId) {
+            homeTimeline.forgetTimelineCacheAccount()
+            if (previousActiveAccountId != null || homeTimeline.reverseBrowsePreviousHeadId != null) {
+                homeTimeline.resetTimelineReadingSession()
+                homeTimeline.selectedTimelineGroupId = null
+                // A pending cache-position restore belongs to the previous account.
+                homeTimeline.feedInitialScrollReconciled = true
+            }
             mineAccountGeneration += 1
             mineAlbumJob?.cancel()
             mineProfile = null
@@ -4663,9 +4830,18 @@ fun WeiboApp() {
     }
 
     suspend fun persistLoginSession(makeActive: Boolean = false) {
+        val cacheSessionGeneration = homeTimeline.timelineCacheSessionGeneration
         runCatching { session.persistCurrentAccount(accountStore, makeActive = makeActive) }
-            .onSuccess {
+            .onSuccess { account ->
+                val cacheSessionCurrent = cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration
                 reloadStoredAccounts()
+                if (cacheSessionCurrent && account != null) {
+                    val verifiedId = validTimelineAccountId(account.id).takeIf { it == activeAccountId }
+                    if (verifiedId != homeTimeline.timelineCacheAccountId) {
+                        homeTimeline.followingDiskIds = emptySet()
+                        homeTimeline.timelineCacheAccountId = verifiedId
+                    }
+                }
                 hasLoginCookie = session.hasLoginCookie()
                 mineHasLoginCookie = hasLoginCookie
             }
@@ -5889,7 +6065,7 @@ fun WeiboApp() {
                 add(item)
                 item.retweetedStatus?.let(::collect)
             }
-            (listOfNotNull(selectedItem) + items + minePosts + visitedPosts).forEach(::collect)
+            (listOfNotNull(selectedItem) + homeTimeline.items + minePosts + visitedPosts).forEach(::collect)
         }.distinctBy { it.id }
         fun openPreparedUser(preparedProfile: UserProfile) {
         val leavingDetailForProfile = selectedItem != null
@@ -6126,77 +6302,121 @@ fun WeiboApp() {
 
     fun refreshTimeline(showRefreshHint: Boolean = true) {
         preservedFeedSourceItem = null
-        timelineRefreshJob?.cancel()
-        timelineLoadMoreJob?.cancel()
-        timelineRequestGeneration += 1
-        val requestGeneration = timelineRequestGeneration
-        val refreshHintGeneration = feedRefreshHintGeneration
-        val requestedKind = timelineKind
-        val requestedGroupId = selectedTimelineGroupId
-        timelineRefreshJob = scope.launch {
-            val previousItems = items
-            isLoading = true
-            feedLoadingMore = false
+        homeTimeline.timelineRefreshJob?.cancel()
+        homeTimeline.timelineLoadMoreJob?.cancel()
+        homeTimeline.timelineRequestGeneration += 1
+        val requestGeneration = homeTimeline.timelineRequestGeneration
+        val refreshHintGeneration = homeTimeline.feedRefreshHintGeneration
+        val requestedKind = homeTimeline.timelineKind
+        val requestedGroupId = homeTimeline.selectedTimelineGroupId
+        val requestedAccountId = activeAccountId
+        val cacheSessionGeneration = homeTimeline.timelineCacheSessionGeneration
+        fun routeIsCurrent() = requestGeneration == homeTimeline.timelineRequestGeneration &&
+            requestedKind == homeTimeline.timelineKind && requestedGroupId == homeTimeline.selectedTimelineGroupId &&
+            requestedAccountId == activeAccountId && requestedAccountId == accountStore.readActiveAccountId()
+
+        homeTimeline.timelineRefreshJob = scope.launch {
+            val previousItems = homeTimeline.items
+            val preserveViewport = homeTimeline.preferences.reverseReading && previousItems.isNotEmpty() &&
+                requestedKind.hasOrderedRefresh(requestedGroupId, previousItems)
+            homeTimeline.isLoading = true
+            homeTimeline.feedLoadingMore = false
             hasLoginCookie = session.hasLoginCookie()
-            if (feedListState.layoutInfo.totalItemsCount > 0) {
-                feedListState.animateScrollToTopSmooth()
-            }
             try {
+                if (!preserveViewport && feedListState.layoutInfo.totalItemsCount > 0) {
+                    feedListState.animateScrollToTopSmooth()
+                }
+                val cacheAccountId = homeTimeline.currentFollowingCacheAccount(accountStore, requestedKind, requestedGroupId, requestedAccountId)
                 runCatchingPreservingCancellation {
                     if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                         val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it) }
                             ?: session.loadTimelineRaw(requestedKind)
-                        if (requestedKind == TimelineKind.Following) {
-                            timelineCacheStore.writeFollowingTimeline(raw)
-                        }
-                        WeiboJsonParser.parseTimeline(raw)
+                        WeiboJsonParser.parseTimeline(raw) to raw
                     } else {
-                        session.loadTimeline(requestedKind)
+                        session.loadTimeline(requestedKind) to null
                     }
                 }
-                    .onSuccess { page ->
-                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
+                    .onSuccess { (page, raw) ->
+                        if (!routeIsCurrent()) return@onSuccess
+                        val protectViewport = preserveViewport && homeTimeline.preferences.reverseReading && homeTimeline.items.isNotEmpty()
+                        val keepReading = protectViewport && homeTimeline.timelineVerifiedFromNetwork
+                        if (protectViewport && !keepReading && page.items.isEmpty()) {
+                            // An empty page cannot verify an unowned cache as the baseline.
+                            homeTimeline.feedRefreshHint = null
+                            showMessage("没有读取到微博", "请稍后刷新")
                             return@onSuccess
                         }
-                        items = if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
-                            sortFeedTimelineItems(page.items)
-                        } else page.items
-                        reconcileFeedLikeState(page.items)
-                        // groupstimeline does not always return max_id, especially
-                        // for 特别关注; without a cursor the bottom trigger never
-                        // starts a second page. Fall back to the newest item id.
-                        nextCursor = page.nextCursor ?: when (requestedKind) {
-                            TimelineKind.SpecialFollowing, TimelineKind.FriendsCircle ->
-                                page.items.lastOrNull()?.id
-                            else -> null
+                        if (keepReading) {
+                            if (page.items.isNotEmpty()) {
+                                val previousHeadId = homeTimeline.reverseBrowsePreviousHeadId
+                                    ?: homeTimeline.items.firstOrNull { !it.isPinned }?.id
+                                val merged = mergeFeedTimelineRefresh(homeTimeline.items, sortFeedTimelineItems(page.items))
+                                val projected = projectHomeTimeline(
+                                    merged, previousHeadId, homeTimeline.preferences.newPostLimit, homeTimeline.reverseBrowseGapExpanded,
+                                )
+                                // Read the live viewport immediately before changing rows; never
+                                // replay the position from before the request or override a drag.
+                                feedListState.retainHomeViewportIfKeyRemoved(projected.visibleItems, projected.gap)
+                                homeTimeline.reverseBrowsePreviousHeadId = previousHeadId
+                                homeTimeline.items = merged
+                            }
+                            // The first-page cursor belongs to the newly fetched head, not to
+                            // the retained tail. Keep the original pagination chain and cache.
+                        } else {
+                            homeTimeline.resetGap()
+                            val refreshedItems = if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
+                                sortFeedTimelineItems(page.items)
+                            } else page.items
+                            if (protectViewport) {
+                                feedListState.retainHomeViewportIfKeyRemoved(refreshedItems, gap = null)
+                            }
+                            homeTimeline.items = refreshedItems
+                            homeTimeline.timelineVerifiedFromNetwork = refreshedItems.isNotEmpty()
+                            // groupstimeline sometimes omits max_id; keep the existing cursor fallback.
+                            homeTimeline.nextCursor = page.nextCursor ?: when (requestedKind) {
+                                TimelineKind.SpecialFollowing, TimelineKind.FriendsCircle -> page.items.lastOrNull()?.id
+                                else -> null
+                            }
                         }
+                        reconcileFeedLikeState(page.items)
                         if (requestedKind == TimelineKind.SpecialFollowing) {
                             android.util.Log.e(
                                 "SpecialFollow",
-                                "refresh items=${page.items.size} serverCursor=${page.nextCursor} next=$nextCursor",
+                                "refresh items=${page.items.size} serverCursor=${page.nextCursor} next=${homeTimeline.nextCursor}",
                             )
                         }
                         absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
                         hasLoginCookie = true
+                        if (!keepReading && raw != null && requestedKind == TimelineKind.Following &&
+                            requestedGroupId == null && cacheAccountId != null &&
+                            cacheAccountId == homeTimeline.timelineCacheAccountId && cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration
+                        ) {
+                            // A replacement may remove IDs from the previous disk snapshot.
+                            homeTimeline.followingDiskIds = emptySet()
+                            val writtenIds = homeTimeline.cacheStore.writeFollowingTimeline(cacheAccountId, raw)
+                            if (!routeIsCurrent()) return@onSuccess
+                            if (cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration && cacheAccountId == homeTimeline.timelineCacheAccountId) {
+                                homeTimeline.followingDiskIds = writtenIds.orEmpty()
+                            }
+                        }
                         persistLoginSession()
+                        if (!routeIsCurrent()) return@onSuccess
                         if (page.items.isEmpty()) {
-                            feedRefreshHint = null
+                            homeTimeline.feedRefreshHint = null
                             if (requestedGroupId != null || requestedKind == TimelineKind.SpecialFollowing) {
                                 operationCapsuleHint = null
                             } else {
                                 showMessage("没有读取到微博", "请稍后刷新")
                             }
-                        } else if (showRefreshHint && refreshHintGeneration == feedRefreshHintGeneration) {
-                            feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
+                        } else if (!protectViewport && showRefreshHint && refreshHintGeneration == homeTimeline.feedRefreshHintGeneration) {
+                            homeTimeline.feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
                         } else {
-                            feedRefreshHint = null
+                            homeTimeline.feedRefreshHint = null
                         }
                     }
                     .onFailure { error ->
-                        if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
-                            return@onFailure
-                        }
-                        feedRefreshHint = null
+                        if (!routeIsCurrent()) return@onFailure
+                        homeTimeline.feedRefreshHint = null
                         if (isLoginStateFailure(error)) {
                             hasLoginCookie = false
                             mineHasLoginCookie = false
@@ -6207,112 +6427,59 @@ fun WeiboApp() {
                         showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
                     }
             } finally {
-                if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
-                    isLoading = false
-                    timelineRefreshJob = null
+                if (requestGeneration == homeTimeline.timelineRequestGeneration) {
+                    homeTimeline.isLoading = false
+                    homeTimeline.timelineRefreshJob = null
                 }
             }
-            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
-                if (feedListState.layoutInfo.totalItemsCount > 0) {
-                    feedListState.animateScrollToTopSmooth()
-                }
+            if (!preserveViewport && routeIsCurrent() && feedListState.layoutInfo.totalItemsCount > 0) {
+                feedListState.animateScrollToTopSmooth()
             }
         }
     }
 
-    fun refreshTimelineFromTop() {
-        refreshTimeline()
-        return
-        scope.launch {
-            val previousItems = items
-            feedListState.animateScrollToTopSmooth()
-            isLoading = true
-            hasLoginCookie = session.hasLoginCookie()
-            runCatching {
-                if (timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle) {
-                    val raw = session.loadTimelineRaw(timelineKind)
-                    if (timelineKind == TimelineKind.Following) {
-                        timelineCacheStore.writeFollowingTimeline(raw)
-                    }
-                    WeiboJsonParser.parseTimeline(raw)
-                } else {
-                    session.loadTimeline(timelineKind)
-                }
-            }
-                .onSuccess { page ->
-                    items = sortFeedTimelineItems(page.items)
-                    reconcileFeedLikeState(page.items)
-                    nextCursor = page.nextCursor
-                    absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
-                    hasLoginCookie = true
-                    persistLoginSession()
-                    if (page.items.isEmpty()) {
-                        feedRefreshHint = null
-                        showMessage("\u6CA1\u6709\u8BFB\u5230\u4FE1\u606F\u6D41", "\u8BF7\u5148\u5728\u6211\u7684\u9875\u9762\u8BBE\u7F6E\u4E2D\u767B\u5F55\u5FAE\u535A\uFF0C\u6216\u7A0D\u540E\u518D\u5237\u65B0")
-                    } else if (selectedItem == null && navOverlayStack.isEmpty()) {
-                        feedRefreshHint = feedRefreshHintMessage(previousItems, page.items)
-                    }
-                }
-                .onFailure { error ->
-                    feedRefreshHint = null
-                    if (isLoginStateFailure(error)) {
-                        hasLoginCookie = false
-                        mineHasLoginCookie = false
-                    } else {
-                        hasLoginCookie = session.hasLoginCookie()
-                        mineHasLoginCookie = hasLoginCookie
-                    }
-                    showMessage("同步失败", error.message ?: "请确认已登录 weibo.com")
-                }
-            isLoading = false
-            feedListState.animateScrollToTopSmooth()
-        }
-    }
+    fun refreshTimelineFromTop() = refreshTimeline()
 
     fun switchTimelineKind(kind: TimelineKind) {
-        if (kind == timelineKind && selectedTimelineGroupId == null) return
-        timelineRefreshJob?.cancel()
-        timelineLoadMoreJob?.cancel()
-        timelineRequestGeneration += 1
-        timelineKind = kind
-        selectedTimelineGroupId = null
+        if (kind == homeTimeline.timelineKind && homeTimeline.selectedTimelineGroupId == null) return
+        homeTimeline.resetTimelineReadingSession()
+        homeTimeline.timelineKind = kind
+        homeTimeline.selectedTimelineGroupId = null
         feedDisplaySettingsStore.writeTimelineKind(kind)
-        items = emptyList()
-        nextCursor = null
-        feedRefreshHint = null
         refreshTimeline(showRefreshHint = false)
     }
 
     fun switchTimelineGroup(group: TimelineGroup) {
-        timelineRefreshJob?.cancel()
-        timelineLoadMoreJob?.cancel()
-        timelineRequestGeneration += 1
-        selectedTimelineGroupId = group.id
-        timelineKind = TimelineKind.SpecialFollowing
+        homeTimeline.resetTimelineReadingSession()
+        homeTimeline.selectedTimelineGroupId = group.id
+        homeTimeline.timelineKind = TimelineKind.SpecialFollowing
         feedDisplaySettingsStore.writeTimelineKind(TimelineKind.SpecialFollowing)
         selectedTab = MainTab.Feed
-        items = emptyList()
-        nextCursor = null
-        feedRefreshHint = null
         refreshTimeline(showRefreshHint = false)
     }
 
     fun loadMore() {
-        val cursor = nextCursor ?: run {
-            if (timelineKind == TimelineKind.SpecialFollowing) {
+        val cursor = homeTimeline.nextCursor ?: run {
+            if (homeTimeline.timelineKind == TimelineKind.SpecialFollowing) {
                 android.util.Log.e("SpecialFollow", "loadMore skipped: nextCursor=null")
             }
             return
         }
-        if (feedLoadingMore || isLoading) return
-        val requestGeneration = timelineRequestGeneration
-        val requestedKind = timelineKind
-        val requestedGroupId = selectedTimelineGroupId
+        if (homeTimeline.feedLoadingMore || homeTimeline.isLoading) return
+        val requestGeneration = homeTimeline.timelineRequestGeneration
+        val requestedKind = homeTimeline.timelineKind
+        val requestedGroupId = homeTimeline.selectedTimelineGroupId
+        val requestedAccountId = activeAccountId
+        val cacheSessionGeneration = homeTimeline.timelineCacheSessionGeneration
+        fun routeIsCurrent() = requestGeneration == homeTimeline.timelineRequestGeneration &&
+            requestedKind == homeTimeline.timelineKind && requestedGroupId == homeTimeline.selectedTimelineGroupId &&
+            requestedAccountId == activeAccountId && requestedAccountId == accountStore.readActiveAccountId()
         if (requestedKind == TimelineKind.SpecialFollowing) {
             android.util.Log.e("SpecialFollow", "loadMore start cursor=$cursor")
         }
-        timelineLoadMoreJob = scope.launch {
-            feedLoadingMore = true
+        homeTimeline.timelineLoadMoreJob = scope.launch {
+            homeTimeline.feedLoadingMore = true
+            val cacheAccountId = homeTimeline.currentFollowingCacheAccount(accountStore, requestedKind, requestedGroupId, requestedAccountId)
             runCatchingPreservingCancellation {
                 if (requestedGroupId != null || requestedKind == TimelineKind.Following) {
                     val raw = requestedGroupId?.let { session.loadTimelineGroupRaw(it, cursor) }
@@ -6323,12 +6490,12 @@ fun WeiboApp() {
                 }
             }
                 .onSuccess { (page, raw) ->
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
+                    if (!routeIsCurrent()) {
                         return@onSuccess
                     }
                     // \u5728 Default \u7EBF\u7A0B\u6C60\u505A\u7EAF CPU \u8BA1\u7B97\uFF08merge \u53BB\u91CD + emoticon \u6536\u96C6\uFF09\uFF0C
                     // \u907F\u514D\u5728\u5206\u9875\u89E6\u53D1\u5E27\u963B\u585E\u4E3B\u7EBF\u7A0B\u3002
-                    val currentItems = items  // \u5728 Main \u4E0A\u5148\u62CD\u5FEB\u7167
+                    val currentItems = homeTimeline.items  // \u5728 Main \u4E0A\u5148\u62CD\u5FEB\u7167
                     val (merged, appended) = withContext(Dispatchers.Default) {
                         if (requestedGroupId != null || requestedKind == TimelineKind.Following || requestedKind == TimelineKind.FriendsCircle) {
                             mergeFeedTimelinePages(currentItems, page.items)
@@ -6338,16 +6505,14 @@ fun WeiboApp() {
                             (currentItems + added) to added.size
                         }
                     }
-                    if (requestGeneration != timelineRequestGeneration || requestedKind != timelineKind || requestedGroupId != selectedTimelineGroupId) {
-                        return@onSuccess
-                    }
                     val discoveredEmoticons = withContext(Dispatchers.Default) {
                         page.items.collectAllEmoticons()
                     }
-                    items = merged
+                    if (!routeIsCurrent()) return@onSuccess
+                    homeTimeline.items = merged
                     reconcileFeedLikeState(page.items)
                     absorbDiscoveredEmoticons(discoveredEmoticons)
-                    nextCursor = when {
+                    homeTimeline.nextCursor = when {
                         page.items.isEmpty() -> null
                         appended == 0 -> null
                         else -> page.nextCursor ?: page.items.lastOrNull()?.id
@@ -6356,22 +6521,32 @@ fun WeiboApp() {
                         android.util.Log.e(
                             "SpecialFollow",
                             "loadMore page items=${page.items.size} appended=$appended " +
-                                "serverCursor=${page.nextCursor} next=$nextCursor",
+                                "serverCursor=${page.nextCursor} next=${homeTimeline.nextCursor}",
                         )
                     }
-                    if (raw != null) timelineCacheStore.appendFollowingTimeline(raw)
+                    if (raw != null && requestedKind == TimelineKind.Following && requestedGroupId == null &&
+                        cacheAccountId != null && cacheAccountId == homeTimeline.timelineCacheAccountId &&
+                        cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration
+                    ) {
+                        val writtenIds = homeTimeline.cacheStore.appendFollowingTimeline(cacheAccountId, raw)
+                        if (routeIsCurrent() && cacheSessionGeneration == homeTimeline.timelineCacheSessionGeneration &&
+                            cacheAccountId == homeTimeline.timelineCacheAccountId && writtenIds != null
+                        ) {
+                            homeTimeline.followingDiskIds = writtenIds
+                        }
+                    }
                 }
                 .onFailure { error ->
                     if (requestedKind == TimelineKind.SpecialFollowing) {
                         android.util.Log.e("SpecialFollow", "loadMore failed: ${error.message}", error)
                     }
-                    if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
+                    if (routeIsCurrent()) {
                         showMessage("\u52A0\u8F7D\u5931\u8D25", error.message ?: "\u65E0\u6CD5\u8BFB\u53D6\u4E0B\u4E00\u9875")
                     }
                 }
-            if (requestGeneration == timelineRequestGeneration && requestedKind == timelineKind && requestedGroupId == selectedTimelineGroupId) {
-                feedLoadingMore = false
-                timelineLoadMoreJob = null
+            if (requestGeneration == homeTimeline.timelineRequestGeneration) {
+                homeTimeline.feedLoadingMore = false
+                homeTimeline.timelineLoadMoreJob = null
             }
         }
     }
@@ -6488,9 +6663,12 @@ fun WeiboApp() {
 
     fun switchStoredAccount(accountId: String) {
         scope.launch {
+            homeTimeline.forgetTimelineCacheAccount()
             runCatching { session.activateAccount(accountStore, accountId) }
                 .onSuccess {
                     reloadStoredAccounts()
+                    homeTimeline.timelineCacheAccountId = accountMatchingTimelineCookie(accountStore.getAccount(accountId))
+                        ?.takeIf { it == activeAccountId }
                     hasLoginCookie = session.hasLoginCookie()
                     mineHasLoginCookie = hasLoginCookie
                     refreshTimeline()
@@ -6505,6 +6683,7 @@ fun WeiboApp() {
     fun deleteStoredAccount(accountId: String) {
         scope.launch {
             val deletingActive = activeAccountId == accountId
+            if (deletingActive) homeTimeline.forgetTimelineCacheAccount()
             accountStore.removeAccount(accountId)
             reloadStoredAccounts()
             val nextActiveId = activeAccountId
@@ -6512,6 +6691,8 @@ fun WeiboApp() {
                 if (nextActiveId != null && accountStore.getAccount(nextActiveId) != null) {
                     runCatching { session.activateAccount(accountStore, nextActiveId) }
                         .onSuccess {
+                            homeTimeline.timelineCacheAccountId = accountMatchingTimelineCookie(accountStore.getAccount(nextActiveId))
+                                ?.takeIf { it == activeAccountId }
                             hasLoginCookie = session.hasLoginCookie()
                             mineHasLoginCookie = hasLoginCookie
                             refreshTimeline()
@@ -6524,8 +6705,8 @@ fun WeiboApp() {
                     session.clearAllCookies()
                     hasLoginCookie = false
                     mineHasLoginCookie = false
-                    items = emptyList()
-                    nextCursor = null
+                    homeTimeline.items = emptyList()
+                    homeTimeline.nextCursor = null
                     mineProfile = null
                     minePosts = emptyList()
                     mineAlbumImages = emptyList()
@@ -6642,7 +6823,7 @@ fun WeiboApp() {
         }
         expandedFeedItems = expandedFeedItems + (expanded.statusId to expanded)
         absorbDiscoveredEmoticons(expanded.collectEmoticons())
-        items = items.map { mergeExpandedIntoItem(it, expanded) }
+        homeTimeline.items = homeTimeline.items.map { mergeExpandedIntoItem(it, expanded) }
         minePosts = minePosts.map { mergeExpandedIntoItem(it, expanded) }
         visitedPosts = visitedPosts.map { mergeExpandedIntoItem(it, expanded) }
         selectedItem = selectedItem?.let { mergeExpandedIntoItem(it, expanded) }
@@ -6671,7 +6852,7 @@ fun WeiboApp() {
         expandedFeedItems[id]?.let { return it }
         sequenceOf(selectedItem)
             .filterNotNull()
-            .plus(items)
+            .plus(homeTimeline.items)
             .plus(minePosts)
             .plus(visitedPosts)
             .forEach { item ->
@@ -6763,7 +6944,7 @@ fun WeiboApp() {
                         filterNot { it.actionMenuKey() == key }
 
                     videoPlaybackCoordinator.pauseAll()
-                    items = items.withoutDeletedStatus()
+                    homeTimeline.items = homeTimeline.items.withoutDeletedStatus()
                     minePosts = minePosts.withoutDeletedStatus()
                     visitedPosts = visitedPosts.withoutDeletedStatus()
                     expandedFeedItems = expandedFeedItems.filterValues { it.actionMenuKey() != key }
@@ -6997,13 +7178,13 @@ fun WeiboApp() {
         }
     }
 
-    LaunchedEffect(items, minePosts, visitedPosts, selectedItem) {
+    LaunchedEffect(homeTimeline.items, minePosts, visitedPosts, selectedItem) {
         val candidates = buildList {
             fun addItemAndRetweet(item: FeedItem) {
                 add(item)
                 item.retweetedStatus?.let(::add)
             }
-            items.forEach(::addItemAndRetweet)
+            homeTimeline.items.forEach(::addItemAndRetweet)
             minePosts.forEach(::addItemAndRetweet)
             visitedPosts.forEach(::addItemAndRetweet)
             selectedItem?.let(::addItemAndRetweet)
@@ -7286,8 +7467,8 @@ fun WeiboApp() {
         replacePlaceholder: Boolean = false,
     ) {
         val isBodyLinkPlaceholder = item.id.startsWith(BodyLinkPlaceholderPrefix)
-        feedRefreshHintGeneration += 1
-        feedRefreshHint = null
+        homeTimeline.feedRefreshHintGeneration += 1
+        homeTimeline.feedRefreshHint = null
         if (!isBodyLinkPlaceholder && !replacePlaceholder) homeThumbnailStore.freezeVisible()
         val resolved = if (isBodyLinkPlaceholder) item else resolveFeedItem(item)
         retainedLikeUsersByStatus.remove(resolved.id)
@@ -7476,9 +7657,9 @@ fun WeiboApp() {
     }
 
     fun openDetailFromSource(item: FeedItem, sourceBounds: Rect?, hostItem: FeedItem? = null, section: DetailContentSection? = null) {
-        if (feedRefreshHint != null) {
-            feedRefreshHint = null
-            feedRefreshHintGeneration += 1
+        if (homeTimeline.feedRefreshHint != null) {
+            homeTimeline.feedRefreshHint = null
+            homeTimeline.feedRefreshHintGeneration += 1
             scope.launch {
                 // PixelCopy must capture the feed only after the capsule is gone.
                 withFrameNanos { }
@@ -7860,27 +8041,37 @@ fun WeiboApp() {
     }
 
     LaunchedEffect(Unit) {
-        // Restore the home timeline before session/account/profile caches. Those reads can be
-        // slower, but the persisted feed should be visible as soon as its own cache is ready.
-        val cachedTimeline = if (timelineKind == TimelineKind.Following) timelineCacheStore.readFollowingTimeline() else null
-        cachedTimeline?.let { page ->
-            items = sortFeedTimelineItems(page.items)
-            nextCursor = page.nextCursor
-            if (page.items.isNotEmpty()) {
-                val anchorId = timelineCacheStore.readFollowingAnchor()
-                val anchorIndex = items.indexOfFirst { it.id == anchorId }
-                feedInitialScrollTarget = ScrollRestore(
-                    anchorIndex.takeIf { it >= 0 } ?: initialFollowingScroll.first,
-                    initialFollowingScroll.second,
-                )
+        suspend fun restoreFollowingCache(accountId: String?) {
+            if (accountId == null || homeTimeline.timelineKind != TimelineKind.Following || homeTimeline.selectedTimelineGroupId != null) return
+            val cacheRouteGeneration = homeTimeline.timelineRequestGeneration
+            val cachedTimeline = homeTimeline.cacheStore.readFollowingTimeline(accountId)
+            cachedTimeline?.takeIf {
+                cacheRouteGeneration == homeTimeline.timelineRequestGeneration && accountId == homeTimeline.timelineCacheAccountId &&
+                    accountId == activeAccountId && accountId == accountStore.readActiveAccountId() &&
+                    homeTimeline.timelineKind == TimelineKind.Following && homeTimeline.selectedTimelineGroupId == null
+            }?.let { page ->
+                homeTimeline.items = sortFeedTimelineItems(page.items)
+                homeTimeline.nextCursor = page.nextCursor
+                homeTimeline.followingDiskIds = homeTimeline.items.mapTo(HashSet()) { it.id }
+                val anchorId = homeTimeline.cacheStore.readFollowingAnchor(accountId)
+                val anchorIndex = homeTimeline.items.indexOfFirst { it.id == anchorId }
+                if (anchorIndex >= 0) {
+                    homeTimeline.feedInitialScrollTarget = ScrollRestore(anchorIndex, homeTimeline.cacheStore.readFollowingScroll(accountId).second)
+                }
+                absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
             }
-            absorbDiscoveredEmoticons(page.items.collectAllEmoticons())
         }
-        if (feedInitialScrollTarget == null) {
-            feedInitialScrollTarget = ScrollRestore(0, 0)
+
+        // Restore early only when the saved account matches the live session. If not,
+        // wait for existing login reconciliation rather than showing another account's feed.
+        homeTimeline.timelineCacheAccountId = accountMatchingTimelineCookie(storedAccounts.firstOrNull { it.id == activeAccountId })
+        val earlyCacheAccountId = homeTimeline.timelineCacheAccountId
+        restoreFollowingCache(earlyCacheAccountId)
+        if (earlyCacheAccountId != null) {
+            if (homeTimeline.feedInitialScrollTarget == null) homeTimeline.feedInitialScrollTarget = ScrollRestore(0, 0)
+            feedScrollRestoreApplied = true
+            homeTimeline.feedCacheLoaded = true
         }
-        feedScrollRestoreApplied = true
-        feedCacheLoaded = true
 
         val savedActiveId = accountStore.readActiveAccountId()
         if (session.hasLoginCookie()) {
@@ -7889,9 +8080,19 @@ fun WeiboApp() {
             persistLoginSession(makeActive = true)
         } else if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
             // A snapshot is a fallback only when WebView has no authenticated SUB cookie.
-            runCatching { session.activateAccount(accountStore, savedActiveId) }
+            runCatching { session.activateAccount(accountStore, savedActiveId) }.onSuccess {
+                homeTimeline.timelineCacheAccountId = accountMatchingTimelineCookie(accountStore.getAccount(savedActiveId))
+            }
         }
         reloadStoredAccounts()
+        if (homeTimeline.timelineCacheAccountId != earlyCacheAccountId) {
+            homeTimeline.feedInitialScrollTarget = null
+            homeTimeline.feedInitialScrollReconciled = false
+            restoreFollowingCache(homeTimeline.timelineCacheAccountId)
+        }
+        if (homeTimeline.feedInitialScrollTarget == null) homeTimeline.feedInitialScrollTarget = ScrollRestore(0, 0)
+        feedScrollRestoreApplied = true
+        homeTimeline.feedCacheLoaded = true
 
         emoticonMap = emoticonCacheStore.read()
         recentCommentEmoticons = emoticonCacheStore.readRecent().filter { it in emoticonMap }
@@ -7929,9 +8130,9 @@ fun WeiboApp() {
         mineHasLoginCookie = hasLoginCookie
         cacheLoaded = true
         feedScrollRestoreApplied = true
-        if (feedInitialScrollTarget == null) {
+        if (homeTimeline.feedInitialScrollTarget == null) {
             // 没有可恢复的缓存时，首次网络加载始终从首页顶部开始。
-            feedInitialScrollTarget = ScrollRestore(0, 0)
+            homeTimeline.feedInitialScrollTarget = ScrollRestore(0, 0)
         }
     }
 
@@ -7971,62 +8172,43 @@ fun WeiboApp() {
         }
     }
 
-    LaunchedEffect(feedCacheLoaded, items.size, feedInitialScrollTarget) {
-        if (!feedCacheLoaded || items.isEmpty() || feedInitialScrollReconciled) return@LaunchedEffect
-        val target = feedInitialScrollTarget ?: return@LaunchedEffect
+    LaunchedEffect(homeTimeline.feedCacheLoaded, homeTimeline.items.size, homeTimeline.feedInitialScrollTarget) {
+        if (!homeTimeline.feedCacheLoaded || homeTimeline.items.isEmpty() || homeTimeline.feedInitialScrollReconciled) return@LaunchedEffect
+        val target = homeTimeline.feedInitialScrollTarget ?: return@LaunchedEffect
         withFrameNanos { }
-        val safeIndex = target.index.coerceIn(0, items.lastIndex)
+        val safeIndex = target.index.coerceIn(0, homeTimeline.items.lastIndex)
         val safeOffset = if (safeIndex == target.index) target.offset else 0
         runCatching {
             feedListState.scrollToItem(safeIndex, safeOffset)
         }
-        feedInitialScrollReconciled = true
+        homeTimeline.feedInitialScrollReconciled = true
     }
 
-    LaunchedEffect(cacheLoaded, hasLoginCookie, items.isEmpty()) {
-        if (!cacheLoaded || !hasLoginCookie || items.isNotEmpty()) return@LaunchedEffect
+    LaunchedEffect(cacheLoaded, hasLoginCookie, homeTimeline.items.isEmpty()) {
+        if (!cacheLoaded || !hasLoginCookie || homeTimeline.items.isNotEmpty()) return@LaunchedEffect
         // WebView Cookie 状态可能在冷启动后才恢复；只要首页仍为空，就自动补一次同步。
         refreshTimeline(showRefreshHint = false)
     }
 
-    LaunchedEffect(cacheLoaded, selectedTab, selectedItem, items.isEmpty()) {
-        if (!cacheLoaded || selectedTab != MainTab.Feed || selectedItem != null || items.isNotEmpty()) {
+    LaunchedEffect(cacheLoaded, selectedTab, selectedItem, homeTimeline.items.isEmpty()) {
+        if (!cacheLoaded || selectedTab != MainTab.Feed || selectedItem != null || homeTimeline.items.isNotEmpty()) {
             return@LaunchedEffect
         }
         // Keep an empty feed visibly loading/retrying even if the previous request was interrupted
         // while the app was backgrounded and left its loading flag set.
         repeat(3) { attempt ->
-            if (items.isNotEmpty() || selectedTab != MainTab.Feed || selectedItem != null) return@LaunchedEffect
+            if (homeTimeline.items.isNotEmpty() || selectedTab != MainTab.Feed || selectedItem != null) return@LaunchedEffect
             if (attempt > 0) delay(1_500L)
-            if (!isLoading) refreshTimeline(showRefreshHint = false)
+            if (!homeTimeline.isLoading) refreshTimeline(showRefreshHint = false)
             withTimeoutOrNull(20_000L) {
-                snapshotFlow { isLoading }.first { loading -> !loading }
+                snapshotFlow { homeTimeline.isLoading }.first { loading -> !loading }
             }
-            if (isLoading) {
-                timelineRefreshJob?.cancel()
-                timelineRefreshJob = null
-                isLoading = false
+            if (homeTimeline.isLoading) {
+                homeTimeline.timelineRefreshJob?.cancel()
+                homeTimeline.timelineRefreshJob = null
+                homeTimeline.isLoading = false
             }
         }
-    }
-
-    LaunchedEffect(feedListState, timelineKind) {
-        snapshotFlow {
-            feedListState.isScrollInProgress
-        }
-            .distinctUntilChanged()
-            .collect { scrolling ->
-                if (!scrolling &&
-                    timelineKind == TimelineKind.Following &&
-                    cacheLoaded &&
-                    feedScrollRestoreApplied
-                ) {
-                    timelineCacheStore.writeFollowingScroll(
-                        feedListState.firstVisibleItemIndex,
-                        feedListState.firstVisibleItemScrollOffset,
-                    )
-                }
-            }
     }
 
     LaunchedEffect(activeAccountId, mineProfile?.id, hasLoginCookie) {
@@ -8153,47 +8335,53 @@ fun WeiboApp() {
     val lifecycleOwner = LocalLifecycleOwner.current
     // Save at rest as well as ON_STOP, so process removal cannot lose the last
     // settled position. Do not let an empty, not-yet-restored list overwrite it.
-    LaunchedEffect(timelineKind, feedInitialScrollReconciled, items) {
-        if (timelineKind != TimelineKind.Following || !feedInitialScrollReconciled || items.isEmpty()) {
-            return@LaunchedEffect
+    fun followingScrollAnchor(): Triple<String, ScrollRestore, String>? {
+        val accountId = homeTimeline.timelineCacheAccountId?.takeIf { it == activeAccountId } ?: return null
+        if (homeTimeline.timelineKind != TimelineKind.Following || homeTimeline.selectedTimelineGroupId != null ||
+            !homeTimeline.feedInitialScrollReconciled || homeTimeline.items.isEmpty()
+        ) return null
+        val rows = feedListState.layoutInfo.visibleItemsInfo
+        val firstLazyIndex = feedListState.firstVisibleItemIndex
+        // Ignore the gap and auxiliary loading/empty rows. Do not persist a key
+        // from a stale layout if the current projection has already removed it.
+        val firstPost = rows.firstOrNull { it.index >= firstLazyIndex && it.key != FeedReverseBrowseGapKey }
+            ?: return null
+        val key = firstPost.key as? String ?: return null
+        if (key !in homeTimeline.followingDiskIds || homeTimeline.feedProjection.visibleItems.none { it.id == key }) return null
+        val index = homeTimeline.items.indexOfFirst { it.id == key }
+        if (index < 0) return null
+        val offset = if (firstPost.index == firstLazyIndex) feedListState.firstVisibleItemScrollOffset else 0
+        return Triple(accountId, ScrollRestore(index, offset), key)
+    }
+
+    fun persistFollowingAnchor(anchor: Triple<String, ScrollRestore, String>) {
+        val (accountId, position, key) = anchor
+        if (accountId == homeTimeline.timelineCacheAccountId && accountId == activeAccountId && key in homeTimeline.followingDiskIds) {
+            homeTimeline.cacheStore.writeFollowingScroll(accountId, position.index, position.offset, key)
         }
-        snapshotFlow {
-            Triple(
-                feedListState.firstVisibleItemIndex,
-                feedListState.firstVisibleItemScrollOffset,
-                feedListState.isScrollInProgress,
-            )
-        }.distinctUntilChanged().collect { (index, offset, scrolling) ->
-            if (!scrolling && feedListState.layoutInfo.totalItemsCount > 0) {
-                timelineCacheStore.writeFollowingScroll(index, offset, items.getOrNull(index)?.id)
-            }
-        }
+    }
+
+    fun persistFeedScrollNow() {
+        followingScrollAnchor()?.let { persistFollowingAnchor(it) }
+    }
+
+    LaunchedEffect(feedListState) {
+        snapshotFlow { if (feedListState.isScrollInProgress) null else followingScrollAnchor() }
+            .collect { anchor -> anchor?.let { persistFollowingAnchor(it) } }
     }
     DisposableEffect(
         lifecycleOwner,
         backgroundPlaybackEnabled,
-        timelineKind,
+        homeTimeline.timelineKind,
         cacheLoaded,
         feedScrollRestoreApplied,
-        feedInitialScrollReconciled,
+        homeTimeline.feedInitialScrollReconciled,
         selectedTab,
         selectedItem,
         hasLoginCookie,
-        isLoading,
-        items.isEmpty(),
+        homeTimeline.isLoading,
+        homeTimeline.items.isEmpty(),
     ) {
-        fun persistFeedScrollNow() {
-            if (timelineKind == TimelineKind.Following && cacheLoaded &&
-                feedInitialScrollReconciled && items.isNotEmpty() &&
-                feedListState.layoutInfo.totalItemsCount > 0
-            ) {
-                timelineCacheStore.writeFollowingScroll(
-                    feedListState.firstVisibleItemIndex,
-                    feedListState.firstVisibleItemScrollOffset,
-                    items.getOrNull(feedListState.firstVisibleItemIndex)?.id,
-                )
-            }
-        }
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_START -> {
@@ -8219,13 +8407,13 @@ fun WeiboApp() {
                     val shouldRetryEmptyFeed = cacheLoaded &&
                         selectedTab == MainTab.Feed &&
                         selectedItem == null &&
-                        items.isEmpty() &&
+                        homeTimeline.items.isEmpty() &&
                         hasLoginCookie &&
                         now - lastFeedResumeRefreshAt >= 2_000L
                     if (shouldRetryEmptyFeed) {
                         lastFeedResumeRefreshAt = now
-                        timelineRefreshJob?.cancel()
-                        isLoading = false
+                        homeTimeline.timelineRefreshJob?.cancel()
+                        homeTimeline.isLoading = false
                         refreshTimeline(showRefreshHint = false)
                     }
                 }
@@ -8390,6 +8578,7 @@ fun WeiboApp() {
             overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile &&
                 navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
             ),
+        LocalHomeTimelineReadingState provides homeTimeline,
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
             showCommentLikeCount = enabled
@@ -8731,11 +8920,8 @@ fun WeiboApp() {
                                     commentSortStore.write(sort)
                                 },
                                 listState = feedListState,
-                                items = items,
-                                isLoading = isLoading,
-                                cacheLoaded = feedCacheLoaded,
+                                homeTimeline = homeTimeline,
                                 hasLoginCookie = hasLoginCookie,
-                                isGroupTimeline = selectedTimelineGroupId != null || timelineKind == TimelineKind.SpecialFollowing,
                                 emoticonMap = emoticonMap,
                                 feedUiOnTop = feedUiOnTop,
                                 onRefresh = { refreshTimeline() },
@@ -9226,7 +9412,10 @@ fun WeiboApp() {
                                 activeAccountId = activeAccountId,
                                 onSwitchAccount = ::switchStoredAccount,
                                 onDeleteAccount = ::deleteStoredAccount,
-                                onPrepareAddAccount = { session.prepareAddAccount() },
+                                onPrepareAddAccount = {
+                                    homeTimeline.forgetTimelineCacheAccount()
+                                    session.prepareAddAccount()
+                                },
                                 onPersistLoginSession = { persistLoginSession(makeActive = true) },
                                 onReturnToFeed = {
                                     selectedTab = MainTab.Feed
@@ -9280,7 +9469,7 @@ fun WeiboApp() {
                                     typographySettingsStore.writeFontSize(size)
                                 },
                                 feedPreviewItemProvider = {
-                                    items.firstOrNull()?.let(::resolveFeedItem)
+                                    homeTimeline.items.firstOrNull()?.let(::resolveFeedItem)
                                 },
                                 selectedThemeColor = selectedThemeColor,
                                 onThemeColorChange = { color ->
@@ -9848,9 +10037,9 @@ fun WeiboApp() {
                 selectedTab == MainTab.Feed &&
                 selectedItem == null &&
                 visitedUserId == null &&
-                feedRefreshHint != null
+                homeTimeline.feedRefreshHint != null
             ) {
-                feedRefreshHint
+                homeTimeline.feedRefreshHint
             } else {
                 null
             }
@@ -9885,7 +10074,7 @@ fun WeiboApp() {
                     )
                 }
             }
-            key(feedRefreshHintGeneration) {
+            key(homeTimeline.feedRefreshHintGeneration) {
             AnimatedVisibility(
                 visible = capsuleHintState != null,
                 enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { fullHeight -> -fullHeight / 2 },
@@ -9903,7 +10092,7 @@ fun WeiboApp() {
                         onDismiss = {
                             when {
                                 operationCapsuleHint != null -> operationCapsuleHint = null
-                                else -> feedRefreshHint = null
+                                else -> homeTimeline.feedRefreshHint = null
                             }
                         },
                     )
@@ -9931,13 +10120,13 @@ fun WeiboApp() {
                 }
             }
             val timelineMenuKinds = remember { TimelineKind.entries.toList() }
-            val timelineMenuLabels = remember(timelineGroups) {
-                timelineMenuKinds.map(TimelineKind::label) + listOf("我的分组") + timelineGroups.map(TimelineGroup::name)
+            val timelineMenuLabels = remember(homeTimeline.timelineGroups) {
+                timelineMenuKinds.map(TimelineKind::label) + listOf("我的分组") + homeTimeline.timelineGroups.map(TimelineGroup::name)
             }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
             val timelineMenuNaturalHeight = ActionMenuCardInset * 4 +
-                ActionMenuCapsuleHeight * (timelineMenuKinds.size + timelineGroups.size + 1) +
-                ActionMenuItemGap * (timelineMenuKinds.size + timelineGroups.size + 2) + 38.dp
+                ActionMenuCapsuleHeight * (timelineMenuKinds.size + homeTimeline.timelineGroups.size + 1) +
+                ActionMenuItemGap * (timelineMenuKinds.size + homeTimeline.timelineGroups.size + 2) + 38.dp
             val timelineMenuHeight = minOf(
                 timelineMenuNaturalHeight,
                 (LocalConfiguration.current.screenHeightDp.dp - 160.dp).coerceAtLeast(280.dp),
@@ -9984,8 +10173,8 @@ fun WeiboApp() {
                     timelineMenuExpanded = timelineMenuExpanded,
                     onBarBoundsChanged = { bottomBarBoundsInRoot = it },
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
-                    selectedTimelineKind = timelineKind,
-                    selectedTimelineLabel = timelineGroups.firstOrNull { it.id == selectedTimelineGroupId }?.name,
+                    selectedTimelineKind = homeTimeline.timelineKind,
+                    selectedTimelineLabel = homeTimeline.timelineGroups.firstOrNull { it.id == homeTimeline.selectedTimelineGroupId }?.name,
                     onTimelineKindChange = { kind ->
                         dismissFollowListForTabSwitch()
                         selectedTab = MainTab.Feed
@@ -10056,7 +10245,7 @@ fun WeiboApp() {
                                     ImageActionRow(
                                         label = kind.label,
                                         enabled = true,
-                                        selected = selectedTimelineGroupId == null && timelineKind == kind,
+                                        selected = homeTimeline.selectedTimelineGroupId == null && homeTimeline.timelineKind == kind,
                                         separatorBefore = index > 0,
                                         onClick = {
                                             dismiss()
@@ -10066,7 +10255,7 @@ fun WeiboApp() {
                                         },
                                     )
                                 }
-                                if (timelineGroups.isNotEmpty()) {
+                                if (homeTimeline.timelineGroups.isNotEmpty()) {
                                     Box(
                                         Modifier.fillMaxWidth().height(0.5.dp)
                                             .background(timelineMenuDividerColor),
@@ -10093,11 +10282,11 @@ fun WeiboApp() {
                                                 color = MaterialTheme.colorScheme.onSurface,
                                             )
                                         }
-                                        timelineGroups.forEach { group ->
+                                        homeTimeline.timelineGroups.forEach { group ->
                                             ImageActionRow(
                                                 label = group.name,
                                                 enabled = true,
-                                                selected = selectedTimelineGroupId == group.id,
+                                                selected = homeTimeline.selectedTimelineGroupId == group.id,
                                                 onClick = {
                                                     dismiss()
                                                     dismissFollowListForTabSwitch()
@@ -10115,8 +10304,8 @@ fun WeiboApp() {
                                     ImageActionRow(
                                         label = kind.label,
                                         enabled = true,
-                                        selected = selectedTimelineGroupId == null && timelineKind == kind,
-                                        separatorBefore = index > 0 || timelineGroups.isEmpty(),
+                                        selected = homeTimeline.selectedTimelineGroupId == null && homeTimeline.timelineKind == kind,
+                                        separatorBefore = index > 0 || homeTimeline.timelineGroups.isEmpty(),
                                         onClick = {
                                             dismiss()
                                             dismissFollowListForTabSwitch()
@@ -10784,11 +10973,8 @@ private fun FollowFeedScreen(
     commentSort: CommentSort,
     onCommentSortChange: (CommentSort) -> Unit,
     listState: LazyListState,
-    items: List<FeedItem>,
-    isLoading: Boolean,
-    cacheLoaded: Boolean,
+    homeTimeline: HomeTimelineReadingState,
     hasLoginCookie: Boolean,
-    isGroupTimeline: Boolean = false,
     emoticonMap: Map<String, String> = emptyMap(),
     onUserClick: ((String) -> Unit)? = null,
     onRefresh: () -> Unit,
@@ -10817,7 +11003,7 @@ private fun FollowFeedScreen(
         FeedEmoticonLinkDispatcher.onUrlEntityClick = onUrlEntityClick
     }
 
-    if (!cacheLoaded) {
+    if (!homeTimeline.feedCacheLoaded) {
         Box(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
@@ -10827,17 +11013,40 @@ private fun FollowFeedScreen(
         return
     }
 
+    val projection = homeTimeline.feedProjection
+    val items = projection.visibleItems
+    val timelineGap = projection.gap
+    val timelineGapExpanded = homeTimeline.reverseBrowseGapExpanded
+    val isLoading = homeTimeline.isLoading
+    val isGroupTimeline = homeTimeline.selectedTimelineGroupId != null || homeTimeline.timelineKind == TimelineKind.SpecialFollowing
+    val reading = homeTimeline.preferences
+    val lineLimit = reading.maxLines.takeIf { reading.foldLongPosts }
+    val longPostController = remember(listState, lineLimit) { HomeLongPostController(listState) }
+    val navTopInRoot = LocalImageReturnBarTop.current
+    val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
+    LaunchedEffect(items, longPostController) {
+        longPostController.retainRows(items.mapTo(mutableSetOf()) { it.id })
+    }
+
+    val currentOnLoadMore by rememberUpdatedState(onLoadMore)
+    val postCount by rememberUpdatedState(items.size)
+    val gapIndex by rememberUpdatedState(timelineGap?.insertionIndex)
+    LaunchedEffect(longPostController) { longPostController.watchPagingSuppression() }
+    val currentLongPostController by rememberUpdatedState(longPostController)
     val feedContent: @Composable BoxScope.() -> Unit = {
         LaunchedEffect(listState) {
             snapshotFlow {
-                val layoutInfo = listState.layoutInfo
-                val totalItems = layoutInfo.totalItemsCount
-                val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                totalItems > 0 && lastVisibleItem >= totalItems - ListLoadMoreItemsFromBottom
+                if (currentLongPostController.isLayoutPagingSuppressed) return@snapshotFlow false
+                val gapRow = gapIndex
+                val lastPost = listState.layoutInfo.visibleItemsInfo.lastOrNull {
+                    it.key != FeedReverseBrowseGapKey && it.key != "feed-empty" && it.key != "feed-loading"
+                } ?: return@snapshotFlow false
+                val postIndex = lastPost.index - if (gapRow != null && lastPost.index > gapRow) 1 else 0
+                postCount > 0 && postIndex >= postCount - ListLoadMoreItemsFromBottom
             }
                 .distinctUntilChanged()
                 .filter { it }
-                .collect { onLoadMore() }
+                .collect { currentOnLoadMore() }
         }
 
         LazyColumn(
@@ -10869,7 +11078,21 @@ private fun FollowFeedScreen(
                 }
             }
 
-            items(items, key = { it.id }, contentType = ::feedCardContentType) { item ->
+            fun postAt(index: Int): FeedItem = items[index - if (timelineGap != null && index > timelineGap.insertionIndex) 1 else 0]
+            items(
+                count = items.size + if (timelineGap != null) 1 else 0,
+                key = { if (it == timelineGap?.insertionIndex) FeedReverseBrowseGapKey else postAt(it).id },
+                contentType = { if (it == timelineGap?.insertionIndex) "feed-gap" else feedCardContentType(postAt(it)) },
+            ) { index ->
+                if (timelineGap != null && index == timelineGap.insertionIndex) {
+                    FeedReverseBrowseDivider(timelineGap.hiddenPostCount, timelineGapExpanded) {
+                        // A layout-only toggle must not be mistaken for scrolling to the tail.
+                        longPostController.suppressPagingForLayoutChange()
+                        homeTimeline.toggleTimelineGap()
+                    }
+                    return@items
+                }
+                val item = postAt(index)
                 val resolved = resolveFeedItem(item)
                 var cardBounds by remember(item.id) { mutableStateOf<Rect?>(null) }
                 FeedCard(
@@ -10891,11 +11114,13 @@ private fun FollowFeedScreen(
                     onRepostClick = { onRepostClick(resolved, cardBounds) },
                     menuBackEnabled = feedUiOnTop,
                     showActionMenu = true,
+                    longPostLineLimit = lineLimit,
+                    homeLongPost = if (lineLimit != null) HomeLongPost(longPostController, item.id) else null,
                 )
             }
 
             if (isLoading && items.isNotEmpty()) {
-                item {
+                item(key = "feed-loading") {
                     Box(
                         modifier = Modifier.fillMaxWidth().padding(20.dp),
                         contentAlignment = Alignment.Center,
@@ -10911,8 +11136,55 @@ private fun FollowFeedScreen(
         isRefreshing = isLoading,
         onRefresh = onRefresh,
         modifier = Modifier.fillMaxSize(),
-        content = feedContent,
+    ) {
+        feedContent()
+        if (feedUiOnTop && lineLimit != null) {
+            HomeLongPostOverlay(longPostController, navTopInRoot, topContentInsetPx)
+        }
+    }
+}
+
+@Composable
+private fun FeedReverseBrowseDivider(postCount: Int, expanded: Boolean, onToggle: () -> Unit) {
+    val dividerColor = MaterialTheme.colorScheme.outlineVariant
+    val expandedState = stringResource(
+        if (expanded) R.string.feed_reverse_browse_gap_expanded else R.string.feed_reverse_browse_gap_collapsed,
     )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .semantics { stateDescription = expandedState }
+            .clickable(
+                role = Role.Button,
+                onClickLabel = stringResource(
+                    if (expanded) R.string.feed_reverse_browse_gap_collapse else R.string.feed_reverse_browse_gap_expand,
+                ),
+                onClick = onToggle,
+            )
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HorizontalDivider(Modifier.weight(1f), color = dividerColor)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = stringResource(
+                    if (expanded) R.string.feed_reverse_browse_gap_open else R.string.feed_reverse_browse_gap,
+                    postCount,
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Icon(
+                painter = painterResource(R.drawable.ic_chevron_down),
+                contentDescription = null,
+                modifier = Modifier.size(16.dp).graphicsLayer { rotationZ = if (expanded) 180f else 0f },
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        HorizontalDivider(Modifier.weight(1f), color = dividerColor)
+    }
 }
 
 private fun resolveEmoticonMap(
@@ -10938,6 +11210,7 @@ private fun feedBodyTextStyle(): TextStyle = LocalFeedBodyTextStyle.current
 private class RichTextGeometry {
     var layout: TextLayoutResult? = null
     var coordinates: LayoutCoordinates? = null
+    var visibleTextEnd: Int = Int.MAX_VALUE
 }
 
 @Composable
@@ -10961,9 +11234,15 @@ private fun EmoticonText(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     maxLines: Int = Int.MAX_VALUE,
     overflow: TextOverflow = TextOverflow.Clip,
+    onTextLayout: ((TextLayoutResult) -> Unit)? = null,
 ) {
     if (text.isBlank() && trailingLabel == null && leadingAuthorName == null && trailingLocation == null) {
-        Text(text = "\u65E0\u6B63\u6587", style = style, modifier = modifier)
+        Text(
+            text = "\u65E0\u6B63\u6587",
+            style = style,
+            modifier = modifier,
+            onTextLayout = onTextLayout ?: {},
+        )
         return
     }
 
@@ -10974,6 +11253,7 @@ private fun EmoticonText(
             modifier = modifier,
             maxLines = maxLines,
             overflow = overflow,
+            onTextLayout = onTextLayout ?: {},
         )
         return
     }
@@ -11135,7 +11415,7 @@ private fun EmoticonText(
             val hit = position != null && layout != null &&
                 annotatedString.getLinkAnnotations(0, annotatedString.length).any { range ->
                     (range.item as? LinkAnnotation.Clickable)?.tag == tag &&
-                        (range.start until range.end).any { index ->
+                        (range.start until minOf(range.end, textGeometry.visibleTextEnd)).any { index ->
                             layout.getBoundingBox(index).contains(position)
                         }
                 }
@@ -11159,7 +11439,9 @@ private fun EmoticonText(
         val range = inlineImageAnchorRanges[token] ?: return@rememberUpdatedState null
         val layout = textGeometry.layout ?: return@rememberUpdatedState null
         val coordinates = textGeometry.coordinates ?: return@rememberUpdatedState null
-        textRangeBoundsInWindow(layout, coordinates, range.first, range.second)
+        val end = minOf(range.second, textGeometry.visibleTextEnd)
+        if (range.first >= end) return@rememberUpdatedState null
+        textRangeBoundsInWindow(layout, coordinates, range.first, end)
     }
     SideEffect {
         inlineImageLinks.forEach { (token, images) ->
@@ -11215,7 +11497,15 @@ private fun EmoticonText(
                     Modifier
                 },
             ),
-        onTextLayout = { result -> textGeometry.layout = result },
+        onTextLayout = { result ->
+            textGeometry.layout = result
+            textGeometry.visibleTextEnd = if (onTextLayout != null && result.multiParagraph.didExceedMaxLines) {
+                result.getLineEnd(result.lineCount - 1, visibleEnd = true)
+            } else {
+                Int.MAX_VALUE
+            }
+            onTextLayout?.invoke(result)
+        },
         maxLines = maxLines,
         overflow = overflow,
     )
@@ -11530,7 +11820,7 @@ private fun TraceComposition(
 }
 
 @Composable
-private fun FeedCard(
+internal fun FeedCard(
     item: FeedItem,
     onClick: () -> Unit,
     onBoundsChanged: ((Rect) -> Unit)? = null,
@@ -11555,6 +11845,8 @@ private fun FeedCard(
     insetRounded: Boolean = false,
     sharedDetailCard: Boolean = false,
     compactBottomSpacing: Boolean = false,
+    longPostLineLimit: Int? = null,
+    homeLongPost: HomeLongPost? = null,
 ) {
     val displayItem = remember(item) { WeiboJsonParser.sanitizeRepostVideoLinks(item) }
     val cardMotion = LocalDetailCardMotion.current
@@ -11579,6 +11871,7 @@ private fun FeedCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .homeLongPostCard(homeLongPost)
                 .padding(
                     top = contentVerticalPadding,
                     bottom = when {
@@ -11657,6 +11950,8 @@ private fun FeedCard(
                         },
                         urlEntities = urlEntityMap,
                         onUrlEntityClick = onUrlEntityClick,
+                        longPostLineLimit = longPostLineLimit,
+                        homeLongPost = homeLongPost,
                     )
                 }
             }
@@ -11681,6 +11976,8 @@ private fun FeedCard(
                             inlineImagePreview = InlineImagePreviewRequest(images, anchorBounds)
                         },
                         autoFloatingOnScrollAway = autoFloatingOnScrollAway,
+                        longPostLineLimit = longPostLineLimit.takeIf { homeLongPost != null },
+                        homeLongPost = homeLongPost?.quote(retweeted.statusId.ifBlank { retweeted.id }),
                     )
                 }
             }
@@ -11910,7 +12207,7 @@ private fun formatVoiceDuration(durationMs: Long): String {
 }
 
 @Composable
-private fun StatusTextSection(
+internal fun StatusTextSection(
     item: FeedItem,
     emoticonMap: Map<String, String>,
     style: TextStyle,
@@ -11924,6 +12221,8 @@ private fun StatusTextSection(
     onInlineImageClick: ((List<FeedImage>, Rect?) -> Unit)? = null,
     urlEntities: Map<String, FeedUrlEntity> = emptyMap(),
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
+    longPostLineLimit: Int? = null,
+    homeLongPost: HomeLongPost? = null,
 ) {
     val bodyText = remember(item.text, item.locationName, item.urlEntities) {
         item.urlEntities.filter { entity ->
@@ -11933,6 +12232,8 @@ private fun StatusTextSection(
     val resolvedUrlEntities = remember(bodyText, urlEntities, inlineImageLinks) {
         completeBareUrlEntities(bodyText, urlEntities, inlineImageLinks.keys)
     }
+    val contentKey = item.statusId.ifBlank { item.id }
+    var requestedServerText by remember(contentKey, longPostLineLimit) { mutableStateOf(false) }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -11956,31 +12257,52 @@ private fun StatusTextSection(
         }
     }
     val bodyContent: @Composable () -> Unit = {
-        EmoticonText(
-            modifier = Modifier.fillMaxWidth(),
-            text = bodyText,
-            contentKey = item.statusId.ifBlank { item.id },
-            emoticonMap = emoticonMap,
-            style = style,
-            onUserClick = onUserClick,
-            leadingAuthorName = leadingAuthorName,
-            onLeadingAuthorClick = onLeadingAuthorClick,
-            onBodyClick = onBodyClick,
-            trailingLabel = if (item.isLongText && onLoadLongText != null) {
-                if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
-            } else {
-                null
+        // A server preview is not the full text. Keep its existing read-full flow
+        // available and apply local folding only to a body already available to render.
+        LongPostBody(
+            contentKey = contentKey,
+            lineLimit = longPostLineLimit.takeUnless {
+                item.isLongText || item.requiresLongTextFetch || bodyText.isBlank()
             },
-            onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
-                { onLoadLongText(item) }
-            } else {
-                null
-            },
-            inlineImageLinks = inlineImageLinks,
-            onInlineImageClick = onInlineImageClick,
-            urlEntities = resolvedUrlEntities,
-            onUrlEntityClick = onUrlEntityClick,
-        )
+            initiallyExpanded = requestedServerText,
+            homePost = homeLongPost,
+        ) { maxLines, overflow, onTextLayout ->
+            EmoticonText(
+                modifier = Modifier.fillMaxWidth(),
+                text = bodyText,
+                contentKey = contentKey,
+                emoticonMap = emoticonMap,
+                style = style,
+                onUserClick = onUserClick,
+                leadingAuthorName = leadingAuthorName,
+                onLeadingAuthorClick = onLeadingAuthorClick,
+                onBodyClick = onBodyClick,
+                trailingLabel = if (item.isLongText && onLoadLongText != null) {
+                    if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
+                } else {
+                    null
+                },
+                onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
+                    {
+                        if (homeLongPost != null) {
+                            homeLongPost.controller.expand(homeLongPost.key)
+                        } else if (longPostLineLimit != null) {
+                            requestedServerText = true
+                        }
+                        onLoadLongText(item)
+                    }
+                } else {
+                    null
+                },
+                inlineImageLinks = inlineImageLinks,
+                onInlineImageClick = onInlineImageClick,
+                urlEntities = resolvedUrlEntities,
+                onUrlEntityClick = onUrlEntityClick,
+                maxLines = maxLines,
+                overflow = overflow,
+                onTextLayout = onTextLayout,
+            )
+        }
     }
     if (LocalDetailInlineVideoPlayback.current) {
         SelectionContainer(content = bodyContent)
@@ -12163,6 +12485,8 @@ private fun QuotedStatus(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     autoFloatingOnScrollAway: Boolean = false,
     modifier: Modifier = Modifier,
+    longPostLineLimit: Int? = null,
+    homeLongPost: HomeLongPost? = null,
 ) {
     val quotedVideoTitleEntities = remember(item.urlEntities) {
         item.urlEntities.filter { entity -> entity.title.contains("微博视频") }
@@ -12187,6 +12511,7 @@ private fun QuotedStatus(
     ElevatedCard(
         modifier = modifier
             .fillMaxWidth()
+            .homeLongPostCard(homeLongPost)
             .detailSourceVisibility(hideQuotedSource, LocalHiddenCardBackdrop.current)
             .then(
                 if (onClick != null) {
@@ -12230,6 +12555,8 @@ private fun QuotedStatus(
                     onInlineImageClick = onInlineImageClick,
                     urlEntities = displayItem.urlEntities.associateBy { entity -> entity.shortUrl },
                     onUrlEntityClick = onUrlEntityClick,
+                    longPostLineLimit = longPostLineLimit,
+                    homeLongPost = homeLongPost,
                 )
             }
             MediaStrip(
@@ -25055,6 +25382,8 @@ private fun SettingsScreen(
         if (showHelp) {
             SettingsHelpContent()
         } else {
+            val homeTimeline = LocalHomeTimelineReadingState.current
+            val reading = homeTimeline?.preferences ?: ReadingPreferences()
             LazyColumn(
                 flingBehavior = rememberWeiboListFlingBehavior(),
                 modifier = Modifier.fillMaxSize().padding(
@@ -25093,6 +25422,24 @@ private fun SettingsScreen(
                     SettingsFeedDisplayCard(
                         hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
                         onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
+                    )
+                }
+                item {
+                    ReadingFoldSettingsCard(
+                        enabled = reading.foldLongPosts,
+                        maxLines = reading.maxLines,
+                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(foldLongPosts = enabled) } },
+                        onMaxLinesChange = { lines -> homeTimeline?.updatePreferences { it.copy(maxLines = lines) } },
+                        card = { content -> SettingsPlainCard(content = content) },
+                    )
+                }
+                item {
+                    ReverseReadingSettingsCard(
+                        enabled = reading.reverseReading,
+                        newPostLimit = reading.newPostLimit,
+                        onEnabledChange = { enabled -> homeTimeline?.updatePreferences { it.copy(reverseReading = enabled) } },
+                        onNewPostLimitChange = { limit -> homeTimeline?.updatePreferences { it.copy(newPostLimit = limit) } },
+                        card = { content -> SettingsPlainCard(content = content) },
                     )
                 }
                 item {

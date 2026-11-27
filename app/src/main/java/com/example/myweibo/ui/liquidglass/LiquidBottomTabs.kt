@@ -83,10 +83,20 @@ fun Modifier.drawBottomBarGlassBackdrop(
     glassAmount: Float,
     isLightTheme: Boolean,
 ): Modifier {
+    val surfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
+        .copy(alpha = bottomBarGlassSurfaceAlpha(normalizeBottomBarGlassAmount(frostAmount)))
+    return drawBottomBarGlassBackdrop(backdrop, frostAmount, glassAmount, surfaceColor)
+}
+
+/** Same lens, blur, capsule, highlight and shadow; smaller controls can supply a denser surface. */
+internal fun Modifier.drawBottomBarGlassBackdrop(
+    backdrop: Backdrop,
+    frostAmount: Float,
+    glassAmount: Float,
+    surfaceColor: Color,
+): Modifier {
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
-    val surfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
-        .copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     return drawBackdrop(
         backdrop = backdrop,
         shape = { RoundedCornerShape(percent = 50) },
