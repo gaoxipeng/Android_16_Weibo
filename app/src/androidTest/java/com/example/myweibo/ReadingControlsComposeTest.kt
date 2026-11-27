@@ -12,12 +12,17 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
@@ -51,6 +56,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myweibo.data.FeedImage
@@ -65,6 +73,7 @@ import com.example.myweibo.data.projectFeedTimelineRefresh
 import com.example.myweibo.ui.FeedCard
 import com.example.myweibo.ui.FollowFeedScreen
 import com.example.myweibo.ui.FloatingLongPostCollapseTag
+import com.example.myweibo.ui.HomeFeedLifecycleEffect
 import com.example.myweibo.ui.HomeLongPost
 import com.example.myweibo.ui.HomeLongPostController
 import com.example.myweibo.ui.HomeLongPostGlass
@@ -557,6 +566,142 @@ class ReadingControlsComposeTest {
     @Test
     fun protectedFollowingMergeKeepsFoldMeasurementsWhenStatusAliasesChange() {
         assertHomeRefreshFrames(TimelineKind.Following, expandQuote = true, keepReading = true)
+    }
+
+    @Test
+    fun latestReselectionKeepsFoldedBodyToggleAndMediaInTheFirstRefreshLayouts() {
+        val owner = compose.runOnUiThread {
+            FixtureLifecycleOwner().apply { lifecycle.currentState = Lifecycle.State.RESUMED }
+        }
+        val loading = mutableStateOf(false)
+        val post = fixturePost(1).copy(text = MultilineBody, images = listOf(fixtureImage("reselection")))
+        val anchorOffset = with(compose.density) { 8.dp.roundToPx() }
+        var committedLoading = false
+        var starts = 0
+        lateinit var listState: LazyListState
+        setFixture {
+            val isLoading = loading.value
+            val state = rememberLazyListState(1, anchorOffset)
+            var resumeGeneration by remember { mutableIntStateOf(0) }
+            SideEffect { listState = state; committedLoading = isLoading }
+            HomeFeedLifecycleEffect(
+                lifecycleOwner = owner,
+                onStart = { starts++; resumeGeneration++ },
+                onStop = {},
+                onDispose = {},
+            )
+            Column {
+                // Model tapping an already-selected latest tab: the request enters
+                // loading without navigating away. The test supplies its completion.
+                TextButton(onClick = { loading.value = true }, modifier = Modifier.testTag("reselect-latest")) {
+                    Text("Latest")
+                }
+                // Like WeiboApp, the scroll state outlives the keyed feed subtree.
+                key(resumeGeneration) {
+                    val controller = remember(state) { HomeLongPostController(state) }
+                    LazyColumn(Modifier.fillMaxSize(), state = state) {
+                        item(key = "before") { FixtureRow(fixturePost(0)) }
+                        item(key = post.id) { FixtureFeedCard(post, controller) }
+                        items((2..10).map(::fixturePost), key = { it.id }) { FixtureRow(it) }
+                    }
+                }
+            }
+        }
+
+        val body = cardText(MultilineBody)
+        val expand = cardToggle(quoted = false)
+        val section = textSection(quoted = false)
+        val media = compose.onNodeWithContentDescription("GIF", useUnmergedTree = true)
+        body.assertLayout(2, true, TextOverflow.Ellipsis)
+        assertToggleLabel(R.string.long_post_expand, expand)
+        val bodyId = body.fetchSemanticsNode().id
+        val toggleBounds = expand.fetchSemanticsNode().boundsInRoot
+        val mediaBounds = media.assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        assertRightAligned(toggleBounds, section)
+        val rowHeight = compose.runOnIdle {
+            assertAnchor(listState, 1, post.id, anchorOffset)
+            listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size
+        }
+        val startsBeforeRefresh = compose.runOnIdle { starts }
+
+        fun assertFirstLayouts(expectedLoading: Boolean) {
+            // First commit applies loading; a second frame also catches an erroneous
+            // generation change queued from a re-attached observer in that commit.
+            var checkedCommit = false
+            repeat(4) {
+                compose.mainClock.advanceTimeByFrame()
+                val isRefreshCommit = compose.runOnIdle { committedLoading == expectedLoading }
+                body.assertLayout(2, true, TextOverflow.Ellipsis)
+                assertToggleLabel(R.string.long_post_expand, expand)
+                assertEquals(toggleBounds, expand.fetchSemanticsNode().boundsInRoot)
+                assertEquals(mediaBounds, media.fetchSemanticsNode().boundsInRoot)
+                assertEquals(bodyId, body.fetchSemanticsNode().id)
+                compose.runOnIdle {
+                    assertAnchor(listState, 1, post.id, anchorOffset)
+                    assertEquals(rowHeight, listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size)
+                }
+                if (isRefreshCommit && checkedCommit) {
+                    assertEquals(startsBeforeRefresh, compose.runOnIdle { starts })
+                    return
+                }
+                checkedCommit = isRefreshCommit
+            }
+            error("Loading=$expectedLoading did not commit in time")
+        }
+
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.onNodeWithTag("reselect-latest").performClick()
+            assertFirstLayouts(expectedLoading = true)
+            compose.runOnIdle { loading.value = false }
+            assertFirstLayouts(expectedLoading = false)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
+    fun homeFeedLifecycleIgnoresCatchUpAndUsesCurrentCallbacksOnRealTransitions() {
+        val owner = compose.runOnUiThread {
+            FixtureLifecycleOwner().apply { lifecycle.currentState = Lifecycle.State.STARTED }
+        }
+        val callbackVersion = mutableIntStateOf(1)
+        val mounted = mutableStateOf(true)
+        val events = mutableListOf<String>()
+        setFixture {
+            if (mounted.value) {
+                val version = callbackVersion.intValue
+                HomeFeedLifecycleEffect(
+                    lifecycleOwner = owner,
+                    onStart = { events += "start:$version" },
+                    onStop = { events += "stop:$version" },
+                    onDispose = { events += "dispose:$version" },
+                )
+            }
+        }
+        compose.runOnIdle {
+            assertTrue("Attaching while STARTED must not simulate a resume", events.isEmpty())
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            callbackVersion.intValue = 2
+        }
+        compose.runOnIdle {
+            assertTrue("A recomposition while RESUMED must not replace the observer", events.isEmpty())
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            assertEquals(listOf("stop:2", "start:2"), events)
+            mounted.value = false
+        }
+        compose.runOnIdle {
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            owner.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            assertEquals(listOf("stop:2", "start:2", "dispose:2"), events)
+        }
+    }
+
+    private class FixtureLifecycleOwner : LifecycleOwner {
+        override val lifecycle = LifecycleRegistry(this)
     }
 
     private fun assertHomeRefreshFrames(kind: TimelineKind, expandQuote: Boolean, keepReading: Boolean) {

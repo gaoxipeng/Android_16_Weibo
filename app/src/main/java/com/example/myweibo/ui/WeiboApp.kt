@@ -192,8 +192,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.runtime.DisposableEffect
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -8397,70 +8395,50 @@ fun WeiboApp() {
         snapshotFlow { if (feedListState.isScrollInProgress) null else followingScrollAnchor() }
             .collect { anchor -> anchor?.let { persistFollowingAnchor(it) } }
     }
-    DisposableEffect(
-        lifecycleOwner,
-        backgroundPlaybackEnabled,
-        homeTimeline.timelineKind,
-        cacheLoaded,
-        feedScrollRestoreApplied,
-        homeTimeline.feedInitialScrollReconciled,
-        selectedTab,
-        selectedItem,
-        hasLoginCookie,
-        homeTimeline.isLoading,
-        homeTimeline.items.isEmpty(),
-    ) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> {
-                    val homeIsForeground = cacheLoaded &&
-                        selectedTab == MainTab.Feed &&
-                        visitedUserId == null &&
-                        selectedItem == null &&
-                        mediaPreview == null &&
-                        articleOverlay == null &&
-                        followListOverlay == null &&
-                        albumViewerState == null &&
-                        navExitPendingKind == null &&
-                        navStack.isEmpty()
-                    if (homeIsForeground &&
-                        videoPlaybackCoordinator.activeKey == null &&
-                        videoPeekController.activeRequest == null
-                    ) {
-                        // Recreate only the feed UI subtree when the app returns to the home feed.
-                        // Its LazyListState is held outside the subtree, so scroll position survives.
-                        feedResumeGeneration++
-                    }
-                    val now = android.os.SystemClock.elapsedRealtime()
-                    val shouldRetryEmptyFeed = cacheLoaded &&
-                        selectedTab == MainTab.Feed &&
-                        selectedItem == null &&
-                        homeTimeline.items.isEmpty() &&
-                        hasLoginCookie &&
-                        now - lastFeedResumeRefreshAt >= 2_000L
-                    if (shouldRetryEmptyFeed) {
-                        lastFeedResumeRefreshAt = now
-                        homeTimeline.timelineRefreshJob?.cancel()
-                        homeTimeline.isLoading = false
-                        refreshTimeline(showRefreshHint = false)
-                    }
-                }
-                Lifecycle.Event.ON_STOP -> {
-                    persistFeedScrollNow()
-                    if (!backgroundPlaybackEnabled) {
-                        videoPlaybackCoordinator.pauseAll()
-                        videoPlaybackCoordinator.activeKey = null
-                    }
-                }
-                else -> Unit
+    HomeFeedLifecycleEffect(
+        lifecycleOwner = lifecycleOwner,
+        onStart = {
+            val homeIsForeground = cacheLoaded &&
+                selectedTab == MainTab.Feed &&
+                visitedUserId == null &&
+                selectedItem == null &&
+                mediaPreview == null &&
+                articleOverlay == null &&
+                followListOverlay == null &&
+                albumViewerState == null &&
+                navExitPendingKind == null &&
+                navStack.isEmpty()
+            if (homeIsForeground &&
+                videoPlaybackCoordinator.activeKey == null &&
+                videoPeekController.activeRequest == null
+            ) {
+                // Recreate only the feed UI subtree when the app returns to the home feed.
+                // Its LazyListState is held outside the subtree, so scroll position survives.
+                feedResumeGeneration++
             }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val shouldRetryEmptyFeed = cacheLoaded &&
+                selectedTab == MainTab.Feed &&
+                selectedItem == null &&
+                homeTimeline.items.isEmpty() &&
+                hasLoginCookie &&
+                now - lastFeedResumeRefreshAt >= 2_000L
+            if (shouldRetryEmptyFeed) {
+                lastFeedResumeRefreshAt = now
+                homeTimeline.timelineRefreshJob?.cancel()
+                homeTimeline.isLoading = false
+                refreshTimeline(showRefreshHint = false)
+            }
+        },
+        onStop = {
             persistFeedScrollNow()
-            lifecycleOwner.lifecycle.removeObserver(observer)
-        }
-    }
+            if (!backgroundPlaybackEnabled) {
+                videoPlaybackCoordinator.pauseAll()
+                videoPlaybackCoordinator.activeKey = null
+            }
+        },
+        onDispose = { persistFeedScrollNow() },
+    )
 
     LaunchedEffect(
         selectedTab,
