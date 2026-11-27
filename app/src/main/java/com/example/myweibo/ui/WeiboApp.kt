@@ -15392,7 +15392,7 @@ private suspend fun flingPanOffset(
 }
 
 @Composable
-private fun ZoomableFullscreenImage(
+internal fun ZoomableFullscreenImage(
     image: FeedImage,
     allImages: List<FeedImage>,
     layoutAspectRatio: Float? = null,
