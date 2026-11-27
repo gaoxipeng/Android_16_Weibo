@@ -11134,17 +11134,18 @@ internal fun FollowFeedScreen(
         }
     }
 
-    // A detail covers the still-mounted feed. Keep tracking its readable viewport so
-    // the expanded source card has the same collapse control at the return handoff.
-    val readingViewport = if (lineLimit != null) {
-        Modifier.homeLongPostViewport(longPostController, navTopInRoot, topContentInsetPx)
-    } else Modifier
     AppPullToRefreshBox(
         isRefreshing = isLoading,
         onRefresh = onRefresh,
-        modifier = Modifier.fillMaxSize().then(readingViewport),
-        content = feedContent,
-    )
+        modifier = Modifier.fillMaxSize(),
+    ) {
+        feedContent()
+        // A detail covers the still-mounted feed. Keep its readable viewport so the
+        // expanded source card has the same collapse control at the return handoff.
+        if (lineLimit != null) {
+            HomeLongPostOverlay(longPostController, navTopInRoot, topContentInsetPx)
+        }
+    }
 }
 
 @Composable

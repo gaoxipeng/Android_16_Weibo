@@ -2,13 +2,16 @@ package com.example.myweibo.ui
 
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -27,7 +30,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
@@ -352,9 +354,9 @@ internal fun HomeLongPostTextSection(
             },
         content = {
             content(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
-            if (showCollapse) {
-                // Compose the candidate on a cold row. Only placement exposes it; previous
-                // global coordinates are useful for the glass layer, not for gating the button.
+            if (showCollapse && visible) {
+                // An unplaced clickable can still expose semantics. Wait for real prose
+                // geometry before composing it so offscreen rows never expose a control.
                 LongPostToggle(
                     expanded = true,
                     surface = surface,
@@ -398,14 +400,13 @@ internal fun HomeLongPostTextSection(
     }
 }
 
-/** Publish the real readable bounds before placing feed rows, including on a cold remount. */
-@OptIn(ExperimentalComposeUiApi::class)
+/** Track the common readable viewport and host the collapse animator; controls are local to prose. */
 @Composable
-internal fun Modifier.homeLongPostViewport(
+internal fun HomeLongPostOverlay(
     controller: HomeLongPostController,
     navTopInRoot: () -> Float,
     topContentInsetPx: Float,
-): Modifier {
+) {
     controller.activeCollapse?.let { motion ->
         LaunchedEffect(controller, motion) { controller.animateCollapse(motion) }
     }
@@ -417,22 +418,20 @@ internal fun Modifier.homeLongPostViewport(
         }
         onDispose { stop() }
     }
+    val density = LocalDensity.current
+    val systemBottom = WindowInsets.navigationBars.getBottom(density)
+    var viewport by remember { mutableStateOf<Rect?>(null) }
+    val readable = viewport?.let { bounds ->
+        Rect(
+            bounds.left,
+            bounds.top + topContentInsetPx,
+            bounds.right,
+            minOf(bounds.bottom - systemBottom, navTopInRoot()),
+        ).takeIf { it.bottom > it.top }
+    }
+    SideEffect { controller.readableViewport = readable }
     DisposableEffect(controller) {
         onDispose { controller.detachViewport() }
     }
-    val systemBottom = WindowInsets.navigationBars.getBottom(LocalDensity.current)
-    return layout { measurable, constraints ->
-        val feed = measurable.measure(constraints)
-        layout(feed.width, feed.height) {
-            coordinates?.boundsInRoot()?.let { bounds ->
-                controller.readableViewport = Rect(
-                    bounds.left,
-                    bounds.top + topContentInsetPx,
-                    bounds.right,
-                    minOf(bounds.bottom - systemBottom, navTopInRoot()),
-                ).takeIf { it.bottom > it.top }
-            }
-            feed.placeRelative(0, 0)
-        }
-    }
+    Box(Modifier.fillMaxSize().onGloballyPositioned { viewport = it.boundsInRoot() })
 }
