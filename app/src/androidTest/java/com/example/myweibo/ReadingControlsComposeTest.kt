@@ -1,5 +1,7 @@
 package com.example.myweibo
 
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -36,6 +38,7 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
@@ -48,6 +51,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -575,6 +579,7 @@ class ReadingControlsComposeTest {
         }
         val loading = mutableStateOf(false)
         val post = fixturePost(1).copy(text = MultilineBody, images = listOf(fixtureImage("reselection")))
+        // Keep a partial anchor without scrolling the expand target out of view.
         val anchorOffset = with(compose.density) { 8.dp.roundToPx() }
         var committedLoading = false
         var starts = 0
@@ -610,10 +615,12 @@ class ReadingControlsComposeTest {
 
         val body = cardText(MultilineBody)
         val expand = cardToggle(quoted = false)
+        val expandLabel = InstrumentationRegistry.getInstrumentation().targetContext.getString(R.string.long_post_expand)
+        fun assertExpandLabel() = expand.assertIsDisplayed().assert(hasAnyDescendant(hasText(expandLabel)))
         val section = textSection(quoted = false)
         val media = compose.onNodeWithContentDescription("GIF", useUnmergedTree = true)
         body.assertLayout(2, true, TextOverflow.Ellipsis)
-        assertToggleLabel(R.string.long_post_expand, expand)
+        assertExpandLabel()
         val bodyId = body.fetchSemanticsNode().id
         val toggleBounds = expand.fetchSemanticsNode().boundsInRoot
         val mediaBounds = media.assertIsDisplayed().fetchSemanticsNode().boundsInRoot
@@ -632,7 +639,7 @@ class ReadingControlsComposeTest {
                 compose.mainClock.advanceTimeByFrame()
                 val isRefreshCommit = compose.runOnIdle { committedLoading == expectedLoading }
                 body.assertLayout(2, true, TextOverflow.Ellipsis)
-                assertToggleLabel(R.string.long_post_expand, expand)
+                assertExpandLabel()
                 assertEquals(toggleBounds, expand.fetchSemanticsNode().boundsInRoot)
                 assertEquals(mediaBounds, media.fetchSemanticsNode().boundsInRoot)
                 assertEquals(bodyId, body.fetchSemanticsNode().id)
@@ -655,6 +662,212 @@ class ReadingControlsComposeTest {
             assertFirstLayouts(expectedLoading = true)
             compose.runOnIdle { loading.value = false }
             assertFirstLayouts(expectedLoading = false)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
+    fun homeDetailReturnTabReturnAndResumeKeepFirstFoldedLayoutAndScrollAnchor() {
+        val post = fixturePost(1).copy(text = NavigationBody, images = listOf(fixtureImage("navigation")))
+        val posts = listOf(fixturePost(0), post) + (2..30).map(::fixturePost)
+        val anchorOffset = with(compose.density) { 8.dp.roundToPx() }
+        val route = mutableStateOf(HomeFixturePage.Home)
+        val resumeGeneration = mutableIntStateOf(0)
+        lateinit var listState: LazyListState
+        lateinit var timeline: HomeTimelineReadingState
+        setFixture {
+            val page = route.value
+            val state = rememberLazyListState(1, anchorOffset)
+            val reading = rememberFixtureHomeTimeline(posts)
+            SideEffect { listState = state; timeline = reading }
+            Box(Modifier.fillMaxSize()) {
+                // Same lifetimes as WeiboApp: a detail covers the retained feed, a tab
+                // can dispose it, and a real app resume re-keys it without moving the list.
+                if (page != HomeFixturePage.OtherTab) {
+                    key(resumeGeneration.intValue) {
+                        FixtureHomeTimeline(
+                            state, reading,
+                            feedUiOnTop = page == HomeFixturePage.Home,
+                            onItemClick = { item, _ ->
+                                assertEquals(post.id, item.id)
+                                route.value = HomeFixturePage.Detail
+                            },
+                        )
+                    }
+                }
+                if (page == HomeFixturePage.Detail) {
+                    TextButton(onClick = { route.value = HomeFixturePage.Home }, modifier = Modifier.testTag("fixture-back")) {
+                        Text("Back")
+                    }
+                }
+            }
+        }
+
+        val body = cardText(NavigationBody)
+        val expand = cardToggle(quoted = false)
+        val expandLabel = InstrumentationRegistry.getInstrumentation().targetContext.getString(R.string.long_post_expand)
+        val media = compose.onNodeWithContentDescription("GIF", useUnmergedTree = true)
+        val toggleBounds = expand.assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val mediaBounds = media.assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val originalBodyId = body.fetchSemanticsNode().id
+        val rowHeight = compose.runOnIdle { listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size }
+
+        fun assertHomeLayout() {
+            body.assertLayout(3, true, TextOverflow.Ellipsis)
+            expand.assertIsDisplayed().assert(hasAnyDescendant(hasText(expandLabel)))
+            assertEquals(toggleBounds, expand.fetchSemanticsNode().boundsInRoot)
+            assertEquals(mediaBounds, media.assertIsDisplayed().fetchSemanticsNode().boundsInRoot)
+            compose.runOnIdle {
+                assertAnchor(listState, 1, post.id, anchorOffset)
+                assertEquals(rowHeight, listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size)
+            }
+        }
+
+        assertHomeLayout()
+        body.performTouchInput { click(center) }
+        val back = compose.onNodeWithTag("fixture-back").assertIsDisplayed()
+        compose.mainClock.autoAdvance = false
+        try {
+            back.performClick()
+            compose.mainClock.advanceTimeByFrame()
+            back.assertDoesNotExist()
+            assertHomeLayout()
+            assertEquals(originalBodyId, body.fetchSemanticsNode().id)
+
+            compose.runOnIdle { route.value = HomeFixturePage.OtherTab }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertDoesNotExist()
+            compose.runOnIdle { route.value = HomeFixturePage.Home }
+            compose.mainClock.advanceTimeByFrame()
+            assertHomeLayout()
+            val remountedBodyId = body.fetchSemanticsNode().id
+            assertTrue("Switching tabs must discard the old Text", remountedBodyId != originalBodyId)
+
+            compose.runOnIdle { resumeGeneration.intValue++ }
+            compose.mainClock.advanceTimeByFrame()
+            assertHomeLayout()
+            assertTrue("Activity resume must exercise a new Text", body.fetchSemanticsNode().id != remountedBodyId)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+
+        expand.performClick()
+        body.assertLayout(5, false, TextOverflow.Clip)
+        val expandedHeight = compose.runOnIdle { listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size }
+        val collapse = sectionNode(FloatingLongPostCollapseTag, quoted = false)
+        val collapseBounds = collapse.assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        body.performTouchInput { click(center) }
+        back.assertIsDisplayed()
+        compose.mainClock.autoAdvance = false
+        try {
+            back.performClick()
+            compose.mainClock.advanceTimeByFrame()
+            back.assertDoesNotExist()
+            body.assertLayout(5, false, TextOverflow.Clip)
+            assertEquals(collapseBounds, collapse.assertIsDisplayed().fetchSemanticsNode().boundsInRoot)
+
+            compose.runOnIdle { route.value = HomeFixturePage.OtherTab }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertDoesNotExist()
+            compose.runOnIdle { route.value = HomeFixturePage.Home }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertLayout(5, false, TextOverflow.Clip)
+            compose.runOnIdle {
+                assertAnchor(listState, 1, post.id, anchorOffset)
+                assertEquals(expandedHeight, listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size)
+            }
+            compose.runOnIdle { resumeGeneration.intValue++ }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertLayout(5, false, TextOverflow.Clip)
+
+            // Account/timeline switches reset the reader, even if the next feed has the same row ID.
+            compose.runOnIdle {
+                timeline.resetTimelineReadingSession()
+                timeline.items = posts
+            }
+            compose.mainClock.advanceTimeByFrame()
+            assertHomeLayout()
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
+    fun recycledAndReplacedHomeRowsUseCurrentTextAndLineLimitInTheirFirstLayout() {
+        val first = fixturePost(1).copy(text = NavigationBody)
+        val replacement = first.copy(text = "Replacement one\ntwo\nthree\nfour\nfive")
+        lateinit var state: LazyListState
+        lateinit var timeline: HomeTimelineReadingState
+        setFixture {
+            val list = rememberLazyListState()
+            val reading = rememberFixtureHomeTimeline(listOf(first) + (2..40).map(::fixturePost))
+            SideEffect { state = list; timeline = reading }
+            FixtureHomeTimeline(list, reading)
+        }
+
+        val firstBody = cardText(NavigationBody)
+        val replacementBody = cardText("Replacement one")
+        firstBody.assertLayout(3, true, TextOverflow.Ellipsis)
+        // Move far beyond the original row so lazy reuse, not just feed visibility, is exercised.
+        compose.runOnIdle { state.requestScrollToItem(39) }
+        firstBody.assertDoesNotExist()
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle { state.requestScrollToItem(0) }
+            compose.mainClock.advanceTimeByFrame()
+            firstBody.assertLayout(3, true, TextOverflow.Ellipsis)
+            cardToggle(quoted = false).assertIsDisplayed()
+
+            compose.runOnIdle { timeline.items = listOf(replacement) + timeline.items.drop(1) }
+            compose.mainClock.advanceTimeByFrame()
+            firstBody.assertDoesNotExist()
+            replacementBody.assertLayout(3, true, TextOverflow.Ellipsis)
+            cardToggle(quoted = false).assertIsDisplayed()
+
+            // Change the actual Home setting: an N+1 body is fully visible on its first layout.
+            compose.runOnIdle { timeline.updatePreferences { it.copy(maxLines = 4) } }
+            compose.mainClock.advanceTimeByFrame()
+            replacementBody.assertLayout(5, false, TextOverflow.Clip)
+            cardToggle(quoted = false).assertDoesNotExist()
+
+            compose.runOnIdle { timeline.updatePreferences { it.copy(foldLongPosts = false) } }
+            compose.mainClock.advanceTimeByFrame()
+            replacementBody.assertLayout(5, false, TextOverflow.Clip)
+            cardToggle(quoted = false).assertDoesNotExist()
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
+    @Test
+    fun homeRichQuoteUsesCurrentWidthAndInlinePlaceholdersInTheFirstLayout() {
+        val width = mutableStateOf(150.dp)
+        val quote = fixturePost(20).copy(authorName = "Q", text = "Quote [probe]\nWWWWWWWWWWWWWWWWWW\nthird\nlast")
+        val post = fixturePost(1).copy(text = "Host", retweetedStatus = quote)
+        val posts = listOf(post) + (2..10).map(::fixturePost)
+        val emoticons = mapOf("[probe]" to "fixture-invalid-url")
+        setFixture {
+            Box(Modifier.width(width.value)) {
+                FixtureHomeTimeline(rememberLazyListState(), rememberFixtureHomeTimeline(posts), emoticonMap = emoticons)
+            }
+        }
+
+        val quoteBody = cardText("Quote [probe]")
+        quoteBody.assertLayout(3, true, TextOverflow.Ellipsis)
+        assertTrue(quoteBody.textLayout().layoutInput.placeholders.isNotEmpty())
+        cardToggle(quoted = true).assertIsDisplayed()
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle { width.value = 340.dp }
+            compose.mainClock.advanceTimeByFrame()
+            quoteBody.assertLayout(4, false, TextOverflow.Clip)
+            cardToggle(quoted = true).assertDoesNotExist()
+
+            compose.runOnIdle { width.value = 150.dp }
+            compose.mainClock.advanceTimeByFrame()
+            quoteBody.assertLayout(3, true, TextOverflow.Ellipsis)
+            cardToggle(quoted = true).assertIsDisplayed()
         } finally {
             compose.mainClock.autoAdvance = true
         }
@@ -803,6 +1016,53 @@ class ReadingControlsComposeTest {
         }
     }
 
+    private enum class HomeFixturePage { Home, Detail, OtherTab }
+
+    @Composable
+    private fun rememberFixtureHomeTimeline(posts: List<FeedItem>): HomeTimelineReadingState {
+        val context = LocalContext.current
+        return remember(context) {
+            val isolatedPreferences = object : ContextWrapper(context) {
+                override fun getApplicationContext(): Context = this
+                override fun getSharedPreferences(name: String, mode: Int) =
+                    baseContext.getSharedPreferences("reading_controls_test_$name", mode)
+            }
+            HomeTimelineReadingState(
+                ReadingPreferencesStore(isolatedPreferences), TimelineCacheStore(context), TimelineKind.Following,
+                ReadingPreferences(foldLongPosts = true, maxLines = 3),
+            ).apply {
+                feedCacheLoaded = true
+                timelineVerifiedFromNetwork = true
+                items = posts
+            }
+        }
+    }
+
+    @Composable
+    private fun FixtureHomeTimeline(
+        listState: LazyListState,
+        timeline: HomeTimelineReadingState,
+        emoticonMap: Map<String, String> = emptyMap(),
+        feedUiOnTop: Boolean = true,
+        onItemClick: (FeedItem, Rect?) -> Unit = { _, _ -> },
+    ) {
+        FollowFeedScreen(
+            listState = listState,
+            homeTimeline = timeline,
+            hasLoginCookie = true,
+            emoticonMap = emoticonMap,
+            feedUiOnTop = feedUiOnTop,
+            onRefresh = {},
+            onLoadMore = {},
+            onOpenLoginSettings = {},
+            onItemClick = onItemClick,
+            onCommentClick = { _, _ -> },
+            onCommentLongClick = {},
+            onRepostClick = { _, _ -> },
+            onMediaClick = { _, _ -> },
+        )
+    }
+
     private fun setFixture(content: @Composable () -> Unit) {
         compose.setContent {
             // Keep the width fixture independent of the device's accessibility font scale.
@@ -947,5 +1207,6 @@ class ReadingControlsComposeTest {
         const val TimelineTag = "fixture-timeline"
         const val GapTag = "fixture-refresh-gap"
         const val MultilineBody = "one\ntwo\nthree\nfour"
+        const val NavigationBody = "one\ntwo\nthree\nfour\nfive"
     }
 }

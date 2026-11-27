@@ -295,7 +295,6 @@ import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.TextStyle
@@ -4268,8 +4267,7 @@ internal class HomeTimelineReadingState(
     var timelineRefreshJob by mutableStateOf<Job?>(null)
     var timelineLoadMoreJob by mutableStateOf<Job?>(null)
     var timelineRequestGeneration by mutableIntStateOf(0)
-    var readingSessionGeneration by mutableIntStateOf(0)
-        private set
+    private var longPostReading by mutableStateOf(HomeLongPostReadingSession())
     var feedRefreshHint by mutableStateOf<String?>(null)
     var feedRefreshHintGeneration by mutableIntStateOf(0)
     var feedCacheLoaded by mutableStateOf(false)
@@ -4290,7 +4288,12 @@ internal class HomeTimelineReadingState(
 
     fun updatePreferences(update: (ReadingPreferences) -> ReadingPreferences) {
         val updated = update(preferences)
-        if (preferencesStore.write(updated)) preferences = updated
+        if (preferencesStore.write(updated)) {
+            if (preferences.foldLongPosts != updated.foldLongPosts || preferences.maxLines != updated.maxLines) {
+                resetLongPostReading()
+            }
+            preferences = updated
+        }
     }
 
     fun resetGap() {
@@ -4360,8 +4363,10 @@ internal class HomeTimelineReadingState(
         }
     }
 
+    fun longPostController(listState: LazyListState): HomeLongPostController = longPostReading.controllerFor(listState)
+
     fun resetLongPostReading() {
-        readingSessionGeneration += 1
+        longPostReading = HomeLongPostReadingSession()
     }
 
     fun resetTimelineReadingSession() {
@@ -11010,9 +11015,7 @@ internal fun FollowFeedScreen(
     val isGroupTimeline = homeTimeline.selectedTimelineGroupId != null || homeTimeline.timelineKind == TimelineKind.SpecialFollowing
     val reading = homeTimeline.preferences
     val lineLimit = reading.maxLines.takeIf { reading.foldLongPosts }
-    val longPostController = remember(listState, lineLimit, homeTimeline.readingSessionGeneration) {
-        HomeLongPostController(listState)
-    }
+    val longPostController = homeTimeline.longPostController(listState)
     val navTopInRoot = LocalImageReturnBarTop.current
     val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
     LaunchedEffect(items, longPostController) {
@@ -11133,7 +11136,9 @@ internal fun FollowFeedScreen(
         modifier = Modifier.fillMaxSize(),
     ) {
         feedContent()
-        if (feedUiOnTop && lineLimit != null) {
+        // A detail covers the still-mounted feed. Keep its readable viewport so the
+        // expanded source card has the same collapse control at the return handoff.
+        if (lineLimit != null) {
             HomeLongPostOverlay(longPostController, navTopInRoot, topContentInsetPx)
         }
     }
@@ -11247,27 +11252,28 @@ private fun EmoticonText(
     onUrlEntityClick: ((FeedUrlEntity) -> Unit)? = null,
     maxLines: Int = Int.MAX_VALUE,
     overflow: TextOverflow = TextOverflow.Clip,
-    onTextLayout: ((TextLayoutResult) -> Unit)? = null,
+    folding: LongPostFolding? = null,
 ) {
     if (text.isBlank() && trailingLabel == null && leadingAuthorName == null && trailingLocation == null) {
         Text(
             text = "\u65E0\u6B63\u6587",
             style = style,
             modifier = modifier,
-            onTextLayout = onTextLayout ?: {},
         )
         return
     }
 
     if (!textNeedsRichRendering(text, leadingAuthorName, trailingLabel, trailingLocation, inlineImageLinks, urlEntities)) {
-        Text(
-            text = text,
-            style = style,
-            modifier = modifier,
-            maxLines = maxLines,
-            overflow = overflow,
-            onTextLayout = onTextLayout ?: {},
-        )
+        RenderLongPostText(folding, maxLines, overflow, style, { AnnotatedString(text) }) { lines, textOverflow, onTextLayout ->
+            Text(
+                text = text,
+                style = style,
+                modifier = modifier,
+                maxLines = lines,
+                overflow = textOverflow,
+                onTextLayout = onTextLayout ?: {},
+            )
+        }
         return
     }
 
@@ -11465,63 +11471,66 @@ private fun EmoticonText(
             }
         }
     }
-    Text(
-        text = annotatedString,
-        inlineContent = inlineContent,
-        style = style,
-        modifier = modifier
-            .pointerInput(linkScopeKey) {
-                awaitEachGesture {
-                    val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                    exactTouchPosition = down.position
-                    waitForUpOrCancellation(pass = PointerEventPass.Initial)
-                }
+    val richModifier = modifier
+        .pointerInput(linkScopeKey) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                exactTouchPosition = down.position
+                waitForUpOrCancellation(pass = PointerEventPass.Initial)
             }
-            .onGloballyPositioned { coordinates -> textGeometry.coordinates = coordinates }
-            .then(
-                if (locationStart >= 0 && locationEnd != null && onLocationClick != null) {
-                    Modifier.pointerInput(linkScopeKey, locationStart, locationEnd, textGeometry) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                            val layout = textGeometry.layout
-                            val offset = layout?.getOffsetForPosition(down.position)
-                            val isLocation = offset != null &&
-                                offset >= locationStart &&
-                                offset < locationEnd &&
-                                (locationStart until locationEnd).any { layout.getBoundingBox(it).contains(down.position) }
-                            if (!isLocation) return@awaitEachGesture
-                            down.consume()
-                            val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
-                            val upOffset = up?.let { event ->
-                                layout?.getOffsetForPosition(event.position)
-                            }
-                            if (up != null && upOffset != null &&
-                                upOffset >= locationStart && upOffset < (locationEnd ?: -1) &&
-                                (locationStart until (locationEnd ?: locationStart)).any { layout!!.getBoundingBox(it).contains(up.position) }
-                            ) {
-                                up.consume()
-                                locationClickState.value?.invoke()
-                            } else {
-                                up?.consume()
-                            }
+        }
+        .onGloballyPositioned { coordinates -> textGeometry.coordinates = coordinates }
+        .then(
+            if (locationStart >= 0 && locationEnd != null && onLocationClick != null) {
+                Modifier.pointerInput(linkScopeKey, locationStart, locationEnd, textGeometry) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        val layout = textGeometry.layout
+                        val offset = layout?.getOffsetForPosition(down.position)
+                        val isLocation = offset != null &&
+                            offset >= locationStart &&
+                            offset < locationEnd &&
+                            (locationStart until locationEnd).any { layout.getBoundingBox(it).contains(down.position) }
+                        if (!isLocation) return@awaitEachGesture
+                        down.consume()
+                        val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                        val upOffset = up?.let { event ->
+                            layout?.getOffsetForPosition(event.position)
+                        }
+                        if (up != null && upOffset != null &&
+                            upOffset >= locationStart && upOffset < (locationEnd ?: -1) &&
+                            (locationStart until (locationEnd ?: locationStart)).any { layout!!.getBoundingBox(it).contains(up.position) }
+                        ) {
+                            up.consume()
+                            locationClickState.value?.invoke()
+                        } else {
+                            up?.consume()
                         }
                     }
-                } else {
-                    Modifier
-                },
-            ),
-        onTextLayout = { result ->
-            textGeometry.layout = result
-            textGeometry.visibleTextEnd = if (onTextLayout != null && result.multiParagraph.didExceedMaxLines) {
-                result.getLineEnd(result.lineCount - 1, visibleEnd = true)
+                }
             } else {
-                Int.MAX_VALUE
-            }
-            onTextLayout?.invoke(result)
-        },
-        maxLines = maxLines,
-        overflow = overflow,
-    )
+                Modifier
+            },
+        )
+    RenderLongPostText(folding, maxLines, overflow, style, { annotatedString }, inlineContent) { lines, textOverflow, onTextLayout ->
+        Text(
+            text = annotatedString,
+            inlineContent = inlineContent,
+            style = style,
+            modifier = richModifier,
+            onTextLayout = { result ->
+                textGeometry.layout = result
+                textGeometry.visibleTextEnd = if (onTextLayout != null && result.multiParagraph.didExceedMaxLines) {
+                    result.getLineEnd(result.lineCount - 1, visibleEnd = true)
+                } else {
+                    Int.MAX_VALUE
+                }
+                onTextLayout?.invoke(result)
+            },
+            maxLines = lines,
+            overflow = textOverflow,
+        )
+    }
 }
 
 private fun buildEmoticonAnnotatedString(
@@ -11623,13 +11632,13 @@ private fun buildEmoticonAnnotatedString(
                         },
                     )
                     if (entity.title.contains("微博正文")) {
-                        if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                        if (entity.title.contains("超话")) append("#") else appendPostInlineContent(UrlLinkIconInlineContentKey, "链接")
                         withLink(urlLink) {
                             withStyle(linkStyle) { append(entity.title) }
                         }
                     } else withLink(urlLink) {
                         withStyle(linkStyle) {
-                            if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                            if (entity.title.contains("超话")) append("#") else appendPostInlineContent(UrlLinkIconInlineContentKey, "链接")
                             append(entity.title)
                         }
                     }
@@ -11637,12 +11646,12 @@ private fun buildEmoticonAnnotatedString(
                 urlEntities.containsKey(token) -> {
                     val entity = urlEntities.getValue(token)
                     withStyle(SpanStyle(color = primaryColor, fontWeight = FontWeight.Medium)) {
-                        if (entity.title.contains("超话")) append("#") else appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                        if (entity.title.contains("超话")) append("#") else appendPostInlineContent(UrlLinkIconInlineContentKey, "链接")
                         append(entity.title)
                     }
                 }
                 emoticonMap.containsKey(token) -> {
-                    appendInlineContent(token, token)
+                    appendPostInlineContent(token, token)
                 }
                 token.startsWith("@") -> {
                     val screenName = token.removePrefix("@")
@@ -11717,7 +11726,7 @@ private fun buildEmoticonAnnotatedString(
                 textDecoration = TextDecoration.None,
             )
             withStyle(locationStyle) {
-                appendInlineContent(UrlLinkIconInlineContentKey, "链接")
+                appendPostInlineContent(UrlLinkIconInlineContentKey, "链接")
                 append('\u2009')
                 val anchorStart = length
                 append(location.trim())
@@ -12270,52 +12279,45 @@ internal fun StatusTextSection(
         }
     }
     val bodyContent: @Composable () -> Unit = {
-        // A server preview is not the full text. Keep its existing read-full flow
-        // available and apply local folding only to a body already available to render.
-        LongPostBody(
+        // A server preview keeps its read-full flow; only fold text already available to render.
+        val folding = longPostLineLimit
+            ?.takeIf {
+                it in 1 until Int.MAX_VALUE && !item.isLongText && !item.requiresLongTextFetch && bodyText.isNotBlank()
+            }
+            ?.let { LongPostFolding(contentKey, it, requestedServerText, homeLongPost) }
+        EmoticonText(
+            modifier = Modifier.fillMaxWidth(),
+            text = bodyText,
             contentKey = contentKey,
-            lineLimit = longPostLineLimit.takeUnless {
-                item.isLongText || item.requiresLongTextFetch || bodyText.isBlank()
+            emoticonMap = emoticonMap,
+            style = style,
+            onUserClick = onUserClick,
+            leadingAuthorName = leadingAuthorName,
+            onLeadingAuthorClick = onLeadingAuthorClick,
+            onBodyClick = onBodyClick,
+            trailingLabel = if (item.isLongText && onLoadLongText != null) {
+                if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
+            } else {
+                null
             },
-            initiallyExpanded = requestedServerText,
-            homePost = homeLongPost,
-        ) { maxLines, overflow, onTextLayout ->
-            EmoticonText(
-                modifier = Modifier.fillMaxWidth(),
-                text = bodyText,
-                contentKey = contentKey,
-                emoticonMap = emoticonMap,
-                style = style,
-                onUserClick = onUserClick,
-                leadingAuthorName = leadingAuthorName,
-                onLeadingAuthorClick = onLeadingAuthorClick,
-                onBodyClick = onBodyClick,
-                trailingLabel = if (item.isLongText && onLoadLongText != null) {
-                    if (isLongTextLoading) "\u52A0\u8F7D\u5168\u6587..." else "\u9605\u8BFB\u5168\u6587"
-                } else {
-                    null
-                },
-                onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
-                    {
-                        if (homeLongPost != null) {
-                            homeLongPost.controller.expand(homeLongPost.key)
-                        } else if (longPostLineLimit != null) {
-                            requestedServerText = true
-                        }
-                        onLoadLongText(item)
+            onTrailingClick = if (item.isLongText && onLoadLongText != null && !isLongTextLoading) {
+                {
+                    if (homeLongPost != null) {
+                        homeLongPost.controller.expand(homeLongPost.key)
+                    } else if (longPostLineLimit != null) {
+                        requestedServerText = true
                     }
-                } else {
-                    null
-                },
-                inlineImageLinks = inlineImageLinks,
-                onInlineImageClick = onInlineImageClick,
-                urlEntities = resolvedUrlEntities,
-                onUrlEntityClick = onUrlEntityClick,
-                maxLines = maxLines,
-                overflow = overflow,
-                onTextLayout = onTextLayout,
-            )
-        }
+                    onLoadLongText(item)
+                }
+            } else {
+                null
+            },
+            inlineImageLinks = inlineImageLinks,
+            onInlineImageClick = onInlineImageClick,
+            urlEntities = resolvedUrlEntities,
+            onUrlEntityClick = onUrlEntityClick,
+            folding = folding,
+        )
     }
     if (LocalDetailInlineVideoPlayback.current) {
         SelectionContainer(content = bodyContent)

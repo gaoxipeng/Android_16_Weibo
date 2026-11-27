@@ -62,6 +62,21 @@ internal data class HomeLongPostGlass(val frost: Float = 0f, val refraction: Flo
     val enabled: Boolean get() = isRenderEffectSupported() && (frost > 0f || refraction > 0f)
 }
 
+/** Retain expansion and its pre-open anchor, but only within one Home reading session. */
+internal class HomeLongPostReadingSession {
+    private var listState: LazyListState? = null
+    private var controller: HomeLongPostController? = null
+
+    fun controllerFor(state: LazyListState): HomeLongPostController {
+        val current = controller
+        if (listState === state && current != null) return current
+        return HomeLongPostController(state).also {
+            listState = state
+            controller = it
+        }
+    }
+}
+
 /** Timeline-owned so an expanded body stays expanded when recycled by LazyColumn. */
 internal class HomeLongPostController(
     private val listState: LazyListState,

@@ -9,6 +9,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,6 +20,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -29,7 +32,6 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -55,10 +57,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import com.example.myweibo.R
 import com.example.myweibo.ui.liquidglass.drawBottomBarGlassBackdrop
@@ -78,6 +83,86 @@ private val LongPostChevronGap = 4.dp
 private const val LongPostExpandMillis = 220
 internal const val LongPostCollapseMillis = 200
 
+internal data class LongPostFolding(
+    val contentKey: String,
+    val lineLimit: Int,
+    val initiallyExpanded: Boolean,
+    val homePost: HomeLongPost?,
+)
+
+internal data class LongPostFoldMeasurement(val canFold: Boolean, val foldedHeight: Int = 0)
+
+private const val PostInlinePlaceholderTag = "weibo-inline-placeholder"
+
+// Record the ranges we give to Text without depending on Foundation's private annotation tag.
+internal fun AnnotatedString.Builder.appendPostInlineContent(id: String, alternateText: String) {
+    val start = length
+    appendInlineContent(id, alternateText)
+    addStringAnnotation(PostInlinePlaceholderTag, id, start, length)
+}
+
+/** Decide Home's fold before composing the visible text or toggle, even on the first lazy layout. */
+@Composable
+internal fun RenderLongPostText(
+    folding: LongPostFolding?,
+    maxLines: Int,
+    overflow: TextOverflow,
+    style: TextStyle,
+    annotatedText: () -> AnnotatedString,
+    inlineContent: Map<String, InlineTextContent> = emptyMap(),
+    content: @Composable (Int, TextOverflow, ((TextLayoutResult) -> Unit)?) -> Unit,
+) {
+    if (folding == null) {
+        content(maxLines, overflow, null)
+        return
+    }
+    val homePost = folding.homePost
+    if (homePost == null) {
+        LongPostBody(folding.contentKey, folding.lineLimit, folding.initiallyExpanded, content = content)
+        return
+    }
+
+    val text = annotatedText()
+    val placeholders = remember(text, inlineContent) {
+        if (inlineContent.isEmpty()) emptyList() else {
+            text.getStringAnnotations(PostInlinePlaceholderTag, 0, text.length).mapNotNull { range ->
+                inlineContent[range.item]?.let { AnnotatedString.Range(it.placeholder, range.start, range.end) }
+            }
+        }
+    }
+    val textMeasurer = rememberTextMeasurer(cacheSize = 2)
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        // The status Text fills this exact width (including quoted-card insets).
+        // The probe is off-tree: no duplicate Text, link semantics or inline image composition.
+        val textConstraints = if (constraints.hasBoundedWidth) Constraints.fixedWidth(constraints.maxWidth) else Constraints()
+        val probe = textMeasurer.measure(
+            text = text,
+            style = style,
+            placeholders = placeholders,
+            maxLines = folding.lineLimit + 1,
+            constraints = textConstraints,
+        )
+        val canFold = probe.multiParagraph.didExceedMaxLines
+        val foldedHeight = if (canFold && homePost.controller.isExpanded(homePost.key)) {
+            textMeasurer.measure(
+                text = text,
+                style = style,
+                placeholders = placeholders,
+                maxLines = folding.lineLimit,
+                overflow = TextOverflow.Ellipsis,
+                constraints = textConstraints,
+            ).size.height
+        } else 0
+        LongPostBody(
+            contentKey = folding.contentKey,
+            lineLimit = folding.lineLimit,
+            homePost = homePost,
+            foldMeasurement = LongPostFoldMeasurement(canFold, foldedHeight),
+            content = content,
+        )
+    }
+}
+
 /** Renders one real text node and clips its revealed height while it changes. */
 @Composable
 internal fun LongPostBody(
@@ -85,6 +170,7 @@ internal fun LongPostBody(
     lineLimit: Int?,
     initiallyExpanded: Boolean = false,
     homePost: HomeLongPost? = null,
+    foldMeasurement: LongPostFoldMeasurement? = null,
     content: @Composable (Int, TextOverflow, ((TextLayoutResult) -> Unit)?) -> Unit,
 ) {
     if (lineLimit == null || lineLimit <= 0 || lineLimit == Int.MAX_VALUE) {
@@ -93,15 +179,16 @@ internal fun LongPostBody(
     }
 
     // Home owns this body by lazy row (and original for quotes), not by an
-    // endpoint's optional status-ID alias. Keep its measured fold across refreshes.
+    // endpoint's optional status-ID alias. Keep the same body and animation across refreshes.
     key(homePost?.controller, homePost?.key ?: contentKey, lineLimit) {
         var fallbackExpanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
         val expanded = if (homePost != null) homePost.controller.isExpanded(homePost.key) else fallbackExpanded
-        var canFold by remember { mutableStateOf(false) }
-        var foldedHeight by remember { mutableIntStateOf(0) }
+        val fallbackFold = if (foldMeasurement == null) remember { mutableStateOf(LongPostFoldMeasurement(false)) } else null
+        val fold = foldMeasurement ?: checkNotNull(fallbackFold).value
+        val canFold = fold.canFold
         var linkBounds by remember { mutableStateOf(emptyList<Rect>()) }
         val probeLimit = lineLimit + 1
-        val textMeasurer = rememberTextMeasurer(cacheSize = 2)
+        val textMeasurer = if (foldMeasurement == null) rememberTextMeasurer(cacheSize = 2) else null
         val transition = updateTransition(expanded, label = "long-post")
         val collapseMotion = homePost?.let { owner -> owner.controller.activeCollapse?.takeIf { it.key == owner.key } }
         // Compose's tween uses the system animator duration scale, including zero.
@@ -132,7 +219,7 @@ internal fun LongPostBody(
                 Box(
                     Modifier.fillMaxWidth().clipToBounds().layout { measurable, constraints ->
                         val text = measurable.measure(constraints)
-                        val collapsed = foldedHeight
+                        val collapsed = fold.foldedHeight
                         val height = if (showFullText && canFold && collapsed in 1 until text.height) {
                             val fraction = collapseMotion?.remaining ?: reveal.value
                             (collapsed + (text.height - collapsed) * fraction).roundToInt()
@@ -145,28 +232,32 @@ internal fun LongPostBody(
                         if (!showFullText && canFold) TextOverflow.Ellipsis else TextOverflow.Clip,
                         { layout ->
                             val input = layout.layoutInput
-                            fun measure(maxLines: Int, overflow: TextOverflow) = textMeasurer.measure(
-                                text = input.text,
-                                style = input.style,
-                                overflow = overflow,
-                                softWrap = input.softWrap,
-                                maxLines = maxLines,
-                                placeholders = input.placeholders,
-                                constraints = input.constraints,
-                                layoutDirection = input.layoutDirection,
-                                density = input.density,
-                                fontFamilyResolver = input.fontFamilyResolver,
-                            )
-                            canFold = when (input.maxLines) {
-                                Int.MAX_VALUE -> layout.lineCount > probeLimit
-                                probeLimit -> layout.multiParagraph.didExceedMaxLines
-                                // Recheck an already-capped body after reflow, off-tree so it
-                                // never duplicates link semantics or adds a second Text node.
-                                else -> measure(probeLimit, TextOverflow.Clip).multiParagraph.didExceedMaxLines
-                            }
-                            if (canFold) {
-                                foldedHeight = if (input.maxLines == lineLimit) layout.size.height
-                                    else measure(lineLimit, TextOverflow.Ellipsis).size.height
+                            if (textMeasurer != null && fallbackFold != null) {
+                                fun measure(maxLines: Int, overflow: TextOverflow) = textMeasurer.measure(
+                                    text = input.text,
+                                    style = input.style,
+                                    overflow = overflow,
+                                    softWrap = input.softWrap,
+                                    maxLines = maxLines,
+                                    placeholders = input.placeholders,
+                                    constraints = input.constraints,
+                                    layoutDirection = input.layoutDirection,
+                                    density = input.density,
+                                    fontFamilyResolver = input.fontFamilyResolver,
+                                )
+                                val measuredCanFold = when (input.maxLines) {
+                                    Int.MAX_VALUE -> layout.lineCount > probeLimit
+                                    probeLimit -> layout.multiParagraph.didExceedMaxLines
+                                    // Recheck an already-capped body after reflow, off-tree so it
+                                    // never duplicates link semantics or adds a second Text node.
+                                    else -> measure(probeLimit, TextOverflow.Clip).multiParagraph.didExceedMaxLines
+                                }
+                                val height = when {
+                                    !measuredCanFold -> 0
+                                    input.maxLines == lineLimit -> layout.size.height
+                                    else -> measure(lineLimit, TextOverflow.Ellipsis).size.height
+                                }
+                                fallbackFold.value = LongPostFoldMeasurement(measuredCanFold, height)
                             }
                             linkBounds = if (homePost != null && showFullText) {
                                 input.text.getLinkAnnotations(0, input.text.length).mapNotNull { link ->
