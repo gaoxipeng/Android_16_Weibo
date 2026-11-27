@@ -7,6 +7,7 @@ import com.example.myweibo.data.FeedTimelineGap
 import com.example.myweibo.data.mergeFeedTimelinePages
 import com.example.myweibo.data.mergeFeedTimelineRefresh
 import com.example.myweibo.data.projectFeedTimelineRefresh
+import com.example.myweibo.data.replaceFeedTimelineRefresh
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -123,6 +124,27 @@ class FeedTimelineRefreshPolicyTest {
 
         val full = mergeFeedTimelineRefresh(listOf(current), listOf(incoming))
         assertEquals(listOf(incoming.copy(retweetedStatus = expanded.copy(commentsCount = "2"))), full)
+    }
+
+    @Test fun replacementKeepsOverlappingRowIdentityAndFullBodiesButNotOldOrderOrTail() {
+        val quote = post(1).copy(text = "Entire quote")
+        val old = post(3).copy(isPinned = true, text = "Entire post", retweetedStatus = quote)
+        val fresh = old.copy(
+            id = "outer-alias", isPinned = false, text = "Preview…", requiresLongTextFetch = true,
+            likesCount = "2",
+            retweetedStatus = quote.copy(id = "quote-alias", text = "Preview…", requiresLongTextFetch = true),
+        )
+        val current = listOf(old, post(2), post(4))
+        assertEquals(
+            listOf(post(2), old.copy(isPinned = false, likesCount = "2")),
+            replaceFeedTimelineRefresh(current, listOf(post(2), fresh)),
+        )
+        val edited = fresh.copy(editCount = 1)
+        assertEquals(
+            listOf(edited.copy(id = old.id, retweetedStatus = quote)),
+            replaceFeedTimelineRefresh(current, listOf(edited)),
+        )
+        assertEquals(listOf(fresh), replaceFeedTimelineRefresh(emptyList(), listOf(fresh)))
     }
 
     @Test fun initialLoadAndNoNewPostsDoNotCreateAGap() {

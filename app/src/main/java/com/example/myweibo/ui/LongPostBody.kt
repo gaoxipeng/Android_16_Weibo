@@ -92,7 +92,9 @@ internal fun LongPostBody(
         return
     }
 
-    key(contentKey, lineLimit) {
+    // Home owns this body by lazy row (and original for quotes), not by an
+    // endpoint's optional status-ID alias. Keep its measured fold across refreshes.
+    key(homePost?.controller, homePost?.key ?: contentKey, lineLimit) {
         var fallbackExpanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
         val expanded = if (homePost != null) homePost.controller.isExpanded(homePost.key) else fallbackExpanded
         var canFold by remember { mutableStateOf(false) }

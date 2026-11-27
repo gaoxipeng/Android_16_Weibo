@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
@@ -54,14 +55,21 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.example.myweibo.data.FeedImage
 import com.example.myweibo.data.FeedItem
+import com.example.myweibo.data.ReadingPreferences
+import com.example.myweibo.data.ReadingPreferencesStore
+import com.example.myweibo.data.TimelineCacheStore
+import com.example.myweibo.data.TimelineKind
+import com.example.myweibo.data.TimelinePage
 import com.example.myweibo.data.mergeFeedTimelineRefresh
 import com.example.myweibo.data.projectFeedTimelineRefresh
 import com.example.myweibo.ui.FeedCard
+import com.example.myweibo.ui.FollowFeedScreen
 import com.example.myweibo.ui.FloatingLongPostCollapseTag
 import com.example.myweibo.ui.HomeLongPost
 import com.example.myweibo.ui.HomeLongPostController
 import com.example.myweibo.ui.HomeLongPostGlass
 import com.example.myweibo.ui.HomeLongPostOverlay
+import com.example.myweibo.ui.HomeTimelineReadingState
 import com.example.myweibo.ui.LongPostBody
 import com.example.myweibo.ui.LongPostCollapseGlassTag
 import com.example.myweibo.ui.LongPostTextSectionTag
@@ -74,7 +82,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
-/** Compose fixtures only: no service login, network, or full production refresh flow. */
+/** Native Compose tests with local payloads; no service login or network. */
 @RunWith(AndroidJUnit4::class)
 class ReadingControlsComposeTest {
     @get:Rule
@@ -533,6 +541,120 @@ class ReadingControlsComposeTest {
                 listOf("post-16", "post-15", GapTag, previous.first().id),
                 listState.layoutInfo.visibleItemsInfo.take(4).map { it.key },
             )
+        }
+    }
+
+    @Test
+    fun recommendationReplacementNeverFlashesExpandedPostOrFoldedQuote() {
+        assertHomeRefreshFrames(TimelineKind.Hot, expandQuote = false, keepReading = false)
+    }
+
+    @Test
+    fun followingReplacementNeverFlashesFoldedPostOrExpandedQuote() {
+        assertHomeRefreshFrames(TimelineKind.Following, expandQuote = true, keepReading = false)
+    }
+
+    @Test
+    fun protectedFollowingMergeKeepsFoldMeasurementsWhenStatusAliasesChange() {
+        assertHomeRefreshFrames(TimelineKind.Following, expandQuote = true, keepReading = true)
+    }
+
+    private fun assertHomeRefreshFrames(kind: TimelineKind, expandQuote: Boolean, keepReading: Boolean) {
+        val bodyText = (1..6).joinToString("\n") { "Ordinary line $it" }
+        val quoteText = (1..6).joinToString("\n") { "Quoted line $it" }
+        // Start with an omitted mblogid for the outer status (the parser falls back to id).
+        val quote = fixturePost(20).copy(authorName = "Q", text = quoteText)
+        val post = fixturePost(10).let { it.copy(statusId = it.id, text = bodyText, retweetedStatus = quote) }
+        val tail = (9 downTo 1).map(::fixturePost)
+        lateinit var timeline: HomeTimelineReadingState
+        lateinit var listState: LazyListState
+        setFixture {
+            val context = LocalContext.current
+            val state = rememberLazyListState()
+            val reading = remember {
+                HomeTimelineReadingState(
+                    ReadingPreferencesStore(context), TimelineCacheStore(context), kind,
+                    ReadingPreferences(foldLongPosts = true, maxLines = 3, reverseReading = keepReading),
+                ).apply {
+                    feedCacheLoaded = true
+                    timelineVerifiedFromNetwork = true
+                    items = listOf(post) + tail
+                }
+            }
+            SideEffect { listState = state; timeline = reading }
+            FollowFeedScreen(
+                listState = state,
+                homeTimeline = reading,
+                hasLoginCookie = true,
+                onRefresh = {},
+                onLoadMore = {},
+                onOpenLoginSettings = {},
+                onItemClick = { _, _ -> },
+                onCommentClick = { _, _ -> },
+                onCommentLongClick = {},
+                onRepostClick = { _, _ -> },
+                onMediaClick = { _, _ -> },
+            )
+        }
+
+        val expandedBody = cardText(if (expandQuote) "Quoted line 1" else "Ordinary line 1")
+        val foldedBody = cardText(if (expandQuote) "Ordinary line 1" else "Quoted line 1")
+        val expand = cardToggle(quoted = !expandQuote)
+        val collapse = sectionNode(FloatingLongPostCollapseTag, quoted = expandQuote)
+        cardToggle(quoted = expandQuote).performClick()
+        expandedBody.assertLayout(6, false, TextOverflow.Clip)
+        foldedBody.assertLayout(3, true, TextOverflow.Ellipsis)
+        expand.assertIsDisplayed()
+        collapse.assertIsDisplayed()
+        val expandedNodeId = expandedBody.fetchSemanticsNode().id
+        val foldedNodeId = foldedBody.fetchSemanticsNode().id
+        val expandBounds = expand.fetchSemanticsNode().boundsInRoot
+        val collapseBounds = collapse.fetchSemanticsNode().boundsInRoot
+        val rowHeight = compose.runOnIdle { listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size }
+        val rowOffset = compose.runOnIdle { listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.offset }
+
+        fun assertNextFrame() {
+            compose.mainClock.advanceTimeByFrame()
+            compose.runOnIdle {
+                val row = checkNotNull(listState.layoutInfo.visibleItemsInfo.firstOrNull { it.key == post.id }) {
+                    "Visible lazy row ${post.id} disappeared during refresh"
+                }
+                assertEquals(rowHeight, row.size)
+                assertEquals(rowOffset, row.offset)
+            }
+            expandedBody.assertLayout(6, false, TextOverflow.Clip)
+            foldedBody.assertLayout(3, true, TextOverflow.Ellipsis)
+            assertEquals(expandedNodeId, expandedBody.fetchSemanticsNode().id)
+            assertEquals(foldedNodeId, foldedBody.fetchSemanticsNode().id)
+            expand.assertIsDisplayed()
+            collapse.assertIsDisplayed()
+            assertEquals(expandBounds, expand.fetchSemanticsNode().boundsInRoot)
+            assertEquals(collapseBounds, collapse.fetchSemanticsNode().boundsInRoot)
+        }
+
+        // A refresh starts before its response. Check both that phase and the *first*
+        // layouts after publishing, without draining Compose's clock to steady state.
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle { timeline.isLoading = true }
+            repeat(2) { assertNextFrame() }
+            val refreshed = post.copy(
+                statusId = "canonical-id",
+                authorName = "Refreshed author",
+                text = "Ordinary line 1…",
+                requiresLongTextFetch = true,
+                retweetedStatus = quote.copy(id = "original-alias", text = "Quoted line 1…", requiresLongTextFetch = true),
+            )
+            compose.runOnIdle {
+                timeline.publishRefresh(TimelinePage(listOf(refreshed) + tail), listState, keepReading, keepReading)
+            }
+            repeat(4) { assertNextFrame() }
+            // Confirm the response rendered, not merely that the old page stayed visible.
+            compose.onNodeWithText("Refreshed author", useUnmergedTree = true).assertIsDisplayed()
+            compose.runOnIdle { timeline.isLoading = false }
+            repeat(2) { assertNextFrame() }
+        } finally {
+            compose.mainClock.autoAdvance = true
         }
     }
 

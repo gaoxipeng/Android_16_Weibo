@@ -81,6 +81,32 @@ fun mergeFeedTimelineRefresh(current: List<FeedItem>, incoming: List<FeedItem>):
     return merged
 }
 
+/** Replace the first page in server order, without remounting overlapping rows or downgrading their bodies. */
+internal fun replaceFeedTimelineRefresh(current: List<FeedItem>, incoming: List<FeedItem>): List<FeedItem> {
+    if (current.isEmpty()) return incoming
+    val existing = FeedRefreshIndex()
+    val previous = current.filter { existing.add(it) }
+    val emitted = FeedRefreshIndex()
+    return incoming.mapNotNull { fresh ->
+        val known = existing.indexOf(fresh)?.let(previous::get)
+        val row = if (known != null) mergeRefreshedFeedItem(known, fresh, retainPin = false) else fresh
+        row.takeIf { emitted.add(it) }
+    }
+}
+
+/** Detail/full-text fallbacks may return aliases; payload updates must not replace home row owners. */
+internal fun FeedItem.withHomeRowIdentity(row: FeedItem): FeedItem {
+    val original = retweetedStatus
+    val known = row.retweetedStatus
+    val quote = if (original != null && known != null && known.matchesRefreshStatus(original)) {
+        original.withHomeRowIdentity(known)
+    } else original
+    return if (id == row.id && quote === original) this else copy(id = row.id, retweetedStatus = quote)
+}
+
+private fun FeedItem.matchesRefreshStatus(other: FeedItem): Boolean =
+    id == other.id || (statusId.isNotBlank() && statusId == other.statusId)
+
 /**
  * Capture [previousHeadId] from the first non-pinned post in the full timeline immediately
  * before the first protected refresh. Keep that ID per feed across refreshes and pagination;
@@ -116,25 +142,31 @@ fun projectFeedTimelineRefresh(
     )
 }
 
-private fun mergeRefreshedFeedItem(current: FeedItem, incoming: FeedItem): FeedItem {
+private fun mergeRefreshedFeedItem(
+    current: FeedItem,
+    incoming: FeedItem,
+    retainPin: Boolean = true,
+): FeedItem {
     val retweet = incoming.retweetedStatus?.let { fresh ->
         val known = current.retweetedStatus
-        val sameStatus = known?.statusId?.takeIf { it.isNotBlank() } == fresh.statusId
-        if (known != null && (known.id == fresh.id || sameStatus)) {
-            mergeRefreshedFeedItem(known, fresh)
+        if (known != null && known.matchesRefreshStatus(fresh)) {
+            mergeRefreshedFeedItem(known, fresh, retainPin)
         } else fresh
     }
     val updated = incoming.copy(
         id = current.id,
-        statusId = incoming.statusId.ifBlank { current.statusId },
+        // The parser falls back to the row ID when mblogid is omitted.
+        statusId = incoming.statusId.takeUnless { it.isBlank() || it == incoming.id }
+            ?: current.statusId.ifBlank { incoming.statusId },
         createdAt = incoming.createdAt ?: current.createdAt,
-        isPinned = current.isPinned,
+        isPinned = if (retainPin) current.isPinned else incoming.isPinned,
         retweetedStatus = retweet,
     )
     // Long-text expansion clears both flags and adds body-bound links, images, and emoticons.
     // Don't downgrade that body to a preview unless the server reports a newer edit.
     val keepBody = (incoming.requiresLongTextFetch || incoming.isLongText) &&
-        !current.requiresLongTextFetch && !current.isLongText && incoming.editCount <= current.editCount
+        !current.requiresLongTextFetch && !current.isLongText && current.text.isNotBlank() &&
+        incoming.editCount <= current.editCount
     if (!keepBody) return updated
     return updated.copy(
         text = current.text,
