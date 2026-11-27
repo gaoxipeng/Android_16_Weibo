@@ -541,7 +541,7 @@ private const val BottomBarHideGestureThresholdPx = 36f
 private const val ListLoadMoreItemsFromBottom = 3
 private const val FeedReverseBrowseGapKey = "feed-reverse-browse-gap"
 
-private fun TimelineKind.hasOrderedRefresh(groupId: String?, current: List<FeedItem>): Boolean = when (this) {
+internal fun TimelineKind.hasOrderedRefresh(groupId: String?, current: List<FeedItem>): Boolean = when (this) {
     TimelineKind.Following, TimelineKind.FriendsCircle -> true
     TimelineKind.SpecialFollowing -> {
         // User group snapshots are already sorted by the home feed. The standalone
@@ -11020,8 +11020,10 @@ internal fun FollowFeedScreen(
     val longPostController = homeTimeline.longPostController(listState)
     val navTopInRoot = LocalImageReturnBarTop.current
     val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
-    LaunchedEffect(items, longPostController) {
-        longPostController.retainRows(items.mapTo(mutableSetOf()) { it.id })
+    val sourceItems = homeTimeline.items
+    LaunchedEffect(sourceItems, longPostController) {
+        // A collapsed reverse-reading gap hides rows without removing them from this feed.
+        longPostController.retainRows(sourceItems.mapTo(mutableSetOf()) { it.id })
     }
 
     val currentOnLoadMore by rememberUpdatedState(onLoadMore)
@@ -11132,18 +11134,17 @@ internal fun FollowFeedScreen(
         }
     }
 
+    // A detail covers the still-mounted feed. Keep tracking its readable viewport so
+    // the expanded source card has the same collapse control at the return handoff.
+    val readingViewport = if (lineLimit != null) {
+        Modifier.homeLongPostViewport(longPostController, navTopInRoot, topContentInsetPx)
+    } else Modifier
     AppPullToRefreshBox(
         isRefreshing = isLoading,
         onRefresh = onRefresh,
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        feedContent()
-        // A detail covers the still-mounted feed. Keep its readable viewport so the
-        // expanded source card has the same collapse control at the return handoff.
-        if (lineLimit != null) {
-            HomeLongPostOverlay(longPostController, navTopInRoot, topContentInsetPx)
-        }
-    }
+        modifier = Modifier.fillMaxSize().then(readingViewport),
+        content = feedContent,
+    )
 }
 
 @Composable

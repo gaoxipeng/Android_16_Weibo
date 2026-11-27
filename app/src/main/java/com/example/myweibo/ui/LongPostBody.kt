@@ -90,8 +90,6 @@ internal data class LongPostFolding(
     val homePost: HomeLongPost?,
 )
 
-internal data class LongPostFoldMeasurement(val canFold: Boolean, val foldedHeight: Int = 0)
-
 private const val PostInlinePlaceholderTag = "weibo-inline-placeholder"
 
 // Record the ranges we give to Text without depending on Foundation's private annotation tag.
@@ -101,7 +99,7 @@ internal fun AnnotatedString.Builder.appendPostInlineContent(id: String, alterna
     addStringAnnotation(PostInlinePlaceholderTag, id, start, length)
 }
 
-/** Decide Home's fold before composing the visible text or toggle, even on the first lazy layout. */
+/** Decide the fold before composing the visible text or toggle, even on the first lazy layout. */
 @Composable
 internal fun RenderLongPostText(
     folding: LongPostFolding?,
@@ -112,16 +110,11 @@ internal fun RenderLongPostText(
     inlineContent: Map<String, InlineTextContent> = emptyMap(),
     content: @Composable (Int, TextOverflow, ((TextLayoutResult) -> Unit)?) -> Unit,
 ) {
-    if (folding == null) {
+    if (folding == null || folding.lineLimit !in 1 until Int.MAX_VALUE) {
         content(maxLines, overflow, null)
         return
     }
     val homePost = folding.homePost
-    if (homePost == null) {
-        LongPostBody(folding.contentKey, folding.lineLimit, folding.initiallyExpanded, content = content)
-        return
-    }
-
     val text = annotatedText()
     val placeholders = remember(text, inlineContent) {
         if (inlineContent.isEmpty()) emptyList() else {
@@ -135,164 +128,121 @@ internal fun RenderLongPostText(
         // The status Text fills this exact width (including quoted-card insets).
         // The probe is off-tree: no duplicate Text, link semantics or inline image composition.
         val textConstraints = if (constraints.hasBoundedWidth) Constraints.fixedWidth(constraints.maxWidth) else Constraints()
-        val probe = textMeasurer.measure(
+        fun measure(lines: Int, overflow: TextOverflow) = textMeasurer.measure(
             text = text,
             style = style,
             placeholders = placeholders,
-            maxLines = folding.lineLimit + 1,
+            maxLines = lines,
+            overflow = overflow,
             constraints = textConstraints,
         )
-        val canFold = probe.multiParagraph.didExceedMaxLines
-        val foldedHeight = if (canFold && homePost.controller.isExpanded(homePost.key)) {
-            textMeasurer.measure(
-                text = text,
-                style = style,
-                placeholders = placeholders,
-                maxLines = folding.lineLimit,
-                overflow = TextOverflow.Ellipsis,
-                constraints = textConstraints,
-            ).size.height
-        } else 0
-        LongPostBody(
-            contentKey = folding.contentKey,
-            lineLimit = folding.lineLimit,
-            homePost = homePost,
-            foldMeasurement = LongPostFoldMeasurement(canFold, foldedHeight),
-            content = content,
-        )
+        val canFold = measure(folding.lineLimit + 1, TextOverflow.Clip).multiParagraph.didExceedMaxLines
+        // Home owns this body by lazy row (and original for quotes), not by an
+        // endpoint's optional status-ID alias. Keep the same body and animation across refreshes.
+        key(homePost?.controller, homePost?.key ?: folding.contentKey, folding.lineLimit) {
+            val localExpansion = if (homePost == null) rememberSaveable { mutableStateOf(folding.initiallyExpanded) } else null
+            val expanded = if (homePost != null) homePost.controller.isExpanded(homePost.key) else localExpansion?.value == true
+            LongPostBody(
+                lineLimit = folding.lineLimit,
+                homePost = homePost,
+                canFold = canFold,
+                expanded = expanded,
+                measureFoldedHeight = { measure(folding.lineLimit, TextOverflow.Ellipsis).size.height },
+                onToggle = {
+                    if (homePost != null) homePost.controller.expand(homePost.key)
+                    else localExpansion?.value = !expanded
+                },
+                content = content,
+            )
+        }
     }
 }
 
 /** Renders one real text node and clips its revealed height while it changes. */
 @Composable
-internal fun LongPostBody(
-    contentKey: String,
-    lineLimit: Int?,
-    initiallyExpanded: Boolean = false,
-    homePost: HomeLongPost? = null,
-    foldMeasurement: LongPostFoldMeasurement? = null,
+private fun LongPostBody(
+    lineLimit: Int,
+    homePost: HomeLongPost?,
+    canFold: Boolean,
+    expanded: Boolean,
+    measureFoldedHeight: () -> Int,
+    onToggle: () -> Unit,
     content: @Composable (Int, TextOverflow, ((TextLayoutResult) -> Unit)?) -> Unit,
 ) {
-    if (lineLimit == null || lineLimit <= 0 || lineLimit == Int.MAX_VALUE) {
-        content(Int.MAX_VALUE, TextOverflow.Clip, null)
-        return
+    var linkBounds by remember { mutableStateOf(emptyList<Rect>()) }
+    val transition = updateTransition(expanded, label = "long-post")
+    val collapseMotion = homePost?.let { owner -> owner.controller.activeCollapse?.takeIf { it.key == owner.key } }
+    // Compose's tween uses the system animator duration scale, including zero.
+    val reveal = transition.animateFloat(
+        transitionSpec = {
+            when {
+                targetState -> tween(LongPostExpandMillis)
+                homePost != null -> snap() // The home controller already drove the shrink and scroll together.
+                else -> tween(LongPostCollapseMillis)
+            }
+        },
+        label = "text-height",
+    ) { if (it) 1f else 0f }
+    val settled = !transition.isRunning && transition.currentState == expanded
+    val showFullText = expanded || (homePost == null && (transition.currentState || transition.isRunning))
+    val hasInlineControl = canFold && (homePost == null || !expanded)
+    val foldedHeight = if (showFullText && canFold) measureFoldedHeight() else 0
+
+    if (homePost != null && expanded && canFold) {
+        SideEffect { homePost.controller.setBodyReady(homePost.key, settled) }
+        DisposableEffect(homePost) {
+            onDispose { homePost.controller.removeReadyBody(homePost.key) }
+        }
     }
 
-    // Home owns this body by lazy row (and original for quotes), not by an
-    // endpoint's optional status-ID alias. Keep the same body and animation across refreshes.
-    key(homePost?.controller, homePost?.key ?: contentKey, lineLimit) {
-        var fallbackExpanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
-        val expanded = if (homePost != null) homePost.controller.isExpanded(homePost.key) else fallbackExpanded
-        val fallbackFold = if (foldMeasurement == null) remember { mutableStateOf(LongPostFoldMeasurement(false)) } else null
-        val fold = foldMeasurement ?: checkNotNull(fallbackFold).value
-        val canFold = fold.canFold
-        var linkBounds by remember { mutableStateOf(emptyList<Rect>()) }
-        val probeLimit = lineLimit + 1
-        val textMeasurer = if (foldMeasurement == null) rememberTextMeasurer(cacheSize = 2) else null
-        val transition = updateTransition(expanded, label = "long-post")
-        val collapseMotion = homePost?.let { owner -> owner.controller.activeCollapse?.takeIf { it.key == owner.key } }
-        // Compose's tween uses the system animator duration scale, including zero.
-        val reveal = transition.animateFloat(
-            transitionSpec = {
-                when {
-                    targetState -> tween(LongPostExpandMillis)
-                    homePost != null -> snap() // The home controller already drove the shrink and scroll together.
-                    else -> tween(LongPostCollapseMillis)
-                }
-            },
-            label = "text-height",
-        ) { if (it) 1f else 0f }
-        val settled = !transition.isRunning && transition.currentState == expanded
-        val showFullText = expanded || (homePost == null && (transition.currentState || transition.isRunning))
-        val hasInlineControl = canFold && (homePost == null || !expanded)
-
-        if (homePost != null && expanded && canFold) {
-            SideEffect { homePost.controller.setBodyReady(homePost.key, settled) }
-            DisposableEffect(homePost) {
-                onDispose { homePost.controller.removeReadyBody(homePost.key) }
-            }
-        }
-
-        val currentLinkBounds = remember { { linkBounds } }
-        HomeLongPostTextSection(homePost, expanded && canFold, settled, currentLinkBounds) { backdropSource ->
-            Column(Modifier.fillMaxWidth().then(backdropSource)) {
-                Box(
-                    Modifier.fillMaxWidth().clipToBounds().layout { measurable, constraints ->
-                        val text = measurable.measure(constraints)
-                        val collapsed = fold.foldedHeight
-                        val height = if (showFullText && canFold && collapsed in 1 until text.height) {
-                            val fraction = collapseMotion?.remaining ?: reveal.value
-                            (collapsed + (text.height - collapsed) * fraction).roundToInt()
-                        } else text.height
-                        layout(text.width, height) { text.placeRelative(0, 0) }
-                    },
-                ) {
-                    content(
-                        if (showFullText) Int.MAX_VALUE else if (canFold) lineLimit else probeLimit,
-                        if (!showFullText && canFold) TextOverflow.Ellipsis else TextOverflow.Clip,
-                        { layout ->
-                            val input = layout.layoutInput
-                            if (textMeasurer != null && fallbackFold != null) {
-                                fun measure(maxLines: Int, overflow: TextOverflow) = textMeasurer.measure(
-                                    text = input.text,
-                                    style = input.style,
-                                    overflow = overflow,
-                                    softWrap = input.softWrap,
-                                    maxLines = maxLines,
-                                    placeholders = input.placeholders,
-                                    constraints = input.constraints,
-                                    layoutDirection = input.layoutDirection,
-                                    density = input.density,
-                                    fontFamilyResolver = input.fontFamilyResolver,
-                                )
-                                val measuredCanFold = when (input.maxLines) {
-                                    Int.MAX_VALUE -> layout.lineCount > probeLimit
-                                    probeLimit -> layout.multiParagraph.didExceedMaxLines
-                                    // Recheck an already-capped body after reflow, off-tree so it
-                                    // never duplicates link semantics or adds a second Text node.
-                                    else -> measure(probeLimit, TextOverflow.Clip).multiParagraph.didExceedMaxLines
-                                }
-                                val height = when {
-                                    !measuredCanFold -> 0
-                                    input.maxLines == lineLimit -> layout.size.height
-                                    else -> measure(lineLimit, TextOverflow.Ellipsis).size.height
-                                }
-                                fallbackFold.value = LongPostFoldMeasurement(measuredCanFold, height)
+    val currentLinkBounds = remember { { linkBounds } }
+    HomeLongPostTextSection(homePost, expanded && canFold, settled, currentLinkBounds) { backdropSource ->
+        Column(Modifier.fillMaxWidth().then(backdropSource)) {
+            Box(
+                Modifier.fillMaxWidth().clipToBounds().layout { measurable, constraints ->
+                    val text = measurable.measure(constraints)
+                    val height = if (foldedHeight in 1 until text.height) {
+                        val fraction = collapseMotion?.remaining ?: reveal.value
+                        (foldedHeight + (text.height - foldedHeight) * fraction).roundToInt()
+                    } else text.height
+                    layout(text.width, height) { text.placeRelative(0, 0) }
+                },
+            ) {
+                content(
+                    if (showFullText) Int.MAX_VALUE else if (canFold) lineLimit else lineLimit + 1,
+                    if (!showFullText && canFold) TextOverflow.Ellipsis else TextOverflow.Clip,
+                    { layout ->
+                        val text = layout.layoutInput.text
+                        linkBounds = if (homePost != null && showFullText) {
+                            text.getLinkAnnotations(0, text.length).mapNotNull { link ->
+                                if (link.start < link.end) layout.getPathForRange(link.start, link.end).getBounds()
+                                else null
                             }
-                            linkBounds = if (homePost != null && showFullText) {
-                                input.text.getLinkAnnotations(0, input.text.length).mapNotNull { link ->
-                                    if (link.start < link.end) layout.getPathForRange(link.start, link.end).getBounds()
-                                    else null
-                                }
-                            } else emptyList()
-                        },
+                        } else emptyList()
+                    },
+                )
+            }
+            when {
+                hasInlineControl -> {
+                    val focusRequester = remember { FocusRequester() }
+                    if (homePost != null && homePost.controller.restoreFocusTo == homePost.key) {
+                        LaunchedEffect(homePost) {
+                            focusRequester.requestFocus()
+                            homePost.controller.consumeRestoreFocus(homePost.key)
+                        }
+                    }
+                    LongPostToggle(
+                        expanded = expanded,
+                        surface = longPostToggleSurface(homePost?.key?.quotedStatusId != null),
+                        modifier = Modifier.align(Alignment.End).then(
+                            if (homePost != null) Modifier.focusRequester(focusRequester) else Modifier,
+                        ),
+                        enabled = homePost != null || settled,
+                        onClick = onToggle,
                     )
                 }
-                when {
-                    hasInlineControl -> {
-                        val focusRequester = remember { FocusRequester() }
-                        if (homePost != null && homePost.controller.restoreFocusTo == homePost.key) {
-                            LaunchedEffect(homePost) {
-                                focusRequester.requestFocus()
-                                homePost.controller.consumeRestoreFocus(homePost.key)
-                            }
-                        }
-                        LongPostToggle(
-                            expanded = expanded,
-                            surface = longPostToggleSurface(homePost?.key?.quotedStatusId != null),
-                            modifier = Modifier.align(Alignment.End).then(
-                                if (homePost != null) Modifier.focusRequester(focusRequester) else Modifier,
-                            ),
-                            enabled = homePost != null || settled,
-                            onClick = {
-                                if (homePost != null) homePost.controller.expand(homePost.key)
-                                else if (settled) fallbackExpanded = !expanded
-                            },
-                        )
-                    }
-                    // Keep the same end-aligned slot, without a duplicate focus/semantics node.
-                    canFold -> Spacer(Modifier.height(LongPostToggleMinSize))
-                }
+                // Keep the same end-aligned slot, without a duplicate focus/semantics node.
+                canFold -> Spacer(Modifier.height(LongPostToggleMinSize))
             }
         }
     }

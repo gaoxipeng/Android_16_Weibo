@@ -10,6 +10,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +45,7 @@ import com.example.myweibo.ui.HomeTimelineReadingState
 import com.example.myweibo.ui.LocalHomeTimelineReadingState
 import com.example.myweibo.ui.LongPostToggleTag
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -96,6 +98,56 @@ class PostListFoldingComposeTest {
         assertBody("quote", lines = 3, folded = true)
         compose.onNodeWithTag(FloatingLongPostCollapseTag).assertDoesNotExist()
         compose.runOnIdle { assertEquals(0, openedDetails) }
+    }
+
+    @Test
+    fun newlyMountedListCardFoldsPlainAndRichBodiesBeforeTheFirstLayoutAndAnimatesInlineCollapse() {
+        val quote = fixturePost("quote").copy(text = "quote: [probe]\ntwo\nthree\nfour\nfive\nsix")
+        val post = fixturePost("outer").copy(retweetedStatus = quote)
+        val show = mutableStateOf(false)
+        setFixture { _ ->
+            if (show.value) {
+                LazyColumn {
+                    item(key = post.id) {
+                        Card(post, emoticonMap = mapOf("[probe]" to "fixture-invalid-url"))
+                    }
+                }
+            }
+        }
+        val toggles = compose.onAllNodesWithTag(LongPostToggleTag)
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle { show.value = true }
+            compose.mainClock.advanceTimeByFrame()
+            assertBody("outer", lines = 3, folded = true)
+            assertBody("quote", lines = 3, folded = true)
+            assertTrue(bodyLayout("quote").layoutInput.placeholders.isNotEmpty())
+            toggles.assertCountEquals(2)
+            assertLabel(toggles[0], R.string.long_post_expand)
+            assertLabel(toggles[1], R.string.long_post_expand)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+
+        val outer = toggles[0]
+        val foldedY = outer.fetchSemanticsNode().boundsInRoot.top
+        outer.performClick()
+        assertLabel(outer, R.string.long_post_collapse)
+        val expandedY = outer.fetchSemanticsNode().boundsInRoot.top
+        compose.mainClock.autoAdvance = false
+        try {
+            outer.performClick()
+            compose.mainClock.advanceTimeBy(96)
+            val collapsingY = outer.fetchSemanticsNode().boundsInRoot.top
+            assertTrue("Expected the inline control to move with the prose height", collapsingY > foldedY && collapsingY < expandedY)
+            assertBody("outer", lines = 6, folded = false)
+            compose.mainClock.advanceTimeBy(240)
+            assertBody("outer", lines = 3, folded = true)
+            assertEquals(foldedY, outer.fetchSemanticsNode().boundsInRoot.top, 0.5f)
+            assertLabel(outer, R.string.long_post_expand)
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
     }
 
     @Test
@@ -167,11 +219,12 @@ class PostListFoldingComposeTest {
     }
 
     @Composable
-    private fun Card(post: FeedItem, sharedDetailCard: Boolean = false) {
+    private fun Card(post: FeedItem, sharedDetailCard: Boolean = false, emoticonMap: Map<String, String> = emptyMap()) {
         FeedCard(
             item = post,
             onClick = {},
             onMediaClick = { _, _ -> },
+            emoticonMap = emoticonMap,
             showAuthorRow = false,
             showActionMenu = false,
             showStatusActions = false,
@@ -180,11 +233,15 @@ class PostListFoldingComposeTest {
         )
     }
 
-    private fun assertBody(which: String, lines: Int, folded: Boolean) {
+    private fun bodyLayout(which: String): TextLayoutResult {
         val layouts = mutableListOf<TextLayoutResult>()
         compose.onNodeWithText("$which:", substring = true, useUnmergedTree = true)
             .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
-        val layout = layouts.single()
+        return layouts.single()
+    }
+
+    private fun assertBody(which: String, lines: Int, folded: Boolean) {
+        val layout = bodyLayout(which)
         assertEquals(lines, layout.lineCount)
         assertEquals(folded, layout.didOverflowHeight)
         assertEquals(folded, layout.isLineEllipsized(lines - 1))

@@ -2,16 +2,13 @@ package com.example.myweibo.ui
 
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -30,6 +27,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
@@ -42,6 +40,8 @@ import com.example.myweibo.data.FeedDisplaySettingsStore
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import com.kyant.backdrop.isRenderEffectSupported
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlin.math.ceil
@@ -256,13 +256,21 @@ internal class HomeLongPostController(
                     motion.remaining = remaining
                 }
             }
-        } finally {
+            currentCoroutineContext().ensureActive()
             if (activeCollapse === motion) {
                 expanded.remove(motion.key)
                 if (motion.restoreFocus) restoreFocusTo = motion.key
-                activeCollapse = null
             }
+        } finally {
+            if (activeCollapse === motion) activeCollapse = null
         }
+    }
+
+    fun detachViewport() {
+        // The animation may not have been launched yet, so clear the motion as well as
+        // cancelling the host's effect. Keep the expansion and the original folded anchor.
+        activeCollapse = null
+        readableViewport = null
     }
 
     private fun ownerTopInRow(key: HomeLongPostKey): Float {
@@ -344,7 +352,9 @@ internal fun HomeLongPostTextSection(
             },
         content = {
             content(if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier)
-            if (showCollapse && visible) {
+            if (showCollapse) {
+                // Compose the candidate on a cold row. Only placement exposes it; previous
+                // global coordinates are useful for the glass layer, not for gating the button.
                 LongPostToggle(
                     expanded = true,
                     surface = surface,
@@ -388,13 +398,14 @@ internal fun HomeLongPostTextSection(
     }
 }
 
-/** Track the common readable viewport and host the collapse animator; controls are local to prose. */
+/** Publish the real readable bounds before placing feed rows, including on a cold remount. */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
-internal fun HomeLongPostOverlay(
+internal fun Modifier.homeLongPostViewport(
     controller: HomeLongPostController,
     navTopInRoot: () -> Float,
     topContentInsetPx: Float,
-) {
+): Modifier {
     controller.activeCollapse?.let { motion ->
         LaunchedEffect(controller, motion) { controller.animateCollapse(motion) }
     }
@@ -406,20 +417,22 @@ internal fun HomeLongPostOverlay(
         }
         onDispose { stop() }
     }
-    val density = LocalDensity.current
-    val systemBottom = WindowInsets.navigationBars.getBottom(density)
-    var viewport by remember { mutableStateOf<Rect?>(null) }
-    val readable = viewport?.let { bounds ->
-        Rect(
-            bounds.left,
-            bounds.top + topContentInsetPx,
-            bounds.right,
-            minOf(bounds.bottom - systemBottom, navTopInRoot()),
-        ).takeIf { it.bottom > it.top }
-    }
-    SideEffect { controller.readableViewport = readable }
     DisposableEffect(controller) {
-        onDispose { controller.readableViewport = null }
+        onDispose { controller.detachViewport() }
     }
-    Box(Modifier.fillMaxSize().onGloballyPositioned { viewport = it.boundsInRoot() })
+    val systemBottom = WindowInsets.navigationBars.getBottom(LocalDensity.current)
+    return layout { measurable, constraints ->
+        val feed = measurable.measure(constraints)
+        layout(feed.width, feed.height) {
+            coordinates?.boundsInRoot()?.let { bounds ->
+                controller.readableViewport = Rect(
+                    bounds.left,
+                    bounds.top + topContentInsetPx,
+                    bounds.right,
+                    minOf(bounds.bottom - systemBottom, navTopInRoot()),
+                ).takeIf { it.bottom > it.top }
+            }
+            feed.placeRelative(0, 0)
+        }
+    }
 }

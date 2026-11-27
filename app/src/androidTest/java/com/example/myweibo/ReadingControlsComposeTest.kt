@@ -52,7 +52,9 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
@@ -81,15 +83,19 @@ import com.example.myweibo.ui.HomeFeedLifecycleEffect
 import com.example.myweibo.ui.HomeLongPost
 import com.example.myweibo.ui.HomeLongPostController
 import com.example.myweibo.ui.HomeLongPostGlass
-import com.example.myweibo.ui.HomeLongPostOverlay
+import com.example.myweibo.ui.HomeLongPostKey
 import com.example.myweibo.ui.HomeTimelineReadingState
-import com.example.myweibo.ui.LongPostBody
+import com.example.myweibo.ui.LongPostFolding
 import com.example.myweibo.ui.LongPostCollapseGlassTag
 import com.example.myweibo.ui.LongPostTextSectionTag
 import com.example.myweibo.ui.LongPostToggleTag
 import com.example.myweibo.ui.QuotedLongPostCardTag
+import com.example.myweibo.ui.RenderLongPostText
 import com.example.myweibo.ui.StatusTextSection
+import com.example.myweibo.ui.hasOrderedRefresh
+import com.example.myweibo.ui.homeLongPostViewport
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -228,13 +234,12 @@ class ReadingControlsComposeTest {
             SideEffect { listState = state; controller = owner }
             LaunchedEffect(owner) { owner.watchPagingSuppression() }
             val width = fixtureWidth.value?.let { Modifier.width(it) } ?: Modifier.fillMaxWidth()
-            Box(width.height(viewportHeight)) {
+            Box(width.height(viewportHeight).homeLongPostViewport(owner, { Float.POSITIVE_INFINITY }, 0f)) {
                 LazyColumn(Modifier.fillMaxSize(), state = state) {
                     item(key = "before") { FixtureRow(fixturePost(0)) }
                     item(key = post.id) { FixtureFeedCard(post, owner, showActions = true) }
                     items((2..10).map(::fixturePost), key = { it.id }) { FixtureRow(it) }
                 }
-                HomeLongPostOverlay(owner, { Float.POSITIVE_INFINITY }, 0f)
             }
         }
 
@@ -375,16 +380,17 @@ class ReadingControlsComposeTest {
             val controller = remember(state) { HomeLongPostController(state) }
             val navTop = remember { mutableStateOf(Float.POSITIVE_INFINITY) }
             SideEffect { listState = state; owner = controller }
-            Box(Modifier.fillMaxWidth().height(360.dp).onGloballyPositioned {
-                navTop.value = it.boundsInRoot().bottom - navHeightPx
-            }) {
+            Box(
+                Modifier.fillMaxWidth().height(360.dp).onGloballyPositioned {
+                    navTop.value = it.boundsInRoot().bottom - navHeightPx
+                }.homeLongPostViewport(controller, { navTop.value }, topInsetPx),
+            ) {
                 LazyColumn(Modifier.fillMaxSize().testTag(TimelineTag), state = state) {
                     item(key = "before") { FixtureRow(fixturePost(0)) }
                     item(key = post.id) { FixtureFeedCard(post, controller) }
                     item(key = next.id) { FixtureFeedCard(next, controller) }
                     items((3..14).map(::fixturePost), key = { it.id }) { FixtureRow(it) }
                 }
-                HomeLongPostOverlay(controller, { navTop.value }, topInsetPx)
             }
         }
 
@@ -474,13 +480,15 @@ class ReadingControlsComposeTest {
             val state = rememberLazyListState()
             val controller = remember(state) { HomeLongPostController(state) }
             SideEffect { listState = state }
-            Box(Modifier.width(width.value).height(280.dp)) {
+            Box(
+                Modifier.width(width.value).height(280.dp)
+                    .homeLongPostViewport(controller, { Float.POSITIVE_INFINITY }, 0f),
+            ) {
                 LazyColumn(Modifier.fillMaxSize(), state = state) {
                     item(key = "before") { FixtureRow(fixturePost(0)) }
                     item(key = post.id) { FixtureFeedCard(post, controller) }
                     items((2..10).map(::fixturePost), key = { it.id }) { FixtureRow(it) }
                 }
-                HomeLongPostOverlay(controller, { Float.POSITIVE_INFINITY }, 0f)
             }
         }
 
@@ -570,6 +578,62 @@ class ReadingControlsComposeTest {
     @Test
     fun protectedFollowingMergeKeepsFoldMeasurementsWhenStatusAliasesChange() {
         assertHomeRefreshFrames(TimelineKind.Following, expandQuote = true, keepReading = true)
+    }
+
+    @Test
+    fun recommendationRefreshKeepsAnExpandedOrdinaryBodyWhenItsTextChanges() {
+        assertEditedBodyStaysExpanded(TimelineKind.Hot, quoted = false, expectedKeepReading = false)
+    }
+
+    @Test
+    fun followingKeepReadingRefreshKeepsAnExpandedQuoteWhenItsTextChanges() {
+        assertEditedBodyStaysExpanded(TimelineKind.Following, quoted = true, expectedKeepReading = true)
+    }
+
+    @Test
+    fun closingAndReopeningReverseReadingGapKeepsExpansionInItsHiddenRows() {
+        val previous = (10 downTo 1).map(::fixturePost)
+        val hidden = fixturePost(11).copy(text = NavigationBody)
+        val newest = fixturePost(12)
+        lateinit var listState: LazyListState
+        lateinit var timeline: HomeTimelineReadingState
+        setFixture {
+            val state = rememberLazyListState()
+            val reading = rememberFixtureHomeTimeline(
+                previous, preferences = ReadingPreferences(foldLongPosts = true, maxLines = 3, reverseReading = true, newPostLimit = 1),
+            )
+            SideEffect { listState = state; timeline = reading }
+            FixtureHomeTimeline(state, reading)
+        }
+        val body = cardText(NavigationBody, substring = false)
+        compose.runOnIdle {
+            timeline.publishRefresh(TimelinePage(listOf(newest, hidden)), listState, protectViewport = true, keepReading = true)
+        }
+        body.assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(1, timeline.feedProjection.gap?.hiddenPostCount)
+            timeline.toggleTimelineGap()
+        }
+        compose.runOnIdle {
+            val projection = timeline.feedProjection
+            listState.requestScrollToItem(projection.lazyIndexOfPost(projection.visibleItems.indexOfFirst { it.id == hidden.id }))
+        }
+        cardToggle(quoted = false).performClick()
+        body.assertLayout(5, false, TextOverflow.Clip)
+        compose.runOnIdle { timeline.toggleTimelineGap() }
+        body.assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue(timeline.items.any { it.id == hidden.id })
+            assertTrue(timeline.longPostController(listState).isExpanded(HomeLongPostKey(hidden.id)))
+            listState.requestScrollToItem(0)
+        }
+        compose.runOnIdle { timeline.toggleTimelineGap() }
+        compose.runOnIdle {
+            val projection = timeline.feedProjection
+            listState.requestScrollToItem(projection.lazyIndexOfPost(projection.visibleItems.indexOfFirst { it.id == hidden.id }))
+        }
+        body.assertLayout(5, false, TextOverflow.Clip)
+        sectionNode(FloatingLongPostCollapseTag, quoted = false).assertIsDisplayed()
     }
 
     @Test
@@ -773,6 +837,7 @@ class ReadingControlsComposeTest {
             compose.runOnIdle { route.value = HomeFixturePage.Home }
             compose.mainClock.advanceTimeByFrame()
             body.assertLayout(5, false, TextOverflow.Clip)
+            assertEquals(collapseBounds, collapse.assertIsDisplayed().fetchSemanticsNode().boundsInRoot)
             compose.runOnIdle {
                 assertAnchor(listState, 1, post.id, anchorOffset)
                 assertEquals(expandedHeight, listState.layoutInfo.visibleItemsInfo.first { it.key == post.id }.size)
@@ -780,6 +845,7 @@ class ReadingControlsComposeTest {
             compose.runOnIdle { resumeGeneration.intValue++ }
             compose.mainClock.advanceTimeByFrame()
             body.assertLayout(5, false, TextOverflow.Clip)
+            assertEquals(collapseBounds, collapse.assertIsDisplayed().fetchSemanticsNode().boundsInRoot)
 
             // Account/timeline switches reset the reader, even if the next feed has the same row ID.
             compose.runOnIdle {
@@ -791,6 +857,54 @@ class ReadingControlsComposeTest {
         } finally {
             compose.mainClock.autoAdvance = true
         }
+    }
+
+    @Test
+    fun leavingHomeDuringCoordinatedCollapseDoesNotCommitTheFold() {
+        val text = (1..72).joinToString("\n") { "Reading paragraph $it" }
+        val post = fixturePost(1).copy(text = text)
+        val posts = listOf(post) + (2..15).map(::fixturePost)
+        val showHome = mutableStateOf(true)
+        val anchor = with(compose.density) { 12.dp.roundToPx() }
+        lateinit var listState: LazyListState
+        lateinit var controller: HomeLongPostController
+        setFixture {
+            val state = rememberLazyListState(0, anchor)
+            val reading = rememberFixtureHomeTimeline(posts)
+            SideEffect { listState = state; controller = reading.longPostController(state) }
+            if (showHome.value) FixtureHomeTimeline(state, reading)
+        }
+        val body = cardText("Reading paragraph 1")
+        val floating = sectionNode(FloatingLongPostCollapseTag, quoted = false)
+        cardToggle(quoted = false).performClick()
+        val midRead = body.textLayout().size.height / 2
+        compose.runOnIdle { listState.requestScrollToItem(0, midRead) }
+        floating.assertIsDisplayed()
+        compose.mainClock.autoAdvance = false
+        try {
+            floating.performSemanticsAction(SemanticsActions.OnClick) { click -> assertTrue(click()) }
+            compose.mainClock.advanceTimeBy(96)
+            compose.runOnIdle {
+                val remaining = checkNotNull(controller.activeCollapse).remaining
+                assertTrue("Expected a partially completed collapse", remaining > 0f && remaining < 1f)
+                showHome.value = false
+            }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertDoesNotExist()
+            compose.runOnIdle {
+                assertNull(controller.activeCollapse)
+                assertTrue(controller.isExpanded(HomeLongPostKey(post.id)))
+                showHome.value = true
+            }
+            compose.mainClock.advanceTimeByFrame()
+            body.assertLayout(72, false, TextOverflow.Clip)
+            floating.assertIsDisplayed()
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+        floating.performClick()
+        body.assertLayout(3, true, TextOverflow.Ellipsis)
+        compose.runOnIdle { assertAnchor(listState, 0, post.id, anchor) }
     }
 
     @Test
@@ -806,7 +920,7 @@ class ReadingControlsComposeTest {
             FixtureHomeTimeline(list, reading)
         }
 
-        val firstBody = cardText(NavigationBody)
+        val firstBody = cardText(NavigationBody, substring = false)
         val replacementBody = cardText("Replacement one")
         firstBody.assertLayout(3, true, TextOverflow.Ellipsis)
         // Move far beyond the original row so lazy reuse, not just feed visibility, is exercised.
@@ -917,6 +1031,56 @@ class ReadingControlsComposeTest {
         override val lifecycle = LifecycleRegistry(this)
     }
 
+    private fun assertEditedBodyStaysExpanded(kind: TimelineKind, quoted: Boolean, expectedKeepReading: Boolean) {
+        val ordinary = (1..6).joinToString("\n") { "Original ordinary $it" }
+        val original = (1..6).joinToString("\n") { "Original quote $it" }
+        val quote = fixturePost(20).copy(authorName = "Q", text = original)
+        val post = fixturePost(10).copy(text = ordinary, retweetedStatus = quote)
+        val posts = listOf(post) + (9 downTo 1).map(::fixturePost)
+        val edit = (1..7).joinToString("\n") { "Edited prose $it" }
+        val refreshed = if (quoted) post.copy(retweetedStatus = quote.copy(text = edit)) else post.copy(text = edit)
+        val preferences = ReadingPreferences(foldLongPosts = true, maxLines = 3, reverseReading = true)
+        lateinit var listState: LazyListState
+        lateinit var timeline: HomeTimelineReadingState
+        setFixture {
+            val state = rememberLazyListState()
+            val reading = rememberFixtureHomeTimeline(posts, kind, preferences)
+            SideEffect { listState = state; timeline = reading }
+            FixtureHomeTimeline(state, reading)
+        }
+        val before = cardText(if (quoted) original else ordinary, substring = false)
+        val after = cardText(edit, substring = false)
+        val sibling = cardText(if (quoted) "Original ordinary 1" else "Original quote 1")
+        val floating = sectionNode(FloatingLongPostCollapseTag, quoted)
+        cardToggle(quoted).performClick()
+        before.assertLayout(6, false, TextOverflow.Clip)
+        sibling.assertLayout(3, true, TextOverflow.Ellipsis)
+        val nodeId = before.fetchSemanticsNode().id
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle {
+                assertEquals(kind, timeline.timelineKind)
+                val protectViewport = timeline.preferences.reverseReading && timeline.items.isNotEmpty() &&
+                    timeline.timelineKind.hasOrderedRefresh(timeline.selectedTimelineGroupId, timeline.items)
+                val keepReading = protectViewport && timeline.timelineVerifiedFromNetwork
+                assertEquals(expectedKeepReading, keepReading)
+                timeline.publishRefresh(TimelinePage(listOf(refreshed), nextCursor = "new-page"), listState, protectViewport, keepReading)
+                assertEquals(if (keepReading) posts.map { it.id } else listOf(post.id), timeline.items.map { it.id })
+                assertEquals(post.id.takeIf { keepReading }, timeline.reverseBrowsePreviousHeadId)
+                assertEquals("new-page".takeUnless { keepReading }, timeline.nextCursor)
+            }
+            compose.mainClock.advanceTimeByFrame()
+            before.assertDoesNotExist()
+            after.assertLayout(7, false, TextOverflow.Clip)
+            assertEquals(nodeId, after.fetchSemanticsNode().id)
+            sibling.assertLayout(3, true, TextOverflow.Ellipsis)
+            cardToggle(quoted = !quoted).assertIsDisplayed()
+            floating.assertIsDisplayed().assertInside(textSection(quoted))
+        } finally {
+            compose.mainClock.autoAdvance = true
+        }
+    }
+
     private fun assertHomeRefreshFrames(kind: TimelineKind, expandQuote: Boolean, keepReading: Boolean) {
         val bodyText = (1..6).joinToString("\n") { "Ordinary line $it" }
         val quoteText = (1..6).joinToString("\n") { "Quoted line $it" }
@@ -1019,7 +1183,11 @@ class ReadingControlsComposeTest {
     private enum class HomeFixturePage { Home, Detail, OtherTab }
 
     @Composable
-    private fun rememberFixtureHomeTimeline(posts: List<FeedItem>): HomeTimelineReadingState {
+    private fun rememberFixtureHomeTimeline(
+        posts: List<FeedItem>,
+        kind: TimelineKind = TimelineKind.Following,
+        preferences: ReadingPreferences = ReadingPreferences(foldLongPosts = true, maxLines = 3),
+    ): HomeTimelineReadingState {
         val context = LocalContext.current
         return remember(context) {
             val isolatedPreferences = object : ContextWrapper(context) {
@@ -1028,8 +1196,7 @@ class ReadingControlsComposeTest {
                     baseContext.getSharedPreferences("reading_controls_test_$name", mode)
             }
             HomeTimelineReadingState(
-                ReadingPreferencesStore(isolatedPreferences), TimelineCacheStore(context), TimelineKind.Following,
-                ReadingPreferences(foldLongPosts = true, maxLines = 3),
+                ReadingPreferencesStore(isolatedPreferences), TimelineCacheStore(context), kind, preferences,
             ).apply {
                 feedCacheLoaded = true
                 timelineVerifiedFromNetwork = true
@@ -1080,13 +1247,18 @@ class ReadingControlsComposeTest {
         tag: String = BodyTag,
     ) {
         Column(Modifier.width(width)) {
-            LongPostBody(contentKey = contentKey, lineLimit = 2) {
-                maxLines, overflow, onTextLayout ->
+            val style = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 16.sp)
+            RenderLongPostText(
+                folding = LongPostFolding(contentKey, lineLimit = 2, initiallyExpanded = false, homePost = null),
+                maxLines = Int.MAX_VALUE,
+                overflow = TextOverflow.Clip,
+                style = style,
+                annotatedText = { AnnotatedString(text) },
+            ) { maxLines, overflow, onTextLayout ->
                 Text(
                     text = text,
                     modifier = Modifier.fillMaxWidth().testTag(tag),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 16.sp,
+                    style = style,
                     maxLines = maxLines,
                     overflow = overflow,
                     onTextLayout = { onTextLayout?.invoke(it) },
@@ -1130,7 +1302,8 @@ class ReadingControlsComposeTest {
         )
     }
 
-    private fun cardText(text: String) = compose.onNodeWithText(text, substring = true, useUnmergedTree = true)
+    private fun cardText(text: String, substring: Boolean = true) =
+        compose.onNodeWithText(text, substring = substring, useUnmergedTree = true)
 
     private fun cardToggle(quoted: Boolean) = sectionNode(LongPostToggleTag, quoted)
 
