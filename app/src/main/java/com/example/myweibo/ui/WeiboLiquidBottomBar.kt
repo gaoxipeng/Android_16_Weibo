@@ -109,6 +109,7 @@ internal fun WeiboLiquidBottomBar(
                     val coverage = tabCoverage(index)
                     val tabColor = tabContentColor
                     LiquidBottomTab(
+                        selected = index == selectedIndex,
                         onClick = { onTabChange(tab) },
                     ) {
                         Box(

@@ -3,7 +3,18 @@ package com.example.myweibo.data
 /** Insert the gap immediately before the post at [insertionIndex] in the visible list. */
 data class FeedTimelineGap(val insertionIndex: Int, val hiddenPostCount: Int)
 
-data class FeedTimelineRefreshProjection(val visibleItems: List<FeedItem>, val gap: FeedTimelineGap?)
+data class FeedTimelineRefreshProjection(
+    val visibleItems: List<FeedItem>,
+    val gap: FeedTimelineGap?,
+    val previousHeadIndex: Int? = null,
+    val newPostsMarkerIndex: Int? = null,
+) {
+    val dividerIndex: Int? get() = gap?.insertionIndex ?: newPostsMarkerIndex
+    val previousHeadLazyIndex: Int? get() = previousHeadIndex?.let(::lazyIndexOfPost)
+
+    fun lazyIndexOfPost(postIndex: Int): Int =
+        postIndex + if (dividerIndex?.let { postIndex >= it } == true) 1 else 0
+}
 
 /**
  * Merge refresh results into the full in-memory timeline (not its visible projection). Ordinary
@@ -116,29 +127,48 @@ private fun FeedItem.matchesRefreshStatus(other: FeedItem): Boolean =
  * [items] is the full merged timeline. Only non-pinned posts before the boundary that aren't
  * known to be older count as new. Keep the latest [maxVisibleNewPosts] of those posts. Neither
  * pinned posts, the boundary post, nor its older history is hidden. Pass the full list to pagination.
+ * The boundary remains a scroll target even with zero new posts, but gets a static marker only
+ * when there are confirmed new posts and no overflow.
  */
 fun projectFeedTimelineRefresh(
     items: List<FeedItem>,
     previousHeadId: String?,
     maxVisibleNewPosts: Int,
+    gapExpanded: Boolean = false,
 ): FeedTimelineRefreshProjection {
     val boundary = items.indexOfFirst { it.id == previousHeadId }
-    val limit = maxVisibleNewPosts.coerceAtLeast(0)
-    if (boundary <= limit || items[boundary].isPinned) return FeedTimelineRefreshProjection(items, gap = null)
+    if (boundary < 0 || items[boundary].isPinned) return FeedTimelineRefreshProjection(items, gap = null)
 
     val boundaryKey = feedItemSortKey(items[boundary])
+    val limit = maxVisibleNewPosts.coerceAtLeast(0)
     var newCount = 0
-    val visiblePrefix = items.take(boundary).filter { item ->
-        if (item.isPinned) return@filter true
+    var firstHiddenIndex = -1
+    val visiblePrefix = items.subList(0, boundary).filterIndexed { index, item ->
+        if (item.isPinned) return@filterIndexed true
         val key = feedItemSortKey(item)
-        if (key != 0L && boundaryKey != 0L && key < boundaryKey) return@filter true
-        ++newCount <= limit
+        if (key != 0L && boundaryKey != 0L && key < boundaryKey) return@filterIndexed true
+        if (++newCount <= limit) return@filterIndexed true
+        if (firstHiddenIndex == -1) firstHiddenIndex = index
+        false
     }
-    if (newCount <= limit) return FeedTimelineRefreshProjection(items, gap = null)
+    if (newCount <= limit) {
+        return FeedTimelineRefreshProjection(
+            visibleItems = items,
+            gap = null,
+            previousHeadIndex = boundary,
+            newPostsMarkerIndex = boundary.takeIf { newCount > 0 },
+        )
+    }
 
+    // Expanded rows use the original order, including pins interleaved with the overflow.
+    val visibleBoundary = if (gapExpanded) boundary else visiblePrefix.size
     return FeedTimelineRefreshProjection(
-        visibleItems = visiblePrefix + items.drop(boundary),
-        gap = FeedTimelineGap(insertionIndex = visiblePrefix.size, hiddenPostCount = newCount - limit),
+        visibleItems = if (gapExpanded) items else visiblePrefix + items.drop(boundary),
+        gap = FeedTimelineGap(
+            insertionIndex = if (gapExpanded) firstHiddenIndex else visibleBoundary,
+            hiddenPostCount = newCount - limit,
+        ),
+        previousHeadIndex = visibleBoundary,
     )
 }
 

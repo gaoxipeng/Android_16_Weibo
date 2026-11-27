@@ -204,7 +204,9 @@ fun LiquidBottomTabs(
                     val targetIndex = targetValue.fastRoundToInt()
                         .fastCoerceIn(0, tabsCount - 1)
                     animateToValue(targetIndex.toFloat())
-                    onTabSelected(targetIndex)
+                    if (targetIndex != currentSelectedIndex.value) {
+                        currentOnTabSelected.value(targetIndex)
+                    }
                     animationScope.launch {
                         offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                     }
@@ -512,8 +514,6 @@ fun LiquidBottomTabs(
                     feedTabIndex,
                     isLtr,
                     tabWidth,
-                    onTabSelected,
-                    onTabLongPress,
                 ) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
@@ -552,7 +552,9 @@ fun LiquidBottomTabs(
                             if (releasedBeforeLongPress) {
                                 val targetIndex = indexAt(down.position)
                                 dampedDragAnimation.animateToValue(targetIndex.toFloat())
-                                onTabSelected(targetIndex)
+                                // A tap also activates the already-selected tab; a drag settling
+                                // on it does not. Read the latest callback without restarting input.
+                                currentOnTabSelected.value(targetIndex)
                                 animationScope.launch {
                                     offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                                 }

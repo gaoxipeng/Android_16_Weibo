@@ -153,11 +153,46 @@ class FeedTimelineRefreshPolicyTest {
         val firstLoad = projectFeedTimelineRefresh(initial, previousHeadId = null, maxVisibleNewPosts = 0)
         assertEquals(initial, firstLoad.visibleItems)
         assertNull(firstLoad.gap)
+        assertNull(firstLoad.dividerIndex)
+        assertNull(firstLoad.previousHeadLazyIndex)
 
         val olderOnly = mergeFeedTimelineRefresh(initial, listOf(post(4), post(2)))
         val noNew = projectFeedTimelineRefresh(olderOnly, initial.first().id, 0)
         assertEquals(ids(4, 3, 2), noNew.visibleItems.map { it.id })
         assertNull(noNew.gap)
+        assertNull(noNew.dividerIndex)
+        assertEquals(0, noNew.previousHeadLazyIndex)
+    }
+
+    @Test fun smallNewBatchUsesStaticMarkerAndOffsetsOldHeadByOneLazyRow() {
+        val pinned = post(9).copy(isPinned = true)
+        val older = post(2)
+        val oldHead = post(4)
+        val full = listOf(pinned, post(7), older, post(5), oldHead, post(3))
+        for (limit in listOf(2, 3)) {
+            val projection = projectFeedTimelineRefresh(full, oldHead.id, limit, gapExpanded = true)
+            assertEquals(full, projection.visibleItems)
+            assertNull(projection.gap)
+            assertEquals(4, projection.newPostsMarkerIndex)
+            assertEquals(5, projection.previousHeadLazyIndex)
+        }
+    }
+
+    @Test fun foldedAndExpandedJumpIndicesBothTargetOldHeadWithoutReorderingPins() {
+        val pinned = post(10).copy(isPinned = true)
+        val oldHead = post(4)
+        val full = listOf(post(7), post(6), pinned, post(5), oldHead, post(3))
+        val folded = projectFeedTimelineRefresh(full, oldHead.id, 1)
+        assertEquals(listOf(post(7), pinned, oldHead, post(3)), folded.visibleItems)
+        assertNull(folded.newPostsMarkerIndex)
+        assertEquals(FeedTimelineGap(2, 2), folded.gap)
+        assertEquals(3, folded.previousHeadLazyIndex)
+
+        val expanded = projectFeedTimelineRefresh(full, oldHead.id, 1, gapExpanded = true)
+        assertEquals(full, expanded.visibleItems)
+        assertNull(expanded.newPostsMarkerIndex)
+        assertEquals(FeedTimelineGap(1, 2), expanded.gap)
+        assertEquals(5, expanded.previousHeadLazyIndex)
     }
 
     @Test fun paginationConsumesFullTimelineAndProjectionDoesNotCountAppendedHistory() {
@@ -186,7 +221,9 @@ class FeedTimelineRefreshPolicyTest {
         val projection = projectFeedTimelineRefresh(full, previous.first { !it.isPinned }.id, 1)
         assertEquals(ids(1, 8, 5, 4, 3, 2), projection.visibleItems.map { it.id })
         assertEquals(FeedTimelineGap(2, 1), projection.gap)
-        assertNull(projectFeedTimelineRefresh(full, pinned.id, 0).gap)
+        val pinnedBoundary = projectFeedTimelineRefresh(full, pinned.id, 0)
+        assertNull(pinnedBoundary.dividerIndex)
+        assertNull(pinnedBoundary.previousHeadLazyIndex)
     }
 
     @Test fun movedPinsAreNotOverlapAnchorsForUndatedPosts() {
@@ -210,6 +247,8 @@ class FeedTimelineRefreshPolicyTest {
         val missing = projectFeedTimelineRefresh(boundaryRemoved, previous.first().id, 0)
         assertEquals(boundaryRemoved, missing.visibleItems)
         assertNull(missing.gap)
+        assertNull(missing.dividerIndex)
+        assertNull(missing.previousHeadLazyIndex)
     }
 
     @Test fun knownOldPostsDoNotMoveAboveTheBoundaryEvenWhenTheServerListsThemFirst() {

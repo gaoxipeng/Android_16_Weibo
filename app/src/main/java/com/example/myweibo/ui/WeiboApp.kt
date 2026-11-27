@@ -413,7 +413,6 @@ import com.example.myweibo.data.parseWeiboCreatedAtMillis
 import com.example.myweibo.data.collectEmoticons
 import com.example.myweibo.data.collectAllEmoticons
 import com.example.myweibo.data.collectAllCommentEmoticons
-import com.example.myweibo.data.FeedTimelineGap
 import com.example.myweibo.data.FeedTimelineRefreshProjection
 import com.example.myweibo.data.TimelinePage
 import com.example.myweibo.data.feedItemSortKey
@@ -555,42 +554,23 @@ private fun TimelineKind.hasOrderedRefresh(groupId: String?, current: List<FeedI
     TimelineKind.Hot, TimelineKind.Nearby, TimelineKind.Favorites, TimelineKind.Liked -> false
 }
 
-private fun projectHomeTimeline(
-    items: List<FeedItem>,
-    previousHeadId: String?,
-    limit: Int,
-    gapExpanded: Boolean,
-): FeedTimelineRefreshProjection {
-    val folded = projectFeedTimelineRefresh(items, previousHeadId, limit)
-    val gap = folded.gap ?: return folded
-    if (!gapExpanded) return folded
-
-    val visibleIds = folded.visibleItems.mapTo(HashSet()) { it.id }
-    val overflow = items.filterNot { it.id in visibleIds }
-    // The divider and every row above it stay in place; expanded cached posts are
-    // inserted immediately below it, before the same old-history boundary.
-    val rows = folded.visibleItems.take(gap.insertionIndex) + overflow +
-        folded.visibleItems.drop(gap.insertionIndex)
-    return FeedTimelineRefreshProjection(rows, gap)
-}
-
-private fun LazyListState.retainHomeViewportIfKeyRemoved(posts: List<FeedItem>, gap: FeedTimelineGap?) {
+private fun LazyListState.retainHomeViewportIfKeyRemoved(projection: FeedTimelineRefreshProjection) {
     val layout = layoutInfo
     val visible = layout.visibleItemsInfo.dropWhile { it.index < firstVisibleItemIndex }
     val first = visible.firstOrNull() ?: return
     // Compose retains the first key and exact pixel offset, including during a drag/fling.
     // A collapsed row has no new index: choose the next surviving visible post instead.
-    if (first.key == FeedReverseBrowseGapKey && gap != null) return
-    val postIndices = posts.mapIndexed { index, post -> post.id to index }.toMap()
+    val dividerIndex = projection.dividerIndex
+    if (first.key == FeedReverseBrowseGapKey && dividerIndex != null) return
+    val postIndices = projection.visibleItems.mapIndexed { index, post -> post.id to index }.toMap()
     val firstPostKey = first.key as? String
     if (isScrollInProgress || (firstPostKey != null && postIndices.containsKey(firstPostKey))) return
     val fallback = visible.firstNotNullOfOrNull { row ->
         val key = row.key as? String ?: return@firstNotNullOfOrNull null
         val index = postIndices[key] ?: return@firstNotNullOfOrNull null
-        val lazyIndex = index + if (gap != null && index >= gap.insertionIndex) 1 else 0
-        lazyIndex to -row.offset
+        projection.lazyIndexOfPost(index) to -row.offset
     }
-    requestScrollToItem(fallback?.first ?: gap?.insertionIndex ?: 0, fallback?.second ?: 0)
+    requestScrollToItem(fallback?.first ?: dividerIndex ?: 0, fallback?.second ?: 0)
 }
 private const val ListScrollToTopMaxDurationMillis = 500L
 
@@ -4300,9 +4280,9 @@ internal class HomeTimelineReadingState(
     var timelineCacheAccountId by mutableStateOf<String?>(null)
 
     val feedProjection by derivedStateOf {
-        projectHomeTimeline(
+        projectFeedTimelineRefresh(
             items,
-            reverseBrowsePreviousHeadId.takeIf { preferences.reverseReading },
+            reverseBrowsePreviousHeadId.takeIf { preferences.reverseReading && timelineVerifiedFromNetwork },
             preferences.newPostLimit,
             reverseBrowseGapExpanded,
         )
@@ -4316,6 +4296,17 @@ internal class HomeTimelineReadingState(
     fun resetGap() {
         reverseBrowsePreviousHeadId = null
         reverseBrowseGapExpanded = false
+    }
+
+    fun onHomeTabReselected(listState: LazyListState, refresh: () -> Unit) {
+        val target = feedProjection.previousHeadLazyIndex
+        if (target == null) {
+            refresh()
+            return
+        }
+        // Use the current projection (including an intervening divider), not the full-list
+        // index. Zero positions the old head at the list's padded content start.
+        listState.requestScrollToItem(target, scrollOffset = 0)
     }
 
     fun toggleTimelineGap() {
@@ -4346,9 +4337,9 @@ internal class HomeTimelineReadingState(
             if (page.items.isEmpty()) return
             val previousHeadId = reverseBrowsePreviousHeadId ?: items.firstOrNull { !it.isPinned }?.id
             val merged = mergeFeedTimelineRefresh(items, sortFeedTimelineItems(page.items))
-            val projected = projectHomeTimeline(merged, previousHeadId, preferences.newPostLimit, reverseBrowseGapExpanded)
+            val projected = projectFeedTimelineRefresh(merged, previousHeadId, preferences.newPostLimit, reverseBrowseGapExpanded)
             // Read the live viewport, never the position from before the request.
-            listState.retainHomeViewportIfKeyRemoved(projected.visibleItems, projected.gap)
+            listState.retainHomeViewportIfKeyRemoved(projected)
             reverseBrowsePreviousHeadId = previousHeadId
             items = merged
             // The first-page cursor does not belong to the retained tail.
@@ -4358,7 +4349,9 @@ internal class HomeTimelineReadingState(
         val ordered = selectedTimelineGroupId != null || timelineKind == TimelineKind.Following || timelineKind == TimelineKind.FriendsCircle
         val incoming = if (ordered) sortFeedTimelineItems(page.items) else page.items
         val refreshed = replaceFeedTimelineRefresh(items, incoming)
-        if (protectViewport) listState.retainHomeViewportIfKeyRemoved(refreshed, gap = null)
+        if (protectViewport) {
+            listState.retainHomeViewportIfKeyRemoved(FeedTimelineRefreshProjection(refreshed, gap = null))
+        }
         items = refreshed
         timelineVerifiedFromNetwork = refreshed.isNotEmpty()
         nextCursor = page.nextCursor ?: when (timelineKind) {
@@ -10208,7 +10201,7 @@ fun WeiboApp() {
                         }
                         if (tab == selectedTab) {
                             when (tab) {
-                                MainTab.Feed -> refreshTimelineFromTop()
+                                MainTab.Feed -> homeTimeline.onHomeTabReselected(feedListState, ::refreshTimelineFromTop)
                                 MainTab.Mine -> {
                                     scope.launch {
                                         if (minePagerPage == 0) {
@@ -11011,6 +11004,7 @@ internal fun FollowFeedScreen(
     val projection = homeTimeline.feedProjection
     val items = projection.visibleItems
     val timelineGap = projection.gap
+    val dividerIndex = projection.dividerIndex
     val timelineGapExpanded = homeTimeline.reverseBrowseGapExpanded
     val isLoading = homeTimeline.isLoading
     val isGroupTimeline = homeTimeline.selectedTimelineGroupId != null || homeTimeline.timelineKind == TimelineKind.SpecialFollowing
@@ -11027,18 +11021,18 @@ internal fun FollowFeedScreen(
 
     val currentOnLoadMore by rememberUpdatedState(onLoadMore)
     val postCount by rememberUpdatedState(items.size)
-    val gapIndex by rememberUpdatedState(timelineGap?.insertionIndex)
+    val currentDividerIndex by rememberUpdatedState(dividerIndex)
     LaunchedEffect(longPostController) { longPostController.watchPagingSuppression() }
     val currentLongPostController by rememberUpdatedState(longPostController)
     val feedContent: @Composable BoxScope.() -> Unit = {
         LaunchedEffect(listState) {
             snapshotFlow {
                 if (currentLongPostController.isLayoutPagingSuppressed) return@snapshotFlow false
-                val gapRow = gapIndex
+                val dividerRow = currentDividerIndex
                 val lastPost = listState.layoutInfo.visibleItemsInfo.lastOrNull {
                     it.key != FeedReverseBrowseGapKey && it.key != "feed-empty" && it.key != "feed-loading"
                 } ?: return@snapshotFlow false
-                val postIndex = lastPost.index - if (gapRow != null && lastPost.index > gapRow) 1 else 0
+                val postIndex = lastPost.index - if (dividerRow != null && lastPost.index > dividerRow) 1 else 0
                 postCount > 0 && postIndex >= postCount - ListLoadMoreItemsFromBottom
             }
                 .distinctUntilChanged()
@@ -11075,17 +11069,21 @@ internal fun FollowFeedScreen(
                 }
             }
 
-            fun postAt(index: Int): FeedItem = items[index - if (timelineGap != null && index > timelineGap.insertionIndex) 1 else 0]
+            fun postAt(index: Int): FeedItem = items[index - if (dividerIndex != null && index > dividerIndex) 1 else 0]
             items(
-                count = items.size + if (timelineGap != null) 1 else 0,
-                key = { if (it == timelineGap?.insertionIndex) FeedReverseBrowseGapKey else postAt(it).id },
-                contentType = { if (it == timelineGap?.insertionIndex) "feed-gap" else feedCardContentType(postAt(it)) },
+                count = items.size + if (dividerIndex != null) 1 else 0,
+                key = { if (it == dividerIndex) FeedReverseBrowseGapKey else postAt(it).id },
+                contentType = { if (it == dividerIndex) "feed-gap" else feedCardContentType(postAt(it)) },
             ) { index ->
-                if (timelineGap != null && index == timelineGap.insertionIndex) {
-                    FeedReverseBrowseDivider(timelineGap.hiddenPostCount, timelineGapExpanded) {
-                        // A layout-only toggle must not be mistaken for scrolling to the tail.
-                        longPostController.suppressPagingForLayoutChange()
-                        homeTimeline.toggleTimelineGap()
+                if (index == dividerIndex) {
+                    if (timelineGap == null) {
+                        FeedNewPostsMarker()
+                    } else {
+                        FeedReverseBrowseDivider(timelineGap.hiddenPostCount, timelineGapExpanded) {
+                            // A layout-only toggle must not be mistaken for scrolling to the tail.
+                            longPostController.suppressPagingForLayoutChange()
+                            homeTimeline.toggleTimelineGap()
+                        }
                     }
                     return@items
                 }
@@ -11138,6 +11136,24 @@ internal fun FollowFeedScreen(
         if (feedUiOnTop && lineLimit != null) {
             HomeLongPostOverlay(longPostController, navTopInRoot, topContentInsetPx)
         }
+    }
+}
+
+@Composable
+private fun FeedNewPostsMarker() {
+    val dividerColor = MaterialTheme.colorScheme.outlineVariant
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        HorizontalDivider(Modifier.weight(1f), color = dividerColor)
+        Text(
+            text = stringResource(R.string.feed_reverse_browse_new_posts_marker),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        HorizontalDivider(Modifier.weight(1f), color = dividerColor)
     }
 }
 
