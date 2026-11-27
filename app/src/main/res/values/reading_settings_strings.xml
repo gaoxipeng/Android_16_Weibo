@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="reading_fold_title">折叠长微博</string>
-    <string name="reading_fold_description">正文超过设定行数时先折叠，点「展开全文」可继续阅读。</string>
+    <string name="reading_fold_description">在微博列表里折叠较长的正文，点「展开全文」可继续阅读。详情页不折叠。</string>
     <string name="reading_fold_lines_label">正文显示行数</string>
     <string name="reading_fold_lines_value">%d 行</string>
     <string name="reading_reverse_title">倒序浏览</string>

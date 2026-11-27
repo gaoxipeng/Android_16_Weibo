@@ -2748,7 +2748,7 @@ private fun upgradeWeiboWebUrl(url: String): String {
 private val LocalDetailInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalProfileInlineVideoPlayback = staticCompositionLocalOf { false }
 private val LocalProfileUnderlay = staticCompositionLocalOf { false }
-private val LocalHomeTimelineReadingState = staticCompositionLocalOf<HomeTimelineReadingState?> { null }
+internal val LocalHomeTimelineReadingState = staticCompositionLocalOf<HomeTimelineReadingState?> { null }
 private val LocalShowCommentLikeCount = staticCompositionLocalOf { true }
 private val LocalSetShowCommentLikeCount = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
 private val LocalAlbumVideoDetailOpener = staticCompositionLocalOf<((FeedMedia, String, Rect?) -> Unit)?> { null }
@@ -4252,6 +4252,9 @@ internal class HomeTimelineReadingState(
 ) {
     var preferences by mutableStateOf(initialPreferences)
         private set
+    val foldedPostLineLimit by derivedStateOf {
+        preferences.maxLines.takeIf { preferences.foldLongPosts }
+    }
     var timelineKind by mutableStateOf(initialKind)
     var timelineGroups by mutableStateOf<List<TimelineGroup>>(emptyList())
     var selectedTimelineGroupId by mutableStateOf<String?>(null)
@@ -11013,8 +11016,7 @@ internal fun FollowFeedScreen(
     val timelineGapExpanded = homeTimeline.reverseBrowseGapExpanded
     val isLoading = homeTimeline.isLoading
     val isGroupTimeline = homeTimeline.selectedTimelineGroupId != null || homeTimeline.timelineKind == TimelineKind.SpecialFollowing
-    val reading = homeTimeline.preferences
-    val lineLimit = reading.maxLines.takeIf { reading.foldLongPosts }
+    val lineLimit = homeTimeline.foldedPostLineLimit
     val longPostController = homeTimeline.longPostController(listState)
     val navTopInRoot = LocalImageReturnBarTop.current
     val topContentInsetPx = with(LocalDensity.current) { topInset.toPx() }
@@ -11867,9 +11869,13 @@ internal fun FeedCard(
     insetRounded: Boolean = false,
     sharedDetailCard: Boolean = false,
     compactBottomSpacing: Boolean = false,
-    longPostLineLimit: Int? = null,
+    longPostLineLimit: Int? = if (sharedDetailCard) null else LocalHomeTimelineReadingState.current?.foldedPostLineLimit,
     homeLongPost: HomeLongPost? = null,
 ) {
+    // Detail reuses the list card for its transition, but never inherits its folding.
+    // Non-home lists use LongPostBody’s row-local inline controls, not Home’s overlay.
+    val bodyLineLimit = longPostLineLimit.takeUnless { sharedDetailCard }
+    val overlayPost = homeLongPost.takeIf { bodyLineLimit != null }
     val displayItem = remember(item) { WeiboJsonParser.sanitizeRepostVideoLinks(item) }
     val cardMotion = LocalDetailCardMotion.current
     val hideSourceCard = !insetRounded && isHiddenDetailSource(item.id)
@@ -11893,7 +11899,7 @@ internal fun FeedCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .homeLongPostCard(homeLongPost)
+                .homeLongPostCard(overlayPost)
                 .padding(
                     top = contentVerticalPadding,
                     bottom = when {
@@ -11972,8 +11978,8 @@ internal fun FeedCard(
                         },
                         urlEntities = urlEntityMap,
                         onUrlEntityClick = onUrlEntityClick,
-                        longPostLineLimit = longPostLineLimit,
-                        homeLongPost = homeLongPost,
+                        longPostLineLimit = bodyLineLimit,
+                        homeLongPost = overlayPost,
                     )
                 }
             }
@@ -11998,8 +12004,8 @@ internal fun FeedCard(
                             inlineImagePreview = InlineImagePreviewRequest(images, anchorBounds)
                         },
                         autoFloatingOnScrollAway = autoFloatingOnScrollAway,
-                        longPostLineLimit = longPostLineLimit.takeIf { homeLongPost != null },
-                        homeLongPost = homeLongPost?.quote(retweeted.id),
+                        longPostLineLimit = bodyLineLimit,
+                        homeLongPost = overlayPost?.quote(retweeted.id),
                     )
                 }
             }
