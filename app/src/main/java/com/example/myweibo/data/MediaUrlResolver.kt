@@ -12,6 +12,9 @@ object MediaUrlResolver {
     fun livePhotoVideoCandidates(url: String): List<String> =
         protocolCandidates(url, allowDataUri = false)
 
+    fun canonicalLivePhotoPlaybackUrl(url: String): String? =
+        livePhotoVideoCandidates(url).firstOrNull()
+
     fun downloadableVideoCandidates(media: FeedMedia): List<String> =
         listOfNotNull(
             media.downloadUrl,

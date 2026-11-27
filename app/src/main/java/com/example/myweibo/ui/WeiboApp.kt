@@ -15434,6 +15434,7 @@ private fun ZoomableFullscreenImage(
     }
     var fullscreenLoading by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
     var livePlaying by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
+    var explicitLivePlaybackRequest by remember(resolvedImage.largeUrl) { mutableIntStateOf(0) }
     var actionMenuOffset by remember(resolvedImage.largeUrl) { mutableStateOf<Offset?>(null) }
     var actionMenuVisible by remember(resolvedImage.largeUrl) { mutableStateOf(false) }
 
@@ -15936,6 +15937,7 @@ private fun ZoomableFullscreenImage(
                         },
                         onLongPress = { offset ->
                             if (resolvedImage.isLivePhoto && isInsideDisplayedImage(offset)) {
+                                explicitLivePlaybackRequest += 1
                                 livePlaying = true
                             } else {
                                 actionMenuOffset = offset
@@ -16009,6 +16011,7 @@ private fun ZoomableFullscreenImage(
                         stillBitmap = loadedBitmap,
                         modifier = Modifier.fillMaxSize(),
                         isActive = isActive && livePlaying,
+                        explicitPlaybackRequest = explicitLivePlaybackRequest,
                         isInFullscreen = true,
                         onEnded = { livePlaying = false },
                     )
@@ -16030,7 +16033,10 @@ private fun ZoomableFullscreenImage(
                             interactionSource = remember(resolvedImage.largeUrl) {
                                 MutableInteractionSource()
                             },
-                            onClick = { livePlaying = true },
+                            onClick = {
+                                explicitLivePlaybackRequest += 1
+                                livePlaying = true
+                            },
                         ),
                     tint = Color.White.copy(alpha = 0.92f),
                 )
@@ -16184,16 +16190,20 @@ private fun BoxScope.FullscreenImageActionMenu(
 }
 
 @Composable
-private fun LivePhotoOverlay(    image: FeedImage,
+private fun LivePhotoOverlay(
+    image: FeedImage,
     stillBitmap: Bitmap? = null,
     modifier: Modifier = Modifier,
     isActive: Boolean = true,
+    explicitPlaybackRequest: Int,
     isInFullscreen: Boolean = false,
     onEnded: () -> Unit,
 ) {
     val context = LocalContext.current
     val videoCoordinator = LocalVideoPlaybackCoordinator.current
-    val videoUrl = image.livePhotoVideoUrl?.takeIf { it.isNotBlank() } ?: return
+    val videoUrl = remember(image.livePhotoVideoUrl) {
+        image.livePhotoVideoUrl?.let(MediaUrlResolver::canonicalLivePhotoPlaybackUrl)
+    } ?: return
     val playbackKey = remember(image.id, image.largeUrl, videoUrl) {
         "${image.id}:$videoUrl"
     }
@@ -16205,25 +16215,9 @@ private fun LivePhotoOverlay(    image: FeedImage,
             repeatMode = androidx.media3.common.Player.REPEAT_MODE_OFF
             volume = 0f
             playWhenReady = false
-            prepare()
         }
     }
-
-    LaunchedEffect(isActive, playbackKey) {
-        if (isActive) {
-            videoCoordinator.pausePeek()
-            if (player.playbackState == androidx.media3.common.Player.STATE_ENDED) {
-                player.seekTo(0)
-            }
-            player.volume = 1f
-            player.playWhenReady = true
-        } else {
-            player.playWhenReady = false
-            player.pause()
-            player.volume = 0f
-            videoVisible = false
-        }
-    }
+    val activation = remember(player) { LivePhotoPlaybackActivation(explicitPlaybackRequest) }
 
     DisposableEffect(player, playbackKey, isInFullscreen) {
         val pauseHandler = { player.pause() }
@@ -16238,6 +16232,14 @@ private fun LivePhotoOverlay(    image: FeedImage,
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                videoVisible = false
+                val httpStatus = generateSequence(error.cause) { it.cause }
+                    .filterIsInstance<androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException>()
+                    .firstOrNull()?.responseCode
+                android.util.Log.w(
+                    "LivePhotoPlayback",
+                    "Playback failed: code=${error.errorCode}, httpStatus=${httpStatus ?: "n/a"}",
+                )
                 onEnded()
             }
         }
@@ -16247,6 +16249,30 @@ private fun LivePhotoOverlay(    image: FeedImage,
             player.removeListener(listener)
             player.release()
         }
+    }
+
+    LaunchedEffect(player, isActive, explicitPlaybackRequest) {
+        val action = activation.onActivation(
+            isActive = isActive,
+            explicitRequest = explicitPlaybackRequest,
+            playbackState = player.playbackState,
+            hasTerminalError = player.playerError != null,
+        )
+        if (action == LivePhotoPlaybackAction.Pause || action == LivePhotoPlaybackAction.WaitForRetry) {
+            player.pause()
+            player.volume = 0f
+            videoVisible = false
+            if (action == LivePhotoPlaybackAction.WaitForRetry) onEnded()
+            return@LaunchedEffect
+        }
+        videoCoordinator.pausePeek()
+        when (action) {
+            LivePhotoPlaybackAction.Prepare -> player.prepare()
+            LivePhotoPlaybackAction.Rewind -> player.seekTo(0)
+            else -> Unit
+        }
+        player.volume = 1f
+        player.playWhenReady = true
     }
 
     AndroidView(
