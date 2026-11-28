@@ -93,7 +93,7 @@ import com.example.myweibo.ui.LongPostToggleTag
 import com.example.myweibo.ui.QuotedLongPostCardTag
 import com.example.myweibo.ui.RenderLongPostText
 import com.example.myweibo.ui.StatusTextSection
-import com.example.myweibo.ui.hasOrderedRefresh
+import com.example.myweibo.ui.HomeRefreshTrigger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -589,7 +589,7 @@ class ReadingControlsComposeTest {
     }
 
     @Test
-    fun closingAndReopeningReverseReadingGapKeepsExpansionInItsHiddenRows() {
+    fun expandedReverseReadingGapKeepsLongBodyExpandedWhenRecycled() {
         val previous = (10 downTo 1).map(::fixturePost)
         val hidden = fixturePost(11).copy(text = NavigationBody)
         val newest = fixturePost(12)
@@ -605,12 +605,19 @@ class ReadingControlsComposeTest {
         }
         val body = cardText(NavigationBody, substring = false)
         compose.runOnIdle {
-            timeline.publishRefresh(TimelinePage(listOf(newest, hidden)), listState, protectViewport = true, keepReading = true)
+            timeline.timelineCacheAccountId = "123"
+            timeline.acceptOrderedRows("123", chronological = true)
+            val baseline = requireNotNull(timeline.captureExplicitRefreshBaseline("123"))
+            val trigger = HomeRefreshTrigger.Pull
+            timeline.applyRefreshPage(
+                TimelinePage(listOf(newest, hidden, previous.first())), listState, trigger,
+                timeline.preservesRefreshViewport(trigger), "123", timeline.displayedOrderedRoute, explicitBaseline = baseline,
+            )
         }
         body.assertDoesNotExist()
         compose.runOnIdle {
             assertEquals(1, timeline.feedProjection.gap?.hiddenPostCount)
-            timeline.toggleTimelineGap()
+            timeline.expandTimelineGap(listState)
         }
         compose.runOnIdle {
             val projection = timeline.feedProjection
@@ -618,14 +625,12 @@ class ReadingControlsComposeTest {
         }
         cardToggle(quoted = false).performClick()
         body.assertLayout(5, false, TextOverflow.Clip)
-        compose.runOnIdle { timeline.toggleTimelineGap() }
+        compose.runOnIdle { listState.requestScrollToItem(timeline.feedProjection.visibleItems.lastIndex) }
         body.assertDoesNotExist()
         compose.runOnIdle {
-            assertTrue(timeline.items.any { it.id == hidden.id })
+            assertTrue(timeline.reverseBrowseGapExpanded)
             assertTrue(timeline.longPostController(listState).isExpanded(HomeLongPostKey(hidden.id)))
-            listState.requestScrollToItem(0)
         }
-        compose.runOnIdle { timeline.toggleTimelineGap() }
         compose.runOnIdle {
             val projection = timeline.feedProjection
             listState.requestScrollToItem(projection.lazyIndexOfPost(projection.visibleItems.indexOfFirst { it.id == hidden.id }))
@@ -1072,13 +1077,15 @@ class ReadingControlsComposeTest {
         try {
             compose.runOnIdle {
                 assertEquals(kind, timeline.timelineKind)
-                val protectViewport = timeline.preferences.reverseReading && timeline.items.isNotEmpty() &&
-                    timeline.timelineKind.hasOrderedRefresh(timeline.selectedTimelineGroupId, timeline.items)
-                val keepReading = protectViewport && timeline.timelineVerifiedFromNetwork
+                val trigger = HomeRefreshTrigger.Automatic
+                val publication = requireNotNull(timeline.applyRefreshPage(
+                    TimelinePage(listOf(refreshed), nextCursor = "new-page"), listState, trigger,
+                    timeline.preservesRefreshViewport(trigger), "123", timeline.displayedOrderedRoute,
+                ))
+                val keepReading = publication.keptReading
                 assertEquals(expectedKeepReading, keepReading)
-                timeline.publishRefresh(TimelinePage(listOf(refreshed), nextCursor = "new-page"), listState, protectViewport, keepReading)
                 assertEquals(if (keepReading) posts.map { it.id } else listOf(post.id), timeline.items.map { it.id })
-                assertEquals(post.id.takeIf { keepReading }, timeline.reverseBrowsePreviousHeadId)
+                assertNull(timeline.confirmedRefresh)
                 assertEquals("new-page".takeUnless { keepReading }, timeline.nextCursor)
             }
             compose.mainClock.advanceTimeByFrame()
@@ -1103,18 +1110,11 @@ class ReadingControlsComposeTest {
         lateinit var timeline: HomeTimelineReadingState
         lateinit var listState: LazyListState
         setFixture {
-            val context = LocalContext.current
             val state = rememberLazyListState()
-            val reading = remember {
-                HomeTimelineReadingState(
-                    ReadingPreferencesStore(context), TimelineCacheStore(context), kind,
-                    ReadingPreferences(foldLongPosts = true, maxLines = 3, reverseReading = keepReading),
-                ).apply {
-                    feedCacheLoaded = true
-                    timelineVerifiedFromNetwork = true
-                    items = listOf(post) + tail
-                }
-            }
+            val reading = rememberFixtureHomeTimeline(
+                listOf(post) + tail, kind,
+                ReadingPreferences(foldLongPosts = true, maxLines = 3, reverseReading = keepReading),
+            )
             SideEffect { listState = state; timeline = reading }
             FollowFeedScreen(
                 listState = state,
@@ -1180,7 +1180,12 @@ class ReadingControlsComposeTest {
                 retweetedStatus = quote.copy(id = "original-alias", text = "Quoted line 1…", requiresLongTextFetch = true),
             )
             compose.runOnIdle {
-                timeline.publishRefresh(TimelinePage(listOf(refreshed) + tail), listState, keepReading, keepReading)
+                val trigger = HomeRefreshTrigger.Automatic
+                val publication = requireNotNull(timeline.applyRefreshPage(
+                    TimelinePage(listOf(refreshed) + tail), listState, trigger,
+                    timeline.preservesRefreshViewport(trigger), "123", timeline.displayedOrderedRoute,
+                ))
+                assertEquals(keepReading, publication.keptReading)
             }
             repeat(4) { assertNextFrame() }
             // Confirm the response rendered, not merely that the old page stayed visible.
@@ -1211,8 +1216,9 @@ class ReadingControlsComposeTest {
                 ReadingPreferencesStore(isolatedPreferences), TimelineCacheStore(context), kind, preferences,
             ).apply {
                 feedCacheLoaded = true
-                timelineVerifiedFromNetwork = true
                 items = posts
+                timelineCacheAccountId = "123"
+                acceptOrderedRows("123", chronological = true)
             }
         }
     }

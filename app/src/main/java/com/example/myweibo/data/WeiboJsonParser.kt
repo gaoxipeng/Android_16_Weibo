@@ -11,11 +11,7 @@ import java.util.TimeZone
 object WeiboJsonParser {
     fun parseTimeline(raw: String): TimelinePage {
         val root = JSONObject(raw)
-        val statuses = root.optJSONArray("statuses")
-            ?: root.optJSONObject("data")?.optJSONArray("statuses")
-            ?: root.optJSONObject("data")?.optJSONArray("list")
-            ?: root.optJSONArray("list")
-            ?: JSONArray()
+        val statuses = timelineStatusEntries(root) ?: JSONArray()
         val items = buildList {
             for (index in 0 until statuses.length()) {
                 val entry = statuses.optJSONObject(index) ?: continue
@@ -28,6 +24,63 @@ object WeiboJsonParser {
             ?: root.optJSONObject("data")?.optNullableString("max_id")
             ?: root.optJSONObject("data")?.optNullableString("next_cursor")
         return TimelinePage(items = items, nextCursor = nextCursor)
+    }
+
+    private fun timelineStatusEntries(root: JSONObject): JSONArray? = root.optJSONArray("statuses")
+        ?: root.optJSONObject("data")?.optJSONArray("statuses")
+        ?: root.optJSONObject("data")?.optJSONArray("list")
+        ?: root.optJSONArray("list")
+
+    /** The display parser is deliberately tolerant. Losing even one ordinary row or
+     * seeing an error/partial envelope cannot confirm a new-post batch. */
+    internal fun hasCompleteExplicitTimelineResponse(raw: String, page: TimelinePage): Boolean {
+        val root = try { JSONObject(raw) } catch (_: org.json.JSONException) { return false }
+        val data = root.optJSONObject("data")
+        if (root.has("data") && !root.isNull("data") && data == null) return false
+        val envelopes = listOfNotNull(root, data)
+        if (envelopes.any { !it.hasCompleteTimelineEnvelope() }) return false
+        val containers = envelopes.flatMap { envelope ->
+            listOf("statuses", "list").filter(envelope::has).map(envelope::opt)
+        }
+        if (containers.size != 1 || containers.single() !is JSONArray) return false
+        val entries = timelineStatusEntries(root) ?: return false
+        var displayed = 0
+        for (i in 0 until entries.length()) {
+            val entry = entries.optJSONObject(i) ?: return false
+            val status = if (entry.has("mblog")) entry.optJSONObject("mblog") ?: return false else entry
+            if (status.looksLikeAd()) {
+                // The UI also skips on the mere presence of some ad fields. Do not
+                // trust that heuristic to exclude an otherwise ordinary row from proof.
+                val title = status.opt("title") as? JSONObject
+                val labelledAd = listOf(status.opt("mblogtypename"), status.opt("title"), title?.opt("text"))
+                    .any { it is String && it.contains("广告") }
+                if (!status.optTruthy("is_ad") && !labelledAd) return false
+                continue
+            }
+            val post = page.items.getOrNull(displayed++) ?: return false
+            val id = listOf("idstr", "mid", "id").firstNotNullOfOrNull { key ->
+                val value = status.opt(key)
+                if (value is Number || value is String) status.optNullableString(key) else null
+            } ?: return false
+            if (post.id != id || post.isPinned != status.isPinnedStatus()) return false
+        }
+        return displayed == page.items.size && page.items.any { !it.isPinned }
+    }
+
+    private fun JSONObject.hasCompleteTimelineEnvelope(): Boolean {
+        fun value(key: String) = opt(key)?.toString()?.trim()?.lowercase(Locale.ROOT)
+        for (key in listOf("ok", "success", "complete", "is_complete")) {
+            if (has(key) && value(key) !in setOf("1", "true")) return false
+        }
+        for (key in listOf("partial", "is_partial", "truncated", "is_truncated")) {
+            if (has(key) && value(key) !in setOf("0", "false")) return false
+        }
+        for (key in listOf("errno", "error_code")) {
+            if (has(key) && value(key) != "0") return false
+        }
+        if (has("code") && value("code") !in setOf("0", "200")) return false
+        if (has("error") && !isNull("error") && value("error") !in setOf("", "0", "false")) return false
+        return true
     }
 
     fun parseUserSearchTimeline(raw: String, uid: String, page: Int): TimelinePage {

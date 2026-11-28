@@ -170,7 +170,7 @@ class FeedTimelineRefreshPolicyTest {
         val oldHead = post(4)
         val full = listOf(pinned, post(7), older, post(5), oldHead, post(3))
         for (limit in listOf(2, 3)) {
-            val projection = projectFeedTimelineRefresh(full, oldHead.id, limit, gapExpanded = true)
+            val projection = projectFeedTimelineRefresh(full, oldHead.id, limit)
             assertEquals(full, projection.visibleItems)
             assertNull(projection.gap)
             assertEquals(4, projection.newPostsMarkerIndex)
@@ -188,11 +188,14 @@ class FeedTimelineRefreshPolicyTest {
         assertEquals(FeedTimelineGap(2, 2), folded.gap)
         assertEquals(3, folded.previousHeadLazyIndex)
 
-        val expanded = projectFeedTimelineRefresh(full, oldHead.id, 1, gapExpanded = true)
-        assertEquals(full, expanded.visibleItems)
-        assertNull(expanded.newPostsMarkerIndex)
-        assertEquals(FeedTimelineGap(1, 2), expanded.gap)
-        assertEquals(5, expanded.previousHeadLazyIndex)
+        for (limit in listOf(1, 3)) {
+            val expanded = projectFeedTimelineRefresh(full, oldHead.id, limit, gapExpanded = true)
+            assertEquals(full, expanded.visibleItems)
+            assertNull(expanded.gap)
+            assertNull(expanded.newPostsMarkerIndex)
+            assertNull(expanded.dividerIndex)
+            assertEquals(4, expanded.previousHeadLazyIndex)
+        }
     }
 
     @Test fun paginationConsumesFullTimelineAndProjectionDoesNotCountAppendedHistory() {
