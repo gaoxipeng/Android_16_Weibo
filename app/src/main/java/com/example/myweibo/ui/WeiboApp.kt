@@ -4331,6 +4331,8 @@ fun WeiboApp() {
     var timelineGroupsOwnerId by remember { mutableStateOf<String?>(null) }
     var dockVerifiedAccountId by remember { mutableStateOf<String?>(null) }
     var dockAccountSessionGeneration by remember { mutableIntStateOf(0) }
+    var dockAccountTransitionInProgress by remember { mutableStateOf(false) }
+    val dockAccountTransitionMutex = remember { Mutex() }
     var selectedTimelineGroupId by remember { mutableStateOf<String?>(null) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
@@ -4460,19 +4462,24 @@ fun WeiboApp() {
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var messagesInboxRoute by remember(activeAccountId, hasLoginCookie) { mutableStateOf(true) }
-    LaunchedEffect(hasLoginCookie, activeAccountId, dockVerifiedAccountId) {
-        val ownerId = dockVerifiedAccountId?.takeIf { it == activeAccountId }
+    fun currentDockGroupRequest(): DockGroupRequest? {
+        if (!hasLoginCookie || dockAccountTransitionInProgress) return null
+        val ownerId = dockVerifiedAccountId?.takeIf { it == activeAccountId } ?: return null
+        return DockGroupRequest(ownerId, dockAccountSessionGeneration)
+    }
+    val dockGroupRequest = currentDockGroupRequest()
+    LaunchedEffect(dockGroupRequest) {
+        // Recomposition may not observe the revoked identity before a switch completes.
+        if (dockGroupRequest != currentDockGroupRequest()) return@LaunchedEffect
         timelineGroups = emptyList()
         timelineGroupsOwnerId = null
-        if (!hasLoginCookie || ownerId == null) return@LaunchedEffect
-        runCatching { session.loadTimelineGroups() }
-            .onSuccess { groups ->
-                if (ownerId == dockVerifiedAccountId?.takeIf { it == activeAccountId } && hasLoginCookie) {
-                    timelineGroups = groups
-                    timelineGroupsOwnerId = ownerId
-                }
-            }
-            .onFailure { if (it is CancellationException) throw it }
+        val request = dockGroupRequest ?: return@LaunchedEffect
+        runCatchingPreservingCancellation {
+            request.loadIfCurrent(::currentDockGroupRequest, session::loadTimelineGroups)
+        }.getOrNull()?.let { groups ->
+            timelineGroups = groups
+            timelineGroupsOwnerId = request.ownerId
+        }
     }
     var cacheLoaded by remember { mutableStateOf(false) }
     var feedCacheLoaded by remember { mutableStateOf(false) }
@@ -4621,11 +4628,6 @@ fun WeiboApp() {
         }
     }
 
-    fun openAccountLoginManagement() {
-        selectedTab = MainTab.Mine
-        pendingOpenAccountLogin = true
-    }
-
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
         operationCapsuleHint = listOf(title, detail).filter { it.isNotBlank() }.joinToString("：")
@@ -4672,15 +4674,30 @@ fun WeiboApp() {
             message.contains("weibo-native-request-failed:403")
     }
 
+    fun revokeDockAccountIdentity() {
+        dockVerifiedAccountId = null
+        dockAccountSessionGeneration += 1
+        timelineGroups = emptyList()
+        timelineGroupsOwnerId = null
+    }
+
+    suspend fun changeDockAccountSession(change: suspend () -> Unit) = dockAccountTransitionMutex.withLock {
+        dockAccountTransitionInProgress = true
+        // Invalidate synchronously, before activation can suspend and replace cookies.
+        revokeDockAccountIdentity()
+        try {
+            change()
+        } finally {
+            dockAccountTransitionInProgress = false
+        }
+    }
+
     fun reloadStoredAccounts() {
         val previousActiveAccountId = activeAccountId
         storedAccounts = accountStore.readAccounts()
         activeAccountId = accountStore.readActiveAccountId()
         if (previousActiveAccountId != activeAccountId) {
-            timelineGroups = emptyList()
-            timelineGroupsOwnerId = null
-            dockVerifiedAccountId = null
-            dockAccountSessionGeneration += 1
+            revokeDockAccountIdentity()
             if (previousActiveAccountId != null) {
                 if (selectedTimelineGroupId != null) {
                     timelineKind = TimelineKind.Following
@@ -4708,12 +4725,16 @@ fun WeiboApp() {
     }
 
     suspend fun persistLoginSession(makeActive: Boolean = false) {
+        if (dockAccountTransitionInProgress) return
         val sessionGeneration = dockAccountSessionGeneration
-        runCatching { session.persistCurrentAccount(accountStore, makeActive = makeActive) }
+        fun isCurrent() = !dockAccountTransitionInProgress && sessionGeneration == dockAccountSessionGeneration
+        runCatchingPreservingCancellation {
+            session.persistCurrentAccount(accountStore, makeActive = makeActive, canPersist = ::isCurrent)
+        }
             .onSuccess { account ->
-                val sessionCurrent = sessionGeneration == dockAccountSessionGeneration
+                if (!isCurrent()) return@onSuccess
                 reloadStoredAccounts()
-                if (sessionCurrent && account != null) {
+                if (account != null) {
                     dockVerifiedAccountId = validTimelineAccountId(account.id).takeIf { it == activeAccountId }
                 }
                 hasLoginCookie = session.hasLoginCookie()
@@ -5533,7 +5554,6 @@ fun WeiboApp() {
     }
 
     fun leaveRetainedSearchForTabSwitch() {
-        if (selectedTab != MainTab.Search) return
         val kind = navOverlayStack.lastOrNull()
         if (kind != NavOverlayKind.DockSearch && kind != NavOverlayKind.TabSwitch) return
         // Explicit tab or timeline selection leaves Search; only Back restores its source.
@@ -5546,6 +5566,13 @@ fun WeiboApp() {
         searchReturnBackground = null
         searchPendingQuery = null
         searchPendingMode = null
+        searchResultsBackAction = null
+    }
+
+    fun openAccountLoginManagement() {
+        leaveRetainedSearchForTabSwitch()
+        selectedTab = MainTab.Mine
+        pendingOpenAccountLogin = true
     }
 
     fun dismissFollowListForTabSwitch() {
@@ -6553,7 +6580,10 @@ fun WeiboApp() {
 
     fun switchStoredAccount(accountId: String) {
         scope.launch {
-            runCatching { session.activateAccount(accountStore, accountId) }
+            if (dockAccountTransitionInProgress) return@launch
+            runCatchingPreservingCancellation {
+                changeDockAccountSession { session.activateAccount(accountStore, accountId) }
+            }
                 .onSuccess {
                     reloadStoredAccounts()
                     dockVerifiedAccountId = accountMatchingTimelineCookie(accountStore.getAccount(accountId))
@@ -6570,13 +6600,18 @@ fun WeiboApp() {
 
     fun deleteStoredAccount(accountId: String) {
         scope.launch {
-            val deletingActive = activeAccountId == accountId
-            accountStore.removeAccount(accountId)
-            reloadStoredAccounts()
-            val nextActiveId = activeAccountId
-            if (deletingActive) {
+            if (dockAccountTransitionInProgress) return@launch
+            if (activeAccountId != accountId) {
+                accountStore.removeAccount(accountId)
+                reloadStoredAccounts()
+                return@launch
+            }
+            changeDockAccountSession {
+                accountStore.removeAccount(accountId)
+                reloadStoredAccounts()
+                val nextActiveId = activeAccountId
                 if (nextActiveId != null && accountStore.getAccount(nextActiveId) != null) {
-                    runCatching { session.activateAccount(accountStore, nextActiveId) }
+                    runCatchingPreservingCancellation { session.activateAccount(accountStore, nextActiveId) }
                         .onSuccess {
                             dockVerifiedAccountId = accountMatchingTimelineCookie(accountStore.getAccount(nextActiveId))
                             hasLoginCookie = session.hasLoginCookie()
@@ -6589,10 +6624,6 @@ fun WeiboApp() {
                         }
                 } else {
                     session.clearAllCookies()
-                    dockVerifiedAccountId = null
-                    dockAccountSessionGeneration += 1
-                    timelineGroups = emptyList()
-                    timelineGroupsOwnerId = null
                     hasLoginCookie = false
                     mineHasLoginCookie = false
                     items = emptyList()
@@ -7961,7 +7992,9 @@ fun WeiboApp() {
             persistLoginSession(makeActive = true)
         } else if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
             // A snapshot is a fallback only when WebView has no authenticated SUB cookie.
-            runCatching { session.activateAccount(accountStore, savedActiveId) }
+            runCatchingPreservingCancellation {
+                changeDockAccountSession { session.activateAccount(accountStore, savedActiveId) }
+            }
                 .onSuccess {
                     dockVerifiedAccountId = accountMatchingTimelineCookie(accountStore.getAccount(savedActiveId))
                 }
@@ -9327,7 +9360,7 @@ fun WeiboApp() {
                                 activeAccountId = activeAccountId,
                                 onSwitchAccount = ::switchStoredAccount,
                                 onDeleteAccount = ::deleteStoredAccount,
-                                onPrepareAddAccount = { session.prepareAddAccount() },
+                                onPrepareAddAccount = { changeDockAccountSession { session.prepareAddAccount() } },
                                 onPersistLoginSession = { persistLoginSession(makeActive = true) },
                                 onReturnToFeed = {
                                     selectedTab = MainTab.Feed
@@ -10044,20 +10077,19 @@ fun WeiboApp() {
                 switchTimelineKind(kind)
             }
             fun openDockGroup(group: TimelineGroup) {
-                val ownerId = timelineGroupsOwnerId ?: return
-                if (!hasLoginCookie || ownerId != activeAccountId || ownerId != dockVerifiedAccountId ||
-                    timelineGroups.none { it.id == group.id }
-                ) return
-                bottomBarVisible = true
-                bottomBarScrollDistance[0] = 0f
-                leaveRetainedSearchForTabSwitch()
-                dismissFollowListForTabSwitch()
-                if (visitedUserId != null) clearVisitedProfileState()
-                if (selectedTab != MainTab.Feed) {
-                    hasLoginCookie = session.hasLoginCookie()
+                val request = dockGroupRequest ?: return
+                if (request.ownerId != timelineGroupsOwnerId) return
+                request.selectGroupIfCurrent(::currentDockGroupRequest, timelineGroups, group.id) { currentGroup ->
+                    bottomBarVisible = true
+                    bottomBarScrollDistance[0] = 0f
+                    leaveRetainedSearchForTabSwitch()
+                    dismissFollowListForTabSwitch()
+                    if (visitedUserId != null) clearVisitedProfileState()
+                    if (selectedTab != MainTab.Feed) {
+                        hasLoginCookie = session.hasLoginCookie()
+                    }
+                    switchTimelineGroup(currentGroup)
                 }
-                if (selectedTimelineGroupId == group.id) selectedTab = MainTab.Feed
-                else switchTimelineGroup(group)
             }
             val visibleTimelineGroups = timelineGroups.takeIf {
                 hasLoginCookie && activeAccountId != null &&
@@ -10153,7 +10185,7 @@ fun WeiboApp() {
                         }
                         bottomBarVisible = true
                         bottomBarScrollDistance[0] = 0f
-                        if (tab != selectedTab) leaveRetainedSearchForTabSwitch()
+                        if (tab != MainTab.Search) leaveRetainedSearchForTabSwitch()
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {

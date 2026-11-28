@@ -64,6 +64,29 @@ class DockAppComposeTest {
         searchPage.assertDoesNotExist()
     }
 
+    @Test fun searchLoginThenExplicitHomeDoesNotBackToMine() {
+        assertSignedOutHome()
+        dock(MainTab.Mine).performClick()
+        dock(MainTab.Search).performClick()
+        compose.onNodeWithText("打开登录").performClick()
+        val accountManagement = hasText("账号管理")
+        compose.waitUntil(timeoutMillis = 8_000) {
+            compose.onAllNodes(accountManagement).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(accountManagement).assertIsDisplayed()
+
+        pressBack() // Account management dialog
+        pressBack() // Settings
+        dock(MainTab.Mine).assertIsSelected()
+        dock(MainTab.Feed).performClick()
+        assertSignedOutHome()
+
+        pressBack()
+
+        assertSignedOutHome()
+        dock(MainTab.Mine).assertIsDisplayed()
+    }
+
     @Test fun mineSettingsDockChangesSurviveRecreateAndMovedHomeStillLongPresses() {
         assertSignedOutHome()
         dock(MainTab.Mine).performClick()
