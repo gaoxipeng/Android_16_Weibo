@@ -2042,6 +2042,7 @@ class WeiboWebSession(context: Context) {
     suspend fun persistCurrentAccount(
         store: WeiboAccountStore,
         makeActive: Boolean = false,
+        canPersist: () -> Boolean = { true },
     ): StoredWeiboAccount? {
         if (!hasLoginCookie()) return null
         // During login/add-account the current store active id can still point to the
@@ -2052,6 +2053,7 @@ class WeiboWebSession(context: Context) {
         var accountPersisted = false
         return try {
             val profile = loadCurrentUserProfile()
+            if (!canPersist()) return null
             val account = StoredWeiboAccount(
                 id = profile.id,
                 screenName = profile.screenName,
@@ -2065,10 +2067,12 @@ class WeiboWebSession(context: Context) {
         } finally {
             // AccountStore has been switched to the identified account before subsequent
             // native responses are allowed to refresh the active cookie snapshot.
-            setCookieSnapshotUpdatesEnabled(
-                if (accountPersisted) store.readActiveAccountId() != null
-                else previousCookieSnapshotUpdatesEnabled,
-            )
+            if (canPersist()) {
+                setCookieSnapshotUpdatesEnabled(
+                    if (accountPersisted) store.readActiveAccountId() != null
+                    else previousCookieSnapshotUpdatesEnabled,
+                )
+            }
         }
     }
 

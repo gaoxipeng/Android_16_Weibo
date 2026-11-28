@@ -391,6 +391,10 @@ import com.example.myweibo.data.NativeUiMessage
 import com.example.myweibo.data.StoredWeiboAccount
 import com.example.myweibo.data.AppearanceMode
 import com.example.myweibo.data.ThemeSettingsStore
+import com.example.myweibo.data.LocalDockState
+import com.example.myweibo.data.DockItem
+import com.example.myweibo.data.rememberDockPreferencesState
+import com.example.myweibo.data.dockCatalogue
 import com.example.myweibo.data.TimelineCacheStore
 import com.example.myweibo.data.TimelineKind
 import com.example.myweibo.data.TimelineGroup
@@ -2638,6 +2642,7 @@ private sealed interface NavOverlayKind {
     data object MediaPreview : NavOverlayKind
     data object Article : NavOverlayKind
     data object TabSwitch : NavOverlayKind
+    data object DockSearch : NavOverlayKind
 }
 
 private enum class OverlayTop {
@@ -2659,7 +2664,7 @@ private fun overlayTopKind(stack: List<NavOverlayKind>): OverlayTop = when (stac
     NavOverlayKind.AlbumViewer -> OverlayTop.AlbumViewer
     NavOverlayKind.MediaPreview -> OverlayTop.MediaPreview
     NavOverlayKind.Article -> OverlayTop.Article
-    NavOverlayKind.TabSwitch, null -> OverlayTop.None
+    NavOverlayKind.TabSwitch, NavOverlayKind.DockSearch, null -> OverlayTop.None
 }
 
 private fun navOverlayKindsMatch(a: NavOverlayKind?, b: NavOverlayKind?): Boolean {
@@ -4180,6 +4185,26 @@ private fun profileAvatarFeedImage(avatarUrl: String?): FeedImage? {
     )
 }
 
+private fun validTimelineAccountId(id: String?): String? = id?.trim()?.takeIf {
+    it.isNotEmpty() && it != "0" && it.all { digit -> digit in '0'..'9' }
+}
+
+// A selected ID alone does not identify a newer WebView login. Accept the saved
+// account offline only when its authenticated cookie matches the live one.
+private fun accountMatchingTimelineCookie(account: StoredWeiboAccount?): String? {
+    account ?: return null
+    val uid = validTimelineAccountId(account.id) ?: return null
+    fun subCookie(header: String?): String? = header?.split(';')
+        ?.firstOrNull { it.trimStart().startsWith("SUB=") }
+        ?.trim()?.substringAfter('=')?.takeIf { it.isNotBlank() }
+    val manager = CookieManager.getInstance()
+    val origin = "https://weibo.com/"
+    val fallback = "https://www.weibo.com/"
+    val liveSub = subCookie(manager.getCookie(origin) ?: manager.getCookie(fallback)) ?: return null
+    val savedSub = subCookie(account.cookies[origin] ?: account.cookies[fallback])
+    return uid.takeIf { liveSub == savedSub }
+}
+
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun WeiboApp() {
@@ -4302,7 +4327,7 @@ fun WeiboApp() {
     var feedRefreshHintGeneration by remember { mutableIntStateOf(0) }
     var operationCapsuleHint by remember { mutableStateOf<String?>(null) }
     var timelineKind by remember { mutableStateOf(feedDisplaySettingsStore.readTimelineKind()) }
-    var timelineGroups by remember { mutableStateOf<List<TimelineGroup>>(emptyList()) }
+    val dockAccount = remember { DockAccountState() }
     var selectedTimelineGroupId by remember { mutableStateOf<String?>(null) }
     var favoriteOverrides by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     var items by remember { mutableStateOf<List<FeedItem>>(emptyList()) }
@@ -4432,13 +4457,24 @@ fun WeiboApp() {
     var storedAccounts by remember { mutableStateOf(accountStore.readAccounts()) }
     var activeAccountId by remember { mutableStateOf(accountStore.readActiveAccountId()) }
     var messagesInboxRoute by remember(activeAccountId, hasLoginCookie) { mutableStateOf(true) }
-    LaunchedEffect(hasLoginCookie, activeAccountId) {
-        if (!hasLoginCookie) {
-            timelineGroups = emptyList()
-            return@LaunchedEffect
+    fun currentDockGroupRequest(): DockGroupRequest? {
+        if (!hasLoginCookie || dockAccount.transitionInProgress) return null
+        val ownerId = dockAccount.verifiedId?.takeIf { it == activeAccountId } ?: return null
+        return DockGroupRequest(ownerId, dockAccount.generation)
+    }
+    val dockGroupRequest = currentDockGroupRequest()
+    LaunchedEffect(dockGroupRequest) {
+        // Recomposition may not observe the revoked identity before a switch completes.
+        if (dockGroupRequest != currentDockGroupRequest()) return@LaunchedEffect
+        dockAccount.groups = emptyList()
+        dockAccount.groupsOwnerId = null
+        val request = dockGroupRequest ?: return@LaunchedEffect
+        runCatchingPreservingCancellation {
+            request.loadIfCurrent(::currentDockGroupRequest, session::loadTimelineGroups)
+        }.getOrNull()?.let { groups ->
+            dockAccount.groups = groups
+            dockAccount.groupsOwnerId = request.ownerId
         }
-        runCatching { session.loadTimelineGroups() }
-            .onSuccess { timelineGroups = it }
     }
     var cacheLoaded by remember { mutableStateOf(false) }
     var feedCacheLoaded by remember { mutableStateOf(false) }
@@ -4587,11 +4623,6 @@ fun WeiboApp() {
         }
     }
 
-    fun openAccountLoginManagement() {
-        selectedTab = MainTab.Mine
-        pendingOpenAccountLogin = true
-    }
-
     fun showMessage(title: String, detail: String) {
         message = NativeUiMessage(title, detail)
         operationCapsuleHint = listOf(title, detail).filter { it.isNotBlank() }.joinToString("：")
@@ -4638,11 +4669,37 @@ fun WeiboApp() {
             message.contains("weibo-native-request-failed:403")
     }
 
+    fun revokeDockAccountIdentity() {
+        dockAccount.verifiedId = null
+        dockAccount.generation += 1
+        dockAccount.groups = emptyList()
+        dockAccount.groupsOwnerId = null
+    }
+
+    suspend fun changeDockAccountSession(change: suspend () -> Unit) = dockAccount.transitionMutex.withLock {
+        dockAccount.transitionInProgress = true
+        // Invalidate synchronously, before activation can suspend and replace cookies.
+        revokeDockAccountIdentity()
+        try {
+            change()
+        } finally {
+            dockAccount.transitionInProgress = false
+        }
+    }
+
     fun reloadStoredAccounts() {
         val previousActiveAccountId = activeAccountId
         storedAccounts = accountStore.readAccounts()
         activeAccountId = accountStore.readActiveAccountId()
         if (previousActiveAccountId != activeAccountId) {
+            revokeDockAccountIdentity()
+            if (previousActiveAccountId != null) {
+                if (selectedTimelineGroupId != null) {
+                    timelineKind = TimelineKind.Following
+                    feedDisplaySettingsStore.writeTimelineKind(TimelineKind.Following)
+                }
+                selectedTimelineGroupId = null
+            }
             mineAccountGeneration += 1
             mineAlbumJob?.cancel()
             mineProfile = null
@@ -4663,9 +4720,18 @@ fun WeiboApp() {
     }
 
     suspend fun persistLoginSession(makeActive: Boolean = false) {
-        runCatching { session.persistCurrentAccount(accountStore, makeActive = makeActive) }
-            .onSuccess {
+        if (dockAccount.transitionInProgress) return
+        val sessionGeneration = dockAccount.generation
+        fun isCurrent() = !dockAccount.transitionInProgress && sessionGeneration == dockAccount.generation
+        runCatchingPreservingCancellation {
+            session.persistCurrentAccount(accountStore, makeActive = makeActive, canPersist = ::isCurrent)
+        }
+            .onSuccess { account ->
+                if (!isCurrent()) return@onSuccess
                 reloadStoredAccounts()
+                if (account != null) {
+                    dockAccount.verifiedId = validTimelineAccountId(account.id).takeIf { it == activeAccountId }
+                }
                 hasLoginCookie = session.hasLoginCookie()
                 mineHasLoginCookie = hasLoginCookie
             }
@@ -5337,11 +5403,10 @@ fun WeiboApp() {
         val exitingKind = navOverlayStack.lastOrNull()
         nestedDetailReturnAnimating = !albumDetailSwipeReturn && exitingKind is NavOverlayKind.Detail &&
             navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
-        // TabSwitch records the page to restore after opening a topic search, but it
-        // has no NavAnimatedOverlay to finish an exit and clear this pending state.
+        // Search return entries have no NavAnimatedOverlay to finish an exit and clear this pending state.
         // Leaving it pending makes feedUiOnTop permanently false when returning home.
         navExitPendingKind = exitingKind?.takeUnless {
-            it == NavOverlayKind.TabSwitch ||
+            (it == NavOverlayKind.TabSwitch || it == NavOverlayKind.DockSearch) ||
                 (albumDetailSwipeReturn && it is NavOverlayKind.Detail &&
                     navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail)
         }
@@ -5414,7 +5479,7 @@ fun WeiboApp() {
         if (exitingKind == NavOverlayKind.AlbumViewer) {
             albumDismissScrollTarget = null
         }
-        if (exitingKind == NavOverlayKind.TabSwitch &&
+        if ((exitingKind == NavOverlayKind.TabSwitch || exitingKind == NavOverlayKind.DockSearch) &&
             previous.detail?.instanceKey == currentDetailSnapshot()?.instanceKey &&
             previous.visitedProfile?.userId == visitedUserId
         ) {
@@ -5481,6 +5546,28 @@ fun WeiboApp() {
 
     fun closeFollowList() {
         navigateBack()
+    }
+
+    fun leaveRetainedSearchForTabSwitch() {
+        val kind = navOverlayStack.lastOrNull()
+        if (kind != NavOverlayKind.DockSearch && kind != NavOverlayKind.TabSwitch) return
+        // Explicit tab or timeline selection leaves Search; only Back restores its source.
+        navStack = emptyList()
+        navOverlayStack = emptyList()
+        navEnterPendingKind = null
+        navExitPendingKind = null
+        selectedItem = null
+        if (visitedUserId != null) clearVisitedProfileState()
+        searchReturnBackground = null
+        searchPendingQuery = null
+        searchPendingMode = null
+        searchResultsBackAction = null
+    }
+
+    fun openAccountLoginManagement() {
+        leaveRetainedSearchForTabSwitch()
+        selectedTab = MainTab.Mine
+        pendingOpenAccountLogin = true
     }
 
     fun dismissFollowListForTabSwitch() {
@@ -6057,6 +6144,7 @@ fun WeiboApp() {
             lastHomeBackPressAt = 0L
             return@BackHandler
         }
+        if (selectedTab != MainTab.Search) leaveRetainedSearchForTabSwitch()
         if (popNavigation()) {
             lastHomeBackPressAt = 0L
             return@BackHandler
@@ -6283,14 +6371,14 @@ fun WeiboApp() {
         refreshTimeline(showRefreshHint = false)
     }
 
-    fun switchTimelineGroup(group: TimelineGroup) {
+    fun switchTimelineGroup(group: TimelineGroup, selectFeed: Boolean = true) {
         timelineRefreshJob?.cancel()
         timelineLoadMoreJob?.cancel()
         timelineRequestGeneration += 1
         selectedTimelineGroupId = group.id
         timelineKind = TimelineKind.SpecialFollowing
         feedDisplaySettingsStore.writeTimelineKind(TimelineKind.SpecialFollowing)
-        selectedTab = MainTab.Feed
+        if (selectFeed) selectedTab = MainTab.Feed
         items = emptyList()
         nextCursor = null
         feedRefreshHint = null
@@ -6488,9 +6576,13 @@ fun WeiboApp() {
 
     fun switchStoredAccount(accountId: String) {
         scope.launch {
-            runCatching { session.activateAccount(accountStore, accountId) }
+            if (dockAccount.transitionInProgress) return@launch
+            runCatchingPreservingCancellation {
+                changeDockAccountSession { session.activateAccount(accountStore, accountId) }
+            }
                 .onSuccess {
                     reloadStoredAccounts()
+                    dockAccount.verifiedId = accountMatchingTimelineCookie(accountStore.getAccount(accountId))
                     hasLoginCookie = session.hasLoginCookie()
                     mineHasLoginCookie = hasLoginCookie
                     refreshTimeline()
@@ -6504,14 +6596,20 @@ fun WeiboApp() {
 
     fun deleteStoredAccount(accountId: String) {
         scope.launch {
-            val deletingActive = activeAccountId == accountId
-            accountStore.removeAccount(accountId)
-            reloadStoredAccounts()
-            val nextActiveId = activeAccountId
-            if (deletingActive) {
+            if (dockAccount.transitionInProgress) return@launch
+            if (activeAccountId != accountId) {
+                accountStore.removeAccount(accountId)
+                reloadStoredAccounts()
+                return@launch
+            }
+            changeDockAccountSession {
+                accountStore.removeAccount(accountId)
+                reloadStoredAccounts()
+                val nextActiveId = activeAccountId
                 if (nextActiveId != null && accountStore.getAccount(nextActiveId) != null) {
-                    runCatching { session.activateAccount(accountStore, nextActiveId) }
+                    runCatchingPreservingCancellation { session.activateAccount(accountStore, nextActiveId) }
                         .onSuccess {
+                            dockAccount.verifiedId = accountMatchingTimelineCookie(accountStore.getAccount(nextActiveId))
                             hasLoginCookie = session.hasLoginCookie()
                             mineHasLoginCookie = hasLoginCookie
                             refreshTimeline()
@@ -7883,13 +7981,19 @@ fun WeiboApp() {
         feedCacheLoaded = true
 
         val savedActiveId = accountStore.readActiveAccountId()
+        dockAccount.verifiedId = accountMatchingTimelineCookie(storedAccounts.firstOrNull { it.id == activeAccountId })
         if (session.hasLoginCookie()) {
             // Keep WebView's potentially newer, server-refreshed session. Restoring the
             // saved snapshot here would roll authentication back to an older cookie set.
             persistLoginSession(makeActive = true)
         } else if (savedActiveId != null && accountStore.getAccount(savedActiveId) != null) {
             // A snapshot is a fallback only when WebView has no authenticated SUB cookie.
-            runCatching { session.activateAccount(accountStore, savedActiveId) }
+            runCatchingPreservingCancellation {
+                changeDockAccountSession { session.activateAccount(accountStore, savedActiveId) }
+            }
+                .onSuccess {
+                    dockAccount.verifiedId = accountMatchingTimelineCookie(accountStore.getAccount(savedActiveId))
+                }
         }
         reloadStoredAccounts()
 
@@ -8382,7 +8486,31 @@ fun WeiboApp() {
         typography = MaterialTheme.typography,
     ) {
     val pollController = remember(session, activeAccountId) { PollUiController(session) }
+    val dockState = rememberDockPreferencesState()
+    LaunchedEffect(dockState.preferences.visibleItems) {
+        val current = when (selectedTab) {
+            MainTab.Messages -> DockItem.MESSAGES
+            MainTab.Compose -> DockItem.COMPOSE
+            else -> null
+        }
+        if (current != null && current !in dockState.preferences.visibleItems) selectedTab = MainTab.Feed
+    }
+    val dockAccountId = dockAccount.verifiedId?.takeIf { hasLoginCookie && it == activeAccountId }
+    val dockGroups = dockAccount.groups.takeIf { dockAccountId != null && dockAccount.groupsOwnerId == dockAccountId }.orEmpty()
+    val currentDockCatalogue = remember(dockAccountId, dockGroups) { dockCatalogue(dockAccountId, dockGroups) }
+    val dockSelectedShortcut = selectedDockTimelineShortcut(currentDockCatalogue, timelineKind, selectedTimelineGroupId)
+    DockVisibilityEffect(dockState.preferences, currentDockCatalogue, dockSelectedShortcut) { entry ->
+        if (entry.group != null) switchTimelineGroup(entry.group, selectFeed = false)
+        else switchTimelineKind(entry.timelineKind ?: TimelineKind.Following)
+    }
+    LaunchedEffect(dockAccount.groupsOwnerId, dockGroups, selectedTimelineGroupId) {
+        val selectedGroup = selectedTimelineGroupId ?: return@LaunchedEffect
+        if (dockAccountId != null && dockAccountId == dockAccount.groupsOwnerId && dockGroups.none { it.id == selectedGroup }) {
+            switchTimelineKind(TimelineKind.Following)
+        }
+    }
     CompositionLocalProvider(
+        LocalDockCatalogue provides currentDockCatalogue,
         LocalPollController provides pollController,
         LocalProfileRetainedUi provides remember { mutableMapOf<String, ProfileRetainedUi>() },
         LocalVideoPlaybackCoordinator provides videoPlaybackCoordinator,
@@ -8390,6 +8518,7 @@ fun WeiboApp() {
             overlayTopKind(navOverlayStack) == OverlayTop.VisitedProfile &&
                 navOverlayStack.dropLast(1).lastOrNull() is NavOverlayKind.Detail
             ),
+        LocalDockState provides dockState,
         LocalShowCommentLikeCount provides showCommentLikeCount,
         LocalSetShowCommentLikeCount provides { enabled ->
             showCommentLikeCount = enabled
@@ -8558,9 +8687,10 @@ fun WeiboApp() {
             val mediaPreviewVisible = overlayTop == OverlayTop.MediaPreview && mediaLayerActive
             val articleLayerActive = navOverlayStack.any { it == NavOverlayKind.Article } && articleOverlay != null
             val articleOverlayVisible = overlayTop == OverlayTop.Article && articleLayerActive
-            val topicSearchOnTop = selectedTab == MainTab.Search &&
-                navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch
-            val searchUiOnTop = selectedTab == MainTab.Search && (topicSearchOnTop || (
+            val retainedSearchOnTop = selectedTab == MainTab.Search &&
+                (navOverlayStack.lastOrNull() == NavOverlayKind.TabSwitch ||
+                    navOverlayStack.lastOrNull() == NavOverlayKind.DockSearch)
+            val searchUiOnTop = selectedTab == MainTab.Search && (retainedSearchOnTop || (
                 visitedUserId == null &&
                 detailOverlayItem == null &&
                 followListOverlay == null &&
@@ -8668,7 +8798,7 @@ fun WeiboApp() {
                 !detailOverlayVisible &&
                 (navExitPendingKind == null || navExitPendingKind is NavOverlayKind.Detail && !detailLayerActive)
             val retainFeedBehindSearch = selectedTab == MainTab.Search &&
-                navOverlayStack.any { it == NavOverlayKind.TabSwitch } &&
+                navOverlayStack.any { it == NavOverlayKind.TabSwitch || it == NavOverlayKind.DockSearch } &&
                 navStack.any { it.selectedTab == MainTab.Feed }
             val keepFeedAlive = retainFeedBehindSearch || selectedTab == MainTab.Feed && (
                 (visitedUserId != null && detailOverlayItem == null) ||
@@ -9226,7 +9356,7 @@ fun WeiboApp() {
                                 activeAccountId = activeAccountId,
                                 onSwitchAccount = ::switchStoredAccount,
                                 onDeleteAccount = ::deleteStoredAccount,
-                                onPrepareAddAccount = { session.prepareAddAccount() },
+                                onPrepareAddAccount = { changeDockAccountSession { session.prepareAddAccount() } },
                                 onPersistLoginSession = { persistLoginSession(makeActive = true) },
                                 onReturnToFeed = {
                                     selectedTab = MainTab.Feed
@@ -9676,14 +9806,14 @@ fun WeiboApp() {
             }
             // A nested detail pop returns to another detail and keeps the main controls hidden.
             val detailExiting = navExitPendingKind is NavOverlayKind.Detail && !nestedDetailReturnAnimating
-            val topicSearchForeground = topicSearchOnTop
+            val retainedSearchForeground = retainedSearchOnTop
             // Keep the source bar intact until the incoming profile has covered it.
             val profileEnteringFromMain = navEnterPendingKind is NavOverlayKind.VisitedProfile &&
                 navStack.lastOrNull()?.let { it.detail == null && it.visitedProfile == null } == true
             val bottomBarNavVisible = if (selectedTab == MainTab.Messages) {
                 messagesInboxRoute
             } else {
-                !userPostsSearchLayerActive && (topicSearchForeground || profileEnteringFromMain ||
+                !userPostsSearchLayerActive && (retainedSearchForeground || profileEnteringFromMain ||
                     ((visitedUserId == null || profileIsExiting) && followListOverlay == null &&
                         (selectedItem == null || detailExiting || detailSwipeReturningHome)))
             }
@@ -9930,14 +10060,45 @@ fun WeiboApp() {
                     )
                 }
             }
+            fun openDockTimeline(kind: TimelineKind) {
+                bottomBarVisible = true
+                bottomBarScrollDistance[0] = 0f
+                leaveRetainedSearchForTabSwitch()
+                dismissFollowListForTabSwitch()
+                if (visitedUserId != null) clearVisitedProfileState()
+                if (selectedTab != MainTab.Feed) {
+                    hasLoginCookie = session.hasLoginCookie()
+                }
+                selectedTab = MainTab.Feed
+                switchTimelineKind(kind)
+            }
+            fun openDockGroup(group: TimelineGroup) {
+                val request = dockGroupRequest ?: return
+                if (request.ownerId != dockAccount.groupsOwnerId) return
+                request.selectGroupIfCurrent(::currentDockGroupRequest, dockAccount.groups, group.id) { currentGroup ->
+                    bottomBarVisible = true
+                    bottomBarScrollDistance[0] = 0f
+                    leaveRetainedSearchForTabSwitch()
+                    dismissFollowListForTabSwitch()
+                    if (visitedUserId != null) clearVisitedProfileState()
+                    if (selectedTab != MainTab.Feed) {
+                        hasLoginCookie = session.hasLoginCookie()
+                    }
+                    switchTimelineGroup(currentGroup)
+                }
+            }
+            val visibleTimelineGroups = dockAccount.groups.takeIf {
+                hasLoginCookie && activeAccountId != null &&
+                    dockAccount.groupsOwnerId == activeAccountId && dockAccount.verifiedId == activeAccountId
+            }.orEmpty()
             val timelineMenuKinds = remember { TimelineKind.entries.toList() }
-            val timelineMenuLabels = remember(timelineGroups) {
-                timelineMenuKinds.map(TimelineKind::label) + listOf("我的分组") + timelineGroups.map(TimelineGroup::name)
+            val timelineMenuLabels = remember(visibleTimelineGroups) {
+                timelineMenuKinds.map(TimelineKind::label) + listOf("我的分组") + visibleTimelineGroups.map(TimelineGroup::name)
             }
             val timelineMenuWidth = rememberActionMenuWidth(timelineMenuLabels)
             val timelineMenuNaturalHeight = ActionMenuCardInset * 4 +
-                ActionMenuCapsuleHeight * (timelineMenuKinds.size + timelineGroups.size + 1) +
-                ActionMenuItemGap * (timelineMenuKinds.size + timelineGroups.size + 2) + 38.dp
+                ActionMenuCapsuleHeight * (timelineMenuKinds.size + visibleTimelineGroups.size + 1) +
+                ActionMenuItemGap * (timelineMenuKinds.size + visibleTimelineGroups.size + 2) + 38.dp
             val timelineMenuHeight = minOf(
                 timelineMenuNaturalHeight,
                 (LocalConfiguration.current.screenHeightDp.dp - 160.dp).coerceAtLeast(280.dp),
@@ -9970,8 +10131,10 @@ fun WeiboApp() {
                     }
                     .zIndex(91f),
             ) {
+                val shortcuts = LocalDockCatalogue.current
                 WeiboLiquidBottomBar(
                     selectedTab = selectedTab,
+                    dockPreferences = LocalDockState.current.preferences,
                     darkSurfaceOverride = darkTheme && selectedTab == MainTab.Messages && messagesInboxRoute,
                     backdrop = when {
                         selectedTab == MainTab.Feed -> homeBottomBarBackdrop
@@ -9985,13 +10148,32 @@ fun WeiboApp() {
                     onBarBoundsChanged = { bottomBarBoundsInRoot = it },
                     onTimelineMenuExpandedChange = { timelineMenuExpanded = it },
                     selectedTimelineKind = timelineKind,
-                    selectedTimelineLabel = timelineGroups.firstOrNull { it.id == selectedTimelineGroupId }?.name,
-                    onTimelineKindChange = { kind ->
-                        dismissFollowListForTabSwitch()
-                        selectedTab = MainTab.Feed
-                        switchTimelineKind(kind)
-                    },
-                    onTabChange = { tab ->
+                    selectedTimelineLabel = visibleTimelineGroups.firstOrNull { it.id == selectedTimelineGroupId }?.name,
+                    dockRuntime = DockRuntime(
+                        catalogue = shortcuts,
+                        selectedEntryId = selectedDockTimelineShortcut(shortcuts, timelineKind, selectedTimelineGroupId),
+                        onEntrySelected = { entry ->
+                            entry.group?.let { openDockGroup(it) } ?: entry.timelineKind?.let { openDockTimeline(it) }
+                        },
+                        onSelectedTimelineClick = {
+                            bottomBarVisible = true
+                            bottomBarScrollDistance[0] = 0f
+                            refreshTimelineFromTop()
+                        },
+                        profileAvatar = resolveDockAvatarRequest(
+                            dockAccount.verifiedId, activeAccountId, hasLoginCookie, mineProfile, storedAccounts,
+                        ),
+                    ),
+                    onTabChange = tabChange@{ tab ->
+                        if (tab == MainTab.Search && selectedTab != MainTab.Search) {
+                            // Retain the source without borrowing topic search’s results-back behavior.
+                            pushNavigation(NavOverlayKind.DockSearch) {
+                                selectedTab = MainTab.Search
+                                bottomBarVisible = true
+                                bottomBarScrollDistance[0] = 0f
+                            }
+                            return@tabChange
+                        }
                         if (selectedTab == MainTab.Feed && tab == MainTab.Mine) {
                             // Retain decoded thumbnails before the feed's lazy rows unmount.
                             homeThumbnailStore.releaseSnapshot()
@@ -9999,19 +10181,7 @@ fun WeiboApp() {
                         }
                         bottomBarVisible = true
                         bottomBarScrollDistance[0] = 0f
-                        if (tab != selectedTab && topicSearchForeground) {
-                            // Explicit tab navigation leaves the retained source
-                            // stack; only Back should return to its detail page.
-                            navStack = emptyList()
-                            navOverlayStack = emptyList()
-                            navEnterPendingKind = null
-                            navExitPendingKind = null
-                            selectedItem = null
-                            if (visitedUserId != null) clearVisitedProfileState()
-                            searchReturnBackground = null
-                            searchPendingQuery = null
-                            searchPendingMode = null
-                        }
+                        if (tab != MainTab.Search) leaveRetainedSearchForTabSwitch()
                         if (tab != selectedTab) {
                             dismissFollowListForTabSwitch()
                             if (tab == MainTab.Feed && visitedUserId != null) {
@@ -10060,13 +10230,11 @@ fun WeiboApp() {
                                         separatorBefore = index > 0,
                                         onClick = {
                                             dismiss()
-                                            dismissFollowListForTabSwitch()
-                                            selectedTab = MainTab.Feed
-                                            switchTimelineKind(kind)
+                                            openDockTimeline(kind)
                                         },
                                     )
                                 }
-                                if (timelineGroups.isNotEmpty()) {
+                                if (visibleTimelineGroups.isNotEmpty()) {
                                     Box(
                                         Modifier.fillMaxWidth().height(0.5.dp)
                                             .background(timelineMenuDividerColor),
@@ -10093,15 +10261,14 @@ fun WeiboApp() {
                                                 color = MaterialTheme.colorScheme.onSurface,
                                             )
                                         }
-                                        timelineGroups.forEach { group ->
+                                        visibleTimelineGroups.forEach { group ->
                                             ImageActionRow(
                                                 label = group.name,
                                                 enabled = true,
                                                 selected = selectedTimelineGroupId == group.id,
                                                 onClick = {
                                                     dismiss()
-                                                    dismissFollowListForTabSwitch()
-                                                    switchTimelineGroup(group)
+                                                    openDockGroup(group)
                                                 },
                                             )
                                         }
@@ -10116,12 +10283,10 @@ fun WeiboApp() {
                                         label = kind.label,
                                         enabled = true,
                                         selected = selectedTimelineGroupId == null && timelineKind == kind,
-                                        separatorBefore = index > 0 || timelineGroups.isEmpty(),
+                                        separatorBefore = index > 0 || visibleTimelineGroups.isEmpty(),
                                         onClick = {
                                             dismiss()
-                                            dismissFollowListForTabSwitch()
-                                            selectedTab = MainTab.Feed
-                                            switchTimelineKind(kind)
+                                            openDockTimeline(kind)
                                         },
                                     )
                                 }
@@ -25042,16 +25207,10 @@ private fun SettingsScreen(
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
         }.getOrNull().orEmpty().ifBlank { "1.2" }
     }
+    val navigateBack: () -> Unit = { if (showHelp) showHelp = false else onBack() }
+    BackHandler(onBack = navigateBack)
 
-    BackHandler {
-        if (showHelp) {
-            showHelp = false
-        } else {
-            onBack()
-        }
-    }
-
-    SettingsPageShell(title = if (showHelp) "使用说明" else "设置", onBack = onBack) {
+    SettingsPageShell(title = if (showHelp) "使用说明" else "设置", onBack = navigateBack) {
         if (showHelp) {
             SettingsHelpContent()
         } else {
@@ -25093,6 +25252,14 @@ private fun SettingsScreen(
                     SettingsFeedDisplayCard(
                         hideBottomBarOnScroll = hideBottomBarOnFeedScroll,
                         onHideBottomBarOnScrollChange = onHideBottomBarOnFeedScrollChange,
+                    )
+                }
+                item(key = "dock-settings") {
+                    val dock = LocalDockState.current
+                    DockSettings(
+                        preferences = dock.preferences,
+                        onPreferencesChange = dock::update,
+                        catalogue = LocalDockCatalogue.current,
                     )
                 }
                 item {
@@ -25174,10 +25341,10 @@ private val appHelpSections = listOf(
     HelpSection(
         title = "底部导航与首页",
         items = listOf(
-            "底部依次为信息流、消息、搜索、写微博、我的。",
-            "长按第一个小房子图标，可切换「最新微博、好友圈、我的收藏、我的赞、热门、同城」或自定义分组；下方文字显示当前选择。",
-            "下拉刷新当前信息流，接近列表末尾时自动加载更多；刷新成功会显示更新条数提示。",
-            "「自动隐藏底栏」开启时，上滑隐藏、下滑显示；关闭后滚动时保持显示。进入设置和编辑等页面时底栏会隐藏。",
+            "搜索和我的位于底栏两侧；中间项目、顺序与图标文字可在「设置 → 底栏」中调整。",
+            "长按时间线图标，可切换「最新微博、好友圈、特别关注、我的收藏、我的赞、热门、同城」或自定义分组；开启「显示图标文字」后，图标下方显示名称。",
+            "单击当前时间线回到顶部并刷新，单击其他时间线切换栏目；也可下拉刷新，接近列表末尾时自动加载更多。",
+            "「自动隐藏底栏」开启时，上滑隐藏、下滑显示；关闭后滚动时保持显示。进入编辑等页面时底栏会隐藏。",
             "首页连续按两次返回可退出应用。",
         ),
     ),
