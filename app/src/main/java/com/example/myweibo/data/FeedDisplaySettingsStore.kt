@@ -5,6 +5,18 @@ import android.content.Context
 class FeedDisplaySettingsStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    fun readHideFeedPosition(): Boolean = prefs.getBoolean("hide_feed_position", false)
+
+    fun writeHideFeedPosition(enabled: Boolean) {
+        prefs.edit().putBoolean("hide_feed_position", enabled).apply()
+    }
+
+    fun readRefreshReturnToTop(): Boolean = prefs.getBoolean("refresh_return_to_top", false)
+
+    fun writeRefreshReturnToTop(enabled: Boolean) {
+        prefs.edit().putBoolean("refresh_return_to_top", enabled).apply()
+    }
+
     fun readHideBottomBarOnScroll(): Boolean =
         prefs.getBoolean(KEY_HIDE_BOTTOM_BAR_ON_SCROLL, true)
 

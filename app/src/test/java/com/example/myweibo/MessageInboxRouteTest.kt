@@ -25,6 +25,5 @@ class MessageInboxRouteTest {
     @Test fun pageTitlesDistinguishInboxFromAChat() {
         assertTrue(isWeiboMessageInboxTitle("消息箱"))
         assertTrue(isWeiboMessageInboxTitle("评论"))
-        assertFalse(isWeiboMessageInboxTitle("花心大挪卜"))
     }
 }

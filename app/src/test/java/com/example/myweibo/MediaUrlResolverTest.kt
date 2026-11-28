@@ -12,6 +12,15 @@ import org.junit.Test
 
 class MediaUrlResolverTest {
     @Test
+    fun canonicalLivePhotoPlaybackUrlPrefersHttpsAndPreservesQuery() {
+        val http = "http://motion.example.test/live.mp4?Expires=1700000000&variant=a%2Fb"
+        val https = "https://motion.example.test/live.mp4?Expires=1700000000&variant=a%2Fb"
+        assertEquals(https, MediaUrlResolver.canonicalLivePhotoPlaybackUrl(" $http "))
+        assertEquals(https, MediaUrlResolver.canonicalLivePhotoPlaybackUrl(https))
+        assertNull(MediaUrlResolver.canonicalLivePhotoPlaybackUrl(" "))
+    }
+
+    @Test
     fun parseUrlDeadlineMs_readsExpiresSeconds() {
         val url = "https://f.video.weibocdn.com/video.mp4?Expires=1700000000&ssig=abc"
         assertEquals(1_700_000_000_000L, MediaUrlResolver.parseUrlDeadlineMs(url))

@@ -194,7 +194,8 @@ fun LiquidBottomTabs(
                     val targetIndex = targetValue.fastRoundToInt()
                         .fastCoerceIn(0, tabsCount - 1)
                     animateToValue(targetIndex.toFloat())
-                    onTabSelected(targetIndex)
+                    // The pointer gesture dispatches selection once. Settling the
+                    // indicator must not dispatch a second click after switching tabs.
                     animationScope.launch {
                         offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                     }
@@ -502,8 +503,6 @@ fun LiquidBottomTabs(
                     feedTabIndex,
                     isLtr,
                     tabWidth,
-                    onTabSelected,
-                    onTabLongPress,
                 ) {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
@@ -542,7 +541,7 @@ fun LiquidBottomTabs(
                             if (releasedBeforeLongPress) {
                                 val targetIndex = indexAt(down.position)
                                 dampedDragAnimation.animateToValue(targetIndex.toFloat())
-                                onTabSelected(targetIndex)
+                                currentOnTabSelected.value(targetIndex)
                                 animationScope.launch {
                                     offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                                 }
