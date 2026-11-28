@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="reading_fold_title">折叠长微博</string>
+    <string name="reading_fold_description">在微博列表里折叠较长的正文，点「展开全文」可继续阅读。详情页不折叠。</string>
+    <string name="reading_fold_lines_label">正文显示行数</string>
+    <string name="reading_fold_lines_value">%d 行</string>
+    <string name="reading_reverse_title">倒序浏览</string>
+    <string name="reading_reverse_description">刷新后留在上次读到的位置，往列表顶部可查看新微博。</string>
+    <string name="reading_reverse_limit_label">刷新时保留的新微博条数</string>
+    <string name="reading_reverse_limit_value">%d 条</string>
+    <string name="reading_reverse_limit_description">新微博超过设定条数时，只显示最新的 %d 条。</string>
+    <string name="reading_number_invalid">请输入 %1$d–%2$d 之间的整数</string>
+    <string name="reading_dialog_cancel">取消</string>
+    <string name="reading_dialog_confirm">确定</string>
+</resources>

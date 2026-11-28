@@ -1,6 +1,7 @@
 package com.example.myweibo.data
 
 import android.content.Context
+import android.content.SharedPreferences
 
 class FeedDisplaySettingsStore(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -25,6 +26,18 @@ class FeedDisplaySettingsStore(context: Context) {
 
     fun writeBottomBarGlassAmount(value: Float) {
         prefs.edit().putFloat(KEY_BOTTOM_BAR_REFRACTION_AMOUNT, normalizeBottomBarGlassAmount(value)).apply()
+    }
+
+    /** Observe the committed values without adding home UI state to the app root. */
+    internal fun observeBottomBarGlass(onChange: (frost: Float, glass: Float) -> Unit): () -> Unit {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == null || key == KEY_BOTTOM_BAR_GLASS_AMOUNT || key == KEY_BOTTOM_BAR_REFRACTION_AMOUNT) {
+                onChange(readBottomBarFrostAmount(), readBottomBarGlassAmount())
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onChange(readBottomBarFrostAmount(), readBottomBarGlassAmount())
+        return { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
 
     fun readShowCommentLikeCount(): Boolean = prefs.getBoolean("show_comment_like_count", true)

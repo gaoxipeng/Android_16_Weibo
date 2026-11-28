@@ -10,30 +10,42 @@ import org.json.JSONObject
 import java.io.File
 
 class TimelineCacheStore(context: Context) {
-    private val cacheFile = File(context.filesDir, "following_timeline_cache.json")
-    private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    // Only verified account IDs are accepted. Never adopt the old unowned file or prefs.
+    private fun accountSuffix(accountId: String): String {
+        require(accountId.isNotEmpty() && accountId != "0" && accountId.all { it in '0'..'9' })
+        return "_account_$accountId"
+    }
+
+    private fun cacheFile(accountId: String) =
+        File(appContext.filesDir, "following_timeline_cache${accountSuffix(accountId)}.json")
+
+    private fun prefs(accountId: String) = appContext.getSharedPreferences(
+        PREFS_NAME + accountSuffix(accountId), Context.MODE_PRIVATE,
+    )
     private val cacheMutex = Mutex()
 
-    suspend fun readFollowingTimeline(): TimelinePage? =
+    suspend fun readFollowingTimeline(accountId: String): TimelinePage? =
         withContext(Dispatchers.IO) {
             runCatching {
+                val cacheFile = cacheFile(accountId)
                 if (!cacheFile.exists()) return@withContext null
                 val raw = cacheFile.readText(Charsets.UTF_8)
                 WeiboJsonParser.parseTimeline(raw)
             }.getOrNull()
         }
 
-    suspend fun writeFollowingTimeline(rawJson: String) {
+    suspend fun writeFollowingTimeline(accountId: String, rawJson: String): Set<String>? =
         withContext(Dispatchers.IO) {
             cacheMutex.withLock {
-                runCatching { writeCacheAtomically(rawJson) }
+                runCatching { writeCacheAtomically(cacheFile(accountId), rawJson) }.getOrNull()
             }
         }
-    }
 
-    suspend fun appendFollowingTimeline(rawJson: String) = withContext(Dispatchers.IO) {
+    suspend fun appendFollowingTimeline(accountId: String, rawJson: String): Set<String>? = withContext(Dispatchers.IO) {
         cacheMutex.withLock {
             runCatching {
+                val cacheFile = cacheFile(accountId)
                 val previous = if (cacheFile.exists()) JSONObject(cacheFile.readText(Charsets.UTF_8)) else JSONObject()
                 val incoming = JSONObject(rawJson)
                 val statuses = JSONArray()
@@ -51,25 +63,28 @@ class TimelineCacheStore(context: Context) {
                     }
                 }
                 val cursor = WeiboJsonParser.parseTimeline(rawJson).nextCursor
-                writeCacheAtomically(JSONObject().put("statuses", statuses).put("max_id", cursor).toString())
-            }
+                writeCacheAtomically(cacheFile, JSONObject().put("statuses", statuses).put("max_id", cursor).toString())
+            }.getOrNull()
         }
-        Unit
     }
 
-    private fun writeCacheAtomically(rawJson: String) {
+    // Return the IDs the same parser can actually restore, only after the atomic rename succeeds.
+    private fun writeCacheAtomically(cacheFile: File, rawJson: String): Set<String> {
+        val ids = WeiboJsonParser.parseTimeline(rawJson).items.mapTo(HashSet()) { it.id }
         val temporary = File(cacheFile.parentFile, "${cacheFile.name}.tmp")
         temporary.writeText(rawJson, Charsets.UTF_8)
         check(temporary.renameTo(cacheFile)) { "Unable to persist timeline cache" }
+        return ids
     }
 
-    fun readFollowingScroll(): Pair<Int, Int> =
-        prefs.getInt(KEY_SCROLL_INDEX, 0) to prefs.getInt(KEY_SCROLL_OFFSET, 0)
+    fun readFollowingScroll(accountId: String): Pair<Int, Int> = prefs(accountId).let {
+        it.getInt(KEY_SCROLL_INDEX, 0) to it.getInt(KEY_SCROLL_OFFSET, 0)
+    }
 
-    fun readFollowingAnchor(): String? = prefs.getString("scroll_status_id", null)
+    fun readFollowingAnchor(accountId: String): String? = prefs(accountId).getString("scroll_status_id", null)
 
-    fun writeFollowingScroll(index: Int, offset: Int, statusId: String? = null) {
-        prefs.edit()
+    fun writeFollowingScroll(accountId: String, index: Int, offset: Int, statusId: String) {
+        prefs(accountId).edit()
             .putInt(KEY_SCROLL_INDEX, index.coerceAtLeast(0))
             .putInt(KEY_SCROLL_OFFSET, offset.coerceAtLeast(0))
             .putString("scroll_status_id", statusId)

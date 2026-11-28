@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="feed_reverse_browse_new_posts_marker">以上是新微博</string>
+    <string name="feed_reverse_browse_gap">已折叠 %d 条</string>
+    <string name="feed_reverse_browse_gap_expand">展开微博</string>
+    <string name="feed_reverse_browse_gap_collapsed">已折叠</string>
+</resources>

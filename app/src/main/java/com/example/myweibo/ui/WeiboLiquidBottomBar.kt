@@ -62,6 +62,7 @@ internal fun WeiboLiquidBottomBar(
     timelineMenuGap: Dp = 4.dp,
     onBarBoundsChanged: ((Rect) -> Unit)? = null,
     modifier: Modifier = Modifier,
+    onSelectedFeedDoubleClick: (() -> Unit)? = null,
 ) {
     val accentColor = MaterialTheme.colorScheme.primary
     val tabContentColor = if (isAppLightTheme() && !darkSurfaceOverride) Color.Black else Color(0xFFD0D0D0)
@@ -98,6 +99,7 @@ internal fun WeiboLiquidBottomBar(
                 tabsCount = tabs.size,
                 gestureController = tabsGestureController,
                 feedTabIndex = feedIndex,
+                onSelectedFeedDoubleClick = onSelectedFeedDoubleClick,
                 onTabLongPress = { onTimelineMenuExpandedChange(true) },
                 modifier = Modifier.fillMaxWidth().onGloballyPositioned {
                     onBarBoundsChanged?.invoke(it.boundsInRoot())
@@ -109,6 +111,7 @@ internal fun WeiboLiquidBottomBar(
                     val coverage = tabCoverage(index)
                     val tabColor = tabContentColor
                     LiquidBottomTab(
+                        selected = index == selectedIndex,
                         onClick = { onTabChange(tab) },
                     ) {
                         Box(

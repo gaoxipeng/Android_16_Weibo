@@ -83,10 +83,20 @@ fun Modifier.drawBottomBarGlassBackdrop(
     glassAmount: Float,
     isLightTheme: Boolean,
 ): Modifier {
+    val surfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
+        .copy(alpha = bottomBarGlassSurfaceAlpha(normalizeBottomBarGlassAmount(frostAmount)))
+    return drawBottomBarGlassBackdrop(backdrop, frostAmount, glassAmount, surfaceColor)
+}
+
+/** Same lens, blur, capsule, highlight and shadow; smaller controls can supply a denser surface. */
+internal fun Modifier.drawBottomBarGlassBackdrop(
+    backdrop: Backdrop,
+    frostAmount: Float,
+    glassAmount: Float,
+    surfaceColor: Color,
+): Modifier {
     val frost = normalizeBottomBarGlassAmount(frostAmount)
     val glass = normalizeBottomBarGlassAmount(glassAmount)
-    val surfaceColor = (if (isLightTheme) Color.White else Color(0xFF121212))
-        .copy(alpha = bottomBarGlassSurfaceAlpha(frost))
     return drawBackdrop(
         backdrop = backdrop,
         shape = { RoundedCornerShape(percent = 50) },
@@ -123,6 +133,7 @@ fun LiquidBottomTabs(
         rememberLiquidBottomTabsGestureController(),
     feedTabIndex: Int = 0,
     onTabLongPress: (index: Int) -> Unit = {},
+    onSelectedFeedDoubleClick: (() -> Unit)? = null,
     content: @Composable RowScope.() -> Unit,
 ) {
     val isLightTheme = isAppLightTheme()
@@ -165,6 +176,7 @@ fun LiquidBottomTabs(
         val currentMaxWidth = rememberUpdatedState(constraints.maxWidth)
         val currentMaxHeight = rememberUpdatedState(constraints.maxHeight)
         val currentOnTabSelected = rememberUpdatedState(onTabSelected)
+        val currentOnSelectedFeedDoubleClick = rememberUpdatedState(onSelectedFeedDoubleClick)
         val currentOnTabLongPress = rememberUpdatedState(onTabLongPress)
         fun valueAt(position: Offset): Float {
             val visualValue = (
@@ -194,7 +206,9 @@ fun LiquidBottomTabs(
                     val targetIndex = targetValue.fastRoundToInt()
                         .fastCoerceIn(0, tabsCount - 1)
                     animateToValue(targetIndex.toFloat())
-                    onTabSelected(targetIndex)
+                    if (targetIndex != currentSelectedIndex.value) {
+                        currentOnTabSelected.value(targetIndex)
+                    }
                     animationScope.launch {
                         offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                     }
@@ -502,15 +516,19 @@ fun LiquidBottomTabs(
                     feedTabIndex,
                     isLtr,
                     tabWidth,
-                    onTabSelected,
-                    onTabLongPress,
                 ) {
+                    var previousFeedTap: Long? = null
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        val precedingTap = previousFeedTap
+                        previousFeedTap = null
+                        val targetIndex = indexAt(down.position)
+                        val startedOnSelectedFeed = targetIndex == feedTabIndex &&
+                            targetIndex == currentSelectedIndex.value && currentOnSelectedFeedDoubleClick.value != null
                         down.consume()
                         dampedDragAnimation.press()
                         var latestPosition = down.position
-                        var releasedBeforeLongPress = false
+                        var releaseTime: Long? = null
                         var movedBeforeLongPress = false
                         val completedBeforeTimeout = withTimeoutOrNull(
                             viewConfiguration.longPressTimeoutMillis,
@@ -524,7 +542,7 @@ fun LiquidBottomTabs(
                                     }
                                 latestPosition = change.position
                                 if (!change.pressed) {
-                                    releasedBeforeLongPress = true
+                                    releaseTime = change.uptimeMillis
                                     change.consume()
                                     return@withTimeoutOrNull true
                                 }
@@ -539,10 +557,27 @@ fun LiquidBottomTabs(
                         } != null
 
                         if (completedBeforeTimeout) {
-                            if (releasedBeforeLongPress) {
-                                val targetIndex = indexAt(down.position)
+                            val upTime = releaseTime
+                            if (upTime != null) {
                                 dampedDragAnimation.animateToValue(targetIndex.toFloat())
-                                onTabSelected(targetIndex)
+                                // A tap also activates the already-selected tab; a drag settling
+                                // on it does not. Read the latest callback without restarting input.
+                                val doubleClick = currentOnSelectedFeedDoubleClick.value
+                                if (startedOnSelectedFeed && targetIndex == currentSelectedIndex.value && doubleClick != null) {
+                                    // Both downs must hit the selected Feed tab; touch slop is
+                                    // for movement within a tap, not drift between two taps.
+                                    if (precedingTap != null &&
+                                        down.uptimeMillis - precedingTap in
+                                        viewConfiguration.doubleTapMinTimeMillis..viewConfiguration.doubleTapTimeoutMillis
+                                    ) {
+                                        doubleClick()
+                                    } else {
+                                        previousFeedTap = upTime
+                                        currentOnTabSelected.value(targetIndex)
+                                    }
+                                } else {
+                                    currentOnTabSelected.value(targetIndex)
+                                }
                                 animationScope.launch {
                                     offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                                 }
