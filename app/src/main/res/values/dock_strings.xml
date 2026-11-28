@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="dock_title">底栏</string>
+    <string name="dock_items">底栏项目</string>
+    <string name="dock_items_hint">勾选要显示的项目，用箭头调整顺序，也可在同一区内拖动排序。至少保留一条时间线。搜索和我的固定在两侧。</string>
+    <string name="dock_visible_count">中间 %1$d/%2$d 项</string>
+    <string name="dock_slots_full">中间已满，请先取消一项。</string>
+    <string name="dock_restore_defaults">恢复默认</string>
+    <string name="dock_show_labels">显示图标文字</string>
+    <string name="dock_preview">预览</string>
+    <string name="dock_move_up">上移%1$s</string>
+    <string name="dock_move_down">下移%1$s</string>
+    <string name="dock_show_item">显示%1$s</string>
+    <string name="dock_item_position">%1$d</string>
+    <string name="dock_last_timeline">至少保留一条时间线</string>
+    <string name="dock_section_common">常用项目</string>
+    <string name="dock_section_timelines">时间线</string>
+    <string name="dock_section_groups">我的分组</string>
+    <string name="dock_home">首页</string>
+    <string name="dock_messages">消息</string>
+    <string name="dock_compose">写微博</string>
+    <string name="dock_profile">我的</string>
+    <string name="dock_search">搜索</string>
+</resources>
